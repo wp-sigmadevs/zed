@@ -92,7 +92,7 @@ pub struct LanguageSettings {
     pub line_ending: LineEndingSetting,
     /// How to perform a buffer format.
     pub formatter: settings::FormatterList,
-    /// Zed's Prettier integration settings.
+    /// Zenith's Prettier integration settings.
     pub prettier: PrettierSettings,
     /// Whether to automatically close JSX tags.
     pub jsx_tag_auto_close: bool,
@@ -258,13 +258,13 @@ pub struct LanguageTaskSettings {
     /// Extra task variables to set for a particular language.
     pub variables: HashMap<String, String>,
     pub enabled: bool,
-    /// Use LSP tasks over Zed language extension ones.
+    /// Use LSP tasks over Zenith language extension ones.
     /// If no LSP tasks are returned due to error/timeout or regular execution,
-    /// Zed language extension tasks will be used instead.
+    /// Zenith language extension tasks will be used instead.
     ///
-    /// Other Zed tasks will still be shown:
-    /// * Zed task from either of the task config file
-    /// * Zed task from history (e.g. one-off task was spawned before)
+    /// Other Zenith tasks will still be shown:
+    /// * Zenith task from either of the task config file
+    /// * Zenith task from history (e.g. one-off task was spawned before)
     pub prefer_lsp: bool,
 }
 
@@ -503,7 +503,7 @@ pub struct EditPredictionSettings {
     pub provider: settings::EditPredictionProvider,
     /// Disable edit predictions for files matching these glob patterns.
     ///
-    /// Use `"..."` to add patterns without repeating Zed's defaults. In project
+    /// Use `"..."` to add patterns without repeating Zenith's defaults. In project
     /// settings, it extends the user or parent configuration value. Omit
     /// `"..."` to replace the inherited list.
     ///
@@ -580,8 +580,8 @@ impl EditPredictionSettings {
 
     /// Returns the configured debounce delay for the active prediction delegate.
     ///
-    /// The Zed edit-prediction delegate handles multiple settings providers
-    /// (Zed, Mercury, Ollama, OpenAI-compatible), so it is identified by name
+    /// The Zenith edit-prediction delegate handles multiple settings providers
+    /// (Zenith, Mercury, Ollama, OpenAI-compatible), so it is identified by name
     /// and then uses the currently configured provider to resolve the delay.
     pub fn debounce_for_delegate(&self, delegate_name: &str) -> Duration {
         match delegate_name {
