@@ -176,8 +176,8 @@ impl NodeRuntime {
                     // and/or have shared tracking of when internet is available.
                     Box::new(UnavailableNodeRuntime {
                         error_message: format!(
-                            "failure while downloading and/or installing Zed managed Node.js, \
-                            restart Zed to retry: {}",
+                            "failure while downloading and/or installing Zenith managed Node.js, \
+                            restart Zenith to retry: {}",
                             err
                         )
                         .into(),
