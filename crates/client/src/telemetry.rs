@@ -1097,6 +1097,12 @@ mod tests {
         cx.update(|cx| {
             let settings_store = SettingsStore::test(cx);
             cx.set_global(settings_store);
+            // Zenith ships with metrics off by default; these tests exercise event reporting.
+            SettingsStore::update_global(cx, |settings_store, cx| {
+                settings_store.update_user_settings(cx, |settings| {
+                    settings.telemetry.get_or_insert_default().metrics = Some(true);
+                });
+            });
         });
     }
 
