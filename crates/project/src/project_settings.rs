@@ -3,14 +3,16 @@ use collections::HashMap;
 use context_server::ContextServerCommand;
 use dap::adapters::DebugAdapterName;
 use fs::Fs;
-use futures::StreamExt as _;
+use futures::{FutureExt as _, StreamExt as _};
 use git::repository::DEFAULT_WORKTREE_DIRECTORY;
 use gpui::{AsyncApp, BorrowAppContext, Context, Entity, EventEmitter, Subscription, Task};
 use lsp::{DEFAULT_LSP_REQUEST_TIMEOUT_SECS, LanguageServerName};
 use paths::{
-    EDITORCONFIG_NAME, debug_task_file_name, local_debug_file_relative_path,
-    local_settings_file_relative_path, local_tasks_file_relative_path,
-    local_vscode_launch_file_relative_path, local_vscode_tasks_file_relative_path, task_file_name,
+    EDITORCONFIG_NAME, debug_task_file_name, legacy_local_debug_file_relative_path,
+    legacy_local_settings_file_relative_path, legacy_local_tasks_file_relative_path,
+    local_debug_file_relative_path, local_settings_file_relative_path,
+    local_tasks_file_relative_path, local_vscode_launch_file_relative_path,
+    local_vscode_tasks_file_relative_path, task_file_name,
 };
 use rpc::{
     AnyProtoClient, TypedEnvelope,
@@ -1258,14 +1260,18 @@ impl SettingsObserver {
 
         let mut settings_contents = Vec::new();
         for (path, _, change) in changes.iter() {
-            let (settings_dir, kind) = if path.ends_with(local_settings_file_relative_path()) {
+            let (settings_dir, kind) = if path.ends_with(local_settings_file_relative_path())
+                || path.ends_with(legacy_local_settings_file_relative_path())
+            {
                 let settings_dir = path
                     .ancestors()
                     .nth(local_settings_file_relative_path().components().count())
                     .unwrap()
                     .into();
                 (settings_dir, LocalSettingsKind::Settings)
-            } else if path.ends_with(local_tasks_file_relative_path()) {
+            } else if path.ends_with(local_tasks_file_relative_path())
+                || path.ends_with(legacy_local_tasks_file_relative_path())
+            {
                 let settings_dir = path
                     .ancestors()
                     .nth(
@@ -1289,7 +1295,9 @@ impl SettingsObserver {
                     .unwrap()
                     .into();
                 (settings_dir, LocalSettingsKind::Tasks)
-            } else if path.ends_with(local_debug_file_relative_path()) {
+            } else if path.ends_with(local_debug_file_relative_path())
+                || path.ends_with(legacy_local_debug_file_relative_path())
+            {
                 let settings_dir = path
                     .ancestors()
                     .nth(
@@ -1342,6 +1350,19 @@ impl SettingsObserver {
             let removed = change == &PathChange::Removed;
             let fs = fs.clone();
             let abs_path = worktree.read(cx).absolutize(path);
+            // Zenith: `.zenith/settings.json` and legacy `.zed/settings.json` share one
+            // settings dir, so always load both and merge (`.zenith` wins).
+            if kind == LocalSettingsKind::Settings {
+                let dir_abs_path = worktree.read(cx).absolutize(&settings_dir);
+                settings_contents.push(
+                    async move {
+                        let content = load_merged_local_settings(fs.as_ref(), &dir_abs_path).await;
+                        (settings_dir, kind, content.transpose())
+                    }
+                    .boxed(),
+                );
+                continue;
+            }
             settings_contents.push(async move {
                 (
                     settings_dir,
@@ -1394,7 +1415,8 @@ impl SettingsObserver {
                         )
                     },
                 )
-            });
+            }
+            .boxed());
         }
 
         if settings_contents.is_empty() {
@@ -1721,4 +1743,34 @@ impl From<DapSettingsContent> for DapSettings {
 pub enum DapBinary {
     Default,
     Custom(String),
+}
+
+/// Zenith: loads a directory's project settings from `.zenith/settings.json` and the
+/// legacy `.zed/settings.json`. A single file is returned verbatim; when both exist
+/// they are merged with `.zenith` keys winning. `Ok(None)` when neither exists.
+async fn load_merged_local_settings(
+    fs: &dyn Fs,
+    dir_abs_path: &std::path::Path,
+) -> anyhow::Result<Option<String>> {
+    let load = async |relative: &RelPath| -> anyhow::Result<Option<String>> {
+        let abs_path = dir_abs_path.join(relative.as_std_path());
+        if fs.is_file(&abs_path).await {
+            Ok(Some(fs.load(&abs_path).await?))
+        } else {
+            Ok(None)
+        }
+    };
+    let zenith = load(local_settings_file_relative_path()).await?;
+    let legacy = load(legacy_local_settings_file_relative_path()).await?;
+    match (zenith, legacy) {
+        (Some(zenith), Some(legacy)) => {
+            let mut merged: serde_json::Value =
+                parse_json_with_comments(&legacy).context("parsing legacy .zed/settings.json")?;
+            let zenith: serde_json::Value =
+                parse_json_with_comments(&zenith).context("parsing .zenith/settings.json")?;
+            util::merge_json_value_into(zenith, &mut merged);
+            Ok(Some(serde_json::to_string(&merged)?))
+        }
+        (zenith, legacy) => Ok(zenith.or(legacy)),
+    }
 }

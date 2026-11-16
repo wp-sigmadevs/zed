@@ -284,6 +284,15 @@ pub async fn resolve_creatable_global_skill_descendant_path(
     restrict_to_skill_descendant(resolve_creatable_global_skill_path(path, fs).await, fs).await
 }
 
+/// Zenith: both `.zenith` and legacy `.zed` project folders hold local settings.
+fn is_local_settings_component(component: &std::ffi::OsStr) -> bool {
+    component_matches_ignore_ascii_case(component, paths::local_settings_folder_name())
+        || component_matches_ignore_ascii_case(
+            component,
+            paths::legacy_local_settings_folder_name(),
+        )
+}
+
 /// Returns the kind of sensitive settings or agent skills location this path targets, if any:
 /// either inside a `.zed/` local-settings directory, inside `.agents/skills/`, or inside
 /// the global config dir.
@@ -313,14 +322,13 @@ pub async fn sensitive_settings_kind(
     canonical_worktree_roots: &[PathBuf],
     fs: &dyn Fs,
 ) -> Option<SensitiveSettingsKind> {
-    let local_settings_folder = paths::local_settings_folder_name();
-
     // Fast path: scan the raw path components before any I/O. Covers the
     // common case where the agent passes a path that literally contains
     // `.zed/` or `.agents/skills/`.
-    if path.components().any(|component| {
-        component_matches_ignore_ascii_case(component.as_os_str(), local_settings_folder)
-    }) {
+    if path
+        .components()
+        .any(|component| is_local_settings_component(component.as_os_str()))
+    {
         return Some(SensitiveSettingsKind::Local);
     }
 
@@ -337,9 +345,10 @@ pub async fn sensitive_settings_kind(
                 continue;
             };
 
-            if relative.components().any(|component| {
-                component_matches_ignore_ascii_case(component.as_os_str(), local_settings_folder)
-            }) {
+            if relative
+                .components()
+                .any(|component| is_local_settings_component(component.as_os_str()))
+            {
                 return Some(SensitiveSettingsKind::Local);
             }
             if is_agents_skills_path(relative) {
@@ -651,10 +660,9 @@ pub fn authorize_file_edit(
     // worktree, but we can short-circuit straight to the appropriate
     // SensitiveSettingsKind on these fast paths and skip the async
     // `sensitive_settings_kind` canonicalization step below.
-    let local_settings_folder = paths::local_settings_folder_name();
-    let is_local_settings = path.components().any(|component| {
-        component_matches_ignore_ascii_case(component.as_os_str(), local_settings_folder)
-    });
+    let is_local_settings = path
+        .components()
+        .any(|component| is_local_settings_component(component.as_os_str()));
     let is_agents_skills = is_agents_skills_path(path);
 
     cx.spawn(async move |cx| {
