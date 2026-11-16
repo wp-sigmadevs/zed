@@ -222,31 +222,22 @@ impl ZenithWelcome {
                 )
                 .child(self.projects.clone())
                 .into_any_element(),
-            Page::Customize => {
-                let Some(user_store) = self
-                    .workspace
-                    .upgrade()
-                    .map(|ws| ws.read(cx).app_state().user_store.clone())
-                else {
-                    return div().into_any_element();
-                };
-                v_flex()
-                    .gap_6()
-                    .max_w(rems(48.))
-                    .child(crate::customize::render_customize(&user_store, cx))
-                    .child(
-                        h_flex().justify_end().child(
-                            Button::new("customize-done", "Done")
-                                .style(ButtonStyle::Filled)
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.page = Page::Projects;
-                                    this.projects.focus_handle(cx).focus(window, cx);
-                                    cx.notify();
-                                })),
-                        ),
-                    )
-                    .into_any_element()
-            }
+            Page::Customize => v_flex()
+                .gap_6()
+                .max_w(rems(48.))
+                .child(crate::customize::render_customize(cx))
+                .child(
+                    h_flex().justify_end().child(
+                        Button::new("customize-done", "Done")
+                            .style(ButtonStyle::Filled)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.page = Page::Projects;
+                                this.projects.focus_handle(cx).focus(window, cx);
+                                cx.notify();
+                            })),
+                    ),
+                )
+                .into_any_element(),
             Page::Plugins => crate::plugins::render_plugins(cx).into_any_element(),
             Page::Learn => crate::learn::render_learn(cx).into_any_element(),
         }

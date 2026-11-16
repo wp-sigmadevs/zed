@@ -26,7 +26,7 @@ const ENTRIES: &[(&str, &str, Target)] = &[
         Target::Action(|| OpenSettings.boxed_clone()),
     ),
     (
-        "Zed Documentation",
+        "Editor Documentation",
         "Upstream editor docs (zed.dev)",
         Target::Url("https://zed.dev/docs"),
     ),
