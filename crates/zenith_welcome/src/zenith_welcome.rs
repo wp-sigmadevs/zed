@@ -1,5 +1,7 @@
 mod customize;
 mod detect;
+mod learn;
+mod plugins;
 mod projects;
 mod view;
 
@@ -301,5 +303,21 @@ mod tests {
         picker.read_with(cx, |picker, _| {
             assert_eq!(picker.delegate.matched_paths(), vec!["/code/laravel-crm"]);
         });
+    }
+
+    #[gpui::test]
+    async fn every_page_renders(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (workspace, cx) = workspace(cx).await;
+        cx.dispatch_action(OpenOnboarding);
+        cx.run_until_parked();
+        for page in [Page::Projects, Page::Customize, Page::Plugins, Page::Learn] {
+            cx.update(|_, cx| view::request_page(workspace.entity_id(), page, cx));
+            cx.run_until_parked();
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            cx.update(|_, cx| {
+                assert!(matches!(cx.global::<view::PageRequest>(), view::PageRequest(None)));
+            });
+        }
     }
 }

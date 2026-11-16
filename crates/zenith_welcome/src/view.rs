@@ -247,7 +247,8 @@ impl ZenithWelcome {
                     )
                     .into_any_element()
             }
-            page => Headline::new(page.label()).into_any_element(),
+            Page::Plugins => crate::plugins::render_plugins(cx).into_any_element(),
+            Page::Learn => crate::learn::render_learn(cx).into_any_element(),
         }
     }
 }
