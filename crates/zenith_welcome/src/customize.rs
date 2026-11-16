@@ -70,7 +70,7 @@ fn render_agents(cx: &mut App) -> impl IntoElement {
 /// Upstream's keymap picker with Zed's default keymap labelled as Zenith's own; no telemetry.
 fn render_base_keymap_section(tab_index: &mut isize, cx: &mut App) -> impl IntoElement {
     const KEYMAPS: [(&str, IconName, BaseKeymap); 8] = [
-        ("Zenith (default)", IconName::Sparkle, BaseKeymap::Zed),
+        ("Zenith (default)", IconName::Zenith, BaseKeymap::Zed),
         ("VS Code", IconName::EditorVsCode, BaseKeymap::VSCode),
         (
             "JetBrains",
