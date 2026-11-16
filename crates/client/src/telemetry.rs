@@ -771,7 +771,7 @@ mod tests {
     use super::*;
     use clock::FakeSystemClock;
 
-    use gpui::TestAppContext;
+    use gpui::{BorrowAppContext as _, TestAppContext};
     use http_client::FakeHttpClient;
     use std::collections::HashMap;
     use telemetry_events::FlexibleEvent;
@@ -1097,6 +1097,12 @@ mod tests {
         cx.update(|cx| {
             let settings_store = SettingsStore::test(cx);
             cx.set_global(settings_store);
+            // Zenith ships with metrics off by default; these tests exercise event reporting.
+            cx.update_global::<SettingsStore, _>(|settings_store, cx| {
+                settings_store.update_user_settings(cx, |settings| {
+                    settings.telemetry.get_or_insert_default().metrics = Some(true);
+                });
+            });
         });
     }
 

@@ -82,7 +82,7 @@ struct Export {
     exclusion_scope: &'static str,
 }
 
-const EXCLUSION_SCOPE: &str = "Patterns Zed skips when scanning your open local projects. Excluded files may still produce watcher events.";
+const EXCLUSION_SCOPE: &str = "Patterns Zenith skips when scanning your open local projects. Excluded files may still produce watcher events.";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum WatcherTab {
