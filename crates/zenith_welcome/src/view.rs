@@ -186,8 +186,8 @@ impl ZenithWelcome {
             )
             .children(Page::ALL.into_iter().map(|page| {
                 tab_index += 1;
+                // Not full_width: that centers the label; the column stretches it instead.
                 Button::new(page.label(), page.label())
-                    .full_width()
                     .tab_index(tab_index)
                     .toggle_state(self.page == page)
                     .on_click(cx.listener(move |this, _, window, cx| {
