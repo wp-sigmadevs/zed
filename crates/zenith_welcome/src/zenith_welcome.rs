@@ -316,8 +316,36 @@ mod tests {
             cx.run_until_parked();
             cx.update(|window, cx| window.draw(cx).clear(cx));
             cx.update(|_, cx| {
-                assert!(matches!(cx.global::<view::PageRequest>(), view::PageRequest(None)));
+                assert!(matches!(
+                    cx.global::<view::PageRequest>(),
+                    view::PageRequest(None)
+                ));
             });
         }
+    }
+
+    #[gpui::test]
+    async fn first_run_opens_customize_and_writes_flag(cx: &mut TestAppContext) {
+        // `AppState::test` installs its own settings store and base themes.
+        let app_state = cx.update(AppState::test);
+        cx.update(|cx| {
+            theme_settings::init(theme::LoadThemes::All(Box::new(assets::Assets)), cx);
+            editor::init(cx);
+            init(cx);
+            client::Client::set_global(app_state.client.clone(), cx);
+            <dyn fs::Fs>::set_global(app_state.fs.clone(), cx);
+        });
+        cx.update(|cx| show_onboarding_view(app_state, cx))
+            .await
+            .expect("first run opens a workspace");
+        cx.run_until_parked();
+        let flag = cx.update(|cx| KeyValueStore::global(cx).read_kvp(FIRST_OPEN));
+        assert_eq!(flag.expect("kvp read").as_deref(), Some("false"));
+        cx.update(|cx| {
+            assert!(matches!(
+                cx.global::<view::PageRequest>(),
+                view::PageRequest(None)
+            ));
+        });
     }
 }
