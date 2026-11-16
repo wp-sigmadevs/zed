@@ -2928,6 +2928,14 @@
     // Delay in milliseconds before showing the which-key popup.
     "delay_ms": 1000,
   },
+  // Zenith-only features.
+  "zenith": {
+    "welcome": {
+      // Whether to show the Zenith welcome screen instead of the
+      // upstream onboarding and welcome pages.
+      "enabled": true,
+    },
+  },
   // The server to connect to. If the environment variable
   // ZED_SERVER_URL is set, it will override this setting.
   "server_url": "https://zed.dev",

@@ -22669,6 +22669,7 @@ dependencies = [
  "zed_actions",
  "zed_credentials_provider",
  "zed_env_vars",
+ "zenith",
  "zlog",
  "zlog_settings",
  "ztracing",
@@ -22862,6 +22863,22 @@ name = "zed_test_extension"
 version = "0.1.0"
 dependencies = [
  "zed_extension_api 0.8.0",
+]
+
+[[package]]
+name = "zenith"
+version = "0.1.0"
+dependencies = [
+ "gpui",
+ "zenith_welcome",
+]
+
+[[package]]
+name = "zenith_welcome"
+version = "0.1.0"
+dependencies = [
+ "gpui",
+ "settings",
 ]
 
 [[package]]
