@@ -483,9 +483,42 @@ pub fn devcontainer_dir() -> &'static PathBuf {
     DEVCONTAINER_DIR.get_or_init(|| data_dir().join("devcontainer"))
 }
 
-/// Returns the relative path to a `.zed` folder within a project.
+/// Returns the relative path to a `.zenith` folder within a project.
+/// New project-local files (settings, tasks, debug scenarios) are created here.
 pub fn local_settings_folder_name() -> &'static str {
+    ".zenith"
+}
+
+/// Zenith: the upstream `.zed` project folder, still read so existing
+/// projects keep working. `.zenith` settings win over `.zed` ones.
+pub fn legacy_local_settings_folder_name() -> &'static str {
     ".zed"
+}
+
+/// Zenith: whether `name` is a project-local settings folder (`.zenith` or `.zed`).
+pub fn is_local_settings_folder_name(name: &str) -> bool {
+    name == local_settings_folder_name() || name == legacy_local_settings_folder_name()
+}
+
+/// Returns the relative path to a legacy `.zed/settings.json` file within a project.
+pub fn legacy_local_settings_file_relative_path() -> &'static RelPath {
+    static CACHED: LazyLock<&'static RelPath> =
+        LazyLock::new(|| RelPath::from_unix_str(".zed/settings.json").unwrap());
+    *CACHED
+}
+
+/// Returns the relative path to a legacy `.zed/tasks.json` file within a project.
+pub fn legacy_local_tasks_file_relative_path() -> &'static RelPath {
+    static CACHED: LazyLock<&'static RelPath> =
+        LazyLock::new(|| RelPath::from_unix_str(".zed/tasks.json").unwrap());
+    *CACHED
+}
+
+/// Returns the relative path to a legacy `.zed/debug.json` file within a project.
+pub fn legacy_local_debug_file_relative_path() -> &'static RelPath {
+    static CACHED: LazyLock<&'static RelPath> =
+        LazyLock::new(|| RelPath::from_unix_str(".zed/debug.json").unwrap());
+    *CACHED
 }
 
 /// Returns the relative path to a `.vscode` folder within a project.
@@ -496,14 +529,14 @@ pub fn local_vscode_folder_name() -> &'static str {
 /// Returns the relative path to a `settings.json` file within a project.
 pub fn local_settings_file_relative_path() -> &'static RelPath {
     static CACHED: LazyLock<&'static RelPath> =
-        LazyLock::new(|| RelPath::from_unix_str(".zed/settings.json").unwrap());
+        LazyLock::new(|| RelPath::from_unix_str(".zenith/settings.json").unwrap());
     *CACHED
 }
 
 /// Returns the relative path to a `tasks.json` file within a project.
 pub fn local_tasks_file_relative_path() -> &'static RelPath {
     static CACHED: LazyLock<&'static RelPath> =
-        LazyLock::new(|| RelPath::from_unix_str(".zed/tasks.json").unwrap());
+        LazyLock::new(|| RelPath::from_unix_str(".zenith/tasks.json").unwrap());
     *CACHED
 }
 
@@ -523,10 +556,10 @@ pub fn task_file_name() -> &'static str {
 }
 
 /// Returns the relative path to a `debug.json` file within a project.
-/// .zed/debug.json
+/// .zenith/debug.json
 pub fn local_debug_file_relative_path() -> &'static RelPath {
     static CACHED: LazyLock<&'static RelPath> =
-        LazyLock::new(|| RelPath::from_unix_str(".zed/debug.json").unwrap());
+        LazyLock::new(|| RelPath::from_unix_str(".zenith/debug.json").unwrap());
     *CACHED
 }
 

@@ -1546,6 +1546,17 @@ mod tests {
             MaybeUndefined::Value("Edit `.zed/settings.json` (local settings)".into())
         );
 
+        // 5.1b (Zenith): .zenith/settings.json is sensitive too
+        let (stream_tx, mut stream_rx) = ToolCallEventStream::test();
+        let _auth = cx.update(|cx| {
+            edit_tool.authorize(&PathBuf::from(".zenith/settings.json"), &stream_tx, cx)
+        });
+        let event = stream_rx.expect_authorization().await;
+        assert_eq!(
+            event.tool_call.title,
+            MaybeUndefined::Value("Edit `.zenith/settings.json` (local settings)".into())
+        );
+
         // 5.2: /etc/hosts is outside the project, but Allow auto-approves
         let (stream_tx, mut stream_rx) = ToolCallEventStream::test();
         cx.update(|cx| edit_tool.authorize(&PathBuf::from("/etc/hosts"), &stream_tx, cx))
