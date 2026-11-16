@@ -1,5 +1,6 @@
-use std::sync::Arc;
+use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
+use crate::detect::ProjectInfo;
 use chrono::{DateTime, Utc};
 use fuzzy_nucleo::{
     MaxResults, StringMatch, StringMatchCandidate, StringMatchOptions, match_strings,
@@ -16,6 +17,7 @@ use workspace::{
 pub struct ProjectsDelegate {
     workspace: WeakEntity<Workspace>,
     projects: Vec<RecentWorkspace>,
+    info: HashMap<PathBuf, ProjectInfo>,
     matches: Vec<StringMatch>,
     selected_index: usize,
 }
@@ -25,6 +27,7 @@ impl ProjectsDelegate {
         Self {
             workspace,
             projects: Vec::new(),
+            info: HashMap::new(),
             matches: Vec::new(),
             selected_index: 0,
         }
@@ -32,6 +35,10 @@ impl ProjectsDelegate {
 
     pub fn set_projects(&mut self, projects: Vec<RecentWorkspace>) {
         self.projects = projects;
+    }
+
+    pub fn set_info(&mut self, info: HashMap<PathBuf, ProjectInfo>) {
+        self.info = info;
     }
 
     #[cfg(test)]
@@ -178,7 +185,15 @@ impl PickerDelegate for ProjectsDelegate {
     ) -> Option<Self::ListItem> {
         let hit = self.matches.get(ix)?;
         let project = self.projects.get(hit.candidate_id)?;
+        let info = project
+            .paths
+            .paths()
+            .first()
+            .and_then(|root| self.info.get(root));
         let mut meta = relative_time(project.timestamp, Utc::now());
+        if let Some(branch) = info.and_then(|info| info.branch.as_deref()) {
+            meta = format!("{branch} · {meta}");
+        }
         if let SerializedWorkspaceLocation::Remote(options) = &project.location {
             meta = format!("{} · {meta}", options.display_name());
         }
@@ -190,7 +205,16 @@ impl PickerDelegate for ProjectsDelegate {
                 .child(
                     v_flex()
                         .min_w_0()
-                        .child(Label::new(project_name(project)))
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .child(Label::new(project_name(project)))
+                                .children(info.and_then(|info| info.framework).map(|framework| {
+                                    Label::new(framework.label())
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Accent)
+                                })),
+                        )
                         .child(
                             h_flex()
                                 .gap_2()

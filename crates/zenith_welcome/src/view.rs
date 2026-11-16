@@ -1,3 +1,5 @@
+use std::{collections::HashMap, path::PathBuf};
+
 use gpui::{
     Action as _, AnyElement, App, Context, Entity, EntityId, FocusHandle, Focusable as _, Global,
     Render, Subscription, WeakEntity, Window,
@@ -5,9 +7,15 @@ use gpui::{
 use picker::Picker;
 use ui::{Vector, VectorName, prelude::*};
 use util::ResultExt as _;
-use workspace::{NewFile, Open, Workspace, WorkspaceDb};
+use workspace::{NewFile, Open, SerializedWorkspaceLocation, Workspace, WorkspaceDb};
 
+use crate::detect::{self, ProjectInfo};
 use crate::projects::ProjectsDelegate;
+
+/// Detection results for this app session, keyed by project root.
+#[derive(Default)]
+struct DetectCache(HashMap<PathBuf, ProjectInfo>);
+impl Global for DetectCache {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Page {
@@ -104,9 +112,42 @@ impl ZenithWelcome {
                 .await
                 .log_err()
                 .unwrap_or_default();
+            let roots: Vec<PathBuf> = projects
+                .iter()
+                .filter(|p| matches!(p.location, SerializedWorkspaceLocation::Local))
+                .filter_map(|p| p.paths.paths().first().cloned())
+                .collect();
+            let Ok(missing) = picker.update_in(cx, |picker, window, cx| {
+                let cache = cx.default_global::<DetectCache>();
+                let missing: Vec<PathBuf> = roots
+                    .into_iter()
+                    .filter(|root| !cache.0.contains_key(root))
+                    .collect();
+                picker.delegate.set_info(cache.0.clone());
+                picker.delegate.set_projects(projects);
+                picker.refresh(window, cx);
+                missing
+            }) else {
+                return;
+            };
+            if missing.is_empty() {
+                return;
+            }
+            let found = cx
+                .background_spawn(async move {
+                    let mut found = Vec::with_capacity(missing.len());
+                    for root in missing {
+                        let info = detect::detect(fs.as_ref(), &root).await;
+                        found.push((root, info));
+                    }
+                    found
+                })
+                .await;
             picker
                 .update_in(cx, |picker, window, cx| {
-                    picker.delegate.set_projects(projects);
+                    let cache = cx.default_global::<DetectCache>();
+                    cache.0.extend(found);
+                    picker.delegate.set_info(cache.0.clone());
                     picker.refresh(window, cx);
                 })
                 .log_err();
