@@ -22870,6 +22870,7 @@ name = "zenith"
 version = "0.1.0"
 dependencies = [
  "gpui",
+ "onboarding",
  "zenith_welcome",
 ]
 
@@ -22877,8 +22878,24 @@ dependencies = [
 name = "zenith_welcome"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "chrono",
+ "db",
+ "editor",
+ "fs",
+ "fuzzy_nucleo",
+ "git",
  "gpui",
+ "onboarding",
+ "picker",
+ "project",
  "settings",
+ "theme",
+ "theme_settings",
+ "ui",
+ "util",
+ "workspace",
+ "zed_actions",
 ]
 
 [[package]]
