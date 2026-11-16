@@ -22879,7 +22879,9 @@ name = "zenith_welcome"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "assets",
  "chrono",
+ "client",
  "db",
  "editor",
  "fs",

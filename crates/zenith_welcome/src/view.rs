@@ -200,7 +200,7 @@ impl ZenithWelcome {
             }))
     }
 
-    fn render_page(&self) -> AnyElement {
+    fn render_page(&self, cx: &mut Context<Self>) -> AnyElement {
         match self.page {
             Page::Projects => v_flex()
                 .size_full()
@@ -222,6 +222,31 @@ impl ZenithWelcome {
                 )
                 .child(self.projects.clone())
                 .into_any_element(),
+            Page::Customize => {
+                let Some(user_store) = self
+                    .workspace
+                    .upgrade()
+                    .map(|ws| ws.read(cx).app_state().user_store.clone())
+                else {
+                    return div().into_any_element();
+                };
+                v_flex()
+                    .gap_6()
+                    .max_w(rems(48.))
+                    .child(crate::customize::render_customize(&user_store, cx))
+                    .child(
+                        h_flex().justify_end().child(
+                            Button::new("customize-done", "Done")
+                                .style(ButtonStyle::Filled)
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.page = Page::Projects;
+                                    this.projects.focus_handle(cx).focus(window, cx);
+                                    cx.notify();
+                                })),
+                        ),
+                    )
+                    .into_any_element()
+            }
             page => Headline::new(page.label()).into_any_element(),
         }
     }
@@ -242,7 +267,7 @@ impl Render for ZenithWelcome {
                     .p_8()
                     .gap_4()
                     .overflow_y_scroll()
-                    .child(self.render_page()),
+                    .child(self.render_page(cx)),
             )
     }
 }

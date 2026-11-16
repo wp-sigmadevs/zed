@@ -43,7 +43,7 @@ fn get_theme_family_themes(theme_name: &str) -> Option<(&'static str, &'static s
     None
 }
 
-fn render_theme_section(tab_index: &mut isize, cx: &mut App) -> impl IntoElement {
+pub fn render_theme_section(tab_index: &mut isize, cx: &mut App) -> impl IntoElement {
     let theme_selection = ThemeSettings::get_global(cx).theme.clone();
     let system_appearance = theme::SystemAppearance::global(cx);
 
@@ -329,7 +329,7 @@ fn render_telemetry_section(tab_index: &mut isize, cx: &App) -> impl IntoElement
         )
 }
 
-fn render_base_keymap_section(tab_index: &mut isize, cx: &mut App) -> impl IntoElement {
+pub fn render_base_keymap_section(tab_index: &mut isize, cx: &mut App) -> impl IntoElement {
     let base_keymap = match BaseKeymap::get_global(cx) {
         BaseKeymap::Zed => Some(0),
         BaseKeymap::VSCode => Some(1),
@@ -394,7 +394,7 @@ fn render_base_keymap_section(tab_index: &mut isize, cx: &mut App) -> impl IntoE
     }
 }
 
-fn render_vim_mode_switch(tab_index: &mut isize, cx: &mut App) -> impl IntoElement {
+pub fn render_vim_mode_switch(tab_index: &mut isize, cx: &mut App) -> impl IntoElement {
     let toggle_state = if VimModeSetting::get_global(cx).0 {
         ui::ToggleState::Selected
     } else {
@@ -432,7 +432,7 @@ fn render_vim_mode_switch(tab_index: &mut isize, cx: &mut App) -> impl IntoEleme
     })
 }
 
-fn render_worktree_auto_trust_switch(tab_index: &mut isize, cx: &mut App) -> impl IntoElement {
+pub fn render_worktree_auto_trust_switch(tab_index: &mut isize, cx: &mut App) -> impl IntoElement {
     let toggle_state = if ProjectSettings::get_global(cx).session.trust_all_worktrees {
         ui::ToggleState::Selected
     } else {
@@ -444,7 +444,9 @@ fn render_worktree_auto_trust_switch(tab_index: &mut isize, cx: &mut App) -> imp
     SwitchField::new(
         "onboarding-auto-trust-worktrees",
         Some("Trust All Projects By Default"),
-        Some("Automatically mark all new projects as trusted to unlock all Zenith's features".into()),
+        Some(
+            "Automatically mark all new projects as trusted to unlock all Zenith's features".into(),
+        ),
         toggle_state,
         {
             let fs = <dyn Fs>::global(cx);
@@ -499,7 +501,7 @@ fn render_setting_import_button(
         })
 }
 
-fn render_import_settings_section(tab_index: &mut isize, cx: &mut App) -> impl IntoElement {
+pub fn render_import_settings_section(tab_index: &mut isize, cx: &mut App) -> impl IntoElement {
     let import_state = SettingsImportState::global(cx);
     let imports: [(SharedString, &dyn Action, bool); 2] = [
         (
@@ -536,10 +538,10 @@ fn render_import_settings_section(tab_index: &mut isize, cx: &mut App) -> impl I
         .child(h_flex().gap_1().child(vscode).child(cursor))
 }
 
-pub(crate) const FEATURED_AGENT_IDS: &[&str] =
+pub const FEATURED_AGENT_IDS: &[&str] =
     &["claude-acp", "codex-acp", "github-copilot-cli", "cursor"];
 
-fn render_registry_agent_button(
+pub fn render_registry_agent_button(
     agent: &RegistryAgent,
     installed: bool,
     cx: &mut App,
@@ -598,7 +600,7 @@ fn render_registry_agent_button(
         })
 }
 
-fn render_zed_agent_button(user_store: &Entity<UserStore>, cx: &mut App) -> impl IntoElement {
+pub fn render_zed_agent_button(user_store: &Entity<UserStore>, cx: &mut App) -> impl IntoElement {
     let client = Client::global(cx);
     let status = *client.status().borrow();
 

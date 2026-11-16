@@ -1,3 +1,4 @@
+mod customize;
 mod detect;
 mod projects;
 mod view;
@@ -127,7 +128,8 @@ mod tests {
         cx.update(|cx| {
             let store = SettingsStore::test(cx);
             cx.set_global(store);
-            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            // Customize renders upstream theme tiles, which need the bundled themes.
+            theme_settings::init(theme::LoadThemes::All(Box::new(assets::Assets)), cx);
             editor::init(cx);
             init(cx);
         });
@@ -150,6 +152,12 @@ mod tests {
         let (multi, cx) =
             cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
         let workspace = multi.read_with(cx, |multi, _| multi.workspace().clone());
+        // Upstream Customize sections read these app globals.
+        cx.update(|_, cx| {
+            let app_state = workspace.read(cx).app_state().clone();
+            client::Client::set_global(app_state.client.clone(), cx);
+            <dyn fs::Fs>::set_global(app_state.fs.clone(), cx);
+        });
         (workspace, cx)
     }
 
