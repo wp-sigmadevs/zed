@@ -30,6 +30,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
+    time::Duration,
 };
 use text::Point;
 use ui::{HighlightedLabel, KeyBinding, ListItem, ListItemSpacing, prelude::*};
@@ -54,6 +55,7 @@ actions!(
 );
 
 const RECENT_FILES_LIMIT: usize = 20;
+const SYMBOL_QUERY_DEBOUNCE: Duration = Duration::from_millis(100);
 
 pub fn init(cx: &mut App) {
     cx.observe_new(|workspace: &mut Workspace, _, _| {
@@ -349,21 +351,29 @@ impl SearchDelegate {
             self.matches.clear();
             return Task::ready(());
         }
-        let symbols = self
-            .project
-            .update(cx, |project, cx| project.symbols(&query, cx));
         // rust-analyzer takes `path::Name` queries; rank on the last segment only.
         let filter_query = query
             .rsplit_once("::")
             .map_or(&*query, |(_, suffix)| suffix)
             .to_owned();
         cx.spawn_in(window, async move |picker, cx| {
+            // Each keystroke replaces this task, so the server only sees the query
+            // once typing pauses.
+            cx.background_executor().timer(SYMBOL_QUERY_DEBOUNCE).await;
+            let Ok(symbols) = picker.update(cx, |picker, cx| {
+                picker
+                    .delegate
+                    .project
+                    .update(cx, |project, cx| project.symbols(&query, cx))
+            }) else {
+                return;
+            };
             let Some(symbols) = symbols.await.log_err() else {
                 return;
             };
             let symbols = symbols
                 .into_iter()
-                .filter(|symbol| !classes_only || is_class_like(symbol.kind))
+                .filter(|symbol| !classes_only || is_class_like(symbol))
                 .collect::<Vec<_>>();
             let Ok(in_project) = picker.update(cx, |picker, cx| {
                 let project = picker.delegate.project.read(cx);
@@ -524,13 +534,23 @@ impl SearchDelegate {
     }
 }
 
-/// What the Classes tab keeps. LSP has no trait kind; PHP servers report traits
-/// as one of these.
-fn is_class_like(kind: SymbolKind) -> bool {
-    matches!(
-        kind,
-        SymbolKind::Class | SymbolKind::Interface | SymbolKind::Enum | SymbolKind::Struct
-    )
+/// What the Classes tab keeps. LSP has no trait kind: PHPantom reports PHP
+/// traits as Class, Intelephense as Module, so Module counts only in PHP files
+/// (elsewhere it means Rust modules, TypeScript namespaces and the like).
+fn is_class_like(symbol: &Symbol) -> bool {
+    match symbol.kind {
+        SymbolKind::Class | SymbolKind::Interface | SymbolKind::Enum | SymbolKind::Struct => true,
+        SymbolKind::Module => {
+            let extension = match &symbol.path {
+                SymbolLocation::InProject(project_path) => project_path.path.extension(),
+                SymbolLocation::OutsideProject { abs_path, .. } => abs_path
+                    .extension()
+                    .and_then(|extension| extension.to_str()),
+            };
+            extension == Some("php")
+        }
+        _ => false,
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1092,7 +1112,10 @@ mod tests {
             .as_fake()
             .insert_tree(
                 path!("/root"),
-                json!({ "widget.rs": "fn helper() {}\nstruct Widget;\nenum WidgetKind {}\nfn widget_new() {}\n" }),
+                json!({
+                    "widget.rs": "fn helper() {}\nstruct Widget;\nenum WidgetKind {}\nfn widget_new() {}\nmod widget_mod {}\n",
+                    "widget_trait.php": "<?php\ntrait WidgetTrait {}\n",
+                }),
             )
             .await;
         let project = Project::test(app_state.fs.clone(), [path!("/root").as_ref()], cx).await;
@@ -1126,12 +1149,28 @@ mod tests {
             .await
             .expect("buffer opens");
         let fake_server = fake_servers.next().await.expect("language server starts");
-        fake_server.set_request_handler::<lsp::WorkspaceSymbolRequest, _, _>(|_, _| async {
-            Ok(Some(lsp::WorkspaceSymbolResponse::Flat(vec![
-                symbol("Widget", lsp::SymbolKind::STRUCT, 1),
-                symbol("WidgetKind", lsp::SymbolKind::ENUM, 2),
-                symbol("widget_new", lsp::SymbolKind::FUNCTION, 3),
-            ])))
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        fake_server.set_request_handler::<lsp::WorkspaceSymbolRequest, _, _>({
+            let requests = requests.clone();
+            move |_, _| {
+                requests.fetch_add(1, Ordering::SeqCst);
+                async {
+                    let rust = path!("/root/widget.rs");
+                    Ok(Some(lsp::WorkspaceSymbolResponse::Flat(vec![
+                        symbol("Widget", lsp::SymbolKind::STRUCT, rust, 1),
+                        symbol("WidgetKind", lsp::SymbolKind::ENUM, rust, 2),
+                        symbol("widget_new", lsp::SymbolKind::FUNCTION, rust, 3),
+                        // A Rust module is not a class; an Intelephense PHP trait is.
+                        symbol("widget_mod", lsp::SymbolKind::MODULE, rust, 4),
+                        symbol(
+                            "WidgetTrait",
+                            lsp::SymbolKind::MODULE,
+                            path!("/root/widget_trait.php"),
+                            1,
+                        ),
+                    ])))
+                }
+            }
         });
         let (multi_workspace, cx) =
             cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
@@ -1167,19 +1206,42 @@ mod tests {
         cx.dispatch_action(Toggle);
         let picker = open_picker(&workspace, cx);
         switch_tab(Tab::Symbols, cx);
-        cx.simulate_input("widget");
+        // Typed one key at a time with the app idle in between, as a person types.
+        for character in ["w", "i", "d", "g", "e", "t"] {
+            cx.simulate_input(character);
+            cx.run_until_parked();
+        }
+        cx.executor().advance_clock(SYMBOL_QUERY_DEBOUNCE);
         cx.run_until_parked();
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            1,
+            "typing one word sends one query"
+        );
         let mut symbols = names(&picker, cx);
         symbols.sort();
-        assert_eq!(symbols, ["Widget", "WidgetKind", "widget_new"]);
+        assert_eq!(
+            symbols,
+            [
+                "Widget",
+                "WidgetKind",
+                "WidgetTrait",
+                "widget_mod",
+                "widget_new"
+            ]
+        );
 
         switch_tab(Tab::Classes, cx);
         cx.run_until_parked();
+        cx.executor().advance_clock(SYMBOL_QUERY_DEBOUNCE);
+        cx.run_until_parked();
         let mut classes = names(&picker, cx);
         classes.sort();
-        assert_eq!(classes, ["Widget", "WidgetKind"]);
+        assert_eq!(classes, ["Widget", "WidgetKind", "WidgetTrait"]);
 
         cx.simulate_input("kind");
+        cx.run_until_parked();
+        cx.executor().advance_clock(SYMBOL_QUERY_DEBOUNCE);
         cx.run_until_parked();
         assert_eq!(names(&picker, cx), ["WidgetKind"]);
         cx.dispatch_action(menu::Confirm);
@@ -1201,7 +1263,7 @@ mod tests {
         });
     }
 
-    fn symbol(name: &str, kind: lsp::SymbolKind, row: u32) -> lsp::SymbolInformation {
+    fn symbol(name: &str, kind: lsp::SymbolKind, path: &str, row: u32) -> lsp::SymbolInformation {
         #[allow(deprecated)]
         lsp::SymbolInformation {
             name: name.to_string(),
@@ -1210,7 +1272,7 @@ mod tests {
             deprecated: None,
             container_name: None,
             location: lsp::Location::new(
-                lsp::Uri::from_file_path(path!("/root/widget.rs")).expect("absolute path"),
+                lsp::Uri::from_file_path(path).expect("absolute path"),
                 lsp::Range::new(lsp::Position::new(row, 0), lsp::Position::new(row, 0)),
             ),
         }
