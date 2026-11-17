@@ -154,6 +154,28 @@ mod tests {
         assert!(defaults.contains(r#""archipelago-icons": true"#));
     }
 
+    // Plan 34 step 2: ⇧⇧ opens search, as in PhpStorm.
+    #[gpui::test]
+    fn test_double_shift_opens_file_finder(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update(|cx| {
+            let bindings = settings::KeymapFile::load_asset_allow_partial_failure(
+                settings::DEFAULT_KEYMAP_PATH,
+                cx,
+            )
+            .expect("default keymap loads");
+            let toggle = workspace::ToggleFileFinder::default();
+            assert!(bindings.iter().any(|binding| {
+                binding.action().partial_eq(&toggle)
+                    && binding
+                        .keystrokes()
+                        .iter()
+                        .map(|keystroke| keystroke.inner().key.as_str())
+                        .eq(["shift", "shift"])
+            }));
+        });
+    }
+
     #[gpui::test]
     fn test_driftwood_warning_is_not_agent_orange(cx: &mut TestAppContext) {
         use theme::ActiveTheme as _;

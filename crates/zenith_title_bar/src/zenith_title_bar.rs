@@ -31,6 +31,7 @@ pub fn search_box(action: Box<dyn gpui::Action>) -> impl IntoElement {
         .child(
             h_flex()
                 .w_48()
+                .min_w_0()
                 .gap_1()
                 .child(
                     Icon::new(IconName::MagnifyingGlass)
@@ -40,7 +41,8 @@ pub fn search_box(action: Box<dyn gpui::Action>) -> impl IntoElement {
                 .child(
                     Label::new("Search Everywhere")
                         .size(LabelSize::Small)
-                        .color(Color::Muted),
+                        .color(Color::Muted)
+                        .truncate(),
                 ),
         )
         .tooltip({
