@@ -1,7 +1,9 @@
 //! Search Everywhere (plan 34, step 4): one modal, a tab per source. Step 4a ships
 //! the tab strip and the Actions source; the other tabs light up in 4b–4e.
 
-use command_palette::{humanize_action_name, normalize_action_query};
+use command_palette::{
+    command_usage, humanize_action_name, normalize_action_query, record_command_invocation,
+};
 use command_palette_hooks::CommandPaletteFilter;
 use fuzzy_nucleo::{StringMatch, StringMatchCandidate, StringMatchOptions};
 use gpui::{
@@ -9,8 +11,9 @@ use gpui::{
     SharedString, Task, WeakEntity, Window, actions,
 };
 use picker::{Picker, PickerDelegate};
-use std::sync::Arc;
+use std::{cmp::Reverse, sync::Arc};
 use ui::{HighlightedLabel, KeyBinding, ListItem, ListItemSpacing, prelude::*};
+use util::ResultExt as _;
 use workspace::{ModalView, Workspace};
 
 actions!(
@@ -118,6 +121,7 @@ impl SearchEverywhere {
             commands,
             matches: Vec::new(),
             selected_ix: 0,
+            latest_query: String::new(),
         };
         let picker = cx.new(|cx| Picker::uniform_list(delegate, window, cx).embedded());
         Self { picker }
@@ -159,6 +163,7 @@ pub struct ActionsDelegate {
     commands: Vec<Command>,
     matches: Vec<StringMatch>,
     selected_ix: usize,
+    latest_query: String,
 }
 
 impl PickerDelegate for ActionsDelegate {
@@ -184,34 +189,56 @@ impl PickerDelegate for ActionsDelegate {
         self.selected_ix = ix;
     }
 
-    // shortcut: matches on the UI thread (a few thousand short strings); move to
-    // match_strings_async if it ever lags, as the command palette does.
     fn update_matches(
         &mut self,
         query: String,
-        _: &mut Window,
-        _: &mut Context<Picker<Self>>,
+        window: &mut Window,
+        cx: &mut Context<Picker<Self>>,
     ) -> Task<()> {
+        let usage = command_usage(cx);
         let candidates = self
             .commands
             .iter()
             .enumerate()
             .map(|(ix, command)| StringMatchCandidate::from_shared(ix, command.name.clone()))
             .collect::<Vec<_>>();
-        self.matches = fuzzy_nucleo::match_strings(
-            &candidates,
-            &normalize_action_query(&query),
-            StringMatchOptions::default(),
-        );
-        if query.is_empty() {
-            self.matches.sort_by(|a, b| {
-                self.commands[a.candidate_id]
-                    .name
-                    .cmp(&self.commands[b.candidate_id].name)
+        let usage = self
+            .commands
+            .iter()
+            .map(|command| usage.get(&command.name).copied())
+            .collect::<Vec<_>>();
+        let normalized_query = normalize_action_query(&query);
+        let is_empty_query = query.is_empty();
+        self.latest_query = query;
+        let executor = cx.background_executor().clone();
+        let matching = cx.background_spawn(async move {
+            let mut matches = fuzzy_nucleo::match_strings_async(
+                &candidates,
+                &normalized_query,
+                StringMatchOptions::default(),
+                executor,
+            )
+            .await;
+            // Recently used first, as in the command palette; the rest keep fuzzy
+            // order, or name order when nothing is typed.
+            matches.sort_by_cached_key(|string_match| {
+                (
+                    Reverse(usage.get(string_match.candidate_id).copied().flatten()),
+                    is_empty_query.then(|| string_match.string.clone()),
+                )
             });
-        }
-        self.selected_ix = 0;
-        Task::ready(())
+            matches
+        });
+        cx.spawn_in(window, async move |picker, cx| {
+            let matches = matching.await;
+            picker
+                .update(cx, |picker, cx| {
+                    picker.delegate.matches = matches;
+                    picker.delegate.selected_ix = 0;
+                    cx.notify();
+                })
+                .log_err();
+        })
     }
 
     fn confirm(&mut self, _secondary: bool, window: &mut Window, cx: &mut Context<Picker<Self>>) {
@@ -219,7 +246,11 @@ impl PickerDelegate for ActionsDelegate {
             self.dismissed(window, cx);
             return;
         };
-        let action = self.commands[command_ix].action.boxed_clone();
+        let Some(command) = self.commands.get(command_ix) else {
+            return;
+        };
+        record_command_invocation(command.name.clone(), self.latest_query.clone(), cx);
+        let action = command.action.boxed_clone();
         window.focus(&self.previous_focus_handle, cx);
         self.dismissed(window, cx);
         window.dispatch_action(action, cx);
@@ -282,6 +313,7 @@ mod tests {
             editor::init(cx);
             menu::init();
             workspace::init(app_state.clone(), cx);
+            command_palette::init(cx);
             init(cx);
             cx.bind_keys(KeymapFile::load_panic_on_failure(
                 r#"[{ "bindings": { "enter": "menu::Confirm" } }]"#,
@@ -315,6 +347,7 @@ mod tests {
         picker.read_with(cx, |picker, _| assert!(picker.delegate.matches.len() > 5));
 
         cx.simulate_input("bcksp");
+        cx.run_until_parked();
         picker.read_with(cx, |picker, _| {
             let first = &picker.delegate.matches[0];
             assert_eq!(
@@ -327,6 +360,49 @@ mod tests {
         workspace.update(cx, |workspace, cx| {
             assert!(workspace.active_modal::<SearchEverywhere>(cx).is_none());
             assert_eq!(editor.read(cx).text(cx), "ab");
+        });
+
+        // The pick is remembered and leads the list next time.
+        cx.run_until_parked();
+        cx.dispatch_action(Toggle);
+        cx.run_until_parked();
+        let picker = workspace.update(cx, |workspace, cx| {
+            workspace
+                .active_modal::<SearchEverywhere>(cx)
+                .expect("Search Everywhere reopens")
+                .read(cx)
+                .picker
+                .clone()
+        });
+        picker.read_with(cx, |picker, _| {
+            assert_eq!(picker.delegate.matches[0].string, "editor: backspace");
+        });
+    }
+
+    #[gpui::test]
+    fn test_keymap_opens_search_like_phpstorm(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            settings::init(cx);
+            workspace::init(AppState::test(cx), cx);
+            init(cx);
+            let bindings = KeymapFile::load_asset(settings::ZENITH_KEYMAP_PATH, None, cx)
+                .expect("Zenith keymap loads");
+            let bound_to = |action: &dyn Action, keys: &[&str]| {
+                bindings.iter().any(|binding| {
+                    binding.action().partial_eq(action)
+                        && binding
+                            .keystrokes()
+                            .iter()
+                            .map(|keystroke| keystroke.inner().key.as_str())
+                            .eq(keys.iter().copied())
+                })
+            };
+            // ⇧⇧ stays on the file finder until Search Everywhere has Files (step 4b).
+            assert!(bound_to(
+                &workspace::ToggleFileFinder::default(),
+                &["shift", "shift"]
+            ));
+            assert!(bound_to(&Toggle, &["a"]));
         });
     }
 }

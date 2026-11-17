@@ -5,6 +5,8 @@
     "bindings": {
       // ⇧⇧ searches, as in PhpStorm.
       "shift shift": "file_finder::Toggle",
+      // Find Action (⌘⇧A / Ctrl+Shift+A), as in PhpStorm.
+      "secondary-shift-a": "zenith_search::Toggle",
     },
   },
 ]
