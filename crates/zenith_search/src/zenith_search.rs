@@ -1,11 +1,11 @@
-//! Search Everywhere (plan 34, step 4): one modal, a tab per source. Files and
-//! Actions are live; the other tabs light up in 4c–4e.
+//! Search Everywhere (plan 34, step 4): one modal, a tab per source. Classes,
+//! Files, Symbols and Actions are live; All and Hooks light up in 4d–4e.
 
 use command_palette::{
     action_last_invoked, humanize_action_name, normalize_action_query, record_command_invocation,
 };
 use command_palette_hooks::CommandPaletteFilter;
-use editor::Editor;
+use editor::{Bias, Editor, SelectionEffects, scroll::Autoscroll};
 use file_icons::FileIcons;
 use fuzzy_nucleo::{
     MaxResults, PathMatchOptions, StringMatch, StringMatchCandidate, StringMatchOptions,
@@ -14,9 +14,13 @@ use gpui::{
     Action, App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, Render,
     SharedString, Task, WeakEntity, Window, actions,
 };
+use language::SymbolKind;
 use open_path_prompt::file_finder_settings::FileFinderSettings;
 use picker::{Picker, PickerDelegate};
-use project::{Candidates, PathMatchCandidateSet, Project, ProjectPath, WorktreeId};
+use project::{
+    Candidates, PathMatchCandidateSet, Project, ProjectPath, Symbol, WorktreeId,
+    lsp_store::SymbolLocation,
+};
 use settings::Settings as _;
 use std::{
     cmp::Reverse,
@@ -34,7 +38,10 @@ use util::{
     paths::{PathStyle, PathWithPosition},
     rel_path::RelPath,
 };
-use workspace::{ModalView, Workspace, notifications::NotifyResultExt as _};
+use workspace::{
+    ModalView, Workspace,
+    notifications::{NotifyResultExt as _, NotifyTaskExt as _},
+};
 
 actions!(
     zenith_search,
@@ -94,7 +101,9 @@ impl Tab {
 
     fn placeholder(self) -> &'static str {
         match self {
+            Tab::Classes => "Search classes…",
             Tab::Files => "Search files…",
+            Tab::Symbols => "Search symbols…",
             Tab::Actions => "Search actions…",
             _ => "Search…",
         }
@@ -102,7 +111,10 @@ impl Tab {
 
     /// Sources that exist so far; the rest render disabled.
     fn is_ready(self) -> bool {
-        matches!(self, Tab::Files | Tab::Actions)
+        matches!(
+            self,
+            Tab::Classes | Tab::Files | Tab::Symbols | Tab::Actions
+        )
     }
 }
 
@@ -183,6 +195,7 @@ impl SearchEverywhere {
             previous_focus_handle,
             tab,
             commands,
+            symbols: Vec::new(),
             matches: Vec::new(),
             selected_ix: 0,
             latest_query: String::new(),
@@ -238,6 +251,8 @@ struct Command {
 
 enum SearchMatch {
     Action(StringMatch),
+    /// Index into `SearchDelegate::symbols`; positions are in the label text.
+    Symbol(StringMatch),
     File {
         project_path: ProjectPath,
         label: SharedString,
@@ -253,6 +268,7 @@ pub struct SearchDelegate {
     previous_focus_handle: FocusHandle,
     tab: Tab,
     commands: Vec<Command>,
+    symbols: Vec<Symbol>,
     matches: Vec<SearchMatch>,
     selected_ix: usize,
     latest_query: String,
@@ -312,6 +328,85 @@ impl SearchDelegate {
                 .update(cx, |picker, cx| {
                     picker.delegate.matches =
                         matches.into_iter().map(SearchMatch::Action).collect();
+                    picker.delegate.selected_ix = 0;
+                    cx.notify();
+                })
+                .log_err();
+        })
+    }
+
+    /// Language-server workspace symbols, as project symbols: the server filters
+    /// by `query`, then a fuzzy pass ranks; symbols in the project lead.
+    fn match_symbols(
+        &mut self,
+        query: String,
+        classes_only: bool,
+        window: &mut Window,
+        cx: &mut Context<Picker<Self>>,
+    ) -> Task<()> {
+        if query.is_empty() {
+            self.symbols.clear();
+            self.matches.clear();
+            return Task::ready(());
+        }
+        let symbols = self
+            .project
+            .update(cx, |project, cx| project.symbols(&query, cx));
+        // rust-analyzer takes `path::Name` queries; rank on the last segment only.
+        let filter_query = query
+            .rsplit_once("::")
+            .map_or(&*query, |(_, suffix)| suffix)
+            .to_owned();
+        cx.spawn_in(window, async move |picker, cx| {
+            let Some(symbols) = symbols.await.log_err() else {
+                return;
+            };
+            let symbols = symbols
+                .into_iter()
+                .filter(|symbol| !classes_only || is_class_like(symbol.kind))
+                .collect::<Vec<_>>();
+            let Ok(in_project) = picker.update(cx, |picker, cx| {
+                let project = picker.delegate.project.read(cx);
+                symbols
+                    .iter()
+                    .map(|symbol| match &symbol.path {
+                        SymbolLocation::InProject(path) => project
+                            .entry_for_path(path, cx)
+                            .is_some_and(|entry| !entry.is_ignored),
+                        SymbolLocation::OutsideProject { .. } => false,
+                    })
+                    .collect::<Vec<_>>()
+            }) else {
+                return;
+            };
+            let candidates = symbols
+                .iter()
+                .enumerate()
+                .map(|(ix, symbol)| StringMatchCandidate::new(ix, symbol.label.filter_text()))
+                .collect::<Vec<_>>();
+            let mut matches = fuzzy_nucleo::match_strings_async(
+                &candidates,
+                &filter_query,
+                StringMatchOptions {
+                    max_results: MaxResults::limit::<100>(),
+                    ..Default::default()
+                },
+                cx.background_executor().clone(),
+            )
+            .await;
+            // Stable: keeps fuzzy order within each group.
+            matches.sort_by_key(|string_match| !in_project[string_match.candidate_id]);
+            for string_match in &mut matches {
+                let filter_start = symbols[string_match.candidate_id].label.filter_range.start;
+                for position in &mut string_match.positions {
+                    *position += filter_start;
+                }
+            }
+            picker
+                .update(cx, |picker, cx| {
+                    picker.delegate.symbols = symbols;
+                    picker.delegate.matches =
+                        matches.into_iter().map(SearchMatch::Symbol).collect();
                     picker.delegate.selected_ix = 0;
                     cx.notify();
                 })
@@ -429,6 +524,15 @@ impl SearchDelegate {
     }
 }
 
+/// What the Classes tab keeps. LSP has no trait kind; PHP servers report traits
+/// as one of these.
+fn is_class_like(kind: SymbolKind) -> bool {
+    matches!(
+        kind,
+        SymbolKind::Class | SymbolKind::Interface | SymbolKind::Enum | SymbolKind::Struct
+    )
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FileTarget {
     /// `file:row` or `file:row:column`, 1-based as typed.
@@ -538,7 +642,9 @@ impl PickerDelegate for SearchDelegate {
         match self.tab {
             Tab::Actions => self.match_actions(query, window, cx),
             Tab::Files => self.match_files(query, window, cx),
-            Tab::All | Tab::Classes | Tab::Symbols | Tab::Hooks => {
+            Tab::Symbols => self.match_symbols(query, false, window, cx),
+            Tab::Classes => self.match_symbols(query, true, window, cx),
+            Tab::All | Tab::Hooks => {
                 self.matches.clear();
                 Task::ready(())
             }
@@ -557,6 +663,46 @@ impl PickerDelegate for SearchDelegate {
                 window.focus(&self.previous_focus_handle, cx);
                 self.dismissed(window, cx);
                 window.dispatch_action(action, cx);
+            }
+            Some(SearchMatch::Symbol(string_match)) => {
+                let Some(symbol) = self.symbols.get(string_match.candidate_id).cloned() else {
+                    return;
+                };
+                let buffer = self.project.update(cx, |project, cx| {
+                    project.open_buffer_for_symbol(&symbol, cx)
+                });
+                let workspace = self.workspace.clone();
+                cx.spawn_in(window, async move |_, cx| {
+                    let buffer = buffer.await?;
+                    workspace.update_in(cx, |workspace, window, cx| {
+                        let position = buffer
+                            .read(cx)
+                            .clip_point_utf16(symbol.range.start, Bias::Left);
+                        let pane = secondary.then(|| workspace.adjacent_pane(window, cx));
+                        let editor = workspace.open_project_item::<Editor>(
+                            pane, buffer, true, true, true, true, window, cx,
+                        );
+                        editor.update(cx, |editor, cx| {
+                            let multibuffer_snapshot = editor.buffer().read(cx).snapshot(cx);
+                            let Some(buffer_snapshot) = multibuffer_snapshot.as_singleton() else {
+                                return;
+                            };
+                            let text_anchor = buffer_snapshot.anchor_before(position);
+                            let Some(anchor) = multibuffer_snapshot.anchor_in_buffer(text_anchor)
+                            else {
+                                return;
+                            };
+                            editor.change_selections(
+                                SelectionEffects::scroll(Autoscroll::center()).unfold(),
+                                window,
+                                cx,
+                                |selections| selections.select_ranges([anchor..anchor]),
+                            );
+                        });
+                    })
+                })
+                .detach_and_notify_err(self.workspace.clone(), window, cx);
+                self.dismissed(window, cx);
             }
             Some(SearchMatch::File { project_path, .. }) => {
                 let Some(workspace) = self.workspace.upgrade() else {
@@ -631,6 +777,46 @@ impl PickerDelegate for SearchDelegate {
                     ),
                 )
             }
+            SearchMatch::Symbol(string_match) => {
+                let symbol = self.symbols.get(string_match.candidate_id)?;
+                let project = self.project.read(cx);
+                let location = match &symbol.path {
+                    SymbolLocation::InProject(project_path) => {
+                        let worktree = project.worktree_for_id(project_path.worktree_id, cx);
+                        let prefix = match worktree {
+                            Some(worktree) if project.visible_worktrees(cx).count() > 1 => {
+                                worktree.read(cx).root_name()
+                            }
+                            _ => RelPath::empty(),
+                        };
+                        file_label(prefix, &project_path.path, project.path_style(cx))
+                    }
+                    SymbolLocation::OutsideProject { abs_path, .. } => {
+                        abs_path.to_string_lossy().into_owned()
+                    }
+                };
+                Some(
+                    item.child(
+                        h_flex()
+                            .w_full()
+                            .justify_between()
+                            .gap_2()
+                            .child(
+                                HighlightedLabel::new(
+                                    symbol.label.text.clone(),
+                                    string_match.positions.clone(),
+                                )
+                                .truncate(),
+                            )
+                            .child(
+                                Label::new(format!("{location}:{}", symbol.range.start.0.row + 1))
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted)
+                                    .truncate(),
+                            ),
+                    ),
+                )
+            }
             SearchMatch::File {
                 label, positions, ..
             } => Some(
@@ -650,7 +836,7 @@ impl PickerDelegate for SearchDelegate {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use editor::Editor;
+    use futures::StreamExt as _;
     use gpui::{TestAppContext, VisualTestContext};
     use serde_json::json;
     use settings::KeymapFile;
@@ -799,7 +985,7 @@ mod tests {
                 .iter()
                 .filter_map(|search_match| match search_match {
                     SearchMatch::File { label, .. } => Some(label.to_string()),
-                    SearchMatch::Action(_) => None,
+                    SearchMatch::Action(_) | SearchMatch::Symbol(_) => None,
                 })
                 .collect::<Vec<_>>();
             assert_eq!(labels, [path!("src/main.rs")]);
@@ -896,6 +1082,138 @@ mod tests {
         cx.dispatch_action(menu::SecondaryConfirm);
         cx.run_until_parked();
         workspace.update(cx, |workspace, _| assert_eq!(workspace.panes().len(), 2));
+    }
+
+    #[gpui::test]
+    async fn test_symbols_and_classes_tabs(cx: &mut TestAppContext) {
+        let app_state = init_test(cx);
+        app_state
+            .fs
+            .as_fake()
+            .insert_tree(
+                path!("/root"),
+                json!({ "widget.rs": "fn helper() {}\nstruct Widget;\nenum WidgetKind {}\nfn widget_new() {}\n" }),
+            )
+            .await;
+        let project = Project::test(app_state.fs.clone(), [path!("/root").as_ref()], cx).await;
+        let language_registry = project.read_with(cx, |project, _| project.languages().clone());
+        language_registry.add(Arc::new(language::Language::new(
+            language::LanguageConfig {
+                name: "Rust".into(),
+                matcher: language::LanguageMatcher {
+                    path_suffixes: vec!["rs".into()],
+                    ..Default::default()
+                }
+                .into(),
+                ..Default::default()
+            },
+            None,
+        )));
+        let mut fake_servers = language_registry.register_fake_lsp(
+            "Rust",
+            language::FakeLspAdapter {
+                capabilities: lsp::ServerCapabilities {
+                    workspace_symbol_provider: Some(lsp::OneOf::Left(true)),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        let _buffer = project
+            .update(cx, |project, cx| {
+                project.open_local_buffer_with_lsp(path!("/root/widget.rs"), cx)
+            })
+            .await
+            .expect("buffer opens");
+        let fake_server = fake_servers.next().await.expect("language server starts");
+        fake_server.set_request_handler::<lsp::WorkspaceSymbolRequest, _, _>(|_, _| async {
+            Ok(Some(lsp::WorkspaceSymbolResponse::Flat(vec![
+                symbol("Widget", lsp::SymbolKind::STRUCT, 1),
+                symbol("WidgetKind", lsp::SymbolKind::ENUM, 2),
+                symbol("widget_new", lsp::SymbolKind::FUNCTION, 3),
+            ])))
+        });
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        cx.run_until_parked();
+
+        let names = |picker: &Entity<Picker<SearchDelegate>>, cx: &mut VisualTestContext| {
+            picker.read_with(cx, |picker, _| {
+                picker
+                    .delegate
+                    .matches
+                    .iter()
+                    .filter_map(|search_match| match search_match {
+                        SearchMatch::Symbol(string_match) => Some(
+                            picker.delegate.symbols[string_match.candidate_id]
+                                .name
+                                .clone(),
+                        ),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            })
+        };
+        let switch_tab = |tab: Tab, cx: &mut VisualTestContext| {
+            workspace.update_in(cx, |workspace, window, cx| {
+                let modal = workspace
+                    .active_modal::<SearchEverywhere>(cx)
+                    .expect("Search Everywhere is open");
+                modal.update(cx, |modal, cx| modal.switch_tab(tab, window, cx));
+            });
+        };
+
+        cx.dispatch_action(Toggle);
+        let picker = open_picker(&workspace, cx);
+        switch_tab(Tab::Symbols, cx);
+        cx.simulate_input("widget");
+        cx.run_until_parked();
+        let mut symbols = names(&picker, cx);
+        symbols.sort();
+        assert_eq!(symbols, ["Widget", "WidgetKind", "widget_new"]);
+
+        switch_tab(Tab::Classes, cx);
+        cx.run_until_parked();
+        let mut classes = names(&picker, cx);
+        classes.sort();
+        assert_eq!(classes, ["Widget", "WidgetKind"]);
+
+        cx.simulate_input("kind");
+        cx.run_until_parked();
+        assert_eq!(names(&picker, cx), ["WidgetKind"]);
+        cx.dispatch_action(menu::Confirm);
+        cx.run_until_parked();
+        let editor = workspace.update(cx, |workspace, cx| {
+            assert!(workspace.active_modal::<SearchEverywhere>(cx).is_none());
+            workspace
+                .active_item_as::<Editor>(cx)
+                .expect("the symbol opens in an editor")
+        });
+        editor.update(cx, |editor, cx| {
+            let caret = editor
+                .selections
+                .all_adjusted(&editor.display_snapshot(cx))
+                .into_iter()
+                .next()
+                .expect("one caret");
+            assert_eq!(caret.start, Point::new(2, 0));
+        });
+    }
+
+    fn symbol(name: &str, kind: lsp::SymbolKind, row: u32) -> lsp::SymbolInformation {
+        #[allow(deprecated)]
+        lsp::SymbolInformation {
+            name: name.to_string(),
+            kind,
+            tags: None,
+            deprecated: None,
+            container_name: None,
+            location: lsp::Location::new(
+                lsp::Uri::from_file_path(path!("/root/widget.rs")).expect("absolute path"),
+                lsp::Range::new(lsp::Position::new(row, 0), lsp::Position::new(row, 0)),
+            ),
+        }
     }
 
     #[test]
