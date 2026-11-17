@@ -2378,6 +2378,16 @@ pub fn load_default_keymap(cx: &mut App) {
         ));
     }
 
+    // Zenith: after the base keymap so its bindings win in every keymap.
+    cx.bind_keys(
+        KeymapFile::load_asset(
+            settings::ZENITH_KEYMAP_PATH,
+            Some(KeybindSource::Default),
+            cx,
+        )
+        .unwrap(),
+    );
+
     if VimModeSetting::get_global(cx).0 || vim_mode_setting::HelixModeSetting::get_global(cx).0 {
         cx.bind_keys(filter_disabled_ai_bindings(
             KeymapFile::load_asset(VIM_KEYMAP_PATH, Some(KeybindSource::Vim), cx).unwrap(),

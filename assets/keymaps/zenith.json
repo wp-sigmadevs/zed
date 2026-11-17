@@ -1,0 +1,10 @@
+// Zenith bindings, loaded after the base keymap so they apply in every keymap.
+[
+  {
+    "context": "Workspace",
+    "bindings": {
+      // ⇧⇧ searches, as in PhpStorm.
+      "shift shift": "file_finder::Toggle",
+    },
+  },
+]

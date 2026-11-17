@@ -159,11 +159,8 @@ mod tests {
     fn test_double_shift_opens_file_finder(cx: &mut TestAppContext) {
         init_test(cx);
         cx.update(|cx| {
-            let bindings = settings::KeymapFile::load_asset_allow_partial_failure(
-                settings::DEFAULT_KEYMAP_PATH,
-                cx,
-            )
-            .expect("default keymap loads");
+            let bindings = settings::KeymapFile::load_asset(settings::ZENITH_KEYMAP_PATH, None, cx)
+                .expect("Zenith keymap loads");
             let toggle = workspace::ToggleFileFinder::default();
             assert!(bindings.iter().any(|binding| {
                 binding.action().partial_eq(&toggle)
