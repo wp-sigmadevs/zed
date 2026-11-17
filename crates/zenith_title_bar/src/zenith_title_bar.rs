@@ -1,7 +1,7 @@
 //! Zenith additions to the title bar (plan 34, step 2).
 
 use gpui::FontWeight;
-use ui::prelude::*;
+use ui::{ButtonLike, Tooltip, prelude::*};
 
 /// Two-letter badge shown before the project name, e.g. "LG" for `lumen-gallery`.
 pub fn project_badge(project_name: &str, cx: &App) -> Option<impl IntoElement + use<>> {
@@ -21,6 +21,33 @@ pub fn project_badge(project_name: &str, cx: &App) -> Option<impl IntoElement + 
                     .weight(FontWeight::BOLD),
             ),
     )
+}
+
+/// "Search Everywhere" box for the middle of the title bar. Dispatches `action`
+/// (the file finder until the real Search Everywhere lands, plan 34 step 4).
+pub fn search_box(action: Box<dyn gpui::Action>) -> impl IntoElement {
+    ButtonLike::new("zenith-search-everywhere")
+        .style(ButtonStyle::Filled)
+        .child(
+            h_flex()
+                .w_48()
+                .gap_1()
+                .child(
+                    Icon::new(IconName::MagnifyingGlass)
+                        .size(IconSize::XSmall)
+                        .color(Color::Muted),
+                )
+                .child(
+                    Label::new("Search Everywhere")
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                ),
+        )
+        .tooltip({
+            let action = action.boxed_clone();
+            move |_window, cx| Tooltip::for_action("Search Everywhere", action.as_ref(), cx)
+        })
+        .on_click(move |_, window, cx| window.dispatch_action(action.boxed_clone(), cx))
 }
 
 /// First letter of the first two words, or the first two letters of a single word.
