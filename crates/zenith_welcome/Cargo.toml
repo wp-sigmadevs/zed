@@ -1,0 +1,44 @@
+[package]
+name = "zenith_welcome"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/zenith_welcome.rs"
+doctest = false
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+db.workspace = true
+fs.workspace = true
+futures.workspace = true
+fuzzy_nucleo.workspace = true
+git.workspace = true
+gpui.workspace = true
+onboarding.workspace = true
+picker.workspace = true
+project.workspace = true
+settings.workspace = true
+ui.workspace = true
+util.workspace = true
+workspace.workspace = true
+zed_actions.workspace = true
+
+[dev-dependencies]
+assets.workspace = true
+client.workspace = true
+editor = { workspace = true, features = ["test-support"] }
+gpui = { workspace = true, features = ["test-support"] }
+settings = { workspace = true, features = ["test-support"] }
+workspace = { workspace = true, features = ["test-support"] }
+fs = { workspace = true, features = ["test-support"] }
+serde_json.workspace = true
+project = { workspace = true, features = ["test-support"] }
+theme = { workspace = true, features = ["test-support"] }
+theme_settings.workspace = true

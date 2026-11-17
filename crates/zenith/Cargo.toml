@@ -1,0 +1,23 @@
+[package]
+name = "zenith"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/zenith.rs"
+test = false
+doctest = false
+
+[features]
+default = ["welcome"]
+welcome = ["dep:zenith_welcome"]
+
+[dependencies]
+gpui.workspace = true
+onboarding.workspace = true
+zenith_welcome = { workspace = true, optional = true }

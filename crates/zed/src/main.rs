@@ -34,7 +34,8 @@ use gpui_platform;
 
 use gpui_tokio::Tokio;
 use language::LanguageRegistry;
-use onboarding::{FIRST_OPEN, show_onboarding_view};
+use onboarding::FIRST_OPEN;
+use zenith::show_onboarding_view;
 use project_panel::ProjectPanel;
 use prompt_store::PromptBuilder;
 use remote::RemoteConnectionOptions;
@@ -782,6 +783,7 @@ fn main() {
         tabular_data_preview::init(cx);
         svg_preview::init(cx);
         onboarding::init(cx);
+        zenith::init(cx);
         settings_ui::init(cx);
         keymap_editor::init(cx);
         extensions_ui::init(cx);

@@ -7,8 +7,8 @@ use crate::{
 use agent_settings::AgentSettings;
 use git::Clone as GitClone;
 use gpui::{
-    Action, App, Context, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement,
-    ParentElement, Render, Styled, Task, TaskExt, Window, actions,
+    Action, AnyView, App, Context, Entity, EventEmitter, FocusHandle, Focusable,
+    InteractiveElement, ParentElement, Render, Styled, Task, TaskExt, Window, actions,
 };
 use gpui::{WeakEntity, linear_color_stop, linear_gradient};
 use menu::{SelectNext, SelectPrevious};
@@ -240,11 +240,18 @@ impl<const COLS: usize> Section<COLS> {
     }
 }
 
+/// Zenith hook: lets a fork crate replace the welcome page content.
+pub struct WelcomeOverride(
+    pub fn(WeakEntity<Workspace>, FocusHandle, &mut Window, &mut App) -> Option<AnyView>,
+);
+impl gpui::Global for WelcomeOverride {}
+
 pub struct WelcomePage {
     workspace: WeakEntity<Workspace>,
     focus_handle: FocusHandle,
     fallback_to_recent_projects: bool,
     recent_workspaces: Option<Vec<RecentWorkspace>>,
+    custom: Option<AnyView>,
 }
 
 impl WelcomePage {
@@ -257,8 +264,12 @@ impl WelcomePage {
         let focus_handle = cx.focus_handle();
         cx.on_focus(&focus_handle, window, |_, _, cx| cx.notify())
             .detach();
+        let custom = cx
+            .try_global::<WelcomeOverride>()
+            .map(|o| o.0)
+            .and_then(|f| f(workspace.clone(), focus_handle.clone(), window, cx));
 
-        if fallback_to_recent_projects {
+        if fallback_to_recent_projects && custom.is_none() {
             let fs = workspace
                 .upgrade()
                 .map(|ws| ws.read(cx).app_state().fs.clone());
@@ -285,6 +296,7 @@ impl WelcomePage {
             focus_handle,
             fallback_to_recent_projects,
             recent_workspaces: None,
+            custom,
         }
     }
 
@@ -416,6 +428,9 @@ impl WelcomePage {
 
 impl Render for WelcomePage {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if let Some(custom) = self.custom.clone() {
+            return div().size_full().child(custom);
+        }
         let (first_section, second_section) = CONTENT;
         let first_section_entries = first_section.entries.len();
         let mut next_tab_index = first_section_entries + second_section.entries.len();

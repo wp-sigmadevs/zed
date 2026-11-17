@@ -307,6 +307,7 @@ pub enum IconName {
     ZedPredictUp,
     ZedSrcCustom,
     ZedSrcExtension,
+    Zenith,
 }
 
 impl IconName {

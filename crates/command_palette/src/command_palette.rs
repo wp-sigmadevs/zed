@@ -865,6 +865,10 @@ impl PickerDelegate for CommandPaletteDelegate {
 }
 
 pub fn humanize_action_name(name: &str) -> String {
+    // Zenith: show the upstream `zed::` namespace as `zenith:`; action ids stay `zed::` for keymaps.
+    if let Some(rest) = name.strip_prefix("zed::") {
+        return humanize_action_name(&format!("zenith::{rest}"));
+    }
     let chars = name.chars().collect::<Vec<_>>();
     let capacity = name.len() + chars.iter().filter(|c| c.is_uppercase()).count();
     let mut result = String::with_capacity(capacity);
@@ -954,6 +958,10 @@ mod tests {
 
     #[test]
     fn test_humanize_action_name() {
+        assert_eq!(
+            humanize_action_name("zed::OpenOnboarding"),
+            "zenith: open onboarding"
+        );
         assert_eq!(
             humanize_action_name("editor::GoToDefinition"),
             "editor: go to definition"
