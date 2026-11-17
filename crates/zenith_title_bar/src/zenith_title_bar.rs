@@ -29,13 +29,12 @@ pub fn project_badge(project_name: &str, cx: &App) -> Option<impl IntoElement + 
 pub fn middle(project: &Entity<Project>, cx: &App) -> impl IntoElement + use<> {
     h_flex()
         .gap_2()
-        .child(search_box(Box::new(workspace::ToggleFileFinder::default())))
+        .child(search_box(Box::new(zenith_search::Toggle)))
         .child(run_controls(project, cx))
         .child(agent_chip())
 }
 
-/// "Search Everywhere" box for the middle of the title bar. Dispatches `action`
-/// (the file finder until the real Search Everywhere lands, plan 34 step 4).
+/// "Search Everywhere" box for the middle of the title bar; dispatches `action`.
 fn search_box(action: Box<dyn gpui::Action>) -> impl IntoElement {
     ButtonLike::new("zenith-search-everywhere")
         .style(ButtonStyle::Filled)

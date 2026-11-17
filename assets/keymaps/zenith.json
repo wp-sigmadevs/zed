@@ -3,10 +3,10 @@
   {
     "context": "Workspace",
     "bindings": {
-      // ⇧⇧ searches, as in PhpStorm.
-      "shift shift": "file_finder::Toggle",
+      // ⇧⇧ opens Search Everywhere, as in PhpStorm.
+      "shift shift": "zenith_search::Toggle",
       // Find Action (⌘⇧A / Ctrl+Shift+A), as in PhpStorm.
-      "secondary-shift-a": "zenith_search::Toggle",
+      "secondary-shift-a": "zenith_search::FindAction",
     },
   },
 ]

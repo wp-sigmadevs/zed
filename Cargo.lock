@@ -22883,11 +22883,13 @@ dependencies = [
  "command_palette",
  "command_palette_hooks",
  "editor",
+ "file_icons",
  "fuzzy_nucleo",
  "gpui",
  "menu",
  "picker",
  "project",
+ "serde_json",
  "settings",
  "theme",
  "theme_settings",
@@ -22906,6 +22908,7 @@ dependencies = [
  "ui",
  "workspace",
  "zed_actions",
+ "zenith_search",
 ]
 
 [[package]]
