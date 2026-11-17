@@ -1164,7 +1164,9 @@ impl DebugDelegate {
                         id: _,
                         directory_in_worktree: dir,
                         id_base: _,
-                    } => dir.file_name().is_some_and(paths::is_local_settings_folder_name),
+                    } => dir
+                        .file_name()
+                        .is_some_and(paths::is_local_settings_folder_name),
                     _ => false,
                 });
 

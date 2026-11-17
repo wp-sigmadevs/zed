@@ -35,11 +35,11 @@ use gpui_platform;
 use gpui_tokio::Tokio;
 use language::LanguageRegistry;
 use onboarding::FIRST_OPEN;
-use zenith::show_onboarding_view;
 use project_panel::ProjectPanel;
 use prompt_store::PromptBuilder;
 use remote::RemoteConnectionOptions;
 use reqwest_client::ReqwestClient;
+use zenith::show_onboarding_view;
 
 use assets::Assets;
 use node_runtime::{NodeBinaryOptions, NodeRuntime};

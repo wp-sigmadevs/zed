@@ -1621,7 +1621,9 @@ mod tests {
             .await
             .expect_err("remove_root should refuse to delete a recreated worktree");
         assert!(
-            error.to_string().contains("not the worktree Zenith created"),
+            error
+                .to_string()
+                .contains("not the worktree Zenith created"),
             "unexpected error: {error:#}"
         );
 

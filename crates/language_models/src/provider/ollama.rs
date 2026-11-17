@@ -874,8 +874,10 @@ impl ConfigurationView {
                             .child(Label::new("ollama run gpt-oss:20b").inline_code(cx)),
                     )
                     .child(
-                        ListBulletItem::new("Click 'Connect' below to start using Ollama in Zenith")
-                            .label_color(Color::Muted),
+                        ListBulletItem::new(
+                            "Click 'Connect' below to start using Ollama in Zenith",
+                        )
+                        .label_color(Color::Muted),
                     ),
             )
             .child(
