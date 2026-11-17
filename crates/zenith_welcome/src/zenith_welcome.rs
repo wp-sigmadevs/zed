@@ -137,6 +137,19 @@ mod tests {
         });
     }
 
+    // Plan 34 step 1: Driftwood is bundled and is the default dark theme.
+    #[gpui::test]
+    fn test_driftwood_is_bundled_default_dark(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update(|cx| {
+            let theme = theme::ThemeRegistry::global(cx)
+                .get("Driftwood")
+                .expect("Driftwood bundled");
+            assert_eq!(theme.appearance, theme::Appearance::Dark);
+        });
+        assert!(settings::default_settings().contains(r#""dark": "Driftwood""#));
+    }
+
     fn set_enabled(enabled: bool, cx: &mut App) {
         cx.update_global::<SettingsStore, _>(|store, cx| {
             store
