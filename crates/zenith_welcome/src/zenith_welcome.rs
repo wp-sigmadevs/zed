@@ -173,6 +173,24 @@ mod tests {
         });
     }
 
+    // Plan 34 step 6: PhpStorm layout — project tools left, agent right.
+    #[test]
+    fn test_panels_dock_like_phpstorm() {
+        let defaults: serde_json::Value =
+            settings::parse_json_with_comments(&settings::default_settings())
+                .expect("default settings parse");
+        for (panel, side) in [
+            ("project_panel", "left"),
+            ("outline_panel", "left"),
+            ("git_panel", "left"),
+            ("agent", "right"),
+            ("debugger", "bottom"),
+            ("terminal", "bottom"),
+        ] {
+            assert_eq!(defaults[panel]["dock"], side, "{panel}");
+        }
+    }
+
     // Plan 34 step 3: errors and types show in the editor, as in PhpStorm.
     #[gpui::test]
     fn test_inline_diagnostics_and_inlay_hints_on_by_default(cx: &mut TestAppContext) {
