@@ -1,0 +1,32 @@
+[package]
+name = "zenith_search"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/zenith_search.rs"
+doctest = false
+
+[dependencies]
+command_palette.workspace = true
+command_palette_hooks.workspace = true
+fuzzy_nucleo.workspace = true
+gpui.workspace = true
+picker.workspace = true
+ui.workspace = true
+workspace.workspace = true
+
+[dev-dependencies]
+editor = { workspace = true, features = ["test-support"] }
+gpui = { workspace = true, features = ["test-support"] }
+menu.workspace = true
+project = { workspace = true, features = ["test-support"] }
+settings.workspace = true
+theme.workspace = true
+theme_settings.workspace = true
+workspace = { workspace = true, features = ["test-support"] }

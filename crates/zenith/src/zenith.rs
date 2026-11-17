@@ -10,4 +10,6 @@ pub use zenith_welcome::show_onboarding_view;
 pub fn init(cx: &mut App) {
     #[cfg(feature = "welcome")]
     zenith_welcome::init(cx);
+    #[cfg(feature = "search")]
+    zenith_search::init(cx);
 }

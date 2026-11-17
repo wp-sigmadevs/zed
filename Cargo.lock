@@ -22872,7 +22872,27 @@ version = "0.1.0"
 dependencies = [
  "gpui",
  "onboarding",
+ "zenith_search",
  "zenith_welcome",
+]
+
+[[package]]
+name = "zenith_search"
+version = "0.1.0"
+dependencies = [
+ "command_palette",
+ "command_palette_hooks",
+ "editor",
+ "fuzzy_nucleo",
+ "gpui",
+ "menu",
+ "picker",
+ "project",
+ "settings",
+ "theme",
+ "theme_settings",
+ "ui",
+ "workspace",
 ]
 
 [[package]]
