@@ -22883,6 +22883,7 @@ dependencies = [
  "project",
  "task",
  "ui",
+ "workspace",
  "zed_actions",
 ]
 
