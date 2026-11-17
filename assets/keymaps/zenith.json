@@ -9,4 +9,13 @@
       "secondary-shift-a": "zenith_search::FindAction",
     },
   },
+  {
+    // Tab / Shift-Tab switch Search Everywhere tabs, as in PhpStorm; arrows move
+    // through results. Loaded last, so this beats the picker's own Tab.
+    "context": "SearchEverywhere > Editor",
+    "bindings": {
+      "tab": "zenith_search::NextTab",
+      "shift-tab": "zenith_search::PreviousTab",
+    },
+  },
 ]

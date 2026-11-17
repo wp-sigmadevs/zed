@@ -1,5 +1,5 @@
-//! Search Everywhere (plan 34, step 4): one modal, a tab per source. Classes,
-//! Files, Symbols and Actions are live; All and Hooks light up in 4d–4e.
+//! Search Everywhere (plan 34, step 4): one modal, a tab per source. All merges
+//! Classes, Files, Symbols and Actions; Hooks lights up in 4e.
 
 use command_palette::{
     action_last_invoked, humanize_action_name, normalize_action_query, record_command_invocation,
@@ -24,6 +24,7 @@ use project::{
 use settings::Settings as _;
 use std::{
     cmp::Reverse,
+    collections::HashSet,
     ops::Range,
     path::Path,
     sync::{
@@ -50,18 +51,23 @@ actions!(
         /// Opens Search Everywhere.
         Toggle,
         /// Opens Search Everywhere on the Actions tab (PhpStorm's Find Action).
-        FindAction
+        FindAction,
+        /// Moves to the next Search Everywhere tab.
+        NextTab,
+        /// Moves to the previous Search Everywhere tab.
+        PreviousTab
     ]
 );
 
 const RECENT_FILES_LIMIT: usize = 20;
 const SYMBOL_QUERY_DEBOUNCE: Duration = Duration::from_millis(100);
+/// Results per group on the All tab, so one source can't push the others off.
+const ALL_TAB_GROUP_LIMIT: usize = 8;
 
 pub fn init(cx: &mut App) {
     cx.observe_new(|workspace: &mut Workspace, _, _| {
-        // Toggle opens Files until the All tab exists (step 4d).
         workspace.register_action(|workspace, _: &Toggle, window, cx| {
-            SearchEverywhere::open(workspace, Tab::Files, window, cx)
+            SearchEverywhere::open(workspace, Tab::All, window, cx)
         });
         workspace.register_action(|workspace, _: &FindAction, window, cx| {
             SearchEverywhere::open(workspace, Tab::Actions, window, cx)
@@ -107,16 +113,26 @@ impl Tab {
             Tab::Files => "Search files…",
             Tab::Symbols => "Search symbols…",
             Tab::Actions => "Search actions…",
-            _ => "Search…",
+            Tab::All | Tab::Hooks => "Search everywhere…",
         }
     }
 
     /// Sources that exist so far; the rest render disabled.
     fn is_ready(self) -> bool {
-        matches!(
-            self,
-            Tab::Classes | Tab::Files | Tab::Symbols | Tab::Actions
-        )
+        self != Tab::Hooks
+    }
+
+    /// The next ready tab `step` places along, wrapping around.
+    fn cycle(self, step: isize) -> Tab {
+        let count = Self::ORDER.len() as isize;
+        let mut ix = Self::ORDER.iter().position(|tab| *tab == self).unwrap_or(0) as isize;
+        loop {
+            ix = (ix + step).rem_euclid(count);
+            let tab = Self::ORDER[ix as usize];
+            if tab.is_ready() {
+                return tab;
+            }
+        }
     }
 }
 
@@ -135,7 +151,7 @@ impl Focusable for SearchEverywhere {
 
 impl SearchEverywhere {
     /// Opens on `tab`; asking for the tab already shown closes the modal, asking
-    /// for another switches to it (⇧⇧ then ⌘⇧A goes Files → Actions).
+    /// for another switches to it (⇧⇧ then ⌘⇧A goes All → Actions).
     fn open(workspace: &mut Workspace, tab: Tab, window: &mut Window, cx: &mut Context<Workspace>) {
         if let Some(modal) = workspace.active_modal::<Self>(cx) {
             if modal.read(cx).picker.read(cx).delegate.tab == tab {
@@ -216,6 +232,11 @@ impl SearchEverywhere {
         });
         cx.notify();
     }
+
+    fn cycle_tab(&mut self, step: isize, window: &mut Window, cx: &mut Context<Self>) {
+        let tab = self.picker.read(cx).delegate.tab.cycle(step);
+        self.switch_tab(tab, window, cx);
+    }
 }
 
 impl Render for SearchEverywhere {
@@ -223,6 +244,10 @@ impl Render for SearchEverywhere {
         let current_tab = self.picker.read(cx).delegate.tab;
         v_flex()
             .key_context("SearchEverywhere")
+            .on_action(cx.listener(|this, _: &NextTab, window, cx| this.cycle_tab(1, window, cx)))
+            .on_action(
+                cx.listener(|this, _: &PreviousTab, window, cx| this.cycle_tab(-1, window, cx)),
+            )
             .w(rems(38.))
             .elevation_3(cx)
             .overflow_hidden()
@@ -251,6 +276,7 @@ struct Command {
     action: Box<dyn Action>,
 }
 
+#[derive(Clone)]
 enum SearchMatch {
     Action(StringMatch),
     /// Index into `SearchDelegate::symbols`; positions are in the label text.
@@ -280,12 +306,11 @@ pub struct SearchDelegate {
 }
 
 impl SearchDelegate {
-    fn match_actions(
-        &mut self,
-        query: String,
-        window: &mut Window,
+    fn search_actions(
+        &self,
+        query: &str,
         cx: &mut Context<Picker<Self>>,
-    ) -> Task<()> {
+    ) -> Task<Vec<SearchMatch>> {
         let last_invoked = action_last_invoked(cx);
         let candidates = self
             .commands
@@ -298,10 +323,10 @@ impl SearchDelegate {
             .iter()
             .map(|command| last_invoked.get(&command.name).copied())
             .collect::<Vec<_>>();
-        let normalized_query = normalize_action_query(&query);
+        let normalized_query = normalize_action_query(query);
         let is_empty_query = query.is_empty();
         let executor = cx.background_executor().clone();
-        let matching = cx.background_spawn(async move {
+        cx.background_spawn(async move {
             let mut matches = fuzzy_nucleo::match_strings_async(
                 &candidates,
                 &normalized_query,
@@ -322,34 +347,21 @@ impl SearchDelegate {
                     is_empty_query.then(|| string_match.string.clone()),
                 )
             });
-            matches
-        });
-        cx.spawn_in(window, async move |picker, cx| {
-            let matches = matching.await;
-            picker
-                .update(cx, |picker, cx| {
-                    picker.delegate.matches =
-                        matches.into_iter().map(SearchMatch::Action).collect();
-                    picker.delegate.selected_ix = 0;
-                    cx.notify();
-                })
-                .log_err();
+            matches.into_iter().map(SearchMatch::Action).collect()
         })
     }
 
     /// Language-server workspace symbols, as project symbols: the server filters
     /// by `query`, then a fuzzy pass ranks; symbols in the project lead.
-    fn match_symbols(
-        &mut self,
+    fn search_symbols(
+        &self,
         query: String,
         classes_only: bool,
         window: &mut Window,
         cx: &mut Context<Picker<Self>>,
-    ) -> Task<()> {
+    ) -> Task<(Vec<Symbol>, Vec<StringMatch>)> {
         if query.is_empty() {
-            self.symbols.clear();
-            self.matches.clear();
-            return Task::ready(());
+            return Task::ready(Default::default());
         }
         // rust-analyzer takes `path::Name` queries; rank on the last segment only.
         let filter_query = query
@@ -366,10 +378,10 @@ impl SearchDelegate {
                     .project
                     .update(cx, |project, cx| project.symbols(&query, cx))
             }) else {
-                return;
+                return Default::default();
             };
             let Some(symbols) = symbols.await.log_err() else {
-                return;
+                return Default::default();
             };
             let symbols = symbols
                 .into_iter()
@@ -387,7 +399,7 @@ impl SearchDelegate {
                     })
                     .collect::<Vec<_>>()
             }) else {
-                return;
+                return Default::default();
             };
             let candidates = symbols
                 .iter()
@@ -412,36 +424,25 @@ impl SearchDelegate {
                     *position += filter_start;
                 }
             }
-            picker
-                .update(cx, |picker, cx| {
-                    picker.delegate.symbols = symbols;
-                    picker.delegate.matches =
-                        matches.into_iter().map(SearchMatch::Symbol).collect();
-                    picker.delegate.selected_ix = 0;
-                    cx.notify();
-                })
-                .log_err();
+            (symbols, matches)
         })
     }
 
     /// Project files by fuzzy path, as the file finder; recently opened files
     /// when nothing is typed.
-    fn match_files(
+    fn search_files(
         &mut self,
         query: String,
-        window: &mut Window,
         cx: &mut Context<Picker<Self>>,
-    ) -> Task<()> {
+    ) -> Task<Vec<SearchMatch>> {
         let project = self.project.read(cx);
         let path_style = project.path_style(cx);
         let worktrees = project.visible_worktrees(cx).collect::<Vec<_>>();
         let include_root_name = worktrees.len() > 1;
         let include_ignored = FileFinderSettings::get_global(cx).include_ignored;
-        let (query, file_target) = parse_file_query(&query);
-        self.file_target = file_target;
 
         if query.is_empty() {
-            self.matches = self
+            let recent = self
                 .recent_files
                 .iter()
                 .filter_map(|project_path| {
@@ -459,10 +460,16 @@ impl SearchDelegate {
                     })
                 })
                 .collect();
-            self.selected_ix = 0;
-            return Task::ready(());
+            return Task::ready(recent);
         }
 
+        // Single-file worktrees: the matcher reports the root name as the path,
+        // but the file's project path is empty.
+        let single_file_worktrees = worktrees
+            .iter()
+            .filter(|worktree| worktree.read(cx).is_single_file())
+            .map(|worktree| worktree.read(cx).id())
+            .collect::<HashSet<_>>();
         let candidate_sets = worktrees
             .iter()
             .map(|worktree| {
@@ -480,7 +487,8 @@ impl SearchDelegate {
         self.cancel_flag.store(true, Ordering::Release);
         self.cancel_flag = Arc::new(AtomicBool::new(false));
         let cancel_flag = self.cancel_flag.clone();
-        cx.spawn_in(window, async move |picker, cx| {
+        let executor = cx.background_executor().clone();
+        cx.background_spawn(async move {
             let matches = fuzzy_nucleo::match_path_sets(
                 candidate_sets.as_slice(),
                 &query,
@@ -490,48 +498,84 @@ impl SearchDelegate {
                     cancel_flag: Some(&cancel_flag),
                     ..Default::default()
                 },
-                cx.background_executor().clone(),
+                executor,
             )
             .await;
-            if cancel_flag.load(Ordering::Acquire) {
-                return;
-            }
-            picker
-                .update(cx, |picker, cx| {
-                    let project = picker.delegate.project.read(cx);
-                    let matches = matches
-                        .into_iter()
-                        .map(|path_match| {
-                            let worktree_id = WorktreeId::from_usize(path_match.worktree_id);
-                            // Single-file worktrees: the matcher reports the root name
-                            // as the path, but the file's project path is empty.
-                            let path = if project
-                                .worktree_for_id(worktree_id, cx)
-                                .is_some_and(|worktree| worktree.read(cx).is_single_file())
-                            {
-                                RelPath::empty_arc()
-                            } else {
-                                path_match.path.clone()
-                            };
-                            SearchMatch::File {
-                                label: file_label(
-                                    &path_match.path_prefix,
-                                    &path_match.path,
-                                    path_style,
-                                )
-                                .into(),
-                                project_path: ProjectPath { worktree_id, path },
-                                positions: path_match.positions,
-                            }
-                        })
-                        .collect();
-                    picker.delegate.matches = matches;
-                    picker.delegate.selected_ix = 0;
-                    cx.notify();
+            matches
+                .into_iter()
+                .map(|path_match| {
+                    let worktree_id = WorktreeId::from_usize(path_match.worktree_id);
+                    let path = if single_file_worktrees.contains(&worktree_id) {
+                        RelPath::empty_arc()
+                    } else {
+                        path_match.path.clone()
+                    };
+                    SearchMatch::File {
+                        label: file_label(&path_match.path_prefix, &path_match.path, path_style)
+                            .into(),
+                        project_path: ProjectPath { worktree_id, path },
+                        positions: path_match.positions,
+                    }
                 })
-                .log_err();
+                .collect()
         })
     }
+
+    fn set_matches(
+        &mut self,
+        symbols: Vec<Symbol>,
+        matches: Vec<SearchMatch>,
+        reset_selection: bool,
+        cx: &mut Context<Picker<Self>>,
+    ) {
+        self.symbols = symbols;
+        self.matches = matches;
+        self.selected_ix = if reset_selection {
+            0
+        } else {
+            self.selected_ix.min(self.matches.len().saturating_sub(1))
+        };
+        cx.notify();
+    }
+
+    /// Short kind shown on each All-tab row.
+    fn kind_label(&self, search_match: &SearchMatch) -> &'static str {
+        match search_match {
+            SearchMatch::Action(_) => "Action",
+            SearchMatch::File { .. } => "File",
+            SearchMatch::Symbol(string_match) => {
+                match self.symbols.get(string_match.candidate_id) {
+                    Some(symbol) if is_class_like(symbol) => "Class",
+                    _ => "Symbol",
+                }
+            }
+        }
+    }
+}
+
+/// The All tab: classes, files, other symbols, actions, as PhpStorm groups them.
+fn merge_all_tab(
+    symbols: &[Symbol],
+    symbol_matches: Vec<StringMatch>,
+    files: Vec<SearchMatch>,
+    actions: Vec<SearchMatch>,
+) -> Vec<SearchMatch> {
+    let (classes, other_symbols): (Vec<_>, Vec<_>) = symbol_matches
+        .into_iter()
+        .partition(|string_match| is_class_like(&symbols[string_match.candidate_id]));
+    classes
+        .into_iter()
+        .map(SearchMatch::Symbol)
+        .take(ALL_TAB_GROUP_LIMIT)
+        .chain(files.into_iter().take(ALL_TAB_GROUP_LIMIT))
+        .chain(
+            other_symbols
+                .into_iter()
+                .map(SearchMatch::Symbol)
+                .take(ALL_TAB_GROUP_LIMIT),
+        )
+        .chain(actions.into_iter().take(ALL_TAB_GROUP_LIMIT))
+        .collect()
 }
 
 /// What the Classes tab keeps. LSP has no trait kind: PHPantom reports PHP
@@ -659,16 +703,61 @@ impl PickerDelegate for SearchDelegate {
         cx: &mut Context<Picker<Self>>,
     ) -> Task<()> {
         self.latest_query = query.clone();
-        match self.tab {
-            Tab::Actions => self.match_actions(query, window, cx),
-            Tab::Files => self.match_files(query, window, cx),
-            Tab::Symbols => self.match_symbols(query, false, window, cx),
-            Tab::Classes => self.match_symbols(query, true, window, cx),
-            Tab::All | Tab::Hooks => {
-                self.matches.clear();
-                Task::ready(())
-            }
+        let tab = self.tab;
+        if tab == Tab::Hooks {
+            self.set_matches(Vec::new(), Vec::new(), true, cx);
+            return Task::ready(());
         }
+        let is_empty_query = query.is_empty();
+        let (file_query, file_target) = parse_file_query(&query);
+        self.file_target = file_target;
+        let files = if matches!(tab, Tab::All | Tab::Files) {
+            self.search_files(file_query, cx)
+        } else {
+            Task::ready(Vec::new())
+        };
+        // Every action matches an empty query; on All that would bury the recent files.
+        let actions = if tab == Tab::Actions || (tab == Tab::All && !is_empty_query) {
+            self.search_actions(&query, cx)
+        } else {
+            Task::ready(Vec::new())
+        };
+        let symbols = if matches!(tab, Tab::All | Tab::Classes | Tab::Symbols) {
+            self.search_symbols(query, tab == Tab::Classes, window, cx)
+        } else {
+            Task::ready(Default::default())
+        };
+        cx.spawn_in(window, async move |picker, cx| {
+            let files = files.await;
+            let actions = actions.await;
+            if tab == Tab::All && !is_empty_query {
+                // Files and actions are local; show them before the language server answers.
+                let matches = merge_all_tab(&[], Vec::new(), files.clone(), actions.clone());
+                picker
+                    .update(cx, |picker, cx| {
+                        picker.delegate.set_matches(Vec::new(), matches, true, cx)
+                    })
+                    .log_err();
+            }
+            let (symbols, symbol_matches) = symbols.await;
+            let matches = if tab == Tab::All {
+                merge_all_tab(&symbols, symbol_matches, files, actions)
+            } else {
+                files
+                    .into_iter()
+                    .chain(symbol_matches.into_iter().map(SearchMatch::Symbol))
+                    .chain(actions)
+                    .collect()
+            };
+            let reset_selection = tab != Tab::All || is_empty_query;
+            picker
+                .update(cx, |picker, cx| {
+                    picker
+                        .delegate
+                        .set_matches(symbols, matches, reset_selection, cx)
+                })
+                .log_err();
+        })
     }
 
     fn confirm(&mut self, secondary: bool, window: &mut Window, cx: &mut Context<Picker<Self>>) {
@@ -769,11 +858,17 @@ impl PickerDelegate for SearchDelegate {
         _: &mut Window,
         cx: &mut Context<Picker<Self>>,
     ) -> Option<Self::ListItem> {
+        let search_match = self.matches.get(ix)?;
         let item = ListItem::new(ix)
             .inset(true)
             .spacing(ListItemSpacing::Sparse)
-            .toggle_state(selected);
-        match self.matches.get(ix)? {
+            .toggle_state(selected)
+            .end_slot::<Label>((self.tab == Tab::All).then(|| {
+                Label::new(self.kind_label(search_match))
+                    .size(LabelSize::Small)
+                    .color(Color::Muted)
+            }));
+        match search_match {
             SearchMatch::Action(string_match) => {
                 let command = self.commands.get(string_match.candidate_id)?;
                 Some(
@@ -880,6 +975,13 @@ mod tests {
         })
     }
 
+    fn open_on(tab: Tab, workspace: &Entity<Workspace>, cx: &mut VisualTestContext) {
+        workspace.update_in(cx, |workspace, window, cx| {
+            SearchEverywhere::open(workspace, tab, window, cx)
+        });
+        cx.run_until_parked();
+    }
+
     fn open_picker(
         workspace: &Entity<Workspace>,
         cx: &mut VisualTestContext,
@@ -966,7 +1068,7 @@ mod tests {
         let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
         cx.run_until_parked();
 
-        cx.dispatch_action(Toggle);
+        open_on(Tab::Files, &workspace, cx);
         let picker = open_picker(&workspace, cx);
         picker.read_with(cx, |picker, _| assert_eq!(picker.delegate.tab, Tab::Files));
 
@@ -995,7 +1097,7 @@ mod tests {
         });
 
         // With nothing typed, Files lists what was opened recently.
-        cx.dispatch_action(Toggle);
+        open_on(Tab::Files, &workspace, cx);
         cx.run_until_parked();
         let picker = open_picker(&workspace, cx);
         picker.read_with(cx, |picker, _| {
@@ -1027,6 +1129,7 @@ mod tests {
 
         cx.dispatch_action(Toggle);
         let picker = open_picker(&workspace, cx);
+        picker.read_with(cx, |picker, _| assert_eq!(picker.delegate.tab, Tab::All));
         cx.dispatch_action(FindAction);
         cx.run_until_parked();
         picker.read_with(cx, |picker, _| {
@@ -1060,7 +1163,7 @@ mod tests {
         let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
         cx.run_until_parked();
 
-        cx.dispatch_action(Toggle);
+        open_on(Tab::Files, &workspace, cx);
         cx.simulate_input("main.rs:2:9");
         cx.run_until_parked();
         cx.dispatch_action(menu::Confirm);
@@ -1080,7 +1183,7 @@ mod tests {
             assert_eq!((caret.start.row, caret.start.column), (1, 8));
         });
 
-        cx.dispatch_action(Toggle);
+        open_on(Tab::Files, &workspace, cx);
         cx.simulate_input("main.rs:1-2");
         cx.run_until_parked();
         cx.dispatch_action(menu::Confirm);
@@ -1096,7 +1199,7 @@ mod tests {
             assert_eq!(selection.end, Point::new(2, 0));
         });
 
-        cx.dispatch_action(Toggle);
+        open_on(Tab::Files, &workspace, cx);
         cx.simulate_input("main");
         cx.run_until_parked();
         cx.dispatch_action(menu::SecondaryConfirm);
@@ -1261,6 +1364,75 @@ mod tests {
                 .expect("one caret");
             assert_eq!(caret.start, Point::new(2, 0));
         });
+
+        // All: classes, files, other symbols, then actions, each row labelled.
+        cx.dispatch_action(Toggle);
+        let picker = open_picker(&workspace, cx);
+        picker.read_with(cx, |picker, _| assert_eq!(picker.delegate.tab, Tab::All));
+        let kinds = |picker: &Entity<Picker<SearchDelegate>>, cx: &mut VisualTestContext| {
+            picker.read_with(cx, |picker, _| {
+                picker
+                    .delegate
+                    .matches
+                    .iter()
+                    .map(|search_match| picker.delegate.kind_label(search_match))
+                    .collect::<Vec<_>>()
+            })
+        };
+        cx.simulate_input("widget");
+        cx.run_until_parked();
+        // Files show before the language server answers.
+        let early = kinds(&picker, cx);
+        assert_eq!(early[..2], ["File", "File"]);
+        assert!(!early.contains(&"Class") && !early.contains(&"Symbol"));
+
+        cx.executor().advance_clock(SYMBOL_QUERY_DEBOUNCE);
+        cx.run_until_parked();
+        let all = kinds(&picker, cx);
+        assert_eq!(
+            all[..7],
+            [
+                "Class", "Class", "Class", "File", "File", "Symbol", "Symbol"
+            ]
+        );
+        assert!(all[7..].iter().all(|kind| *kind == "Action"));
+    }
+
+    #[gpui::test]
+    async fn test_tab_keys_cycle_ready_tabs(cx: &mut TestAppContext) {
+        let app_state = init_test(cx);
+        cx.update(|cx| {
+            let bindings = KeymapFile::load_asset(settings::ZENITH_KEYMAP_PATH, None, cx)
+                .expect("Zenith keymap loads");
+            cx.bind_keys(bindings);
+        });
+        let project = Project::test(app_state.fs.clone(), [], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+
+        cx.dispatch_action(Toggle);
+        let picker = open_picker(&workspace, cx);
+        let mut seen = Vec::new();
+        for _ in 0..5 {
+            cx.simulate_keystrokes("tab");
+            seen.push(picker.read_with(cx, |picker, _| picker.delegate.tab));
+        }
+        // Hooks has no source yet, so Tab skips it.
+        assert_eq!(
+            seen,
+            [
+                Tab::Classes,
+                Tab::Files,
+                Tab::Symbols,
+                Tab::Actions,
+                Tab::All
+            ]
+        );
+        cx.simulate_keystrokes("shift-tab");
+        picker.read_with(cx, |picker, _| {
+            assert_eq!(picker.delegate.tab, Tab::Actions)
+        });
     }
 
     fn symbol(name: &str, kind: lsp::SymbolKind, path: &str, row: u32) -> lsp::SymbolInformation {
@@ -1344,6 +1516,8 @@ mod tests {
             };
             assert!(bound_to(&Toggle, &["shift", "shift"]));
             assert!(bound_to(&FindAction, &["a"]));
+            assert!(bound_to(&NextTab, &["tab"]));
+            assert!(bound_to(&PreviousTab, &["tab"]));
         });
     }
 }
