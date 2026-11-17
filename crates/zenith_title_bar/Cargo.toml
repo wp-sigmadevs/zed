@@ -1,0 +1,17 @@
+[package]
+name = "zenith_title_bar"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/zenith_title_bar.rs"
+doctest = false
+
+[dependencies]
+gpui.workspace = true
+ui.workspace = true

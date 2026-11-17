@@ -18476,6 +18476,7 @@ dependencies = [
  "util",
  "workspace",
  "zed_actions",
+ "zenith_title_bar",
 ]
 
 [[package]]
@@ -22872,6 +22873,14 @@ dependencies = [
  "gpui",
  "onboarding",
  "zenith_welcome",
+]
+
+[[package]]
+name = "zenith_title_bar"
+version = "0.1.0"
+dependencies = [
+ "gpui",
+ "ui",
 ]
 
 [[package]]

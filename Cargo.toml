@@ -250,6 +250,7 @@ members = [
     "crates/zed_credentials_provider",
     "crates/zed_env_vars",
     "crates/zenith",
+    "crates/zenith_title_bar",
     "crates/zenith_welcome",
     "crates/zeta_prompt",
     "crates/zlog",
@@ -524,6 +525,7 @@ zed_actions = { path = "crates/zed_actions" }
 zed_credentials_provider = { path = "crates/zed_credentials_provider" }
 zed_env_vars = { path = "crates/zed_env_vars" }
 zenith = { path = "crates/zenith" }
+zenith_title_bar = { path = "crates/zenith_title_bar" }
 zenith_welcome = { path = "crates/zenith_welcome" }
 zeta_prompt = { path = "crates/zeta_prompt" }
 zlog = { path = "crates/zlog" }
