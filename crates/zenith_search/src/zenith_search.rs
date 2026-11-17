@@ -2,7 +2,7 @@
 //! the tab strip and the Actions source; the other tabs light up in 4b–4e.
 
 use command_palette::{
-    command_usage, humanize_action_name, normalize_action_query, record_command_invocation,
+    action_last_invoked, humanize_action_name, normalize_action_query, record_command_invocation,
 };
 use command_palette_hooks::CommandPaletteFilter;
 use fuzzy_nucleo::{StringMatch, StringMatchCandidate, StringMatchOptions};
@@ -195,17 +195,17 @@ impl PickerDelegate for ActionsDelegate {
         window: &mut Window,
         cx: &mut Context<Picker<Self>>,
     ) -> Task<()> {
-        let usage = command_usage(cx);
+        let last_invoked = action_last_invoked(cx);
         let candidates = self
             .commands
             .iter()
             .enumerate()
             .map(|(ix, command)| StringMatchCandidate::from_shared(ix, command.name.clone()))
             .collect::<Vec<_>>();
-        let usage = self
+        let last_invoked = self
             .commands
             .iter()
-            .map(|command| usage.get(&command.name).copied())
+            .map(|command| last_invoked.get(&command.name).copied())
             .collect::<Vec<_>>();
         let normalized_query = normalize_action_query(&query);
         let is_empty_query = query.is_empty();
@@ -223,7 +223,12 @@ impl PickerDelegate for ActionsDelegate {
             // order, or name order when nothing is typed.
             matches.sort_by_cached_key(|string_match| {
                 (
-                    Reverse(usage.get(string_match.candidate_id).copied().flatten()),
+                    Reverse(
+                        last_invoked
+                            .get(string_match.candidate_id)
+                            .copied()
+                            .flatten(),
+                    ),
                     is_empty_query.then(|| string_match.string.clone()),
                 )
             });

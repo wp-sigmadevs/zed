@@ -216,7 +216,7 @@ struct Command {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub struct CommandUsage {
+struct CommandUsage {
     last_invoked: i64,
     invocations: u16,
 }
@@ -391,7 +391,26 @@ impl CommandPaletteDelegate {
     /// We only account for commands triggered directly via command palette and not by e.g. keystrokes because
     /// if a user already knows a keystroke for a command, they are unlikely to use a command palette to look for it.
     fn command_usage(&self, cx: &App) -> HashMap<SharedString, CommandUsage> {
-        command_usage(cx)
+        if !CommandPaletteSettings::get_global(cx).use_command_history {
+            return HashMap::new();
+        }
+
+        if let Ok(commands) = CommandPaletteDB::global(cx).list_commands_used() {
+            commands
+                .into_iter()
+                .map(|command| {
+                    (
+                        SharedString::from(command.command_name),
+                        CommandUsage {
+                            last_invoked: command.last_invoked.unix_timestamp(),
+                            invocations: command.invocations,
+                        },
+                    )
+                })
+                .collect()
+        } else {
+            HashMap::new()
+        }
     }
 
     fn remove_command_history(
@@ -728,7 +747,14 @@ impl PickerDelegate for CommandPaletteDelegate {
         );
         self.matches.clear();
         self.commands.clear();
-        record_command_invocation(command.name.clone(), self.latest_query.clone(), cx);
+        let command_name = command.name.clone();
+        let latest_query = self.latest_query.clone();
+        let db = CommandPaletteDB::global(cx);
+        cx.background_spawn(async move {
+            db.write_command_invocation(command_name, latest_query)
+                .await
+        })
+        .detach_and_log_err(cx);
         let action = command.action;
         window.focus(&self.previous_focus_handle, cx);
         self.dismissed(window, cx);
@@ -836,37 +862,6 @@ impl PickerDelegate for CommandPaletteDelegate {
                 .into_any(),
         )
     }
-}
-
-/// Zenith: public so Search Everywhere ranks actions by the same history.
-pub fn command_usage(cx: &App) -> HashMap<SharedString, CommandUsage> {
-    if !CommandPaletteSettings::get_global(cx).use_command_history {
-        return HashMap::new();
-    }
-
-    if let Ok(commands) = CommandPaletteDB::global(cx).list_commands_used() {
-        commands
-            .into_iter()
-            .map(|command| {
-                (
-                    SharedString::from(command.command_name),
-                    CommandUsage {
-                        last_invoked: command.last_invoked.unix_timestamp(),
-                        invocations: command.invocations,
-                    },
-                )
-            })
-            .collect()
-    } else {
-        HashMap::new()
-    }
-}
-
-/// Zenith: public so Search Everywhere feeds the same history.
-pub fn record_command_invocation(command_name: SharedString, query: String, cx: &App) {
-    let db = CommandPaletteDB::global(cx);
-    cx.background_spawn(async move { db.write_command_invocation(command_name, query).await })
-        .detach_and_log_err(cx);
 }
 
 pub fn humanize_action_name(name: &str) -> String {
@@ -1857,4 +1852,32 @@ mod tests {
             assert_eq!(palette.query(cx), "");
         });
     }
+}
+
+// Zenith: Search Everywhere shares the palette's action history. Kept as an
+// appended block so upstream syncs don't conflict with it.
+
+/// When each action was last run from the palette or Search Everywhere, as a Unix timestamp.
+pub fn action_last_invoked(cx: &App) -> HashMap<SharedString, i64> {
+    if !CommandPaletteSettings::get_global(cx).use_command_history {
+        return HashMap::new();
+    }
+    CommandPaletteDB::global(cx)
+        .list_commands_used()
+        .log_err()
+        .into_iter()
+        .flatten()
+        .map(|command| {
+            (
+                SharedString::from(command.command_name),
+                command.last_invoked.unix_timestamp(),
+            )
+        })
+        .collect()
+}
+
+pub fn record_command_invocation(command_name: SharedString, query: String, cx: &App) {
+    let db = CommandPaletteDB::global(cx);
+    cx.background_spawn(async move { db.write_command_invocation(command_name, query).await })
+        .detach_and_log_err(cx);
 }
