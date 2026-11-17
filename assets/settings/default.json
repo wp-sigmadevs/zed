@@ -11,7 +11,7 @@
     "light": "One Light",
     "dark": "Driftwood",
   },
-  "icon_theme": "Zed (Default)",
+  "icon_theme": "Archipelago Icons",
   // The name of a base set of key bindings to use.
   // This setting can take the following values:
   //
@@ -2402,6 +2402,7 @@
   // and change the value to `false`.
   "auto_install_extensions": {
     "html": true,
+    "archipelago-icons": true,
   },
   // Whether to suggest installing extensions based on the files you open.
   "suggest_extensions": true,

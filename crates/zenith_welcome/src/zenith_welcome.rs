@@ -147,7 +147,11 @@ mod tests {
                 .expect("Driftwood bundled");
             assert_eq!(theme.appearance, theme::Appearance::Dark);
         });
-        assert!(settings::default_settings().contains(r#""dark": "Driftwood""#));
+        let defaults = settings::default_settings();
+        assert!(defaults.contains(r#""dark": "Driftwood""#));
+        // Icons ship as an extension: bundled icons render single-colour.
+        assert!(defaults.contains(r#""icon_theme": "Archipelago Icons""#));
+        assert!(defaults.contains(r#""archipelago-icons": true"#));
     }
 
     fn set_enabled(enabled: bool, cx: &mut App) {
