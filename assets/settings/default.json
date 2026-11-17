@@ -12,6 +12,14 @@
     "dark": "Driftwood",
   },
   "icon_theme": "Archipelago Icons",
+  // Zenith: orange means "an agent did this", so Driftwood warnings use amber.
+  "theme_overrides": {
+    "Driftwood": {
+      "warning": "#e2b13c",
+      "warning.background": "#3d3420",
+      "warning.border": "#6b5a28",
+    },
+  },
   // The name of a base set of key bindings to use.
   // This setting can take the following values:
   //

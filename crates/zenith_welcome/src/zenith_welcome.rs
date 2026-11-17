@@ -154,6 +154,26 @@ mod tests {
         assert!(defaults.contains(r#""archipelago-icons": true"#));
     }
 
+    #[gpui::test]
+    fn test_driftwood_warning_is_not_agent_orange(cx: &mut TestAppContext) {
+        use theme::ActiveTheme as _;
+        init_test(cx);
+        cx.update(|cx| {
+            cx.update_global::<SettingsStore, _>(|store, cx| {
+                store
+                    .set_user_settings(r#"{"theme": "Driftwood"}"#, cx)
+                    .result()
+                    .expect("valid settings");
+            });
+        });
+        // Theme reload runs in the settings observer, after the update above.
+        cx.update(|cx| {
+            assert_eq!(cx.theme().name, "Driftwood");
+            let amber: gpui::Hsla = gpui::rgb(0xe2b13c).into();
+            assert_eq!(cx.theme().status().warning, amber);
+        });
+    }
+
     fn set_enabled(enabled: bool, cx: &mut App) {
         cx.update_global::<SettingsStore, _>(|store, cx| {
             store
