@@ -14,16 +14,20 @@ use gpui::{
     Action, App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, Render,
     SharedString, Task, WeakEntity, Window, actions,
 };
+use open_path_prompt::file_finder_settings::FileFinderSettings;
 use picker::{Picker, PickerDelegate};
 use project::{Candidates, PathMatchCandidateSet, Project, ProjectPath, WorktreeId};
+use settings::Settings as _;
 use std::{
     cmp::Reverse,
+    ops::Range,
     path::Path,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
 };
+use text::Point;
 use ui::{HighlightedLabel, KeyBinding, ListItem, ListItemSpacing, prelude::*};
 use util::{
     ResultExt as _,
@@ -182,7 +186,7 @@ impl SearchEverywhere {
             matches: Vec::new(),
             selected_ix: 0,
             latest_query: String::new(),
-            file_position: None,
+            file_target: None,
             cancel_flag: Arc::new(AtomicBool::new(false)),
         };
         let picker = cx.new(|cx| Picker::uniform_list(delegate, window, cx).embedded());
@@ -252,8 +256,8 @@ pub struct SearchDelegate {
     matches: Vec<SearchMatch>,
     selected_ix: usize,
     latest_query: String,
-    /// Row and column from a `file:row:column` query, 1-based as typed.
-    file_position: Option<(u32, Option<u32>)>,
+    /// Where to land from a `file:row:column` or `file:start-end` query.
+    file_target: Option<FileTarget>,
     cancel_flag: Arc<AtomicBool>,
 }
 
@@ -327,9 +331,9 @@ impl SearchDelegate {
         let path_style = project.path_style(cx);
         let worktrees = project.visible_worktrees(cx).collect::<Vec<_>>();
         let include_root_name = worktrees.len() > 1;
-        let path_position = PathWithPosition::parse_str(query.trim().trim_end_matches(':'));
-        self.file_position = path_position.row.map(|row| (row, path_position.column));
-        let query = path_position.path.to_string_lossy().into_owned();
+        let include_ignored = FileFinderSettings::get_global(cx).include_ignored;
+        let (query, file_target) = parse_file_query(&query);
+        self.file_target = file_target;
 
         if query.is_empty() {
             self.matches = self
@@ -360,7 +364,9 @@ impl SearchDelegate {
                 let worktree = worktree.read(cx);
                 PathMatchCandidateSet {
                     snapshot: worktree.snapshot(),
-                    include_ignored: worktree.root_entry().is_some_and(|entry| entry.is_ignored),
+                    include_ignored: include_ignored.unwrap_or_else(|| {
+                        worktree.root_entry().is_some_and(|entry| entry.is_ignored)
+                    }),
                     include_root_name,
                     candidates: Candidates::Files,
                 }
@@ -421,6 +427,66 @@ impl SearchDelegate {
                 .log_err();
         })
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FileTarget {
+    /// `file:row` or `file:row:column`, 1-based as typed.
+    Point { row: u32, column: Option<u32> },
+    /// `file:start-end`: whole lines, 1-based and inclusive.
+    Lines { start: u32, end: u32 },
+}
+
+impl FileTarget {
+    fn range(self, buffer: &text::BufferSnapshot) -> Range<Point> {
+        match self {
+            FileTarget::Point { row, column } => {
+                let point = buffer.point_from_external_input(
+                    row.saturating_sub(1),
+                    column.unwrap_or(1).saturating_sub(1),
+                );
+                point..point
+            }
+            FileTarget::Lines { start, end } => {
+                let max_point = buffer.max_point();
+                let line_start = |row: u32| {
+                    if row > max_point.row {
+                        max_point
+                    } else {
+                        Point::new(row, 0)
+                    }
+                };
+                line_start(start - 1)..line_start(end)
+            }
+        }
+    }
+}
+
+/// Splits a Files query into the path to match and where to land, as the file
+/// finder reads `path:row:column` and `path:start-end`.
+fn parse_file_query(query: &str) -> (String, Option<FileTarget>) {
+    let query = query.trim().trim_end_matches(':');
+    if let Some((path, lines)) = query.rsplit_once(':')
+        && !path.is_empty()
+        && let Some((start, end)) = lines.split_once('-')
+        && let Ok(start) = start.parse::<u32>()
+        && start > 0
+    {
+        let target = match end.parse::<u32>() {
+            Ok(end) if end >= start => FileTarget::Lines { start, end },
+            _ => FileTarget::Point {
+                row: start,
+                column: None,
+            },
+        };
+        return (path.to_owned(), Some(target));
+    }
+    let path_position = PathWithPosition::parse_str(query);
+    let target = path_position.row.map(|row| FileTarget::Point {
+        row,
+        column: path_position.column,
+    });
+    (path_position.path.to_string_lossy().into_owned(), target)
 }
 
 /// The string the path matcher scores against, so match positions line up.
@@ -504,20 +570,17 @@ impl PickerDelegate for SearchDelegate {
                         workspace.open_path(project_path, None, true, window, cx)
                     }
                 });
-                let file_position = self.file_position;
+                let file_target = self.file_target;
                 let workspace = self.workspace.clone();
                 cx.spawn_in(window, async move |_, cx| {
                     let item = open.await.notify_workspace_async_err(workspace, cx)?;
-                    let (row, column) = file_position?;
+                    let file_target = file_target?;
                     let editor = item.downcast::<Editor>()?;
                     editor
                         .update_in(cx, |editor, window, cx| {
                             let buffer = editor.buffer().read(cx).as_singleton()?;
-                            let point = buffer.read(cx).snapshot().point_from_external_input(
-                                row.saturating_sub(1),
-                                column.unwrap_or(1).saturating_sub(1),
-                            );
-                            editor.go_to_singleton_buffer_point(point, window, cx);
+                            let range = file_target.range(&buffer.read(cx).snapshot());
+                            editor.go_to_singleton_buffer_range(range, window, cx);
                             Some(())
                         })
                         .ok()
@@ -572,7 +635,10 @@ impl PickerDelegate for SearchDelegate {
                 label, positions, ..
             } => Some(
                 item.start_slot::<Icon>(
-                    FileIcons::get_icon(Path::new(label.as_ref()), cx)
+                    FileFinderSettings::get_global(cx)
+                        .file_icons
+                        .then(|| FileIcons::get_icon(Path::new(label.as_ref()), cx))
+                        .flatten()
                         .map(|icon| Icon::from_path(icon).color(Color::Muted)),
                 )
                 .child(HighlightedLabel::new(label.clone(), positions.clone()).truncate()),
@@ -809,11 +875,59 @@ mod tests {
         });
 
         cx.dispatch_action(Toggle);
+        cx.simulate_input("main.rs:1-2");
+        cx.run_until_parked();
+        cx.dispatch_action(menu::Confirm);
+        cx.run_until_parked();
+        editor.update(cx, |editor, cx| {
+            let selection = editor
+                .selections
+                .all_adjusted(&editor.display_snapshot(cx))
+                .into_iter()
+                .next()
+                .expect("one selection");
+            assert_eq!(selection.start, Point::new(0, 0));
+            assert_eq!(selection.end, Point::new(2, 0));
+        });
+
+        cx.dispatch_action(Toggle);
         cx.simulate_input("main");
         cx.run_until_parked();
         cx.dispatch_action(menu::SecondaryConfirm);
         cx.run_until_parked();
         workspace.update(cx, |workspace, _| assert_eq!(workspace.panes().len(), 2));
+    }
+
+    #[test]
+    fn test_parse_file_query() {
+        assert_eq!(parse_file_query("main"), ("main".into(), None));
+        assert_eq!(
+            parse_file_query(" main.rs:2:9 "),
+            (
+                "main.rs".into(),
+                Some(FileTarget::Point {
+                    row: 2,
+                    column: Some(9)
+                })
+            )
+        );
+        assert_eq!(
+            parse_file_query("main.rs:2-3"),
+            (
+                "main.rs".into(),
+                Some(FileTarget::Lines { start: 2, end: 3 })
+            )
+        );
+        assert_eq!(
+            parse_file_query("main.rs:3-"),
+            (
+                "main.rs".into(),
+                Some(FileTarget::Point {
+                    row: 3,
+                    column: None
+                })
+            )
+        );
     }
 
     #[gpui::test]
