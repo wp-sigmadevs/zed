@@ -173,6 +173,19 @@ mod tests {
         });
     }
 
+    // Plan 34 step 3: errors and types show in the editor, as in PhpStorm.
+    #[gpui::test]
+    fn test_inline_diagnostics_and_inlay_hints_on_by_default(cx: &mut TestAppContext) {
+        use settings::Settings as _;
+        init_test(cx);
+        cx.update(|cx| {
+            let project_settings = project::project_settings::ProjectSettings::get_global(cx);
+            assert!(project_settings.diagnostics.inline.enabled);
+            let language_settings = language::language_settings::all_language_settings(None, cx);
+            assert!(language_settings.defaults.inlay_hints.enabled);
+        });
+    }
+
     #[gpui::test]
     fn test_driftwood_warning_is_not_agent_orange(cx: &mut TestAppContext) {
         use theme::ActiveTheme as _;

@@ -856,8 +856,9 @@
   "use_smartcase_search": false,
   // Inlay hint related settings
   "inlay_hints": {
-    // Global switch to toggle hints on and off, switched off by default.
-    "enabled": false,
+    // Global switch to toggle hints on and off.
+    // Zenith: on by default, as in PhpStorm.
+    "enabled": true,
     // Toggle certain types of hints on and off, all switched on by default.
     "show_type_hints": true,
     "show_parameter_hints": true,
@@ -1790,7 +1791,8 @@
     // Settings for inline diagnostics
     "inline": {
       // Whether to show diagnostics inline or not
-      "enabled": false,
+      // Zenith: on by default, as in PhpStorm.
+      "enabled": true,
       // The delay in milliseconds to show inline diagnostics after the
       // last diagnostic update.
       "update_debounce_ms": 150,

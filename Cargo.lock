@@ -22902,6 +22902,7 @@ dependencies = [
  "fuzzy_nucleo",
  "git",
  "gpui",
+ "language",
  "onboarding",
  "picker",
  "project",
