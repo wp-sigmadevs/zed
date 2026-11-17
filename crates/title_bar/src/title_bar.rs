@@ -370,6 +370,7 @@ impl Render for TitleBar {
             zenith_title_bar::search_box(Box::new(workspace::ToggleFileFinder::default()))
                 .into_any_element(),
         );
+        children.push(zenith_title_bar::run_controls(&self.project, cx).into_any_element());
 
         if title_bar_settings.show_onboarding_banner {
             if let Some(banner) = &self.banner {

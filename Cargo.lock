@@ -22880,7 +22880,10 @@ name = "zenith_title_bar"
 version = "0.1.0"
 dependencies = [
  "gpui",
+ "project",
+ "task",
  "ui",
+ "zed_actions",
 ]
 
 [[package]]

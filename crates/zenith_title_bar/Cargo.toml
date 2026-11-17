@@ -15,3 +15,10 @@ doctest = false
 [dependencies]
 gpui.workspace = true
 ui.workspace = true
+project.workspace = true
+zed_actions.workspace = true
+
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }
+project = { workspace = true, features = ["test-support"] }
+task.workspace = true

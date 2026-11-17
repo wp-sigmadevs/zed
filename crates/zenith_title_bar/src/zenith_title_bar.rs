@@ -1,7 +1,8 @@
 //! Zenith additions to the title bar (plan 34, step 2).
 
-use gpui::FontWeight;
-use ui::{ButtonLike, Tooltip, prelude::*};
+use gpui::{Action, Entity, FontWeight};
+use project::{Inventory, Project};
+use ui::{ButtonLike, IconButton, Tooltip, prelude::*};
 
 /// Two-letter badge shown before the project name, e.g. "LG" for `lumen-gallery`.
 pub fn project_badge(project_name: &str, cx: &App) -> Option<impl IntoElement + use<>> {
@@ -52,6 +53,68 @@ pub fn search_box(action: Box<dyn gpui::Action>) -> impl IntoElement {
         .on_click(move |_, window, cx| window.dispatch_action(action.boxed_clone(), cx))
 }
 
+/// Run configuration dropdown with ▶ and 🐞, as in PhpStorm. The dropdown opens
+/// Zed's task picker; ▶ reruns the last task; 🐞 starts the debugger.
+pub fn run_controls(project: &Entity<Project>, cx: &App) -> impl IntoElement + use<> {
+    let label = run_label(project.read(cx).task_store().read(cx).task_inventory(), cx);
+    // Looked up by name so the title bar doesn't depend on debugger_ui; absent ⇒ no 🐞.
+    let debug = cx.build_action("debugger::Start", None).ok();
+    h_flex()
+        .gap_0p5()
+        .child(
+            Button::new("zenith-run-configuration", label)
+                .label_size(LabelSize::Small)
+                .color(Color::Muted)
+                .end_icon(
+                    Icon::new(IconName::ChevronDown)
+                        .size(IconSize::XSmall)
+                        .color(Color::Muted),
+                )
+                .tooltip(action_tooltip(
+                    "Run Configurations",
+                    Box::new(zed_actions::Spawn::modal()),
+                ))
+                .on_click(dispatch(Box::new(zed_actions::Spawn::modal()))),
+        )
+        .child(
+            IconButton::new("zenith-run", IconName::PlayFilled)
+                .icon_size(IconSize::Small)
+                .icon_color(Color::Success)
+                .tooltip(action_tooltip(
+                    "Run",
+                    Box::new(zed_actions::Rerun::default()),
+                ))
+                .on_click(dispatch(Box::new(zed_actions::Rerun::default()))),
+        )
+        .when_some(debug, |this, debug| {
+            this.child(
+                IconButton::new("zenith-debug", IconName::Debug)
+                    .icon_size(IconSize::Small)
+                    .tooltip(action_tooltip("Debug", debug.boxed_clone()))
+                    .on_click(dispatch(debug)),
+            )
+        })
+}
+
+/// Name of the last task run, or a prompt to pick one.
+fn run_label(inventory: Option<&Entity<Inventory>>, cx: &App) -> SharedString {
+    inventory
+        .and_then(|inventory| inventory.read(cx).last_scheduled_task(None))
+        .map(|(_, task)| task.resolved_label.into())
+        .unwrap_or_else(|| "Add Configuration…".into())
+}
+
+fn action_tooltip(
+    title: &'static str,
+    action: Box<dyn Action>,
+) -> impl Fn(&mut Window, &mut App) -> gpui::AnyView {
+    move |_window, cx| Tooltip::for_action(title, action.as_ref(), cx)
+}
+
+fn dispatch(action: Box<dyn Action>) -> impl Fn(&gpui::ClickEvent, &mut Window, &mut App) {
+    move |_, window, cx| window.dispatch_action(action.boxed_clone(), cx)
+}
+
 /// First letter of the first two words, or the first two letters of a single word.
 fn initials(name: &str) -> Option<SharedString> {
     let mut words = name
@@ -71,7 +134,30 @@ fn initials(name: &str) -> Option<SharedString> {
 
 #[cfg(test)]
 mod tests {
-    use super::initials;
+    use super::{initials, run_label};
+    use gpui::TestAppContext;
+    use project::{Inventory, TaskSourceKind};
+    use task::{TaskContext, TaskTemplate};
+
+    #[gpui::test]
+    fn test_run_label(cx: &mut TestAppContext) {
+        let inventory = cx.update(Inventory::new);
+        cx.update(|cx| {
+            assert_eq!(run_label(None, cx), "Add Configuration…");
+            assert_eq!(run_label(Some(&inventory), cx), "Add Configuration…");
+        });
+        let task = TaskTemplate {
+            label: "Build".into(),
+            command: "make".into(),
+            ..TaskTemplate::default()
+        }
+        .resolve_task("test", &TaskContext::default())
+        .expect("task resolves");
+        inventory.update(cx, |inventory, _| {
+            inventory.task_scheduled(TaskSourceKind::UserInput, task)
+        });
+        cx.update(|cx| assert_eq!(run_label(Some(&inventory), cx), "Build"));
+    }
 
     #[test]
     fn test_initials() {
