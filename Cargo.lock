@@ -22872,6 +22872,7 @@ version = "0.1.0"
 dependencies = [
  "gpui",
  "onboarding",
+ "zenith_php_tools",
  "zenith_rails",
  "zenith_search",
  "zenith_welcome",
@@ -22881,8 +22882,15 @@ dependencies = [
 name = "zenith_php_tools"
 version = "0.1.0"
 dependencies = [
+ "gpui",
+ "project",
  "serde_json",
+ "settings",
  "tempfile",
+ "theme",
+ "theme_settings",
+ "ui",
+ "workspace",
 ]
 
 [[package]]

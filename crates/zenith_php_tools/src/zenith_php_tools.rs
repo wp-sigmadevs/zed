@@ -150,6 +150,237 @@ pub fn short_version(version: &str) -> String {
     version.split('.').take(2).collect::<Vec<_>>().join(".")
 }
 
+/// Worth a PHP status: a WordPress or Laravel project, or one with `composer.json`
+/// or PHP files at its root.
+pub fn looks_like_php(root: &Path) -> bool {
+    detect_project(root) != ProjectKind::Php
+        || root.join("composer.json").is_file()
+        || top_level_php_files(root).next().is_some()
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PhpInfo {
+    pub kind: ProjectKind,
+    /// `None` when no PHP binary ran.
+    pub version: Option<String>,
+    pub php_path: Option<PathBuf>,
+}
+
+/// The first candidate whose `php -v` answers.
+pub fn find_php(candidates: &[PathBuf]) -> Option<(PathBuf, String)> {
+    candidates
+        .iter()
+        .filter(|candidate| candidate.is_file())
+        .find_map(|candidate| {
+            let output = std::process::Command::new(candidate)
+                .arg("-v")
+                .output()
+                .ok()?;
+            let version = parse_php_version(&String::from_utf8_lossy(&output.stdout))?;
+            Some((candidate.clone(), version))
+        })
+}
+
+pub fn detect_php(root: &Path, candidates: &[PathBuf]) -> PhpInfo {
+    let found = find_php(candidates);
+    PhpInfo {
+        kind: detect_project(root),
+        version: found.as_ref().map(|(_, version)| version.clone()),
+        php_path: found.map(|(path, _)| path),
+    }
+}
+
+/// What "PHP tools: status" shows.
+pub fn status_report(root: &Path, info: &PhpInfo, path_dirs: &[PathBuf]) -> String {
+    let kind = match info.kind {
+        ProjectKind::WordPress => "WordPress",
+        ProjectKind::Laravel => "Laravel",
+        ProjectKind::Php => "PHP",
+    };
+    let mut lines = vec![format!("Project: {kind}")];
+    lines.push(match (&info.version, &info.php_path) {
+        (Some(version), Some(path)) => format!("PHP {version}: {}", path.display()),
+        _ => "PHP: not found (install Herd or Homebrew PHP)".to_string(),
+    });
+    for tool in [
+        Tool::Phpcs,
+        Tool::Phpcbf,
+        Tool::Phpstan,
+        Tool::Pint,
+        Tool::PhpCsFixer,
+    ] {
+        lines.push(match resolve(root, tool, path_dirs) {
+            Some(Resolved { path, source }) => {
+                let source = match source {
+                    Source::Project => "project",
+                    Source::System => "system",
+                };
+                format!("{}: {source}, {}", tool.binary(), path.display())
+            }
+            None => format!("{}: not found", tool.binary()),
+        });
+    }
+    lines.join("\n")
+}
+
+// ---- status bar item and "PHP tools: status" ----
+
+use gpui::{
+    Action as _, App, AppContext as _, Context, Entity, IntoElement, Render, Window, actions,
+};
+use project::Project;
+use ui::{Button, ButtonCommon as _, ButtonSize, Clickable as _, LabelSize, Tooltip, prelude::*};
+use workspace::{
+    HideStatusItem, ItemHandle, StatusItemView, Workspace,
+    notifications::{NotificationId, simple_message_notification::MessageNotification},
+};
+
+actions!(
+    zenith_php_tools,
+    [
+        /// Shows the PHP version and where each PHP tool comes from.
+        Status
+    ]
+);
+
+pub fn init(cx: &mut App) {
+    cx.observe_new(|workspace: &mut Workspace, window, cx| {
+        let Some(window) = window else { return };
+        let project = workspace.project().clone();
+        let item = cx.new(|cx| PhpStatus::new(project, cx));
+        workspace
+            .status_bar()
+            .update(cx, |bar, cx| bar.add_right_item(item, window, cx));
+        workspace.register_action(|workspace, _: &Status, window, cx| {
+            show_status(workspace, window, cx)
+        });
+    })
+    .detach();
+}
+
+fn environment() -> (Vec<PathBuf>, Vec<PathBuf>) {
+    let path_dirs: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|path| std::env::split_paths(&path).collect())
+        .unwrap_or_default();
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_default();
+    (php_candidates(&home, &path_dirs), path_dirs)
+}
+
+fn first_root(project: &Entity<Project>, cx: &App) -> Option<PathBuf> {
+    project
+        .read(cx)
+        .visible_worktrees(cx)
+        .next()
+        .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
+}
+
+fn show_status(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
+    let Some(root) = first_root(workspace.project(), cx) else {
+        return;
+    };
+    cx.spawn_in(window, async move |workspace, cx| {
+        let report = cx
+            .background_spawn(async move {
+                let (candidates, path_dirs) = environment();
+                status_report(&root, &detect_php(&root, &candidates), &path_dirs)
+            })
+            .await;
+        workspace
+            .update(cx, |workspace, cx| {
+                workspace.show_notification(NotificationId::unique::<Status>(), cx, |cx| {
+                    cx.new(|cx| MessageNotification::new(report, cx))
+                });
+            })
+            .ok();
+    })
+    .detach();
+}
+
+/// `PHP 8.5` in the status bar of a PHP project; nothing elsewhere.
+pub struct PhpStatus {
+    project: Entity<Project>,
+    info: Option<PhpInfo>,
+}
+
+impl PhpStatus {
+    fn new(project: Entity<Project>, cx: &mut Context<Self>) -> Self {
+        cx.subscribe(&project, |this, _, event, cx| {
+            if matches!(
+                event,
+                project::Event::WorktreeAdded(_) | project::Event::WorktreeRemoved(_)
+            ) {
+                this.refresh(cx);
+            }
+        })
+        .detach();
+        let mut this = Self {
+            project,
+            info: None,
+        };
+        this.refresh(cx);
+        this
+    }
+
+    fn refresh(&mut self, cx: &mut Context<Self>) {
+        let Some(root) = first_root(&self.project, cx) else {
+            self.info = None;
+            cx.notify();
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let info = cx
+                .background_spawn(async move {
+                    looks_like_php(&root).then(|| detect_php(&root, &environment().0))
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.info = info;
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+}
+
+impl StatusItemView for PhpStatus {
+    fn set_active_pane_item(
+        &mut self,
+        _: Option<&dyn ItemHandle>,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) {
+    }
+
+    fn hide_setting(&self, _: &App) -> Option<HideStatusItem> {
+        None
+    }
+}
+
+impl Render for PhpStatus {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        let Some(info) = &self.info else {
+            return div().into_any_element();
+        };
+        let label = match &info.version {
+            Some(version) => format!("PHP {}", short_version(version)),
+            None => "PHP: not found".to_string(),
+        };
+        div()
+            .debug_selector(|| "zenith-php-status".into())
+            .child(
+                Button::new("zenith-php-status", label)
+                    .label_size(LabelSize::Small)
+                    .size(ButtonSize::Compact)
+                    .tooltip(Tooltip::text("PHP tools: status"))
+                    .on_click(|_, window, cx| window.dispatch_action(Status.boxed_clone(), cx)),
+            )
+            .into_any_element()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -247,5 +478,110 @@ mod tests {
             1
         );
         assert_eq!(found.last().unwrap(), Path::new("/usr/bin/php"));
+    }
+
+    #[cfg(unix)]
+    fn fake_php(dir: &Path, version_line: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+        let path = dir.join("php");
+        fs::write(&path, format!("#!/bin/sh\necho '{version_line}'\n")).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_detect_php_runs_the_first_working_candidate() {
+        let broken = tempfile::tempdir().unwrap();
+        let working = tempfile::tempdir().unwrap();
+        let broken_php = fake_php(broken.path(), "not php at all");
+        let working_php = fake_php(working.path(), "PHP 8.5.0 (cli)");
+        let project = tempfile::tempdir().unwrap();
+        write(project.path(), "composer.json", "{}");
+
+        let info = detect_php(
+            project.path(),
+            &[
+                PathBuf::from("/nonexistent/php"),
+                broken_php,
+                working_php.clone(),
+            ],
+        );
+        assert_eq!(info.version.as_deref(), Some("8.5.0"));
+        assert_eq!(info.php_path, Some(working_php));
+        assert!(looks_like_php(project.path()));
+
+        let none = detect_php(project.path(), &[]);
+        assert_eq!(none.version, None);
+        let report = status_report(project.path(), &none, &[]);
+        assert!(report.contains("PHP: not found"));
+        assert!(report.contains("phpcs: not found"));
+    }
+
+    #[test]
+    fn test_status_report_names_where_each_tool_comes_from() {
+        let project = tempfile::tempdir().unwrap();
+        write(project.path(), "vendor/bin/phpstan", "");
+        let info = PhpInfo {
+            kind: ProjectKind::Laravel,
+            version: Some("8.4.1".into()),
+            php_path: Some(PathBuf::from("/opt/homebrew/bin/php")),
+        };
+        let report = status_report(project.path(), &info, &[]);
+        assert!(report.starts_with("Project: Laravel\nPHP 8.4.1: /opt/homebrew/bin/php"));
+        assert!(report.contains("phpstan: project,"));
+        assert!(report.contains("pint: not found"));
+    }
+
+    #[test]
+    fn test_empty_folder_is_not_a_php_project() {
+        let empty = tempfile::tempdir().unwrap();
+        assert!(!looks_like_php(empty.path()));
+    }
+
+    #[gpui::test]
+    async fn test_status_item_shows_in_php_projects_only(cx: &mut gpui::TestAppContext) {
+        use gpui::AppContext as _;
+        let app_state = cx.update(|cx| {
+            let app_state = workspace::AppState::test(cx);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            workspace::init(app_state.clone(), cx);
+            init(cx);
+            app_state
+        });
+        for (has_composer, expected) in [(true, true), (false, false)] {
+            // The PHP check reads the real disk; the project lives in the fake one.
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().to_str().unwrap().to_string();
+            let name = if has_composer {
+                "composer.json"
+            } else {
+                "notes.txt"
+            };
+            fs::write(dir.path().join(name), "{}").unwrap();
+            app_state
+                .fs
+                .as_fake()
+                .insert_tree(&root, serde_json::json!({ name: "{}" }))
+                .await;
+            let root = root.as_str();
+            let project =
+                Project::test(app_state.fs.clone(), [std::path::Path::new(root)], cx).await;
+            let (_, cx) = cx.add_window_view(|window, cx| {
+                workspace::MultiWorkspace::test_new(project, window, cx)
+            });
+            cx.executor().allow_parking();
+            cx.executor()
+                .advance_clock(std::time::Duration::from_secs(1));
+            // The PHP lookup runs on a real thread; give it a moment.
+            for _ in 0..50 {
+                cx.run_until_parked();
+                if cx.debug_bounds("zenith-php-status").is_some() == expected {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            assert_eq!(cx.debug_bounds("zenith-php-status").is_some(), expected);
+        }
     }
 }

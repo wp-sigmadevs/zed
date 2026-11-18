@@ -14,14 +14,16 @@ test = false
 doctest = false
 
 [features]
-default = ["welcome", "search", "rails"]
+default = ["welcome", "search", "rails", "php"]
 welcome = ["dep:zenith_welcome"]
 search = ["dep:zenith_search"]
 rails = ["dep:zenith_rails"]
+php = ["dep:zenith_php_tools"]
 
 [dependencies]
 gpui.workspace = true
 onboarding.workspace = true
+zenith_php_tools = { workspace = true, optional = true }
 zenith_rails = { workspace = true, optional = true }
 zenith_search = { workspace = true, optional = true }
 zenith_welcome = { workspace = true, optional = true }
