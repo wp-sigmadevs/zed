@@ -12,6 +12,8 @@
       "secondary-shift-o": "zenith_search::GoToFile",
       "secondary-alt-o": "zenith_search::GoToSymbol",
       "secondary-e": "zenith_search::RecentFiles",
+      // Recent Locations, as in PhpStorm; the project panel keeps ⌘1.
+      "secondary-shift-e": "zenith_search::RecentLocations",
     },
   },
   {
@@ -21,6 +23,14 @@
     "bindings": {
       "secondary-shift-o": "zenith_search::GoToFile",
       "secondary-e": "zenith_search::RecentFiles",
+    },
+  },
+  {
+    // Same key, same context string as the editor's "reveal in project panel",
+    // which is two levels deep and would win over the rules above.
+    "context": "!AcpThread > Editor && mode == full",
+    "bindings": {
+      "secondary-shift-e": "zenith_search::RecentLocations",
     },
   },
   {

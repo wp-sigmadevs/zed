@@ -61,6 +61,8 @@ actions!(
         /// Opens Search Everywhere on the Files tab, which lists recent files
         /// first (PhpStorm's Recent Files).
         RecentFiles,
+        /// Opens the places recently visited, newest first (PhpStorm's Recent Locations).
+        RecentLocations,
         /// Moves to the next Search Everywhere tab.
         NextTab,
         /// Moves to the previous Search Everywhere tab.
@@ -69,6 +71,7 @@ actions!(
 );
 
 const RECENT_FILES_LIMIT: usize = 20;
+const RECENT_LOCATIONS_LIMIT: usize = 50;
 const SYMBOL_QUERY_DEBOUNCE: Duration = Duration::from_millis(100);
 /// Results per group on the All tab, so one source can't push the others off.
 const ALL_TAB_GROUP_LIMIT: usize = 8;
@@ -90,6 +93,9 @@ pub fn init(cx: &mut App) {
         workspace.register_action(|workspace, _: &GoToSymbol, window, cx| {
             SearchEverywhere::open(workspace, Tab::Symbols, window, cx)
         });
+        workspace.register_action(|workspace, _: &RecentLocations, window, cx| {
+            SearchEverywhere::open(workspace, Tab::Locations, window, cx)
+        });
         workspace.register_action(|workspace, _: &RecentFiles, window, cx| {
             SearchEverywhere::open(workspace, Tab::Files, window, cx)
         });
@@ -105,6 +111,8 @@ enum Tab {
     Symbols,
     Hooks,
     Actions,
+    /// Recent Locations: opened by its own key, not part of the tab strip.
+    Locations,
 }
 
 impl Tab {
@@ -125,6 +133,7 @@ impl Tab {
             Tab::Symbols => "Symbols",
             Tab::Hooks => "Hooks",
             Tab::Actions => "Actions",
+            Tab::Locations => "Recent Locations",
         }
     }
 
@@ -134,6 +143,7 @@ impl Tab {
             Tab::Files => "Search files…",
             Tab::Symbols => "Search symbols…",
             Tab::Actions => "Search actions…",
+            Tab::Locations => "Search recent locations…",
             Tab::All | Tab::Hooks => "Search everywhere…",
         }
     }
@@ -194,12 +204,14 @@ impl SearchEverywhere {
             .into_iter()
             .map(|(project_path, _)| project_path)
             .collect();
+        let recent_locations = recent_locations(workspace, cx);
         workspace.toggle_modal(window, cx, move |window, cx| {
             Self::new(
                 tab,
                 workspace_handle,
                 project,
                 recent_files,
+                recent_locations,
                 previous_focus_handle,
                 window,
                 cx,
@@ -212,6 +224,7 @@ impl SearchEverywhere {
         workspace: WeakEntity<Workspace>,
         project: Entity<Project>,
         recent_files: Vec<ProjectPath>,
+        recent_locations: Vec<Location>,
         previous_focus_handle: FocusHandle,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -231,6 +244,7 @@ impl SearchEverywhere {
             workspace,
             project,
             recent_files,
+            recent_locations,
             previous_focus_handle,
             tab,
             commands,
@@ -307,6 +321,53 @@ enum SearchMatch {
         label: SharedString,
         positions: Vec<usize>,
     },
+    /// Index into `SearchDelegate::recent_locations`.
+    Location {
+        ix: usize,
+        label: SharedString,
+        positions: Vec<usize>,
+    },
+}
+
+/// A place visited: file and 0-based row, newest first in `recent_locations`.
+#[derive(Clone)]
+struct Location {
+    project_path: ProjectPath,
+    row: u32,
+    label: SharedString,
+}
+
+/// Every place the panes' navigation histories recorded, newest first, one per
+/// file and row.
+fn recent_locations(workspace: &Workspace, cx: &App) -> Vec<Location> {
+    let path_style = workspace.project().read(cx).path_style(cx);
+    let mut visited = Vec::new();
+    for pane in workspace.panes() {
+        pane.read(cx)
+            .nav_history()
+            .for_each_entry(cx, &mut |entry, (project_path, _)| {
+                if let Some(row) = entry.row {
+                    visited.push((entry.timestamp, project_path, row));
+                }
+            });
+    }
+    visited.sort_by_key(|(timestamp, ..)| Reverse(*timestamp));
+    let mut seen = HashSet::<(ProjectPath, u32)>::default();
+    visited
+        .into_iter()
+        .filter(|(_, project_path, row)| seen.insert((project_path.clone(), *row)))
+        .take(RECENT_LOCATIONS_LIMIT)
+        .map(|(_, project_path, row)| Location {
+            label: format!(
+                "{}:{}",
+                file_label(RelPath::empty(), &project_path.path, path_style),
+                row + 1
+            )
+            .into(),
+            project_path,
+            row,
+        })
+        .collect()
 }
 
 pub struct SearchDelegate {
@@ -314,6 +375,7 @@ pub struct SearchDelegate {
     workspace: WeakEntity<Workspace>,
     project: Entity<Project>,
     recent_files: Vec<ProjectPath>,
+    recent_locations: Vec<Location>,
     previous_focus_handle: FocusHandle,
     tab: Tab,
     commands: Vec<Command>,
@@ -449,6 +511,53 @@ impl SearchDelegate {
         })
     }
 
+    /// Recent locations by fuzzy label; all of them, newest first, when nothing is typed.
+    fn search_locations(
+        &self,
+        query: String,
+        cx: &mut Context<Picker<Self>>,
+    ) -> Task<Vec<SearchMatch>> {
+        let locations = self
+            .recent_locations
+            .iter()
+            .enumerate()
+            .map(|(ix, location)| (ix, location.label.clone()))
+            .collect::<Vec<_>>();
+        if query.is_empty() {
+            return Task::ready(
+                locations
+                    .into_iter()
+                    .map(|(ix, label)| SearchMatch::Location {
+                        ix,
+                        label,
+                        positions: Vec::new(),
+                    })
+                    .collect(),
+            );
+        }
+        let candidates = locations
+            .iter()
+            .map(|(ix, label)| StringMatchCandidate::new(*ix, label))
+            .collect::<Vec<_>>();
+        let executor = cx.background_executor().clone();
+        cx.background_spawn(async move {
+            fuzzy_nucleo::match_strings_async(
+                &candidates,
+                &query,
+                StringMatchOptions::default(),
+                executor,
+            )
+            .await
+            .into_iter()
+            .map(|string_match| SearchMatch::Location {
+                ix: string_match.candidate_id,
+                label: string_match.string,
+                positions: string_match.positions,
+            })
+            .collect()
+        })
+    }
+
     /// Project files by fuzzy path, as the file finder; recently opened files
     /// when nothing is typed.
     fn search_files(
@@ -560,10 +669,49 @@ impl SearchDelegate {
     }
 
     /// Short kind shown on each All-tab row.
+    /// Opens `project_path` (split when `secondary`) and lands on `file_target`.
+    fn open_file(
+        &mut self,
+        project_path: ProjectPath,
+        file_target: Option<FileTarget>,
+        secondary: bool,
+        window: &mut Window,
+        cx: &mut Context<Picker<Self>>,
+    ) {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let open = workspace.update(cx, |workspace, cx| {
+            if secondary {
+                workspace.split_path_preview(project_path, false, None, window, cx)
+            } else {
+                workspace.open_path(project_path, None, true, window, cx)
+            }
+        });
+        let workspace = self.workspace.clone();
+        cx.spawn_in(window, async move |_, cx| {
+            let item = open.await.notify_workspace_async_err(workspace, cx)?;
+            let file_target = file_target?;
+            let editor = item.downcast::<Editor>()?;
+            editor
+                .update_in(cx, |editor, window, cx| {
+                    let buffer = editor.buffer().read(cx).as_singleton()?;
+                    let range = file_target.range(&buffer.read(cx).snapshot());
+                    editor.go_to_singleton_buffer_range(range, window, cx);
+                    Some(())
+                })
+                .ok()
+                .flatten()
+        })
+        .detach();
+        self.dismissed(window, cx);
+    }
+
     fn kind_label(&self, search_match: &SearchMatch) -> &'static str {
         match search_match {
             SearchMatch::Action(_) => "Action",
             SearchMatch::File { .. } => "File",
+            SearchMatch::Location { .. } => "Location",
             SearchMatch::Symbol(string_match) => {
                 match self.symbols.get(string_match.candidate_id) {
                     Some(symbol) if is_class_like(symbol) => "Class",
@@ -729,6 +877,17 @@ impl PickerDelegate for SearchDelegate {
             self.set_matches(Vec::new(), Vec::new(), true, cx);
             return Task::ready(());
         }
+        if tab == Tab::Locations {
+            let locations = self.search_locations(query, cx);
+            return cx.spawn_in(window, async move |picker, cx| {
+                let matches = locations.await;
+                picker
+                    .update(cx, |picker, cx| {
+                        picker.delegate.set_matches(Vec::new(), matches, true, cx)
+                    })
+                    .log_err();
+            });
+        }
         let is_empty_query = query.is_empty();
         let (file_query, file_target) = parse_file_query(&query);
         self.file_target = file_target;
@@ -835,35 +994,18 @@ impl PickerDelegate for SearchDelegate {
                 self.dismissed(window, cx);
             }
             Some(SearchMatch::File { project_path, .. }) => {
-                let Some(workspace) = self.workspace.upgrade() else {
+                let (project_path, file_target) = (project_path.clone(), self.file_target);
+                self.open_file(project_path, file_target, secondary, window, cx);
+            }
+            Some(SearchMatch::Location { ix, .. }) => {
+                let Some(location) = self.recent_locations.get(*ix).cloned() else {
                     return;
                 };
-                let project_path = project_path.clone();
-                let open = workspace.update(cx, |workspace, cx| {
-                    if secondary {
-                        workspace.split_path_preview(project_path, false, None, window, cx)
-                    } else {
-                        workspace.open_path(project_path, None, true, window, cx)
-                    }
-                });
-                let file_target = self.file_target;
-                let workspace = self.workspace.clone();
-                cx.spawn_in(window, async move |_, cx| {
-                    let item = open.await.notify_workspace_async_err(workspace, cx)?;
-                    let file_target = file_target?;
-                    let editor = item.downcast::<Editor>()?;
-                    editor
-                        .update_in(cx, |editor, window, cx| {
-                            let buffer = editor.buffer().read(cx).as_singleton()?;
-                            let range = file_target.range(&buffer.read(cx).snapshot());
-                            editor.go_to_singleton_buffer_range(range, window, cx);
-                            Some(())
-                        })
-                        .ok()
-                        .flatten()
-                })
-                .detach();
-                self.dismissed(window, cx);
+                let target = FileTarget::Point {
+                    row: location.row + 1,
+                    column: None,
+                };
+                self.open_file(location.project_path, Some(target), secondary, window, cx);
             }
         }
     }
@@ -953,6 +1095,23 @@ impl PickerDelegate for SearchDelegate {
                     ),
                 )
             }
+            SearchMatch::Location {
+                label, positions, ..
+            } => Some(
+                item.start_slot::<Icon>(
+                    FileFinderSettings::get_global(cx)
+                        .file_icons
+                        .then(|| {
+                            let file = label
+                                .rsplit_once(':')
+                                .map_or(label.as_ref(), |(file, _)| file);
+                            FileIcons::get_icon(Path::new(file), cx)
+                        })
+                        .flatten()
+                        .map(|icon| Icon::from_path(icon).color(Color::Muted)),
+                )
+                .child(HighlightedLabel::new(label.clone(), positions.clone()).truncate()),
+            ),
             SearchMatch::File {
                 label, positions, ..
             } => Some(
@@ -1128,10 +1287,80 @@ mod tests {
                 .iter()
                 .filter_map(|search_match| match search_match {
                     SearchMatch::File { label, .. } => Some(label.to_string()),
-                    SearchMatch::Action(_) | SearchMatch::Symbol(_) => None,
+                    SearchMatch::Action(_)
+                    | SearchMatch::Symbol(_)
+                    | SearchMatch::Location { .. } => None,
                 })
                 .collect::<Vec<_>>();
             assert_eq!(labels, [path!("src/main.rs")]);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_recent_locations_lists_places_visited_newest_first(cx: &mut TestAppContext) {
+        let app_state = init_test(cx);
+        let text = (0..30)
+            .map(|row| format!("line {row}\n"))
+            .collect::<String>();
+        app_state
+            .fs
+            .as_fake()
+            .insert_tree(path!("/root"), json!({ "main.rs": text }))
+            .await;
+        let project = Project::test(app_state.fs.clone(), [path!("/root").as_ref()], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        cx.run_until_parked();
+        let editor = workspace
+            .update_in(cx, |workspace, window, cx| {
+                workspace.open_abs_path(
+                    std::path::PathBuf::from(path!("/root/main.rs")),
+                    workspace::OpenOptions::default(),
+                    window,
+                    cx,
+                )
+            })
+            .await
+            .expect("file opens")
+            .downcast::<Editor>()
+            .expect("an editor");
+        // Each jump records the place it leaves: row 0, then row 10.
+        for row in [10, 20] {
+            editor.update_in(cx, |editor, window, cx| {
+                editor.go_to_singleton_buffer_range(
+                    Point::new(row, 0)..Point::new(row, 0),
+                    window,
+                    cx,
+                )
+            });
+        }
+
+        open_on(Tab::Locations, &workspace, cx);
+        let picker = open_picker(&workspace, cx);
+        picker.read_with(cx, |picker, _| {
+            let labels = picker
+                .delegate
+                .matches
+                .iter()
+                .filter_map(|search_match| match search_match {
+                    SearchMatch::Location { label, .. } => Some(label.to_string()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(labels, ["main.rs:11", "main.rs:1"]);
+        });
+
+        // Picking the older place jumps back to it.
+        cx.dispatch_action(menu::SelectNext);
+        cx.dispatch_action(menu::Confirm);
+        cx.run_until_parked();
+        editor.update(cx, |editor, cx| {
+            let head = editor
+                .selections
+                .newest::<Point>(&editor.display_snapshot(cx))
+                .head();
+            assert_eq!(head.row, 0);
         });
     }
 
@@ -1544,6 +1773,7 @@ mod tests {
             assert!(bound_to(&GoToFile, &["o"]));
             assert!(bound_to(&GoToSymbol, &["o"]));
             assert!(bound_to(&RecentFiles, &["e"]));
+            assert!(bound_to(&RecentLocations, &["e"]));
         });
     }
 
@@ -1611,12 +1841,18 @@ mod tests {
                 Some("project_symbols::Toggle")
             );
 
+            assert_eq!(
+                resolve(&base, "shift-e", &editor).as_deref(),
+                Some("pane::RevealInProjectPanel")
+            );
+
             for contexts in [&editor[..], &terminal, &project_panel] {
                 for (keys, action) in [
                     ("o", "zenith_search::GoToClass"),
                     ("shift-o", "zenith_search::GoToFile"),
                     ("alt-o", "zenith_search::GoToSymbol"),
                     ("e", "zenith_search::RecentFiles"),
+                    ("shift-e", "zenith_search::RecentLocations"),
                 ] {
                     assert_eq!(
                         resolve(&all, keys, contexts).as_deref(),
