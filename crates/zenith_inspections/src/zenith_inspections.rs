@@ -228,6 +228,36 @@ pub fn parse_phpstan(output: &str) -> Result<Vec<Problem>> {
         .collect())
 }
 
+/// PHPCS counts a tab as up to `tab_width` columns; the editor counts characters.
+pub fn char_column(line: &str, column: u32, tab_width: u32) -> u32 {
+    let mut expanded = 1;
+    let mut chars = 1;
+    for character in line.chars() {
+        if expanded >= column {
+            break;
+        }
+        expanded += if character == '\t' {
+            tab_width - (expanded - 1) % tab_width
+        } else {
+            1
+        };
+        chars += 1;
+    }
+    chars
+}
+
+fn fix_tab_columns(problems: &mut [Problem], text: &str) {
+    let lines: Vec<&str> = text.lines().collect();
+    for problem in problems {
+        if let Some(line) = lines.get(problem.line.saturating_sub(1) as usize) {
+            problem.column = char_column(line, problem.column, PHPCS_TAB_WIDTH);
+        }
+    }
+}
+
+/// PHPCS's default, and the WordPress ruleset's.
+const PHPCS_TAB_WIDTH: u32 = 4;
+
 /// Problems as diagnostics. Disk-based, so they follow edits made after the save.
 pub fn diagnostic_entries(
     analyzer: Analyzer,
@@ -307,9 +337,15 @@ pub async fn run(
         .with_context(|| format!("running {}", analyzer.name()));
     Some(result.and_then(|output| {
         // Both tools exit non-zero when they find something; the JSON says what.
-        analyzer
+        let mut problems = analyzer
             .parse(&String::from_utf8_lossy(&output.stdout))
-            .with_context(|| String::from_utf8_lossy(&output.stderr).trim().to_string())
+            .with_context(|| String::from_utf8_lossy(&output.stderr).trim().to_string())?;
+        if analyzer == Analyzer::Phpcs
+            && let Ok(text) = std::fs::read_to_string(file)
+        {
+            fix_tab_columns(&mut problems, &text);
+        }
+        Ok(problems)
     }))
 }
 

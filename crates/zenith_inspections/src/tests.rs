@@ -236,3 +236,28 @@ fn test_older_run_is_stale_after_a_newer_save(cx: &mut TestAppContext) {
         assert_eq!(current_generation(Path::new("/b.php"), cx), other);
     });
 }
+
+#[test]
+fn test_phpcs_tab_columns_become_character_columns() {
+    // Two tabs then `$x`: PHPCS says column 9, the editor's third character.
+    assert_eq!(char_column("\t\t$x  = 1;", 9, 4), 3);
+    assert_eq!(char_column("\t\t$x  = 1;", 1, 4), 1);
+    // Real phpcs: the alignment warning on `=` is column 13 by default, 7 with --tab-width=0.
+    assert_eq!(char_column("\t\t$x  = 1;", 13, 4), 7);
+    // A tab after two characters only reaches the next stop.
+    assert_eq!(char_column("ab\tc", 5, 4), 4);
+    assert_eq!(char_column("no tabs", 4, 4), 4);
+    // Past the end of the line stays on the line.
+    assert_eq!(char_column("\t", 99, 4), 2);
+
+    let mut problems = vec![Problem {
+        path: PathBuf::from("/p/a.php"),
+        line: 2,
+        column: 9,
+        severity: Severity::Error,
+        message: String::new(),
+        rule: None,
+    }];
+    fix_tab_columns(&mut problems, "<?php\n\t\t$x = 1;\n");
+    assert_eq!(problems[0].column, 3);
+}
