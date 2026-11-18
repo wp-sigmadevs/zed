@@ -2379,14 +2379,15 @@ pub fn load_default_keymap(cx: &mut App) {
     }
 
     // Zenith: after the base keymap so its bindings win in every keymap.
-    cx.bind_keys(
+    cx.bind_keys(filter_disabled_ai_bindings(
         KeymapFile::load_asset(
             settings::ZENITH_KEYMAP_PATH,
             Some(KeybindSource::Default),
             cx,
         )
         .unwrap(),
-    );
+        cx,
+    ));
 
     if VimModeSetting::get_global(cx).0 || vim_mode_setting::HelixModeSetting::get_global(cx).0 {
         cx.bind_keys(filter_disabled_ai_bindings(
@@ -3294,7 +3295,8 @@ mod tests {
             .update(cx, |multi_workspace, window, cx| {
                 multi_workspace.workspace().update(cx, |workspace, cx| {
                     assert_eq!(workspace.worktrees(cx).count(), 2);
-                    assert!(workspace.right_dock().read(cx).is_open());
+                    // Zenith: the project panel docks left, as in PhpStorm.
+                    assert!(workspace.left_dock().read(cx).is_open());
                     assert!(
                         workspace
                             .active_pane()
@@ -6359,6 +6361,9 @@ mod tests {
                 "zed",
                 "zed_actions",
                 "zed_predict_onboarding",
+                "zenith_inspections",
+                "zenith_php_tools",
+                "zenith_search",
                 "zeta",
             ];
             assert_eq!(
