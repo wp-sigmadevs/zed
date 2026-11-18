@@ -141,41 +141,28 @@ impl Profile {
         }
     }
 
-    /// The `composer.json` Zenith installs from. Ranges here; the lock file next to
-    /// it (checked into Zenith, installed by a CI job) is what pins versions.
+    /// The `composer.json` Zenith installs from (`profiles/<name>/`).
+    pub fn composer_manifest(self) -> &'static str {
+        match self {
+            Profile::WordPress => include_str!("../profiles/wordpress/composer.json"),
+            Profile::Laravel => include_str!("../profiles/laravel/composer.json"),
+            Profile::Php => include_str!("../profiles/php/composer.json"),
+        }
+    }
+
+    /// The lock that pins every version, so an install gives the same tools each time.
+    /// Regenerate with `composer update --no-install` in `profiles/<name>/` when
+    /// bumping the set.
+    pub fn composer_lock(self) -> &'static str {
+        match self {
+            Profile::WordPress => include_str!("../profiles/wordpress/composer.lock"),
+            Profile::Laravel => include_str!("../profiles/laravel/composer.lock"),
+            Profile::Php => include_str!("../profiles/php/composer.lock"),
+        }
+    }
+
     pub fn composer_json(self) -> serde_json::Value {
-        let require: &[(&str, &str)] = match self {
-            Profile::WordPress => &[
-                ("squizlabs/php_codesniffer", "^3.13"),
-                ("wp-coding-standards/wpcs", "^3.0"),
-                ("phpcompatibility/phpcompatibility-wp", "^2.1"),
-                ("dealerdirect/phpcodesniffer-composer-installer", "^1.0"),
-                ("phpstan/phpstan", "^2.0"),
-                ("szepeviktor/phpstan-wordpress", "^2.0"),
-            ],
-            Profile::Laravel => &[
-                ("laravel/pint", "^1.0"),
-                ("phpstan/phpstan", "^2.0"),
-                ("larastan/larastan", "^3.0"),
-            ],
-            Profile::Php => &[
-                ("phpstan/phpstan", "^2.0"),
-                ("friendsofphp/php-cs-fixer", "^3.0"),
-            ],
-        };
-        serde_json::json!({
-            "name": format!("zenith/php-tools-{}", self.dir_name()),
-            "description": "Tools Zenith manages for PHP projects. Not your project's dependencies.",
-            "type": "project",
-            "require": require
-                .iter()
-                .map(|(package, range)| (package.to_string(), serde_json::json!(range)))
-                .collect::<serde_json::Map<_, _>>(),
-            "config": {
-                "sort-packages": true,
-                "allow-plugins": { "dealerdirect/phpcodesniffer-composer-installer": true },
-            },
-        })
+        serde_json::from_str(self.composer_manifest()).unwrap_or_default()
     }
 }
 
@@ -390,10 +377,13 @@ where
     let dir = managed_root(home).join(profile.dir_name());
     fs::create_dir_all(&dir)
         .map_err(|error| format!("Could not create {}: {error}", dir.display()))?;
-    let manifest = serde_json::to_string_pretty(&profile.composer_json())
-        .map_err(|error| error.to_string())?;
-    fs::write(dir.join("composer.json"), manifest)
-        .map_err(|error| format!("Could not write composer.json: {error}"))?;
+    for (name, text) in [
+        ("composer.json", profile.composer_manifest()),
+        ("composer.lock", profile.composer_lock()),
+    ] {
+        fs::write(dir.join(name), text)
+            .map_err(|error| format!("Could not write {name}: {error}"))?;
+    }
     run(Invocation {
         program: php.to_path_buf(),
         args: vec![
@@ -1096,10 +1086,17 @@ mod tests {
             "COMPOSER_HOME".to_string(),
             dir.join(".composer-home").display().to_string()
         )));
-        // The manifest it installs from was written there.
+        // The manifest and the lock it installs from were written there.
         let manifest: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(dir.join("composer.json")).unwrap()).unwrap();
         assert!(manifest["require"]["wp-coding-standards/wpcs"].is_string());
+        let lock: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(dir.join("composer.lock")).unwrap()).unwrap();
+        assert!(
+            lock["packages"]
+                .as_array()
+                .is_some_and(|packages| !packages.is_empty())
+        );
     }
 
     #[test]
@@ -1132,5 +1129,24 @@ mod tests {
         assert_eq!(run("echo $ZENITH_TEST"), Ok("yes".to_string()));
         let error = run("echo 'could not resolve' >&2; exit 1").unwrap_err();
         assert!(error.contains("could not resolve"), "{error}");
+    }
+
+    #[test]
+    fn test_every_profile_lock_pins_what_its_manifest_requires() {
+        for profile in [Profile::WordPress, Profile::Laravel, Profile::Php] {
+            let manifest = profile.composer_json();
+            let lock: serde_json::Value = serde_json::from_str(profile.composer_lock()).unwrap();
+            let locked: Vec<&str> = lock["packages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|package| package["name"].as_str())
+                .collect();
+            for package in manifest["require"].as_object().unwrap().keys() {
+                assert!(locked.contains(&package.as_str()), "{profile:?}: {package}");
+            }
+            // The lock was made for the manifest next to it.
+            assert!(lock["content-hash"].is_string());
+        }
     }
 }

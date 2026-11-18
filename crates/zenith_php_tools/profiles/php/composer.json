@@ -1,0 +1,18 @@
+{
+    "name": "zenith/php-tools-php",
+    "description": "Tools Zenith manages for PHP projects. Not your project's dependencies.",
+    "type": "project",
+    "require": {
+        "phpstan/phpstan": "^2.0",
+        "friendsofphp/php-cs-fixer": "^3.0"
+    },
+    "config": {
+        "sort-packages": true,
+        "platform": {
+            "php": "8.1.99"
+        },
+        "allow-plugins": {
+            "dealerdirect/phpcodesniffer-composer-installer": true
+        }
+    }
+}
