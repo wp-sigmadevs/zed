@@ -309,6 +309,112 @@ pub fn status_report(
     lines.join("\n")
 }
 
+// ---- consent and install ----
+
+/// What the user told Zenith about installing a profile's tools.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Consent {
+    #[default]
+    Ask,
+    Yes,
+    Never,
+}
+
+impl Profile {
+    fn key(self) -> &'static str {
+        self.dir_name()
+    }
+}
+
+fn consent_file(home: &Path) -> PathBuf {
+    managed_root(home).join("consent.json")
+}
+
+pub fn load_consent(home: &Path, profile: Profile) -> Consent {
+    let Ok(text) = fs::read_to_string(consent_file(home)) else {
+        return Consent::Ask;
+    };
+    let json: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+    match json.get(profile.key()).and_then(|value| value.as_str()) {
+        Some("yes") => Consent::Yes,
+        Some("never") => Consent::Never,
+        _ => Consent::Ask,
+    }
+}
+
+/// `Ask` is not stored: "Not now" is for this session only.
+pub fn save_consent(home: &Path, profile: Profile, consent: Consent) -> std::io::Result<()> {
+    let file = consent_file(home);
+    let mut json: serde_json::Map<String, serde_json::Value> = fs::read_to_string(&file)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default();
+    match consent {
+        Consent::Yes => json.insert(profile.key().into(), "yes".into()),
+        Consent::Never => json.insert(profile.key().into(), "never".into()),
+        Consent::Ask => json.remove(profile.key()),
+    };
+    fs::create_dir_all(managed_root(home))?;
+    fs::write(file, serde_json::to_string_pretty(&json)?)
+}
+
+/// Whether to show the install banner: a trusted, local PHP project that has not
+/// answered, with none of the profile's tools in sight.
+pub fn should_offer(consent: Consent, trusted: bool, local: bool, has_any_tool: bool) -> bool {
+    consent == Consent::Ask && trusted && local && !has_any_tool
+}
+
+/// One external command, for a runner to execute.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Invocation {
+    pub program: PathBuf,
+    pub args: Vec<String>,
+    pub cwd: PathBuf,
+    pub env: Vec<(String, String)>,
+}
+
+/// Installs the profile's tools into the managed folder with the user's Composer.
+/// Composer's home is inside the managed folder, so the user's global Composer
+/// config, cache and auth stay untouched. Returns Composer's output.
+pub async fn install<F, Fut>(
+    home: &Path,
+    profile: Profile,
+    php: &Path,
+    composer: &Path,
+    run: F,
+) -> Result<String, String>
+where
+    F: Fn(Invocation) -> Fut,
+    Fut: std::future::Future<Output = Result<String, String>>,
+{
+    let dir = managed_root(home).join(profile.dir_name());
+    fs::create_dir_all(&dir)
+        .map_err(|error| format!("Could not create {}: {error}", dir.display()))?;
+    let manifest = serde_json::to_string_pretty(&profile.composer_json())
+        .map_err(|error| error.to_string())?;
+    fs::write(dir.join("composer.json"), manifest)
+        .map_err(|error| format!("Could not write composer.json: {error}"))?;
+    run(Invocation {
+        program: php.to_path_buf(),
+        args: vec![
+            composer.display().to_string(),
+            "install".into(),
+            "--no-interaction".into(),
+            "--no-progress".into(),
+            "--prefer-dist".into(),
+        ],
+        cwd: dir.clone(),
+        env: vec![
+            (
+                "COMPOSER_HOME".into(),
+                dir.join(".composer-home").display().to_string(),
+            ),
+            ("COMPOSER_NO_INTERACTION".into(), "1".into()),
+        ],
+    })
+    .await
+}
+
 // ---- status bar item and "PHP tools: status" ----
 
 use gpui::{
@@ -722,6 +828,81 @@ mod tests {
         assert_eq!(
             wordpress["config"]["allow-plugins"]["dealerdirect/phpcodesniffer-composer-installer"],
             true
+        );
+    }
+
+    #[test]
+    fn test_consent_is_remembered_per_profile_and_never_defaults_to_yes() {
+        let home = tempfile::tempdir().unwrap();
+        assert_eq!(load_consent(home.path(), Profile::WordPress), Consent::Ask);
+        save_consent(home.path(), Profile::WordPress, Consent::Never).unwrap();
+        save_consent(home.path(), Profile::Laravel, Consent::Yes).unwrap();
+        assert_eq!(
+            load_consent(home.path(), Profile::WordPress),
+            Consent::Never
+        );
+        assert_eq!(load_consent(home.path(), Profile::Laravel), Consent::Yes);
+        assert_eq!(load_consent(home.path(), Profile::Php), Consent::Ask);
+        // "Not now" forgets the answer.
+        save_consent(home.path(), Profile::WordPress, Consent::Ask).unwrap();
+        assert_eq!(load_consent(home.path(), Profile::WordPress), Consent::Ask);
+        assert_eq!(load_consent(home.path(), Profile::Laravel), Consent::Yes);
+    }
+
+    #[test]
+    fn test_offer_only_when_asked_trusted_local_and_missing() {
+        assert!(should_offer(Consent::Ask, true, true, false));
+        assert!(!should_offer(Consent::Never, true, true, false));
+        assert!(!should_offer(Consent::Yes, true, true, false));
+        assert!(!should_offer(Consent::Ask, false, true, false), "untrusted");
+        assert!(!should_offer(Consent::Ask, true, false, false), "remote");
+        assert!(!should_offer(Consent::Ask, true, true, true), "tools exist");
+    }
+
+    #[test]
+    fn test_install_runs_composer_inside_the_managed_folder_only() {
+        use std::cell::RefCell;
+        let home = tempfile::tempdir().unwrap();
+        let calls = RefCell::new(Vec::new());
+        let result = futures::executor::block_on(install(
+            home.path(),
+            Profile::WordPress,
+            Path::new("/opt/homebrew/bin/php"),
+            Path::new("/usr/local/bin/composer"),
+            |invocation| {
+                calls.borrow_mut().push(invocation);
+                async { Ok("Installing dependencies".to_string()) }
+            },
+        ));
+        assert_eq!(result.as_deref(), Ok("Installing dependencies"));
+        let calls = calls.into_inner();
+        assert_eq!(calls.len(), 1);
+        let dir = managed_root(home.path()).join("wordpress");
+        assert_eq!(calls[0].cwd, dir);
+        assert!(calls[0].args.contains(&"--no-interaction".to_string()));
+        assert!(calls[0].env.contains(&(
+            "COMPOSER_HOME".to_string(),
+            dir.join(".composer-home").display().to_string()
+        )));
+        // The manifest it installs from was written there.
+        let manifest: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(dir.join("composer.json")).unwrap()).unwrap();
+        assert!(manifest["require"]["wp-coding-standards/wpcs"].is_string());
+    }
+
+    #[test]
+    fn test_install_failure_returns_the_composer_error() {
+        let home = tempfile::tempdir().unwrap();
+        let result = futures::executor::block_on(install(
+            home.path(),
+            Profile::Php,
+            Path::new("php"),
+            Path::new("composer"),
+            |_| async { Err("Your requirements could not be resolved".to_string()) },
+        ));
+        assert_eq!(
+            result,
+            Err("Your requirements could not be resolved".to_string())
         );
     }
 }
