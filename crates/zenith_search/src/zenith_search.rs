@@ -352,6 +352,17 @@ fn recent_locations(workspace: &Workspace, cx: &App) -> Vec<Location> {
             });
     }
     visited.sort_by_key(|(timestamp, ..)| Reverse(*timestamp));
+    // Where you are now is the newest place; the history only holds places left.
+    if let Some(editor) = workspace.active_item_as::<Editor>(cx)
+        && let Some(project_path) = workspace::item::ItemHandle::project_path(&editor, cx)
+    {
+        let editor = editor.read(cx);
+        let snapshot = editor.buffer().read(cx).snapshot(cx);
+        let row = snapshot
+            .summary_for_anchor::<Point>(&editor.selections.newest_anchor().head())
+            .row;
+        visited.insert(0, (usize::MAX, project_path, row));
+    }
     let mut seen = HashSet::<(ProjectPath, u32)>::default();
     visited
         .into_iter()
@@ -1325,7 +1336,7 @@ mod tests {
             .expect("file opens")
             .downcast::<Editor>()
             .expect("an editor");
-        // Each jump records the place it leaves: row 0, then row 10.
+        // Each jump records the place it leaves: row 0, then row 10; row 20 is where it ends.
         for row in [10, 20] {
             editor.update_in(cx, |editor, window, cx| {
                 editor.go_to_singleton_buffer_range(
@@ -1348,10 +1359,11 @@ mod tests {
                     _ => None,
                 })
                 .collect::<Vec<_>>();
-            assert_eq!(labels, ["main.rs:11", "main.rs:1"]);
+            assert_eq!(labels, ["main.rs:21", "main.rs:11", "main.rs:1"]);
         });
 
         // Picking the older place jumps back to it.
+        cx.dispatch_action(menu::SelectNext);
         cx.dispatch_action(menu::SelectNext);
         cx.dispatch_action(menu::Confirm);
         cx.run_until_parked();
@@ -1361,6 +1373,48 @@ mod tests {
                 .newest::<Point>(&editor.display_snapshot(cx))
                 .head();
             assert_eq!(head.row, 0);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_recent_locations_after_only_opening_files(cx: &mut TestAppContext) {
+        let app_state = init_test(cx);
+        app_state
+            .fs
+            .as_fake()
+            .insert_tree(path!("/root"), json!({ "a.rs": "a\n", "b.rs": "b\n" }))
+            .await;
+        let project = Project::test(app_state.fs.clone(), [path!("/root").as_ref()], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        cx.run_until_parked();
+        for name in ["a.rs", "b.rs"] {
+            workspace
+                .update_in(cx, |workspace, window, cx| {
+                    workspace.open_abs_path(
+                        std::path::PathBuf::from(path!("/root")).join(name),
+                        workspace::OpenOptions::default(),
+                        window,
+                        cx,
+                    )
+                })
+                .await
+                .expect("file opens");
+        }
+        open_on(Tab::Locations, &workspace, cx);
+        let picker = open_picker(&workspace, cx);
+        picker.read_with(cx, |picker, _| {
+            let labels = picker
+                .delegate
+                .matches
+                .iter()
+                .filter_map(|m| match m {
+                    SearchMatch::Location { label, .. } => Some(label.to_string()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(labels, ["b.rs:1", "a.rs:1"]);
         });
     }
 
