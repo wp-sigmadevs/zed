@@ -252,18 +252,34 @@ struct PhpstanMessage {
 pub fn parse_phpstan(output: &str) -> Result<Vec<Problem>> {
     let json: serde_json::Value =
         serde_json::from_str(json_part(output)).context("phpstan output")?;
-    // Top-level errors are config or bootstrap failures, not findings.
-    if let Some(errors) = json.get("errors").and_then(|errors| errors.as_array())
-        && !errors.is_empty()
-    {
-        let messages: Vec<&str> = errors.iter().filter_map(|error| error.as_str()).collect();
-        anyhow::bail!("phpstan: {}", messages.join("; "));
+    // Top-level errors are config or bootstrap failures, or notes such as an
+    // unmatched ignore pattern. With findings beside them, keep the findings.
+    let top_level: Vec<String> = json
+        .get("errors")
+        .and_then(|errors| errors.as_array())
+        .into_iter()
+        .flatten()
+        .map(|error| match error.as_str() {
+            Some(text) => text.to_string(),
+            None => error.to_string(),
+        })
+        .collect();
+    let problems = if json.get("files").is_some_and(|files| files.is_array()) {
+        Vec::new()
+    } else {
+        phpstan_files(serde_json::from_value(json).context("phpstan output")?)
+    };
+    if problems.is_empty() && !top_level.is_empty() {
+        anyhow::bail!("{}", top_level.join("; "));
     }
-    if json.get("files").is_some_and(|files| files.is_array()) {
-        return Ok(Vec::new());
+    for error in &top_level {
+        log::warn!("phpstan: {error}");
     }
-    let report: PhpstanReport = serde_json::from_value(json).context("phpstan output")?;
-    Ok(report
+    Ok(problems)
+}
+
+fn phpstan_files(report: PhpstanReport) -> Vec<Problem> {
+    report
         .files
         .into_iter()
         .flat_map(|(path, file)| {
@@ -281,7 +297,7 @@ pub fn parse_phpstan(output: &str) -> Result<Vec<Problem>> {
                 rule: message.identifier,
             })
         })
-        .collect())
+        .collect()
 }
 
 /// PHPCS counts a tab as up to `tab_width` columns; the editor counts characters.
@@ -565,13 +581,28 @@ async fn git_changes(root: &Path) -> Result<(PathBuf, String), String> {
 pub fn changed_php_files_in(root: &Path, toplevel: &Path, status: &str) -> Vec<PathBuf> {
     // Git prints the resolved toplevel; compare in the same form.
     let real_root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-    changed_php_files(toplevel, status)
+    let toplevel = std::fs::canonicalize(toplevel).unwrap_or_else(|_| toplevel.to_path_buf());
+    changed_php_files(&toplevel, status)
         .into_iter()
         .filter_map(|path| {
             let relative = path.strip_prefix(&real_root).ok()?;
             Some(root.join(relative))
         })
         .collect()
+}
+
+/// Where the tools run: the worktree root, or its folder when a file was opened
+/// on its own (the worktree root is then the file itself).
+pub fn working_folder(root: &Path, single_file: bool) -> PathBuf {
+    match root.parent() {
+        Some(parent) if single_file => parent.to_path_buf(),
+        _ => root.to_path_buf(),
+    }
+}
+
+fn worktree_folder(worktree: &Entity<project::Worktree>, cx: &App) -> PathBuf {
+    let worktree = worktree.read(cx);
+    working_folder(&worktree.abs_path(), worktree.is_single_file())
 }
 
 fn inspect_changed_files(
@@ -590,6 +621,7 @@ fn inspect_changed_files(
     let worktrees: Vec<(WorktreeId, PathBuf)> = project
         .read(cx)
         .visible_worktrees(cx)
+        .filter(|worktree| !worktree.read(cx).is_single_file())
         .map(|worktree| {
             (
                 worktree.read(cx).id(),
@@ -672,11 +704,7 @@ fn report_errors(
     errors: Vec<String>,
     cx: &mut gpui::Context<Workspace>,
 ) {
-    let shown = &mut cx.default_global::<ShownErrors>().0;
-    let new: Vec<String> = errors
-        .into_iter()
-        .filter(|error| shown.insert(error.clone()))
-        .collect();
+    let new = unseen_errors(&mut cx.default_global::<ShownErrors>().0, errors);
     if !new.is_empty() {
         workspace.show_notification(
             workspace::notifications::NotificationId::unique::<ShownErrors>(),
@@ -695,6 +723,30 @@ fn report_errors(
 
 #[derive(Default)]
 struct ShownErrors(std::collections::HashSet<String>);
+
+const PHP_NOT_FOUND: &str = "PHP was not found.";
+
+/// The errors not shown yet, now marked shown.
+pub fn unseen_errors(
+    shown: &mut std::collections::HashSet<String>,
+    errors: Vec<String>,
+) -> Vec<String> {
+    errors
+        .into_iter()
+        .filter(|error| shown.insert(error.clone()))
+        .collect()
+}
+
+/// A run that worked: its old failures may be shown again if they come back.
+pub fn forget(shown: &mut std::collections::HashSet<String>, prefix: &str) {
+    shown.retain(|error| !error.starts_with(prefix));
+}
+
+fn forget_errors(prefix: &str, cx: &mut App) {
+    if cx.has_global::<ShownErrors>() {
+        forget(&mut cx.global_mut::<ShownErrors>().0, prefix);
+    }
+}
 
 impl gpui::Global for ShownErrors {}
 
@@ -776,14 +828,17 @@ fn fix_current_file(
     ) else {
         return;
     };
-    let root = worktree.read(cx).abs_path().to_path_buf();
+    let root = worktree_folder(&worktree, cx);
+    let environment = tool_environment(cx);
     cx.spawn_in(window, async move |workspace, cx| {
         let result = cx
             .background_spawn({
                 let (root, abs_path) = (root.clone(), abs_path.clone());
                 async move {
-                    let (candidates, path_dirs) = zenith_php_tools::environment();
-                    let Some((php, _)) = zenith_php_tools::find_php(&candidates).await else {
+                    let path_dirs = environment.path_dirs;
+                    let Some((php, _)) =
+                        zenith_php_tools::find_php(&environment.php_candidates).await
+                    else {
                         anyhow::bail!("PHP was not found");
                     };
                     let managed = std::env::var_os("HOME").map(|home| {
@@ -916,7 +971,7 @@ pub fn inspect(
         return;
     };
     // A file opened on its own is its worktree's root, with an empty relative path.
-    let abs_path = worktree.read(cx).abs_path().join(file.path().as_std_path());
+    let abs_path = worktree.read(cx).absolutize(file.path());
     if abs_path
         .extension()
         .is_none_or(|extension| extension != "php")
@@ -924,19 +979,35 @@ pub fn inspect(
         return;
     }
     let run = inspect_path(project, worktree_id, abs_path.clone(), cx);
-    let task = cx.spawn(async move |cx| {
-        let errors = run.await;
-        workspace
-            .update(cx, |workspace, cx| report_errors(workspace, errors, cx))
-            .ok();
+    let key = (project.entity_id(), abs_path);
+    let running = cx.default_global::<Running>();
+    running.next += 1;
+    let id = running.next;
+    let task = cx.spawn({
+        let key = key.clone();
+        async move |cx| {
+            let errors = run.await;
+            workspace
+                .update(cx, |workspace, cx| report_errors(workspace, errors, cx))
+                .ok();
+            cx.update(|cx| {
+                let tasks = &mut cx.default_global::<Running>().tasks;
+                if tasks.get(&key).is_some_and(|(running, _)| *running == id) {
+                    tasks.remove(&key);
+                }
+            });
+        }
     });
     // Replacing the previous run drops it, which kills its tool processes.
-    cx.default_global::<Running>().0.insert(abs_path, task);
+    cx.default_global::<Running>().tasks.insert(key, (id, task));
 }
 
-/// The latest on-save run per file.
+/// The in-flight on-save run per project and file.
 #[derive(Default)]
-struct Running(std::collections::HashMap<PathBuf, gpui::Task<()>>);
+struct Running {
+    next: u64,
+    tasks: std::collections::HashMap<(gpui::EntityId, PathBuf), (u64, gpui::Task<()>)>,
+}
 
 impl gpui::Global for Running {}
 
@@ -955,7 +1026,7 @@ pub fn inspect_path(
     {
         return gpui::Task::ready(Vec::new());
     }
-    let root = worktree.read(cx).abs_path().to_path_buf();
+    let root = worktree_folder(&worktree, cx);
     let environment = tool_environment(cx);
     let lsp_store = project.read(cx).lsp_store();
     let analyzers = InspectionSettings::get_global(cx).analyzers();
@@ -1009,7 +1080,8 @@ pub fn inspect_path(
             Ok(found) => found,
             Err(abs_path) => {
                 cx.update(|cx| finish_generation(&abs_path, generation, cx));
-                return vec!["PHP was not found.".to_string()];
+                log::warn!("inspections: PHP was not found");
+                return vec![PHP_NOT_FOUND.to_string()];
             }
         };
         let mut errors = Vec::new();
@@ -1019,12 +1091,16 @@ pub fn inspect_path(
                 return;
             }
             finish_generation(&abs_path, generation, cx);
+            forget_errors(PHP_NOT_FOUND, cx);
             for analyzer in [Analyzer::Phpcs, Analyzer::Phpstan] {
                 // An analyzer that did not run (switched off, no tool, no config)
                 // clears its old findings; a failed run keeps them.
                 let mine = match results.iter().find(|(ran, _)| *ran == analyzer) {
                     None => Vec::new(),
-                    Some((_, Ok(problems))) => problems.clone(),
+                    Some((_, Ok(problems))) => {
+                        forget_errors(analyzer.name(), cx);
+                        problems.clone()
+                    }
                     Some((_, Err(error))) => {
                         log::warn!("{}: {error:#}", analyzer.name());
                         errors.push(format!("{}: {error:#}", analyzer.name()));

@@ -448,30 +448,19 @@ async fn saved_php_diagnostics(
                 .collect::<Vec<_>>()
         })
     };
-    // Nothing in flight means nothing will change; no need to wait.
-    cx.run_until_parked();
-    if cx.update(|cx| {
-        cx.try_global::<Running>()
-            .is_none_or(|running| running.0.is_empty())
-    }) {
-        return (read(cx), marker.exists());
-    }
-    let mut messages = Vec::new();
-    for _ in 0..100 {
+    // The run spawns real processes; wait until it has finished.
+    for _ in 0..250 {
         cx.run_until_parked();
-        messages = buffer.read_with(cx, |buffer, _| {
-            let snapshot = buffer.snapshot();
-            snapshot
-                .diagnostics_in_range::<_, text::Point>(0..snapshot.len(), false)
-                .map(|entry| (entry.range.start, entry.diagnostic.message.to_string()))
-                .collect::<Vec<_>>()
+        let idle = cx.update(|cx| {
+            cx.try_global::<Running>()
+                .is_none_or(|running| running.tasks.is_empty())
         });
-        if messages.iter().all(|(_, message)| message != "stale") {
+        if idle {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    (messages, marker.exists())
+    (read(cx), marker.exists())
 }
 
 fn settings_from(json: serde_json::Value) -> InspectionSettings {
@@ -571,4 +560,84 @@ async fn test_run_fix_rewrites_the_file_through_the_project_phpcbf(cx: &mut Test
         })
         .await
     );
+}
+
+#[test]
+fn test_char_column_counts_utf16() {
+    // PHPCS counts the emoji as one column; the editor's UTF-16 column counts two.
+    assert_eq!(char_column("\u{1F600}x", 2, 4), 3);
+    assert_eq!(char_column("\u{e9}x", 2, 4), 2);
+}
+
+#[test]
+fn test_phpstan_top_level_errors() {
+    let alone =
+        r#"{"totals":{"errors":1,"file_errors":0},"files":[],"errors":["Invalid configuration"]}"#;
+    let error = parse_phpstan(alone).unwrap_err();
+    assert_eq!(error.to_string(), "Invalid configuration");
+    let beside = r#"{"totals":{"errors":1,"file_errors":1},"files":{"/p/a.php":{"errors":1,"messages":[{"message":"Bad","line":3,"ignorable":true}]}},"errors":["Ignored error pattern #x# was not matched"]}"#;
+    let problems = parse_phpstan(beside).unwrap();
+    assert_eq!(problems.len(), 1);
+    assert_eq!(problems[0].message, "Bad");
+    let not_text =
+        r#"{"totals":{"errors":1,"file_errors":0},"files":[],"errors":[{"message":"x"}]}"#;
+    assert_eq!(
+        parse_phpstan(not_text).unwrap_err().to_string(),
+        r#"{"message":"x"}"#
+    );
+}
+
+#[test]
+fn test_phpcs_ruleset_in_a_parent_folder() {
+    let top = tempfile::tempdir().unwrap();
+    fs::write(
+        top.path().join("phpcs.xml"),
+        r#"<ruleset><arg name="tab-width" value="2"/></ruleset>"#,
+    )
+    .unwrap();
+    let project = top.path().join("wp-content/plugins/demo");
+    fs::create_dir_all(&project).unwrap();
+    assert_eq!(phpcs_standard(&project, ProjectKind::WordPress), None);
+    assert_eq!(ruleset_tab_width(&project), 2);
+}
+
+#[test]
+fn test_changed_files_in_a_repo_subfolder() {
+    let repo = tempfile::tempdir().unwrap();
+    let project = repo.path().join("plugin");
+    fs::create_dir_all(project.join("src")).unwrap();
+    fs::create_dir_all(repo.path().join("other")).unwrap();
+    fs::write(project.join("src/a.php"), "<?php").unwrap();
+    fs::write(repo.path().join("other/b.php"), "<?php").unwrap();
+    // Git prints the resolved toplevel (/private/var on macOS), paths from there.
+    let toplevel = fs::canonicalize(repo.path()).unwrap();
+    let status = " M plugin/src/a.php\0 M other/b.php\0";
+    assert_eq!(
+        changed_php_files_in(&project, &toplevel, status),
+        [project.join("src/a.php")]
+    );
+}
+
+#[test]
+fn test_single_file_runs_in_its_folder() {
+    assert_eq!(
+        working_folder(Path::new("/x/a.php"), true),
+        PathBuf::from("/x")
+    );
+    assert_eq!(
+        working_folder(Path::new("/x/project"), false),
+        PathBuf::from("/x/project")
+    );
+}
+
+#[test]
+fn test_failures_show_once_until_a_run_works() {
+    let mut shown = std::collections::HashSet::new();
+    let failure = || vec!["phpcs: bad ruleset".to_string()];
+    assert_eq!(unseen_errors(&mut shown, failure()), failure());
+    assert_eq!(unseen_errors(&mut shown, failure()), Vec::<String>::new());
+    forget(&mut shown, "phpstan");
+    assert_eq!(unseen_errors(&mut shown, failure()), Vec::<String>::new());
+    forget(&mut shown, "phpcs");
+    assert_eq!(unseen_errors(&mut shown, failure()), failure());
 }
