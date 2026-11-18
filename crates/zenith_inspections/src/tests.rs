@@ -324,3 +324,66 @@ async fn test_run_limited_never_exceeds_the_limit(cx: &mut TestAppContext) {
     assert_eq!(finished.load(Ordering::SeqCst), 5);
     assert_eq!(peak.load(Ordering::SeqCst), 2);
 }
+
+/// Saves a PHP file against a project whose `phpcs` is a script, with a stub `php`
+/// on PATH, and checks the finding reaches the buffer as a diagnostic.
+#[gpui::test]
+async fn test_saving_a_php_file_shows_phpcs_findings(cx: &mut TestAppContext) {
+    let root = tempfile::tempdir().unwrap();
+    let root_path = root.path().to_str().unwrap().to_string();
+    let bin = root.path().join("vendor/bin");
+    fs::create_dir_all(&bin).unwrap();
+    let report = r#"{"totals":{"errors":1,"warnings":0,"fixable":0},"files":{"ROOT/a.php":{"errors":1,"warnings":0,"messages":[{"message":"Missing doc comment","source":"Squiz.Commenting.FunctionComment.Missing","severity":5,"fixable":false,"type":"ERROR","line":2,"column":1}]}}}"#
+        .replace("ROOT", &root_path);
+    let phpcs = bin.join("phpcs");
+    fs::write(&phpcs, format!("#!/bin/sh\necho '{report}'\nexit 2\n")).unwrap();
+    fs::set_permissions(&phpcs, fs::Permissions::from_mode(0o755)).unwrap();
+    let path_dir = tempfile::tempdir().unwrap();
+    let stub_php = path_dir.path().join("php");
+    fs::write(&stub_php, "#!/bin/sh\necho 'PHP 8.3.0 (cli)'\n").unwrap();
+    fs::set_permissions(&stub_php, fs::Permissions::from_mode(0o755)).unwrap();
+    // The stub first, then the system directories other tests' shell scripts need.
+    // SAFETY: nothing else in this crate's tests reads PATH for its result.
+    let path = format!("{}:/usr/bin:/bin", path_dir.path().display());
+    unsafe { std::env::set_var("PATH", path) };
+    fs::write(root.path().join("a.php"), "<?php\nfunction foo() {}\n").unwrap();
+
+    cx.update(|cx| {
+        let settings = settings::SettingsStore::test(cx);
+        cx.set_global(settings);
+    });
+    let fake = project::FakeFs::new(cx.executor());
+    fake.insert_tree(
+        &root_path,
+        serde_json::json!({ "a.php": "<?php\nfunction foo() {}\n" }),
+    )
+    .await;
+    let project = Project::test(fake, [Path::new(&root_path)], cx).await;
+    let buffer = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer(root.path().join("a.php"), cx)
+        })
+        .await
+        .unwrap();
+    cx.executor().allow_parking();
+    cx.update(|cx| inspect(&project, &buffer, cx));
+    let mut messages = Vec::new();
+    for _ in 0..100 {
+        cx.run_until_parked();
+        messages = buffer.read_with(cx, |buffer, _| {
+            let snapshot = buffer.snapshot();
+            snapshot
+                .diagnostics_in_range::<_, text::Point>(0..snapshot.len(), false)
+                .map(|entry| (entry.range.start, entry.diagnostic.message.to_string()))
+                .collect::<Vec<_>>()
+        });
+        if !messages.is_empty() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert_eq!(
+        messages,
+        [(text::Point::new(1, 0), "Missing doc comment".to_string())]
+    );
+}
