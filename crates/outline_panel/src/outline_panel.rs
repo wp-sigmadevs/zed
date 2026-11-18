@@ -13281,3 +13281,18 @@ test/
         })
     }
 }
+
+#[cfg(test)]
+mod zenith_tests {
+    // Zenith: the tool window header menu dispatches these by name.
+    #[gpui::test]
+    fn test_header_menu_actions_exist(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            let actions = workspace::dock::zenith_panel_menu_actions("Outline Panel");
+            assert!(!actions.is_empty());
+            for &(_, action) in actions {
+                cx.build_action(action, None).expect(action);
+            }
+        });
+    }
+}
