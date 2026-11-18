@@ -396,6 +396,19 @@ pub fn changed_php_files(root: &Path, status: &str) -> Vec<PathBuf> {
     files
 }
 
+/// Starts each job only when fewer than `limit` of its batch are running.
+async fn run_limited<Job, Fut>(jobs: Vec<Job>, limit: usize)
+where
+    Job: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    let mut jobs = jobs.into_iter().peekable();
+    while jobs.peek().is_some() {
+        let batch: Vec<Fut> = jobs.by_ref().take(limit).map(|job| job()).collect();
+        futures::future::join_all(batch).await;
+    }
+}
+
 /// Files inspected at once; each starts up to two tool processes.
 const MAX_PARALLEL: usize = 2;
 
@@ -445,18 +458,23 @@ fn inspect_changed_files(
                 );
             })
             .log_err();
-        for batch in files.chunks(MAX_PARALLEL) {
-            let runs = cx
-                .update(|_, cx| {
-                    batch
-                        .iter()
-                        .map(|file| inspect_path(&project, worktree_id, file.clone(), cx))
-                        .collect::<Vec<_>>()
+        run_limited(
+            files
+                .into_iter()
+                .map(|file| {
+                    let (project, mut cx) = (project.clone(), cx.clone());
+                    move || async move {
+                        if let Ok(task) =
+                            cx.update(|_, cx| inspect_path(&project, worktree_id, file, cx))
+                        {
+                            task.await;
+                        }
+                    }
                 })
-                .log_err()
-                .unwrap_or_default();
-            futures::future::join_all(runs).await;
-        }
+                .collect(),
+            MAX_PARALLEL,
+        )
+        .await;
     })
     .detach();
 }

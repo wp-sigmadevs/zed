@@ -295,3 +295,32 @@ fn test_changed_php_files_from_git_status() {
         Vec::<PathBuf>::new()
     );
 }
+
+#[gpui::test]
+async fn test_run_limited_never_exceeds_the_limit(cx: &mut TestAppContext) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let running = std::sync::Arc::new(AtomicUsize::new(0));
+    let peak = std::sync::Arc::new(AtomicUsize::new(0));
+    let finished = std::sync::Arc::new(AtomicUsize::new(0));
+    let executor = cx.executor();
+    let jobs: Vec<_> = (0..5)
+        .map(|_| {
+            let (running, peak, finished, executor) = (
+                running.clone(),
+                peak.clone(),
+                finished.clone(),
+                executor.clone(),
+            );
+            move || async move {
+                let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                executor.timer(std::time::Duration::from_millis(10)).await;
+                running.fetch_sub(1, Ordering::SeqCst);
+                finished.fetch_add(1, Ordering::SeqCst);
+            }
+        })
+        .collect();
+    run_limited(jobs, 2).await;
+    assert_eq!(finished.load(Ordering::SeqCst), 5);
+    assert_eq!(peak.load(Ordering::SeqCst), 2);
+}
