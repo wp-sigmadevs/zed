@@ -573,3 +573,16 @@ impl CodeActionProvider for Entity<Project> {
         })
     }
 }
+
+// Zenith: lets a zenith crate add code actions (upstream dropped this in #56030).
+impl Editor {
+    pub fn add_code_action_provider(&mut self, provider: Rc<dyn CodeActionProvider>) {
+        if self
+            .code_action_providers
+            .iter()
+            .all(|existing| existing.id() != provider.id())
+        {
+            self.code_action_providers.push(provider);
+        }
+    }
+}

@@ -697,3 +697,144 @@ async fn test_folder_php_files_skip_other_folders_and_ignored(cx: &mut TestAppCo
         ]
     );
 }
+
+fn suppressed(analyzer: Analyzer, text: &str, row: u32, column: u32, rule: Option<&str>) -> Option<String> {
+    suppression_edit(analyzer, text, row, column, rule).map(|(range, comment)| {
+        let mut text = text.to_string();
+        text.replace_range(range, &comment);
+        text
+    })
+}
+
+#[test]
+fn test_suppress_comment_goes_on_the_line_above_with_its_indent() {
+    let text = "<?php\nfunction f() {\n\techo $x;\n}\n";
+    assert_eq!(
+        suppressed(Analyzer::Phpcs, text, 2, 1, Some("WordPress.Security.EscapeOutput.OutputNotEscaped")).unwrap(),
+        "<?php\nfunction f() {\n\t// phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped\n\techo $x;\n}\n"
+    );
+    assert_eq!(
+        suppressed(Analyzer::Phpstan, text, 2, 0, Some("variable.undefined")).unwrap(),
+        "<?php\nfunction f() {\n\t// @phpstan-ignore variable.undefined\n\techo $x;\n}\n"
+    );
+    assert_eq!(
+        suppressed(Analyzer::Phpstan, text, 2, 0, None).unwrap(),
+        "<?php\nfunction f() {\n\t// @phpstan-ignore-next-line\n\techo $x;\n}\n"
+    );
+    assert_eq!(
+        suppressed(Analyzer::Phpcs, text, 2, 0, None).unwrap(),
+        "<?php\nfunction f() {\n\t// phpcs:ignore\n\techo $x;\n}\n"
+    );
+}
+
+#[test]
+fn test_suppress_adds_to_an_ignore_comment_above() {
+    let text = "<?php\n  // phpcs:ignore A.B.C\n  echo $x;\n";
+    assert_eq!(
+        suppressed(Analyzer::Phpcs, text, 2, 2, Some("D.E.F")).unwrap(),
+        "<?php\n  // phpcs:ignore A.B.C, D.E.F\n  echo $x;\n"
+    );
+    // Rules go before a reason.
+    let text = "<?php\n// phpcs:ignore A.B.C -- legacy\necho $x;\n";
+    assert_eq!(
+        suppressed(Analyzer::Phpcs, text, 2, 0, Some("D.E.F")).unwrap(),
+        "<?php\n// phpcs:ignore A.B.C, D.E.F -- legacy\necho $x;\n"
+    );
+    let text = "<?php\n// @phpstan-ignore a.b (old code)\nfoo();\n";
+    assert_eq!(
+        suppressed(Analyzer::Phpstan, text, 2, 0, Some("c.d")).unwrap(),
+        "<?php\n// @phpstan-ignore a.b, c.d (old code)\nfoo();\n"
+    );
+    // Already there: nothing to do.
+    let text = "<?php\n// phpcs:ignore A.B.C, D.E.F\necho $x;\n";
+    assert_eq!(suppression_edit(Analyzer::Phpcs, text, 2, 0, Some("D.E.F")), None);
+    // Another tool's comment above is left alone.
+    let text = "<?php\n// phpcs:ignore A.B.C\nfoo();\n";
+    assert_eq!(
+        suppressed(Analyzer::Phpstan, text, 2, 0, Some("c.d")).unwrap(),
+        "<?php\n// phpcs:ignore A.B.C\n// @phpstan-ignore c.d\nfoo();\n"
+    );
+}
+
+#[test]
+fn test_suppress_in_templates_stays_inside_the_php_block() {
+    let text = "<ul>\n  <li><?php echo $title; ?></li>\n</ul>\n";
+    assert_eq!(
+        suppressed(Analyzer::Phpcs, text, 1, 17, Some("X.Y")).unwrap(),
+        "<ul>\n  <li><?php echo $title; // phpcs:ignore X.Y ?></li>\n</ul>\n"
+    );
+    // Two blocks: the one holding the finding.
+    let text = "<?= $a ?> and <?= $b ?>\n";
+    assert_eq!(
+        suppressed(Analyzer::Phpcs, text, 0, 18, Some("X.Y")).unwrap(),
+        "<?= $a ?> and <?= $b // phpcs:ignore X.Y ?>\n"
+    );
+    // PHPStan without an identifier needs the same-line form here.
+    assert_eq!(
+        suppressed(Analyzer::Phpstan, "<p><?= $a ?></p>\n", 0, 0, None).unwrap(),
+        "<p><?= $a // @phpstan-ignore-line ?></p>\n"
+    );
+    // The block opens on this line and stays open: comment at the end.
+    assert_eq!(
+        suppressed(Analyzer::Phpcs, "<?php echo $a;  \n", 0, 6, Some("X.Y")).unwrap(),
+        "<?php echo $a; // phpcs:ignore X.Y  \n"
+    );
+}
+
+#[test]
+fn test_no_suppress_inside_a_docblock() {
+    let text = "<?php\n/**\n * Summary\n */\nfunction f() {}\n";
+    assert_eq!(suppression_edit(Analyzer::Phpcs, text, 2, 3, Some("X.Y")), None);
+    assert_eq!(suppression_edit(Analyzer::Phpcs, text, 9, 0, Some("X.Y")), None);
+}
+
+#[gpui::test]
+async fn test_suppress_actions_for_findings_on_the_cursor_line(cx: &mut TestAppContext) {
+    cx.update(|cx| {
+        let settings = settings::SettingsStore::test(cx);
+        cx.set_global(settings);
+    });
+    let fs = project::FakeFs::new(cx.executor());
+    fs.insert_tree(
+        "/project",
+        serde_json::json!({ "a.php": "<?php\necho $a;\necho $b;\n" }),
+    )
+    .await;
+    let project = Project::test(fs, [Path::new("/project")], cx).await;
+    let buffer = project
+        .update(cx, |project, cx| project.open_local_buffer("/project/a.php", cx))
+        .await
+        .unwrap();
+    let problem = |line, rule: Option<&str>| Problem {
+        path: PathBuf::from("/project/a.php"),
+        line,
+        column: 6,
+        severity: Severity::Error,
+        message: "m".into(),
+        rule: rule.map(Into::into),
+    };
+    project.update(cx, |project, cx| {
+        project.lsp_store().update(cx, |lsp_store, cx| {
+            let path = PathBuf::from("/project/a.php");
+            push_diagnostics(lsp_store, Analyzer::Phpcs, &path, &[problem(2, Some("A.B")), problem(3, Some("C.D"))], cx).unwrap();
+            push_diagnostics(lsp_store, Analyzer::Phpstan, &path, &[problem(2, None)], cx).unwrap();
+        })
+    });
+    cx.run_until_parked();
+
+    let actions = cx.update(|cx| {
+        let snapshot = buffer.read(cx).snapshot();
+        let at = snapshot.anchor_before(text::Point::new(1, 2));
+        SuppressProvider::actions(&buffer, at..at, cx)
+    });
+    let titles: Vec<_> = actions.iter().map(|action| action.lsp_action.title().to_string()).collect();
+    assert_eq!(titles, ["Suppress A.B for this line (PHPCS)", "Suppress PHPStan for this line"]);
+
+    // A line typed above after the menu opened: the comment still lands on the finding.
+    buffer.update(cx, |buffer, cx| buffer.edit([(6..6, "// new\n")], None, cx));
+    cx.update(|cx| SuppressProvider::apply(&buffer, &actions[0], true, cx)).unwrap();
+    assert_eq!(
+        buffer.read_with(cx, |buffer, _| buffer.text()),
+        "<?php\n// new\n// phpcs:ignore A.B\necho $a;\necho $b;\n"
+    );
+}

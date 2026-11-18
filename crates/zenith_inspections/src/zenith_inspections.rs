@@ -18,6 +18,9 @@ use util::ResultExt as _;
 use workspace::Workspace;
 use zenith_php_tools::{ProjectKind, Tool};
 
+mod suppress;
+pub use suppress::{SuppressProvider, suppression_edit};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Severity {
     Error,
@@ -955,6 +958,12 @@ fn fix_current_file(
 
 pub fn init(cx: &mut App) {
     InspectionSettings::register(cx);
+    cx.observe_new(|editor: &mut editor::Editor, _, _| {
+        if editor.mode().is_full() && editor.project().is_some() {
+            editor.add_code_action_provider(std::rc::Rc::new(SuppressProvider));
+        }
+    })
+    .detach();
     cx.observe_new(|workspace: &mut Workspace, _, cx| {
         workspace.register_action(|workspace, _: &FixFileWithPhpcbf, window, cx| {
             fix_current_file(workspace, window, cx)
