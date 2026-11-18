@@ -8,6 +8,7 @@ use language::{Buffer, BufferEvent, Diagnostic, DiagnosticEntry, DiagnosticSourc
 use lsp::{DiagnosticSeverity, LanguageServerId, NumberOrString};
 use project::{Project, WorktreeId, buffer_store::BufferStoreEvent};
 use serde::Deserialize;
+use settings::{RegisterSetting, Settings, SettingsContent};
 use std::{
     collections::BTreeMap,
     ffi::OsString,
@@ -368,6 +369,44 @@ pub async fn run(
     }))
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, RegisterSetting)]
+pub struct InspectionSettings {
+    pub phpcs: bool,
+    pub phpstan: bool,
+    pub run_on_save: bool,
+    pub max_parallel: usize,
+}
+
+impl Settings for InspectionSettings {
+    fn from_settings(content: &SettingsContent) -> Self {
+        let inspections = content
+            .zenith
+            .as_ref()
+            .and_then(|zenith| zenith.inspections.as_ref());
+        let flag = |value: Option<bool>| value.unwrap_or(true);
+        Self {
+            phpcs: flag(inspections.and_then(|settings| settings.phpcs)),
+            phpstan: flag(inspections.and_then(|settings| settings.phpstan)),
+            run_on_save: flag(inspections.and_then(|settings| settings.run_on_save)),
+            max_parallel: inspections
+                .and_then(|settings| settings.max_parallel)
+                .map_or(2, |count| count.max(1) as usize),
+        }
+    }
+}
+
+impl InspectionSettings {
+    pub fn analyzers(&self) -> Vec<Analyzer> {
+        [
+            (Analyzer::Phpcs, self.phpcs),
+            (Analyzer::Phpstan, self.phpstan),
+        ]
+        .into_iter()
+        .filter_map(|(analyzer, enabled)| enabled.then_some(analyzer))
+        .collect()
+    }
+}
+
 gpui::actions!(
     zenith_inspections,
     [
@@ -409,9 +448,6 @@ where
     }
 }
 
-/// Files inspected at once; each starts up to two tool processes.
-const MAX_PARALLEL: usize = 2;
-
 fn inspect_changed_files(
     workspace: &mut Workspace,
     window: &mut gpui::Window,
@@ -423,6 +459,7 @@ fn inspect_changed_files(
     };
     let worktree_id = worktree.read(cx).id();
     let root = worktree.read(cx).abs_path().to_path_buf();
+    let max_parallel = InspectionSettings::get_global(cx).max_parallel;
     cx.spawn_in(window, async move |workspace, cx| {
         let status = cx
             .background_spawn({
@@ -472,7 +509,7 @@ fn inspect_changed_files(
                     }
                 })
                 .collect(),
-            MAX_PARALLEL,
+            max_parallel,
         )
         .await;
     })
@@ -480,6 +517,7 @@ fn inspect_changed_files(
 }
 
 pub fn init(cx: &mut App) {
+    InspectionSettings::register(cx);
     cx.observe_new(|workspace: &mut Workspace, _, cx| {
         workspace.register_action(|workspace, _: &InspectChangedFiles, window, cx| {
             inspect_changed_files(workspace, window, cx)
@@ -493,9 +531,7 @@ pub fn init(cx: &mut App) {
             if let BufferStoreEvent::BufferAdded(buffer) = event {
                 let project = project.clone();
                 cx.subscribe(buffer, move |_, buffer, event, cx| {
-                    if matches!(event, BufferEvent::Saved) {
-                        inspect(&project, &buffer, cx);
-                    }
+                    on_buffer_event(&project, &buffer, event, cx)
                 })
                 .detach();
             }
@@ -503,6 +539,18 @@ pub fn init(cx: &mut App) {
         .detach();
     })
     .detach();
+}
+
+/// Saving a PHP file runs the analyzers, unless `run_on_save` is off.
+fn on_buffer_event(
+    project: &Entity<Project>,
+    buffer: &Entity<Buffer>,
+    event: &BufferEvent,
+    cx: &mut App,
+) {
+    if matches!(event, BufferEvent::Saved) && InspectionSettings::get_global(cx).run_on_save {
+        inspect(project, buffer, cx);
+    }
 }
 
 /// Save counter per file, so a slow older run cannot overwrite a newer one.
@@ -564,6 +612,7 @@ pub fn inspect_path(
     }
     let root = worktree.read(cx).abs_path().to_path_buf();
     let lsp_store = project.read(cx).lsp_store();
+    let analyzers = InspectionSettings::get_global(cx).analyzers();
     let generation = next_generation(&abs_path, cx);
     cx.spawn(async move |cx| {
         let results = cx
@@ -578,7 +627,7 @@ pub fn inspect_path(
                     )
                 });
                 let mut results = Vec::new();
-                for analyzer in [Analyzer::Phpcs, Analyzer::Phpstan] {
+                for analyzer in analyzers {
                     if let Some(result) = run(
                         analyzer,
                         &root,

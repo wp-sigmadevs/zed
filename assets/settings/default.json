@@ -2950,6 +2950,17 @@
       // upstream onboarding and welcome pages.
       "enabled": true,
     },
+    // PHP inspections: PHPCS and PHPStan findings shown as diagnostics.
+    "inspections": {
+      // Run PHPCS.
+      "phpcs": true,
+      // Run PHPStan (only in projects that have a PHPStan config).
+      "phpstan": true,
+      // Analyze a PHP file when it is saved.
+      "run_on_save": true,
+      // Files "Inspect changed files" analyzes at once.
+      "max_parallel": 2,
+    },
   },
   // The server to connect to. If the environment variable
   // ZED_SERVER_URL is set, it will override this setting.

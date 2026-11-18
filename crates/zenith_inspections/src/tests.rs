@@ -329,6 +329,26 @@ async fn test_run_limited_never_exceeds_the_limit(cx: &mut TestAppContext) {
 /// on PATH, and checks the finding reaches the buffer as a diagnostic.
 #[gpui::test]
 async fn test_saving_a_php_file_shows_phpcs_findings(cx: &mut TestAppContext) {
+    assert_eq!(
+        saved_php_diagnostics(cx, serde_json::json!({})).await,
+        [(text::Point::new(1, 0), "Missing doc comment".to_string())]
+    );
+}
+
+#[gpui::test]
+async fn test_switched_off_analyzers_and_saving_show_nothing(cx: &mut TestAppContext) {
+    for off in [
+        serde_json::json!({ "phpcs": false }),
+        serde_json::json!({ "run_on_save": false }),
+    ] {
+        assert_eq!(saved_php_diagnostics(cx, off).await, []);
+    }
+}
+
+async fn saved_php_diagnostics(
+    cx: &mut TestAppContext,
+    inspections: serde_json::Value,
+) -> Vec<(text::Point, String)> {
     let root = tempfile::tempdir().unwrap();
     let root_path = root.path().to_str().unwrap().to_string();
     let bin = root.path().join("vendor/bin");
@@ -350,7 +370,13 @@ async fn test_saving_a_php_file_shows_phpcs_findings(cx: &mut TestAppContext) {
     fs::write(root.path().join("a.php"), "<?php\nfunction foo() {}\n").unwrap();
 
     cx.update(|cx| {
-        let settings = settings::SettingsStore::test(cx);
+        let mut settings = settings::SettingsStore::test(cx);
+        settings
+            .set_user_settings(
+                &serde_json::json!({ "zenith": { "inspections": inspections } }).to_string(),
+                cx,
+            )
+            .unwrap();
         cx.set_global(settings);
     });
     let fake = project::FakeFs::new(cx.executor());
@@ -367,7 +393,7 @@ async fn test_saving_a_php_file_shows_phpcs_findings(cx: &mut TestAppContext) {
         .await
         .unwrap();
     cx.executor().allow_parking();
-    cx.update(|cx| inspect(&project, &buffer, cx));
+    cx.update(|cx| on_buffer_event(&project, &buffer, &BufferEvent::Saved, cx));
     let mut messages = Vec::new();
     for _ in 0..100 {
         cx.run_until_parked();
@@ -383,10 +409,7 @@ async fn test_saving_a_php_file_shows_phpcs_findings(cx: &mut TestAppContext) {
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    assert_eq!(
-        messages,
-        [(text::Point::new(1, 0), "Missing doc comment".to_string())]
-    );
+    messages
 }
 
 /// Puts an environment variable back when dropped, even if the test fails.
@@ -420,4 +443,54 @@ fn test_restore_env_puts_the_variable_back() {
         unsafe { std::env::set_var(name, "during") };
     }
     assert!(std::env::var_os(name).is_none());
+}
+
+fn settings_from(json: serde_json::Value) -> InspectionSettings {
+    let content: SettingsContent =
+        serde_json::from_value(serde_json::json!({ "zenith": { "inspections": json } })).unwrap();
+    InspectionSettings::from_settings(&content)
+}
+
+#[test]
+fn test_inspection_settings_defaults_and_overrides() {
+    let defaults = InspectionSettings::from_settings(&SettingsContent::default());
+    assert_eq!(
+        defaults,
+        InspectionSettings {
+            phpcs: true,
+            phpstan: true,
+            run_on_save: true,
+            max_parallel: 2
+        }
+    );
+    assert_eq!(defaults.analyzers(), [Analyzer::Phpcs, Analyzer::Phpstan]);
+
+    let custom = settings_from(
+        serde_json::json!({ "phpcs": false, "run_on_save": false, "max_parallel": 5 }),
+    );
+    assert_eq!(custom.analyzers(), [Analyzer::Phpstan]);
+    assert!(!custom.run_on_save);
+    assert_eq!(custom.max_parallel, 5);
+
+    // Zero would never start a job.
+    assert_eq!(
+        settings_from(serde_json::json!({ "max_parallel": 0 })).max_parallel,
+        1
+    );
+    assert!(
+        settings_from(serde_json::json!({ "phpcs": false, "phpstan": false }))
+            .analyzers()
+            .is_empty()
+    );
+}
+
+#[test]
+fn test_default_settings_file_matches_the_built_in_defaults() {
+    let defaults: SettingsContent =
+        settings::parse_json_with_comments(&settings::default_settings()).unwrap();
+    assert_eq!(
+        InspectionSettings::from_settings(&defaults),
+        InspectionSettings::from_settings(&SettingsContent::default())
+    );
+    assert!(defaults.zenith.unwrap().inspections.is_some());
 }
