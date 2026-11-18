@@ -270,6 +270,9 @@ impl SearchEverywhere {
                 cx,
             );
             this.tool_windows = tool_windows;
+            if tab == Tab::Locations {
+                this.load_closed_file_snippets(cx);
+            }
             this
         });
     }
@@ -400,6 +403,59 @@ impl Render for SearchEverywhere {
 }
 
 impl SearchEverywhere {
+    /// Recent Locations in files no longer open: read their lines from disk in
+    /// the background, then show them.
+    fn load_closed_file_snippets(&self, cx: &mut Context<Self>) {
+        const MAX_FILE_LEN: u64 = 1024 * 1024;
+        let delegate = &self.picker.read(cx).delegate;
+        let project = delegate.project.read(cx);
+        let fs = project.fs().clone();
+        let jobs = delegate
+            .recent_locations
+            .iter()
+            .enumerate()
+            .filter(|(_, location)| location.snippet.is_none())
+            .filter_map(|(ix, location)| {
+                Some((ix, project.absolute_path(&location.project_path, cx)?, location.row))
+            })
+            .collect::<Vec<_>>();
+        if jobs.is_empty() {
+            return;
+        }
+        let picker = self.picker.downgrade();
+        cx.spawn(async move |_, cx| {
+            let mut found = Vec::new();
+            for (ix, path, row) in jobs {
+                let small = fs
+                    .metadata(&path)
+                    .await
+                    .ok()
+                    .flatten()
+                    .is_some_and(|metadata| !metadata.is_dir && metadata.len <= MAX_FILE_LEN);
+                if !small {
+                    continue;
+                }
+                if let Ok(text) = fs.load(&path).await
+                    && let Some(line) = text.lines().nth(row as usize).map(str::trim)
+                    && !line.is_empty()
+                {
+                    found.push((ix, SharedString::from(line.to_string())));
+                }
+            }
+            picker
+                .update(cx, |picker, cx| {
+                    for (ix, snippet) in found {
+                        if let Some(location) = picker.delegate.recent_locations.get_mut(ix) {
+                            location.snippet = Some(snippet);
+                        }
+                    }
+                    cx.notify();
+                })
+                .ok();
+        })
+        .detach();
+    }
+
     /// The All tab's filter: which groups to show, as PhpStorm's funnel menu.
     fn render_filter_menu(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let modal = cx.entity().downgrade();
@@ -1978,6 +2034,27 @@ mod tests {
                 })
                 .collect::<Vec<_>>();
             assert_eq!(labels, ["b.rs:1", "a.rs:1"]);
+        });
+
+        // A place in a file no longer open reads its line from disk.
+        picker.update(cx, |picker, _| {
+            for location in &mut picker.delegate.recent_locations {
+                location.snippet = None;
+            }
+        });
+        let modal = workspace.read_with(cx, |workspace, cx| {
+            workspace.active_modal::<SearchEverywhere>(cx).unwrap()
+        });
+        modal.update(cx, |modal, cx| modal.load_closed_file_snippets(cx));
+        cx.run_until_parked();
+        picker.read_with(cx, |picker, _| {
+            let snippets = picker
+                .delegate
+                .recent_locations
+                .iter()
+                .map(|location| location.snippet.as_deref().map(str::to_string))
+                .collect::<Vec<_>>();
+            assert_eq!(snippets, [Some("b".into()), Some("a".into())]);
         });
     }
 
