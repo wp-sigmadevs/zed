@@ -85,6 +85,7 @@ impl Tool {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Source {
     Project,
+    Managed,
     System,
 }
 
@@ -94,24 +95,101 @@ pub struct Resolved {
     pub source: Source,
 }
 
-/// The project's own `vendor/bin` first, then the system `PATH`. Zenith-managed
-/// tools slot in between with milestone 2.
-pub fn resolve(project: &Path, tool: Tool, path_dirs: &[PathBuf]) -> Option<Resolved> {
-    let project_bin = project.join("vendor/bin").join(tool.binary());
-    if project_bin.is_file() {
-        return Some(Resolved {
-            path: project_bin,
-            source: Source::Project,
-        });
+/// The project's own `vendor/bin` first, then the Zenith-managed tools for the
+/// project's profile, then the system `PATH`.
+pub fn resolve(
+    project: &Path,
+    tool: Tool,
+    managed_bin: Option<&Path>,
+    path_dirs: &[PathBuf],
+) -> Option<Resolved> {
+    let found = |path: PathBuf, source| path.is_file().then_some(Resolved { path, source });
+    found(
+        project.join("vendor/bin").join(tool.binary()),
+        Source::Project,
+    )
+    .or_else(|| managed_bin.and_then(|bin| found(bin.join(tool.binary()), Source::Managed)))
+    .or_else(|| {
+        path_dirs
+            .iter()
+            .find_map(|dir| found(dir.join(tool.binary()), Source::System))
+    })
+}
+
+/// Tool sets Zenith can install for the user, by project type.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Profile {
+    WordPress,
+    Laravel,
+    Php,
+}
+
+impl Profile {
+    pub fn for_project(kind: ProjectKind) -> Self {
+        match kind {
+            ProjectKind::WordPress => Profile::WordPress,
+            ProjectKind::Laravel => Profile::Laravel,
+            ProjectKind::Php => Profile::Php,
+        }
     }
-    path_dirs
-        .iter()
-        .map(|dir| dir.join(tool.binary()))
-        .find(|candidate| candidate.is_file())
-        .map(|path| Resolved {
-            path,
-            source: Source::System,
+
+    fn dir_name(self) -> &'static str {
+        match self {
+            Profile::WordPress => "wordpress",
+            Profile::Laravel => "laravel",
+            Profile::Php => "php",
+        }
+    }
+
+    /// The `composer.json` Zenith installs from. Ranges here; the lock file next to
+    /// it (checked into Zenith, installed by a CI job) is what pins versions.
+    pub fn composer_json(self) -> serde_json::Value {
+        let require: &[(&str, &str)] = match self {
+            Profile::WordPress => &[
+                ("squizlabs/php_codesniffer", "^3.13"),
+                ("wp-coding-standards/wpcs", "^3.0"),
+                ("phpcompatibility/phpcompatibility-wp", "^2.1"),
+                ("dealerdirect/phpcodesniffer-composer-installer", "^1.0"),
+                ("phpstan/phpstan", "^2.0"),
+                ("szepeviktor/phpstan-wordpress", "^2.0"),
+            ],
+            Profile::Laravel => &[
+                ("laravel/pint", "^1.0"),
+                ("phpstan/phpstan", "^2.0"),
+                ("larastan/larastan", "^3.0"),
+            ],
+            Profile::Php => &[
+                ("phpstan/phpstan", "^2.0"),
+                ("friendsofphp/php-cs-fixer", "^3.0"),
+            ],
+        };
+        serde_json::json!({
+            "name": format!("zenith/php-tools-{}", self.dir_name()),
+            "description": "Tools Zenith manages for PHP projects. Not your project's dependencies.",
+            "type": "project",
+            "require": require
+                .iter()
+                .map(|(package, range)| (package.to_string(), serde_json::json!(range)))
+                .collect::<serde_json::Map<_, _>>(),
+            "config": {
+                "sort-packages": true,
+                "allow-plugins": { "dealerdirect/phpcodesniffer-composer-installer": true },
+            },
         })
+    }
+}
+
+/// `~/.local/share/zenith/tools/php`: where managed tools live, never anywhere a
+/// user's own Composer, `PATH` or shell profile reads.
+pub fn managed_root(home: &Path) -> PathBuf {
+    home.join(".local/share/zenith/tools/php")
+}
+
+/// `<managed root>/<profile>/vendor/bin`.
+pub fn managed_bin(home: &Path, profile: Profile) -> PathBuf {
+    managed_root(home)
+        .join(profile.dir_name())
+        .join("vendor/bin")
 }
 
 /// Where a PHP binary may live, best first: Herd, Homebrew, then the `PATH`.
@@ -193,7 +271,12 @@ pub async fn detect_php(root: &Path, candidates: &[PathBuf]) -> PhpInfo {
 }
 
 /// What "PHP tools: status" shows.
-pub fn status_report(root: &Path, info: &PhpInfo, path_dirs: &[PathBuf]) -> String {
+pub fn status_report(
+    root: &Path,
+    info: &PhpInfo,
+    managed_bin: Option<&Path>,
+    path_dirs: &[PathBuf],
+) -> String {
     let kind = match info.kind {
         ProjectKind::WordPress => "WordPress",
         ProjectKind::Laravel => "Laravel",
@@ -211,10 +294,11 @@ pub fn status_report(root: &Path, info: &PhpInfo, path_dirs: &[PathBuf]) -> Stri
         Tool::Pint,
         Tool::PhpCsFixer,
     ] {
-        lines.push(match resolve(root, tool, path_dirs) {
+        lines.push(match resolve(root, tool, managed_bin, path_dirs) {
             Some(Resolved { path, source }) => {
                 let source = match source {
                     Source::Project => "project",
+                    Source::Managed => "Zenith",
                     Source::System => "system",
                 };
                 format!("{}: {source}, {}", tool.binary(), path.display())
@@ -286,7 +370,10 @@ fn show_status(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<
         let report = cx
             .background_spawn(async move {
                 let (candidates, path_dirs) = environment();
-                status_report(&root, &detect_php(&root, &candidates).await, &path_dirs)
+                let info = detect_php(&root, &candidates).await;
+                let managed = std::env::var_os("HOME")
+                    .map(|home| managed_bin(Path::new(&home), Profile::for_project(info.kind)));
+                status_report(&root, &info, managed.as_deref(), &path_dirs)
             })
             .await;
         workspace
@@ -445,14 +532,14 @@ mod tests {
         write(project.path(), "vendor/bin/phpcs", "");
         let path_dirs = [system.path().to_path_buf()];
 
-        let phpcs = resolve(project.path(), Tool::Phpcs, &path_dirs).unwrap();
+        let phpcs = resolve(project.path(), Tool::Phpcs, None, &path_dirs).unwrap();
         assert_eq!(phpcs.source, Source::Project);
         assert_eq!(phpcs.path, project.path().join("vendor/bin/phpcs"));
 
-        let phpstan = resolve(project.path(), Tool::Phpstan, &path_dirs).unwrap();
+        let phpstan = resolve(project.path(), Tool::Phpstan, None, &path_dirs).unwrap();
         assert_eq!(phpstan.source, Source::System);
 
-        assert_eq!(resolve(project.path(), Tool::Pint, &path_dirs), None);
+        assert_eq!(resolve(project.path(), Tool::Pint, None, &path_dirs), None);
     }
 
     #[test]
@@ -519,7 +606,7 @@ mod tests {
 
         let none = futures::executor::block_on(detect_php(project.path(), &[]));
         assert_eq!(none.version, None);
-        let report = status_report(project.path(), &none, &[]);
+        let report = status_report(project.path(), &none, None, &[]);
         assert!(report.contains("PHP: not found"));
         assert!(report.contains("phpcs: not found"));
     }
@@ -533,7 +620,7 @@ mod tests {
             version: Some("8.4.1".into()),
             php_path: Some(PathBuf::from("/opt/homebrew/bin/php")),
         };
-        let report = status_report(project.path(), &info, &[]);
+        let report = status_report(project.path(), &info, None, &[]);
         assert!(report.starts_with("Project: Laravel\nPHP 8.4.1: /opt/homebrew/bin/php"));
         assert!(report.contains("phpstan: project,"));
         assert!(report.contains("pint: not found"));
@@ -588,5 +675,53 @@ mod tests {
             }
             assert_eq!(cx.debug_bounds("zenith-php-status").is_some(), expected);
         }
+    }
+
+    #[test]
+    fn test_resolution_order_is_project_then_managed_then_system() {
+        let project = tempfile::tempdir().unwrap();
+        let managed = tempfile::tempdir().unwrap();
+        let system = tempfile::tempdir().unwrap();
+        let path_dirs = [system.path().to_path_buf()];
+        for tool in ["phpcs", "phpstan", "pint"] {
+            write(system.path(), tool, "");
+        }
+        for tool in ["phpcs", "phpstan"] {
+            write(managed.path(), tool, "");
+        }
+        write(project.path(), "vendor/bin/phpcs", "");
+
+        let source = |tool| {
+            resolve(project.path(), tool, Some(managed.path()), &path_dirs).map(|r| r.source)
+        };
+        assert_eq!(source(Tool::Phpcs), Some(Source::Project));
+        assert_eq!(source(Tool::Phpstan), Some(Source::Managed));
+        assert_eq!(source(Tool::Pint), Some(Source::System));
+        assert_eq!(source(Tool::PhpCsFixer), None);
+    }
+
+    #[test]
+    fn test_profiles_and_managed_folder() {
+        assert_eq!(
+            managed_bin(Path::new("/Users/a"), Profile::WordPress),
+            Path::new("/Users/a/.local/share/zenith/tools/php/wordpress/vendor/bin")
+        );
+        assert_eq!(Profile::for_project(ProjectKind::Laravel), Profile::Laravel);
+        let wordpress = Profile::WordPress.composer_json();
+        let require = wordpress["require"].as_object().unwrap();
+        for package in [
+            "squizlabs/php_codesniffer",
+            "wp-coding-standards/wpcs",
+            "phpstan/phpstan",
+        ] {
+            assert!(require.contains_key(package), "{package}");
+        }
+        assert!(Profile::Laravel.composer_json()["require"]["laravel/pint"].is_string());
+        assert!(Profile::Php.composer_json()["require"]["friendsofphp/php-cs-fixer"].is_string());
+        // The installer plugin must be allowed, or Composer stops to ask.
+        assert_eq!(
+            wordpress["config"]["allow-plugins"]["dealerdirect/phpcodesniffer-composer-installer"],
+            true
+        );
     }
 }
