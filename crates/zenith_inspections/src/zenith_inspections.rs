@@ -6,7 +6,7 @@ use anyhow::{Context as _, Result};
 use gpui::{App, AppContext as _, Entity};
 use language::{Buffer, BufferEvent, Diagnostic, DiagnosticEntry, DiagnosticSourceKind};
 use lsp::{DiagnosticSeverity, LanguageServerId, NumberOrString};
-use project::{Project, buffer_store::BufferStoreEvent};
+use project::{Project, WorktreeId, buffer_store::BufferStoreEvent};
 use serde::Deserialize;
 use std::{
     collections::BTreeMap,
@@ -368,8 +368,96 @@ pub async fn run(
     }))
 }
 
+gpui::actions!(
+    zenith_inspections,
+    [
+        /// Runs PHPCS and PHPStan on every PHP file git reports as changed.
+        InspectChangedFiles
+    ]
+);
+
+/// PHP files in `git status --porcelain=v1 -z` output that still exist.
+pub fn changed_php_files(root: &Path, status: &str) -> Vec<PathBuf> {
+    let mut entries = status.split('\0').filter(|entry| !entry.is_empty());
+    let mut files = Vec::new();
+    while let Some(entry) = entries.next() {
+        let (Some(code), Some(path)) = (entry.get(..2), entry.get(3..)) else {
+            continue;
+        };
+        // A rename lists its old path as a second entry.
+        if code.contains('R') || code.contains('C') {
+            entries.next();
+        }
+        if code.contains('D') || !path.ends_with(".php") {
+            continue;
+        }
+        files.push(root.join(path));
+    }
+    files
+}
+
+fn inspect_changed_files(
+    workspace: &mut Workspace,
+    window: &mut gpui::Window,
+    cx: &mut gpui::Context<Workspace>,
+) {
+    let project = workspace.project().clone();
+    let Some(worktree) = project.read(cx).visible_worktrees(cx).next() else {
+        return;
+    };
+    let worktree_id = worktree.read(cx).id();
+    let root = worktree.read(cx).abs_path().to_path_buf();
+    cx.spawn_in(window, async move |workspace, cx| {
+        let status = cx
+            .background_spawn({
+                let root = root.clone();
+                async move {
+                    util::command::new_command("git")
+                        .args(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
+                        .current_dir(&root)
+                        .output()
+                        .await
+                }
+            })
+            .await;
+        let message = match status {
+            Ok(output) if output.status.success() => {
+                let files =
+                    changed_php_files(&root, &String::from_utf8_lossy(&output.stdout));
+                let message = match files.len() {
+                    0 => "No changed PHP files.".to_string(),
+                    1 => "Inspecting 1 changed PHP file.".to_string(),
+                    count => format!("Inspecting {count} changed PHP files."),
+                };
+                cx.update(|_, cx| {
+                    for file in files {
+                        inspect_path(&project, worktree_id, file, cx);
+                    }
+                })
+                .log_err();
+                message
+            }
+            Ok(_) => "This folder is not a git repository.".to_string(),
+            Err(error) => format!("Could not run git: {error}"),
+        };
+        workspace
+            .update(cx, |workspace, cx| {
+                workspace.show_notification(
+                    workspace::notifications::NotificationId::unique::<InspectChangedFiles>(),
+                    cx,
+                    |cx| cx.new(|cx| workspace::notifications::simple_message_notification::MessageNotification::new(message, cx)),
+                );
+            })
+            .log_err();
+    })
+    .detach();
+}
+
 pub fn init(cx: &mut App) {
     cx.observe_new(|workspace: &mut Workspace, _, cx| {
+        workspace.register_action(|workspace, _: &InspectChangedFiles, window, cx| {
+            inspect_changed_files(workspace, window, cx)
+        });
         let project = workspace.project().clone();
         if !project.read(cx).is_local() {
             return;
@@ -425,11 +513,29 @@ pub fn inspect(project: &Entity<Project>, buffer: &Entity<Buffer>, cx: &mut App)
     let Some(worktree) = project.read(cx).worktree_for_id(worktree_id, cx) else {
         return;
     };
+    let root = worktree.read(cx).abs_path().to_path_buf();
+    inspect_path(
+        project,
+        worktree_id,
+        root.join(file.path().as_std_path()),
+        cx,
+    );
+}
+
+/// Runs the analyzers on one file under a worktree root, open or not.
+pub fn inspect_path(
+    project: &Entity<Project>,
+    worktree_id: WorktreeId,
+    abs_path: PathBuf,
+    cx: &mut App,
+) {
+    let Some(worktree) = project.read(cx).worktree_for_id(worktree_id, cx) else {
+        return;
+    };
     if !zenith_php_tools::worktree_trusted(project, worktree_id, cx) {
         return;
     }
     let root = worktree.read(cx).abs_path().to_path_buf();
-    let abs_path = root.join(file.path().as_std_path());
     let lsp_store = project.read(cx).lsp_store();
     let generation = next_generation(&abs_path, cx);
     cx.spawn(async move |cx| {

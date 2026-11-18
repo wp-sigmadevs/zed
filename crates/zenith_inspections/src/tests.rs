@@ -276,3 +276,22 @@ fn test_tab_width_comes_from_the_project_ruleset() {
     assert_eq!(tab_width_in("<ruleset/>"), None);
     assert_eq!(char_column("\t$x", 3, 2), 2);
 }
+
+#[test]
+fn test_changed_php_files_from_git_status() {
+    let status =
+        " M src/a.php\0?? new/b.php\0 D gone.php\0R  moved.php\0old.php\0A  readme.md\0AM c.php\0";
+    assert_eq!(
+        changed_php_files(Path::new("/p"), status),
+        [
+            PathBuf::from("/p/src/a.php"),
+            PathBuf::from("/p/new/b.php"),
+            PathBuf::from("/p/moved.php"),
+            PathBuf::from("/p/c.php"),
+        ]
+    );
+    assert_eq!(
+        changed_php_files(Path::new("/p"), ""),
+        Vec::<PathBuf>::new()
+    );
+}
