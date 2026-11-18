@@ -2115,7 +2115,7 @@
     //     }
     "shell": "system",
     // Where to dock terminals panel. Can be `left`, `right`, `bottom`.
-    "dock": "bottom",
+    "dock": "right",
     // Whether the terminal panel should open on startup.
     //
     // Default: false
