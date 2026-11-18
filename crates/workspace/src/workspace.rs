@@ -10295,13 +10295,7 @@ impl Render for Workspace {
                             .border_t_1()
                             .border_b_1()
                             .border_color(colors.border)
-                            .when_some(self.rails.clone(), |this, (left, right)| {
-                                this.px(RAIL_WIDTH)
-                                    .child(div().absolute().top_0().bottom_0().left_0().child(left))
-                                    .child(
-                                        div().absolute().top_0().bottom_0().right_0().child(right),
-                                    )
-                            })
+                            .when(self.rails.is_some(), |this| this.px(RAIL_WIDTH))
                             .child({
                                 let this = cx.entity();
                                 canvas(
@@ -10673,6 +10667,13 @@ impl Render for Workspace {
                                     }
                                 })
                             }))
+                            // After the zoomed overlay, so the rails stay on top of it.
+                            .when_some(self.rails.clone(), |this, (left, right)| {
+                                this.child(div().absolute().top_0().bottom_0().left_0().child(left))
+                                    .child(
+                                        div().absolute().top_0().bottom_0().right_0().child(right),
+                                    )
+                            })
                             .children(self.render_notifications(window, cx)),
                     )
                     .when(self.status_bar_visible(cx), |parent| {
