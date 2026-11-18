@@ -418,7 +418,8 @@ where
 // ---- status bar item and "PHP tools: status" ----
 
 use gpui::{
-    Action as _, App, AppContext as _, Context, Entity, IntoElement, Render, Window, actions,
+    Action as _, App, AppContext as _, Context, Entity, IntoElement, Render, WeakEntity, Window,
+    actions,
 };
 use project::Project;
 use ui::{Button, ButtonCommon as _, ButtonSize, Clickable as _, LabelSize, Tooltip, prelude::*};
@@ -439,7 +440,8 @@ pub fn init(cx: &mut App) {
     cx.observe_new(|workspace: &mut Workspace, window, cx| {
         let Some(window) = window else { return };
         let project = workspace.project().clone();
-        let item = cx.new(|cx| PhpStatus::new(project, cx));
+        let this_workspace = cx.entity().downgrade();
+        let item = cx.new(|cx| PhpStatus::new(project, this_workspace, cx));
         workspace
             .status_bar()
             .update(cx, |bar, cx| bar.add_right_item(item, window, cx));
@@ -496,11 +498,16 @@ fn show_status(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<
 /// `PHP 8.5` in the status bar of a PHP project; nothing elsewhere.
 pub struct PhpStatus {
     project: Entity<Project>,
+    workspace: WeakEntity<Workspace>,
     info: Option<PhpInfo>,
 }
 
 impl PhpStatus {
-    fn new(project: Entity<Project>, cx: &mut Context<Self>) -> Self {
+    fn new(
+        project: Entity<Project>,
+        workspace: WeakEntity<Workspace>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         cx.subscribe(&project, |this, _, event, cx| {
             if matches!(
                 event,
@@ -512,6 +519,7 @@ impl PhpStatus {
         .detach();
         let mut this = Self {
             project,
+            workspace,
             info: None,
         };
         this.refresh(cx);
@@ -526,17 +534,25 @@ impl PhpStatus {
         };
         cx.spawn(async move |this, cx| {
             let info = cx
-                .background_spawn(async move {
-                    if looks_like_php(&root) {
-                        Some(detect_php(&root, &environment().0).await)
-                    } else {
-                        None
+                .background_spawn({
+                    let root = root.clone();
+                    async move {
+                        if looks_like_php(&root) {
+                            Some(detect_php(&root, &environment().0).await)
+                        } else {
+                            None
+                        }
                     }
                 })
                 .await;
             this.update(cx, |this, cx| {
-                this.info = info;
+                this.info = info.clone();
                 cx.notify();
+                if let Some(info) = info {
+                    this.workspace
+                        .update(cx, |workspace, cx| maybe_offer(workspace, &root, &info, cx))
+                        .ok();
+                }
             })
             .ok();
         })
@@ -577,6 +593,202 @@ impl Render for PhpStatus {
                     .on_click(|_, window, cx| window.dispatch_action(Status.boxed_clone(), cx)),
             )
             .into_any_element()
+    }
+}
+
+// ---- the install banner ----
+
+use workspace::notifications::NotificationId as BannerId;
+
+struct InstallBanner;
+struct InstallProgress;
+
+fn find_composer(path_dirs: &[PathBuf]) -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_default();
+    let mut dirs = path_dirs.to_vec();
+    dirs.extend([
+        home.join("Library/Application Support/Herd/bin"),
+        PathBuf::from("/opt/homebrew/bin"),
+        PathBuf::from("/usr/local/bin"),
+    ]);
+    dirs.into_iter()
+        .map(|dir| dir.join("composer"))
+        .find(|candidate| candidate.is_file())
+}
+
+/// Offers to install the profile's tools: once per session until answered, and
+/// only in a trusted local project with PHP and Composer present and no tool found.
+fn maybe_offer(
+    workspace: &mut Workspace,
+    root: &Path,
+    info: &PhpInfo,
+    cx: &mut Context<Workspace>,
+) {
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        return;
+    };
+    let profile = Profile::for_project(info.kind);
+    let (_, path_dirs) = environment();
+    let managed = managed_bin(&home, profile);
+    let has_any_tool = [
+        Tool::Phpcs,
+        Tool::Phpcbf,
+        Tool::Phpstan,
+        Tool::Pint,
+        Tool::PhpCsFixer,
+    ]
+    .into_iter()
+    .any(|tool| resolve(root, tool, Some(&managed), &path_dirs).is_some());
+    let project = workspace.project().clone();
+    let local = project.read(cx).is_local();
+    let worktree_id = project
+        .read(cx)
+        .visible_worktrees(cx)
+        .next()
+        .map(|worktree| worktree.read(cx).id());
+    let trusted = match (
+        project::trusted_worktrees::TrustedWorktrees::try_get_global(cx),
+        worktree_id,
+    ) {
+        (Some(store), Some(worktree_id)) => {
+            let worktree_store = project.read(cx).worktree_store();
+            store.update(cx, |store, cx| {
+                store.can_trust(&worktree_store, worktree_id, cx)
+            })
+        }
+        _ => true,
+    };
+    let (Some(php), Some(composer)) = (info.php_path.clone(), find_composer(&path_dirs)) else {
+        return;
+    };
+    if !should_offer(load_consent(&home, profile), trusted, local, has_any_tool) {
+        return;
+    }
+    let weak = cx.entity().downgrade();
+    let label = match profile {
+        Profile::WordPress => "WordPress tools: PHPCS with the WordPress standards, PHPStan",
+        Profile::Laravel => "Laravel tools: Pint, PHPStan with Larastan",
+        Profile::Php => "PHP tools: PHPStan, PHP-CS-Fixer",
+    };
+    workspace.show_notification(BannerId::unique::<InstallBanner>(), cx, |cx| {
+        cx.new(|cx| {
+            MessageNotification::new(
+                format!("Zenith can set up {label}, in its own folder. Closing this asks again next time."),
+                cx,
+            )
+            .primary_message("Install")
+            .primary_on_click({
+                let (weak, php, composer) = (weak.clone(), php.clone(), composer.clone());
+                move |window, cx| {
+                    let (php, composer) = (php.clone(), composer.clone());
+                    weak.update(cx, |workspace, cx| {
+                        save_consent(&home_dir(), profile, Consent::Yes).ok();
+                        start_install(workspace, profile, php, composer, window, cx);
+                    })
+                    .ok();
+                }
+            })
+            .secondary_message("Never")
+            .secondary_on_click(move |_, cx| {
+                save_consent(&home_dir(), profile, Consent::Never).ok();
+                weak.update(cx, |workspace, cx| {
+                    workspace.dismiss_notification(&BannerId::unique::<InstallBanner>(), cx)
+                })
+                .ok();
+            })
+        })
+    });
+}
+
+fn home_dir() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_default()
+}
+
+fn start_install(
+    workspace: &mut Workspace,
+    profile: Profile,
+    php: PathBuf,
+    composer: PathBuf,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    workspace.dismiss_notification(&BannerId::unique::<InstallBanner>(), cx);
+    workspace.show_notification(BannerId::unique::<InstallProgress>(), cx, |cx| {
+        cx.new(|cx| MessageNotification::new("Installing PHP tools…", cx))
+    });
+    let home = home_dir();
+    cx.spawn_in(window, async move |workspace, cx| {
+        let (run_php, run_composer) = (php.clone(), composer.clone());
+        let result = cx
+            .background_spawn(async move {
+                install(&home, profile, &run_php, &run_composer, run_command).await
+            })
+            .await;
+        workspace
+            .update_in(cx, |workspace, _, cx| match result {
+                Ok(_) => workspace.show_notification(
+                    BannerId::unique::<InstallProgress>(),
+                    cx,
+                    |cx| {
+                        cx.new(|cx| {
+                            MessageNotification::new(
+                                "PHP tools installed. Run \"zenith php tools: status\" to see them.",
+                                cx,
+                            )
+                        })
+                    },
+                ),
+                Err(error) => {
+                    let weak = cx.entity().downgrade();
+                    workspace.show_notification(
+                        BannerId::unique::<InstallProgress>(),
+                        cx,
+                        |cx| {
+                            cx.new(|cx| {
+                                MessageNotification::new(
+                                    format!("Installing PHP tools failed:\n{error}"),
+                                    cx,
+                                )
+                                .primary_message("Retry")
+                                .primary_on_click(move |window, cx| {
+                                    let (php, composer) = (php.clone(), composer.clone());
+                                    weak.update(cx, |workspace, cx| {
+                                        start_install(workspace, profile, php, composer, window, cx)
+                                    })
+                                    .ok();
+                                })
+                            })
+                        },
+                    );
+                }
+            })
+            .ok();
+    })
+    .detach();
+}
+
+/// Runs one `Invocation` for real; the error is Composer's own output.
+async fn run_command(invocation: Invocation) -> Result<String, String> {
+    let output = util::command::new_command(&invocation.program)
+        .args(&invocation.args)
+        .current_dir(&invocation.cwd)
+        .envs(invocation.env.iter().map(|(key, value)| (key, value)))
+        .output()
+        .await
+        .map_err(|error| format!("Could not run {}: {error}", invocation.program.display()))?;
+    let text = |bytes: &[u8]| String::from_utf8_lossy(bytes).trim().to_string();
+    if output.status.success() {
+        Ok(text(&output.stdout))
+    } else {
+        Err(
+            format!("{}\n{}", text(&output.stderr), text(&output.stdout))
+                .trim()
+                .to_string(),
+        )
     }
 }
 
@@ -904,5 +1116,21 @@ mod tests {
             result,
             Err("Your requirements could not be resolved".to_string())
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_run_command_returns_output_or_the_error_text() {
+        let run = |script: &str| {
+            futures::executor::block_on(run_command(Invocation {
+                program: PathBuf::from("/bin/sh"),
+                args: vec!["-c".into(), script.into()],
+                cwd: std::env::temp_dir(),
+                env: vec![("ZENITH_TEST".into(), "yes".into())],
+            }))
+        };
+        assert_eq!(run("echo $ZENITH_TEST"), Ok("yes".to_string()));
+        let error = run("echo 'could not resolve' >&2; exit 1").unwrap_err();
+        assert!(error.contains("could not resolve"), "{error}");
     }
 }
