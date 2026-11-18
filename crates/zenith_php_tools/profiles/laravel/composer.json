@@ -2,6 +2,7 @@
     "name": "zenith/php-tools-laravel",
     "description": "Tools Zenith manages for PHP projects. Not your project's dependencies.",
     "type": "project",
+    "license": "proprietary",
     "require": {
         "laravel/pint": "^1.0",
         "phpstan/phpstan": "^2.0",
