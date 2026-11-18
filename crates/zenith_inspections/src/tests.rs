@@ -494,3 +494,52 @@ fn test_default_settings_file_matches_the_built_in_defaults() {
     );
     assert!(defaults.zenith.unwrap().inspections.is_some());
 }
+
+#[test]
+fn test_phpcbf_exit_codes() {
+    assert_eq!(fix_outcome(Some(0)).unwrap(), FixOutcome::Nothing);
+    assert_eq!(fix_outcome(Some(1)).unwrap(), FixOutcome::Fixed);
+    assert_eq!(fix_outcome(Some(2)).unwrap(), FixOutcome::FixedSome);
+    assert!(fix_outcome(Some(3)).is_err());
+    assert!(fix_outcome(None).is_err());
+}
+
+#[gpui::test]
+async fn test_run_fix_rewrites_the_file_through_the_project_phpcbf(cx: &mut TestAppContext) {
+    let root = tempfile::tempdir().unwrap();
+    let bin = root.path().join("vendor/bin");
+    fs::create_dir_all(&bin).unwrap();
+    let phpcbf = bin.join("phpcbf");
+    // Rewrites the file it is given (the last argument) and exits 1, as phpcbf does.
+    fs::write(
+        &phpcbf,
+        "#!/bin/sh\nfor last; do :; done\nprintf 'fixed\\n' > \"$last\"\necho \"$@\" > \"$last.args\"\nexit 1\n",
+    )
+    .unwrap();
+    fs::set_permissions(&phpcbf, fs::Permissions::from_mode(0o755)).unwrap();
+    let file = root.path().join("a.php");
+    fs::write(&file, "broken\n").unwrap();
+    cx.executor().allow_parking();
+    let (root_path, file_path) = (root.path().to_path_buf(), file.clone());
+    let outcome = cx
+        .background_spawn(async move {
+            run_fix(&root_path, &file_path, Path::new("/no/php"), None, &[]).await
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(outcome, FixOutcome::Fixed);
+    assert_eq!(fs::read_to_string(&file).unwrap(), "fixed\n");
+    let args = fs::read_to_string(root.path().join("a.php.args")).unwrap();
+    assert!(args.contains("--standard=PSR12"), "{args}");
+    let other = tempfile::tempdir().unwrap();
+    let (path, file) = (other.path().to_path_buf(), file.clone());
+    assert!(
+        cx.background_spawn(async move {
+            run_fix(&path, &file, Path::new("/no/php"), None, &[])
+                .await
+                .is_none()
+        })
+        .await
+    );
+}

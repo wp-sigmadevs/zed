@@ -88,13 +88,7 @@ impl Analyzer {
         let mut args: Vec<OsString> = match self {
             Analyzer::Phpcs => {
                 let mut args = vec!["-q".into(), "--report=json".into(), "--no-colors".into()];
-                if !has_any(root, PHPCS_CONFIGS) {
-                    let standard = match kind {
-                        ProjectKind::WordPress => "WordPress",
-                        ProjectKind::Laravel | ProjectKind::Php => "PSR12",
-                    };
-                    args.push(format!("--standard={standard}").into());
-                }
+                args.extend(phpcs_standard(root, kind));
                 args
             }
             // Without the project's config PHPStan reports every WordPress or
@@ -114,6 +108,60 @@ impl Analyzer {
         args.push(file.into());
         Some(args)
     }
+}
+
+/// The standard for projects without a ruleset of their own.
+fn phpcs_standard(root: &Path, kind: ProjectKind) -> Option<OsString> {
+    if has_any(root, PHPCS_CONFIGS) {
+        return None;
+    }
+    let standard = match kind {
+        ProjectKind::WordPress => "WordPress",
+        ProjectKind::Laravel | ProjectKind::Php => "PSR12",
+    };
+    Some(format!("--standard={standard}").into())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FixOutcome {
+    /// Nothing PHPCBF could fix.
+    Nothing,
+    Fixed,
+    /// Fixed what it could; some findings need a hand.
+    FixedSome,
+}
+
+/// PHPCBF exits 0 with nothing to fix, 1 when it fixed all, 2 when some remain.
+pub fn fix_outcome(code: Option<i32>) -> Result<FixOutcome> {
+    match code {
+        Some(0) => Ok(FixOutcome::Nothing),
+        Some(1) => Ok(FixOutcome::Fixed),
+        Some(2) => Ok(FixOutcome::FixedSome),
+        other => anyhow::bail!("phpcbf failed (exit code {other:?})"),
+    }
+}
+
+/// Fixes `file` in place with PHPCBF; `None` when there is no phpcbf to run.
+pub async fn run_fix(
+    root: &Path,
+    file: &Path,
+    php: &Path,
+    managed_bin: Option<&Path>,
+    path_dirs: &[PathBuf],
+) -> Option<Result<FixOutcome>> {
+    let kind = zenith_php_tools::detect_project(root);
+    let tool = zenith_php_tools::resolve(root, Tool::Phpcbf, managed_bin, path_dirs)?;
+    let (program, mut args) = launch(php, &tool.path);
+    args.extend(["-q".into(), "--no-colors".into()]);
+    args.extend(phpcs_standard(root, kind));
+    args.push(file.into());
+    let output = util::command::new_command(&program)
+        .args(args)
+        .current_dir(root)
+        .output()
+        .await
+        .context("running phpcbf");
+    Some(output.and_then(|output| fix_outcome(output.status.code())))
 }
 
 const PHPCS_CONFIGS: &[&str] = &[
@@ -411,7 +459,9 @@ gpui::actions!(
     zenith_inspections,
     [
         /// Runs PHPCS and PHPStan on every PHP file git reports as changed.
-        InspectChangedFiles
+        InspectChangedFiles,
+        /// Fixes the formatting problems in the current PHP file with PHPCBF.
+        FixFileWithPhpcbf
     ]
 );
 
@@ -516,9 +566,107 @@ fn inspect_changed_files(
     .detach();
 }
 
+fn notify(workspace: &mut Workspace, message: String, cx: &mut gpui::Context<Workspace>) {
+    workspace.show_notification(
+        workspace::notifications::NotificationId::unique::<FixFileWithPhpcbf>(),
+        cx,
+        |cx| {
+            cx.new(|cx| {
+                workspace::notifications::simple_message_notification::MessageNotification::new(
+                    message, cx,
+                )
+            })
+        },
+    );
+}
+
+fn fix_current_file(
+    workspace: &mut Workspace,
+    window: &mut gpui::Window,
+    cx: &mut gpui::Context<Workspace>,
+) {
+    let project = workspace.project().clone();
+    let Some(item) = workspace.active_item(cx) else {
+        return;
+    };
+    let Some(project_path) = item.project_path(cx) else {
+        return;
+    };
+    if project_path.path.extension() != Some("php") {
+        return notify(workspace, "PHPCBF fixes PHP files.".into(), cx);
+    }
+    if item.is_dirty(cx) {
+        return notify(
+            workspace,
+            "Save the file first; PHPCBF fixes the saved file.".into(),
+            cx,
+        );
+    }
+    let worktree_id = project_path.worktree_id;
+    if !zenith_php_tools::worktree_trusted(&project, worktree_id, cx) {
+        return notify(
+            workspace,
+            "Trust this project to run its PHP tools.".into(),
+            cx,
+        );
+    }
+    let (Some(abs_path), Some(worktree)) = (
+        project.read(cx).absolute_path(&project_path, cx),
+        project.read(cx).worktree_for_id(worktree_id, cx),
+    ) else {
+        return;
+    };
+    let root = worktree.read(cx).abs_path().to_path_buf();
+    cx.spawn_in(window, async move |workspace, cx| {
+        let result = cx
+            .background_spawn({
+                let (root, abs_path) = (root.clone(), abs_path.clone());
+                async move {
+                    let (candidates, path_dirs) = zenith_php_tools::environment();
+                    let Some((php, _)) = zenith_php_tools::find_php(&candidates).await else {
+                        anyhow::bail!("PHP was not found");
+                    };
+                    let managed = std::env::var_os("HOME").map(|home| {
+                        let kind = zenith_php_tools::detect_project(&root);
+                        zenith_php_tools::managed_bin(
+                            Path::new(&home),
+                            zenith_php_tools::Profile::for_project(kind),
+                        )
+                    });
+                    run_fix(&root, &abs_path, &php, managed.as_deref(), &path_dirs)
+                        .await
+                        .unwrap_or_else(|| {
+                            anyhow::bail!("phpcbf is not installed for this project")
+                        })
+                }
+            })
+            .await;
+        let message = match &result {
+            Ok(FixOutcome::Nothing) => "PHPCBF found nothing it can fix.".to_string(),
+            Ok(FixOutcome::Fixed) => "PHPCBF fixed the file.".to_string(),
+            Ok(FixOutcome::FixedSome) => {
+                "PHPCBF fixed what it could; some problems need a hand.".to_string()
+            }
+            Err(error) => format!("{error:#}"),
+        };
+        workspace
+            .update(cx, |workspace, cx| {
+                notify(workspace, message, cx);
+                if matches!(result, Ok(FixOutcome::Fixed | FixOutcome::FixedSome)) {
+                    inspect_path(&project, worktree_id, abs_path, cx).detach();
+                }
+            })
+            .log_err();
+    })
+    .detach();
+}
+
 pub fn init(cx: &mut App) {
     InspectionSettings::register(cx);
     cx.observe_new(|workspace: &mut Workspace, _, cx| {
+        workspace.register_action(|workspace, _: &FixFileWithPhpcbf, window, cx| {
+            fix_current_file(workspace, window, cx)
+        });
         workspace.register_action(|workspace, _: &InspectChangedFiles, window, cx| {
             inspect_changed_files(workspace, window, cx)
         });
