@@ -344,6 +344,7 @@ async fn test_saving_a_php_file_shows_phpcs_findings(cx: &mut TestAppContext) {
     fs::set_permissions(&stub_php, fs::Permissions::from_mode(0o755)).unwrap();
     // The stub first, then the system directories other tests' shell scripts need.
     // SAFETY: nothing else in this crate's tests reads PATH for its result.
+    let _restore = RestorePath(std::env::var_os("PATH"));
     let path = format!("{}:/usr/bin:/bin", path_dir.path().display());
     unsafe { std::env::set_var("PATH", path) };
     fs::write(root.path().join("a.php"), "<?php\nfunction foo() {}\n").unwrap();
@@ -386,4 +387,19 @@ async fn test_saving_a_php_file_shows_phpcs_findings(cx: &mut TestAppContext) {
         messages,
         [(text::Point::new(1, 0), "Missing doc comment".to_string())]
     );
+}
+
+/// Puts `PATH` back when the test ends, even if it fails.
+struct RestorePath(Option<std::ffi::OsString>);
+
+impl Drop for RestorePath {
+    fn drop(&mut self) {
+        // SAFETY: as where it is set.
+        unsafe {
+            match &self.0 {
+                Some(path) => std::env::set_var("PATH", path),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+    }
 }
