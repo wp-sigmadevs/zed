@@ -396,6 +396,9 @@ pub fn changed_php_files(root: &Path, status: &str) -> Vec<PathBuf> {
     files
 }
 
+/// Files inspected at once; each starts up to two tool processes.
+const MAX_PARALLEL: usize = 2;
+
 fn inspect_changed_files(
     workspace: &mut Workspace,
     window: &mut gpui::Window,
@@ -420,25 +423,18 @@ fn inspect_changed_files(
                 }
             })
             .await;
-        let message = match status {
+        let (message, files) = match status {
             Ok(output) if output.status.success() => {
-                let files =
-                    changed_php_files(&root, &String::from_utf8_lossy(&output.stdout));
+                let files = changed_php_files(&root, &String::from_utf8_lossy(&output.stdout));
                 let message = match files.len() {
                     0 => "No changed PHP files.".to_string(),
                     1 => "Inspecting 1 changed PHP file.".to_string(),
                     count => format!("Inspecting {count} changed PHP files."),
                 };
-                cx.update(|_, cx| {
-                    for file in files {
-                        inspect_path(&project, worktree_id, file, cx);
-                    }
-                })
-                .log_err();
-                message
+                (message, files)
             }
-            Ok(_) => "This folder is not a git repository.".to_string(),
-            Err(error) => format!("Could not run git: {error}"),
+            Ok(_) => ("This folder is not a git repository.".to_string(), Vec::new()),
+            Err(error) => (format!("Could not run git: {error}"), Vec::new()),
         };
         workspace
             .update(cx, |workspace, cx| {
@@ -449,6 +445,18 @@ fn inspect_changed_files(
                 );
             })
             .log_err();
+        for batch in files.chunks(MAX_PARALLEL) {
+            let runs = cx
+                .update(|_, cx| {
+                    batch
+                        .iter()
+                        .map(|file| inspect_path(&project, worktree_id, file.clone(), cx))
+                        .collect::<Vec<_>>()
+                })
+                .log_err()
+                .unwrap_or_default();
+            futures::future::join_all(runs).await;
+        }
     })
     .detach();
 }
@@ -519,7 +527,8 @@ pub fn inspect(project: &Entity<Project>, buffer: &Entity<Buffer>, cx: &mut App)
         worktree_id,
         root.join(file.path().as_std_path()),
         cx,
-    );
+    )
+    .detach();
 }
 
 /// Runs the analyzers on one file under a worktree root, open or not.
@@ -528,12 +537,12 @@ pub fn inspect_path(
     worktree_id: WorktreeId,
     abs_path: PathBuf,
     cx: &mut App,
-) {
+) -> gpui::Task<()> {
     let Some(worktree) = project.read(cx).worktree_for_id(worktree_id, cx) else {
-        return;
+        return gpui::Task::ready(());
     };
     if !zenith_php_tools::worktree_trusted(project, worktree_id, cx) {
-        return;
+        return gpui::Task::ready(());
     }
     let root = worktree.read(cx).abs_path().to_path_buf();
     let lsp_store = project.read(cx).lsp_store();
@@ -601,7 +610,6 @@ pub fn inspect_path(
             }
         });
     })
-    .detach();
 }
 
 #[cfg(test)]

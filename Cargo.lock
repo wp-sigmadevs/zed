@@ -22884,6 +22884,7 @@ name = "zenith_inspections"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "futures 0.3.34",
  "gpui",
  "language",
  "log",
