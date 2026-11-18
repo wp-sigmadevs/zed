@@ -22912,13 +22912,16 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "assets",
+ "editor",
  "gpui",
  "paths",
  "serde_json",
  "tempfile",
  "theme",
  "theme_settings",
+ "ui",
  "util",
+ "workspace",
 ]
 
 [[package]]

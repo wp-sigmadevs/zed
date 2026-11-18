@@ -2,13 +2,15 @@
 
 use gpui::{Action, Entity, FontWeight, Hsla};
 use project::{Inventory, Project};
-use ui::{ButtonLike, IconButton, Tooltip, prelude::*};
+use ui::{ButtonLike, IconButton, Tooltip, Vector, VectorName, prelude::*};
 
 /// Two-letter badge shown before the project name, e.g. "LG" for `lumen-gallery`.
 pub fn project_badge(project_name: &str, cx: &App) -> Option<impl IntoElement + use<>> {
     let initials = initials(project_name)?;
     let colors = cx.theme().colors();
-    Some(
+    // The Zenith mark leads the title bar, as on the Main board.
+    let mark = Vector::square(VectorName::ZedLogo, rems(1.));
+    Some(h_flex().flex_none().gap_2().child(mark).child(
         div()
             .flex_none()
             .px_1()
@@ -21,7 +23,7 @@ pub fn project_badge(project_name: &str, cx: &App) -> Option<impl IntoElement + 
                     .size(LabelSize::XSmall)
                     .weight(FontWeight::BOLD),
             ),
-    )
+    ))
 }
 
 /// Zenith's title bar middle: search, run controls, agent chip. One element, because
@@ -32,6 +34,15 @@ pub fn middle(project: &Entity<Project>, cx: &App) -> impl IntoElement + use<> {
         .child(search_box(Box::new(zenith_search::Toggle)))
         .child(run_controls(project, cx))
         .child(agent_chip())
+        .child(
+            IconButton::new("zenith-settings", IconName::Settings)
+                .icon_size(IconSize::Small)
+                .tooltip(action_tooltip(
+                    "Settings",
+                    Box::new(zed_actions::OpenSettings),
+                ))
+                .on_click(dispatch(Box::new(zed_actions::OpenSettings))),
+        )
 }
 
 /// "Search Everywhere" box for the middle of the title bar; dispatches `action`.

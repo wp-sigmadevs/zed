@@ -74,3 +74,10 @@ impl AssetSource for NoListing {
         anyhow::bail!("listing not expected")
     }
 }
+
+#[test]
+fn test_indent_label() {
+    assert_eq!(indent_label(4, false), "4 spaces");
+    assert_eq!(indent_label(2, false), "2 spaces");
+    assert_eq!(indent_label(4, true), "Tab");
+}

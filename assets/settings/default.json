@@ -1096,7 +1096,8 @@
   },
   "collaboration_panel": {
     // Whether to show the collaboration panel button in the status bar.
-    "button": true,
+    // Zenith: off; not part of the PhpStorm layout.
+    "button": false,
     // Where to dock the collaboration panel. Can be 'left' or 'right'.
     "dock": "right",
     // Default width of the collaboration panel.

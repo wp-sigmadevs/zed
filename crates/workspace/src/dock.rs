@@ -1279,6 +1279,7 @@ impl Render for Dock {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let dispatch_context = Self::dispatch_context(cx);
         if let Some(entry) = self.visible_entry() {
+            let panel_body = self.zenith_panel_body(&entry.panel.clone(), cx);
             let position = self.position;
             let create_resize_handle = || {
                 let handle = div()
@@ -1368,12 +1369,7 @@ impl Render for Dock {
                             Axis::Horizontal => this.w_full().h_full(),
                             Axis::Vertical => this.h_full().w_full(),
                         })
-                        .child(
-                            entry
-                                .panel
-                                .to_any()
-                                .cached(StyleRefinement::default().v_flex().size_full()),
-                        ),
+                        .child(panel_body),
                 )
                 .when(self.resizable(cx), |this| {
                     this.child(create_resize_handle())
@@ -1790,5 +1786,69 @@ pub mod test {
         fn focus_handle(&self, _cx: &App) -> FocusHandle {
             self.focus_handle.clone()
         }
+    }
+}
+
+// Zenith: PhpStorm-style tool window header ("Project  ×") on panels that draw none.
+impl Dock {
+    fn zenith_panel_body(
+        &self,
+        panel: &Arc<dyn PanelHandle>,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let body = panel
+            .to_any()
+            .cached(StyleRefinement::default().v_flex().size_full());
+        let title = cx
+            .has_global::<RailsActive>()
+            .then(|| zenith_panel_title(panel.persistent_name()))
+            .flatten();
+        let Some(title) = title else {
+            return body.into_any_element();
+        };
+        v_flex()
+            .size_full()
+            .child(
+                h_flex()
+                    .debug_selector(|| "zenith-panel-header".into())
+                    .h_8()
+                    .flex_none()
+                    .px_2()
+                    .justify_between()
+                    .child(
+                        Label::new(title)
+                            .size(LabelSize::Small)
+                            .weight(gpui::FontWeight::SEMIBOLD),
+                    )
+                    .child(
+                        IconButton::new("zenith-panel-hide", IconName::Close)
+                            .icon_size(IconSize::Small)
+                            .tooltip(Tooltip::text("Hide"))
+                            .on_click(cx.listener(|dock, _, window, cx| {
+                                dock.set_open(false, window, cx)
+                            })),
+                    ),
+            )
+            .child(div().flex_1().min_h_0().child(body))
+            .into_any_element()
+    }
+}
+
+/// PhpStorm's names for the panels that get a header; others keep their own chrome.
+pub fn zenith_panel_title(persistent_name: &str) -> Option<&'static str> {
+    match persistent_name {
+        "Project Panel" => Some("Project"),
+        "Outline Panel" => Some("Structure"),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod zenith_tests {
+    #[test]
+    fn test_panel_titles() {
+        assert_eq!(super::zenith_panel_title("Project Panel"), Some("Project"));
+        assert_eq!(super::zenith_panel_title("Outline Panel"), Some("Structure"));
+        assert_eq!(super::zenith_panel_title("Git Panel"), None);
     }
 }

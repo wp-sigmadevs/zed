@@ -4,18 +4,30 @@
 //! an installed extension's is.
 
 use anyhow::{Context as _, Result};
-use gpui::{App, AssetSource};
+use gpui::{App, AppContext as _, AssetSource};
 use std::{
     fs,
     path::{Path, PathBuf},
 };
 use theme::ThemeRegistry;
 use util::ResultExt as _;
+use workspace::Workspace;
+
+mod indent;
+pub use indent::{IndentIndicator, indent_label};
 
 pub const ICONS_PREFIX: &str = "icon_themes/archipelago-icons/";
 const THEME_FILE: &str = "icon_themes/archipelago-icons.json";
 
 pub fn init(cx: &mut App) {
+    cx.observe_new(|workspace: &mut Workspace, window, cx| {
+        let Some(window) = window else { return };
+        let item = cx.new(|_| IndentIndicator::default());
+        workspace
+            .status_bar()
+            .update(cx, |bar, cx| bar.add_right_item(item, window, cx));
+    })
+    .detach();
     let assets = cx.asset_source().clone();
     let registry = ThemeRegistry::global(cx);
     let base = paths::data_dir().join("icon_themes");
