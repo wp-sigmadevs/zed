@@ -63,6 +63,9 @@ actions!(
         RecentFiles,
         /// Opens the places recently visited, newest first (PhpStorm's Recent Locations).
         RecentLocations,
+        /// PhpStorm's Switcher (⌃Tab): Recent Files with the previous file picked;
+        /// Tab moves while ⌃ is held, releasing ⌃ opens the pick.
+        Switcher,
         /// Moves to the next Search Everywhere tab.
         NextTab,
         /// Moves to the previous Search Everywhere tab.
@@ -98,6 +101,22 @@ pub fn init(cx: &mut App) {
         });
         workspace.register_action(|workspace, _: &RecentFiles, window, cx| {
             SearchEverywhere::open(workspace, Tab::Recent, window, cx)
+        });
+        workspace.register_action(|workspace, _: &Switcher, window, cx| {
+            if let Some(modal) = workspace.active_modal::<SearchEverywhere>(cx) {
+                modal.update(cx, |modal, cx| {
+                    modal.picker.update(cx, |picker, cx| picker.select_next(&menu::SelectNext, window, cx))
+                });
+                return;
+            }
+            SearchEverywhere::open(workspace, Tab::Recent, window, cx);
+            if let Some(modal) = workspace.active_modal::<SearchEverywhere>(cx) {
+                let modifiers = window.modifiers();
+                modal.update(cx, |modal, cx| {
+                    modal.init_modifiers = modifiers.modified().then_some(modifiers);
+                    modal.picker.update(cx, |picker, _| picker.delegate.select_previous_file = true);
+                });
+            }
         });
     })
     .detach();
@@ -175,6 +194,8 @@ pub struct SearchEverywhere {
     picker: Entity<Picker<SearchDelegate>>,
     /// Recent Files' left column: every panel, as PhpStorm lists tool windows.
     tool_windows: Vec<ToolWindow>,
+    /// Switcher: the modifiers held when it opened; releasing them opens the pick.
+    init_modifiers: Option<gpui::Modifiers>,
 }
 
 struct ToolWindow {
@@ -289,11 +310,13 @@ impl SearchEverywhere {
             file_target: None,
             cancel_flag: Arc::new(AtomicBool::new(false)),
             edited_only: false,
+            select_previous_file: false,
         };
         let picker = cx.new(|cx| Picker::uniform_list(delegate, window, cx).embedded());
         Self {
             picker,
             tool_windows: Vec::new(),
+            init_modifiers: None,
         }
     }
 
@@ -307,6 +330,10 @@ impl SearchEverywhere {
     }
 
     fn cycle_tab(&mut self, step: isize, window: &mut Window, cx: &mut Context<Self>) {
+        // The Recent popups have no tab strip: Tab must not leave them.
+        if matches!(self.picker.read(cx).delegate.tab, Tab::Recent | Tab::Locations) {
+            return;
+        }
         let tab = self.picker.read(cx).delegate.tab.cycle(step);
         self.switch_tab(tab, window, cx);
     }
@@ -346,6 +373,7 @@ impl Render for SearchEverywhere {
         };
         v_flex()
             .key_context("SearchEverywhere")
+            .on_modifiers_changed(cx.listener(Self::modifiers_changed))
             .on_action(cx.listener(|this, _: &NextTab, window, cx| this.cycle_tab(1, window, cx)))
             .on_action(
                 cx.listener(|this, _: &PreviousTab, window, cx| this.cycle_tab(-1, window, cx)),
@@ -363,6 +391,26 @@ impl Render for SearchEverywhere {
 }
 
 impl SearchEverywhere {
+    /// Switcher: letting go of ⌃ opens the picked file, as in PhpStorm.
+    fn modifiers_changed(
+        &mut self,
+        event: &gpui::ModifiersChangedEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(init_modifiers) = self.init_modifiers else {
+            return;
+        };
+        if !event.modified() || !init_modifiers.is_subset_of(event) {
+            self.init_modifiers = None;
+            if self.picker.read(cx).delegate.matches.is_empty() {
+                cx.emit(DismissEvent);
+            } else {
+                window.dispatch_action(menu::Confirm.boxed_clone(), cx);
+            }
+        }
+    }
+
     /// PhpStorm's popup title row: "Recent Files  [ ] Show edited only".
     fn render_popup_header(&self, tab: Tab, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let edited_only = self.picker.read(cx).delegate.edited_only;
@@ -534,6 +582,8 @@ pub struct SearchDelegate {
     cancel_flag: Arc<AtomicBool>,
     /// Recent Files' "Show edited only".
     edited_only: bool,
+    /// Switcher: start on the second recent file (the one before the current).
+    select_previous_file: bool,
 }
 
 impl SearchDelegate {
@@ -874,7 +924,9 @@ impl SearchDelegate {
     ) {
         self.symbols = symbols;
         self.matches = matches;
-        self.selected_ix = if reset_selection {
+        self.selected_ix = if std::mem::take(&mut self.select_previous_file) {
+            1.min(self.matches.len().saturating_sub(1))
+        } else if reset_selection {
             0
         } else {
             self.selected_ix.min(self.matches.len().saturating_sub(1))
@@ -1694,6 +1746,32 @@ mod tests {
         });
         cx.run_until_parked();
         assert_eq!(file_labels(&picker, cx), [path!("src/lib.rs")]);
+
+        // Tab stays inside the popup; it has no tabs to switch to.
+        cx.dispatch_action(NextTab);
+        picker.read_with(cx, |picker, _| assert_eq!(picker.delegate.tab, Tab::Recent));
+        cx.dispatch_action(menu::Cancel);
+        cx.run_until_parked();
+
+        // Switcher: ⌃ held, ⌃Tab picks the previous file; letting go opens it.
+        cx.simulate_modifiers_change(gpui::Modifiers::control());
+        cx.dispatch_action(Switcher);
+        cx.run_until_parked();
+        let picker = open_picker(&workspace, cx);
+        picker.read_with(cx, |picker, _| {
+            assert_eq!(picker.delegate.tab, Tab::Recent);
+            assert_eq!(picker.delegate.selected_ix, 1);
+        });
+        cx.simulate_modifiers_change(gpui::Modifiers::default());
+        cx.run_until_parked();
+        workspace.update(cx, |workspace, cx| {
+            assert!(workspace.active_modal::<SearchEverywhere>(cx).is_none());
+            let opened = workspace
+                .active_item(cx)
+                .and_then(|item| item.project_path(cx))
+                .expect("a file is open");
+            assert_eq!(opened.path.as_unix_str(), "src/main.rs");
+        });
     }
 
     #[gpui::test]

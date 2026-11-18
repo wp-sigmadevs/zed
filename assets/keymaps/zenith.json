@@ -14,6 +14,8 @@
       "secondary-e": "zenith_search::RecentFiles",
       // Recent Locations, as in PhpStorm; the project panel keeps ⌘1.
       "secondary-shift-e": "zenith_search::RecentLocations",
+      // PhpStorm's Switcher: hold ⌃, Tab to step, let go to open.
+      "ctrl-tab": "zenith_search::Switcher",
     },
   },
   {
@@ -40,6 +42,9 @@
     "bindings": {
       "tab": "zenith_search::NextTab",
       "shift-tab": "zenith_search::PreviousTab",
+      // Switcher: more ⌃Tab steps down the list, ⌃⇧Tab back up.
+      "ctrl-tab": "zenith_search::Switcher",
+      "ctrl-shift-tab": "menu::SelectPrevious",
     },
   },
   {
