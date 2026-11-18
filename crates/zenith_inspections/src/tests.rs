@@ -344,7 +344,7 @@ async fn test_saving_a_php_file_shows_phpcs_findings(cx: &mut TestAppContext) {
     fs::set_permissions(&stub_php, fs::Permissions::from_mode(0o755)).unwrap();
     // The stub first, then the system directories other tests' shell scripts need.
     // SAFETY: nothing else in this crate's tests reads PATH for its result.
-    let _restore = RestorePath(std::env::var_os("PATH"));
+    let _restore = RestoreEnv("PATH", std::env::var_os("PATH"));
     let path = format!("{}:/usr/bin:/bin", path_dir.path().display());
     unsafe { std::env::set_var("PATH", path) };
     fs::write(root.path().join("a.php"), "<?php\nfunction foo() {}\n").unwrap();
@@ -389,17 +389,35 @@ async fn test_saving_a_php_file_shows_phpcs_findings(cx: &mut TestAppContext) {
     );
 }
 
-/// Puts `PATH` back when the test ends, even if it fails.
-struct RestorePath(Option<std::ffi::OsString>);
+/// Puts an environment variable back when dropped, even if the test fails.
+struct RestoreEnv(&'static str, Option<std::ffi::OsString>);
 
-impl Drop for RestorePath {
+impl Drop for RestoreEnv {
     fn drop(&mut self) {
-        // SAFETY: as where it is set.
+        // SAFETY: as where the tests set it.
         unsafe {
-            match &self.0 {
-                Some(path) => std::env::set_var("PATH", path),
-                None => std::env::remove_var("PATH"),
+            match &self.1 {
+                Some(value) => std::env::set_var(self.0, value),
+                None => std::env::remove_var(self.0),
             }
         }
     }
+}
+
+#[test]
+fn test_restore_env_puts_the_variable_back() {
+    let name = "ZENITH_INSPECTIONS_TEST_VARIABLE";
+    // SAFETY: a variable no other test touches.
+    unsafe { std::env::set_var(name, "before") };
+    {
+        let _restore = RestoreEnv(name, std::env::var_os(name));
+        unsafe { std::env::set_var(name, "during") };
+        assert_eq!(std::env::var(name).unwrap(), "during");
+    }
+    assert_eq!(std::env::var(name).unwrap(), "before");
+    {
+        let _restore = RestoreEnv(name, None);
+        unsafe { std::env::set_var(name, "during") };
+    }
+    assert!(std::env::var_os(name).is_none());
 }
