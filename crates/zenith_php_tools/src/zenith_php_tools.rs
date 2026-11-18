@@ -313,6 +313,13 @@ impl Profile {
     }
 }
 
+/// Where the last install's Composer output goes.
+pub fn install_log(home: &Path, profile: Profile) -> PathBuf {
+    managed_root(home)
+        .join(profile.dir_name())
+        .join("install.log")
+}
+
 fn consent_file(home: &Path) -> PathBuf {
     managed_root(home).join("consent.json")
 }
@@ -507,6 +514,8 @@ impl PhpStatus {
             }
         })
         .detach();
+        cx.observe_global::<Installing>(|_, cx| cx.notify())
+            .detach();
         let mut this = Self {
             project,
             workspace,
@@ -565,11 +574,13 @@ impl StatusItemView for PhpStatus {
 }
 
 impl Render for PhpStatus {
-    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let Some(info) = &self.info else {
             return div().into_any_element();
         };
+        let installing = cx.try_global::<Installing>().is_some_and(|state| state.0);
         let label = match &info.version {
+            _ if installing => "Installing PHP tools…".to_string(),
             Some(version) => format!("PHP {}", short_version(version)),
             None => "PHP: not found".to_string(),
         };
@@ -592,6 +603,11 @@ use workspace::notifications::NotificationId as BannerId;
 
 struct InstallBanner;
 struct InstallProgress;
+
+/// True while an install runs; the status bar item shows it.
+struct Installing(bool);
+
+impl gpui::Global for Installing {}
 
 fn find_composer(path_dirs: &[PathBuf]) -> Option<PathBuf> {
     let home = std::env::var_os("HOME")
@@ -710,6 +726,7 @@ fn start_install(
     workspace.show_notification(BannerId::unique::<InstallProgress>(), cx, |cx| {
         cx.new(|cx| MessageNotification::new("Installing PHP tools…", cx))
     });
+    cx.set_global(Installing(true));
     let home = home_dir();
     cx.spawn_in(window, async move |workspace, cx| {
         let (run_php, run_composer) = (php.clone(), composer.clone());
@@ -718,6 +735,12 @@ fn start_install(
                 install(&home, profile, &run_php, &run_composer, run_command).await
             })
             .await;
+        let log = install_log(&home_dir(), profile);
+        let text = match &result {
+            Ok(output) | Err(output) => output.clone(),
+        };
+        // Best effort: the notification still carries an error if this fails.
+        std::fs::write(&log, text).ok();
         workspace
             .update_in(cx, |workspace, _, cx| match result {
                 Ok(_) => workspace.show_notification(
@@ -726,7 +749,10 @@ fn start_install(
                     |cx| {
                         cx.new(|cx| {
                             MessageNotification::new(
-                                "PHP tools installed. Run \"zenith php tools: status\" to see them.",
+                                format!(
+                                    "PHP tools installed. Run \"zenith php tools: status\" to see them. Log: {}",
+                                    log.display()
+                                ),
                                 cx,
                             )
                         })
@@ -740,7 +766,10 @@ fn start_install(
                         |cx| {
                             cx.new(|cx| {
                                 MessageNotification::new(
-                                    format!("Installing PHP tools failed:\n{error}"),
+                                    format!(
+                                        "Installing PHP tools failed (log: {}):\n{error}",
+                                        log.display()
+                                    ),
                                     cx,
                                 )
                                 .primary_message("Retry")
@@ -757,6 +786,7 @@ fn start_install(
                 }
             })
             .ok();
+        cx.update(|_, cx| cx.set_global(Installing(false))).ok();
     })
     .detach();
 }
@@ -1148,5 +1178,13 @@ mod tests {
             // The lock was made for the manifest next to it.
             assert!(lock["content-hash"].is_string());
         }
+    }
+
+    #[test]
+    fn test_install_log_sits_next_to_the_manifest() {
+        assert_eq!(
+            install_log(Path::new("/Users/a"), Profile::Php),
+            Path::new("/Users/a/.local/share/zenith/tools/php/php/install.log")
+        );
     }
 }
