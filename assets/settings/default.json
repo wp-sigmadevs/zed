@@ -912,7 +912,8 @@
     //   "chevron"
     // 3. A disclosure chevron followed by a folder icon:
     //   "both"
-    "folder_indicator": "icon",
+    // Zenith: "both", as in PhpStorm.
+    "folder_indicator": "both",
     // Whether to show the git status in the project panel.
     "git_status": true,
     // Amount of indentation for nested items.
