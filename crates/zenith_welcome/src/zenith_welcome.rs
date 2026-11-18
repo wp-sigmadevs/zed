@@ -149,9 +149,9 @@ mod tests {
         });
         let defaults = settings::default_settings();
         assert!(defaults.contains(r#""dark": "Driftwood""#));
-        // Icons ship as an extension: bundled icons render single-colour.
+        // Icons ship inside the app (zenith_look), not from the extension registry.
         assert!(defaults.contains(r#""icon_theme": "Archipelago Icons""#));
-        assert!(defaults.contains(r#""archipelago-icons": true"#));
+        assert!(!defaults.contains(r#""archipelago-icons": true"#));
     }
 
     // Plan 34 step 6: PhpStorm layout — project tools left, agent right.

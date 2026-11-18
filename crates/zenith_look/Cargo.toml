@@ -1,0 +1,27 @@
+[package]
+name = "zenith_look"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/zenith_look.rs"
+doctest = false
+
+[dependencies]
+anyhow.workspace = true
+gpui.workspace = true
+paths.workspace = true
+theme.workspace = true
+theme_settings.workspace = true
+util.workspace = true
+
+[dev-dependencies]
+assets.workspace = true
+gpui = { workspace = true, features = ["test-support"] }
+serde_json.workspace = true
+tempfile.workspace = true

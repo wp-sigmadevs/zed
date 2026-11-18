@@ -1,0 +1,7 @@
+id = "archipelago-icons"
+name = "Archipelago Icons"
+version = "0.1.2"
+schema_version = 1
+description = "Atom Material file and folder icons for Zed: 2,600+ file types and 2,600+ folder names."
+authors = ["Sigma Devs <80900797+wp-sigmadevs@users.noreply.github.com>"]
+repository = "https://github.com/wp-sigmadevs/archipelago"

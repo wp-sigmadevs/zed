@@ -7,7 +7,7 @@
   // - "light": Use the theme indicated by the "light" field
   // - "dark": Use the theme indicated by the "dark" field
   "theme": {
-    "mode": "system",
+    "mode": "dark",
     "light": "One Light",
     "dark": "Driftwood",
   },
@@ -32,11 +32,13 @@
   // 7. "Emacs"
   // 8. "Cursor"
   // 9. "None"
-  "base_keymap": "Zed",
+  // Zenith: JetBrains keys, as in PhpStorm.
+  "base_keymap": "JetBrains",
   // The name of a font to use for rendering text in the editor
   // ".ZedMono" currently aliases to Lilex
   // but this may change in the future.
-  "buffer_font_family": ".ZedMono",
+  // Zenith: JetBrains Mono, bundled in assets/fonts/jetbrains-mono.
+  "buffer_font_family": "JetBrains Mono",
   // Set the buffer text's font fallbacks, this will be merged with
   // the platform's default fallbacks.
   "buffer_font_fallbacks": null,
@@ -44,9 +46,10 @@
   "buffer_font_features": {
     // Disable ligatures:
     // "calt": false
+    "liga": true,
   },
   // The default font size for text in the editor
-  "buffer_font_size": 15,
+  "buffer_font_size": 17,
   // The weight of the editor font in standard CSS units from 100 to 900.
   "buffer_font_weight": 400,
   // Set the buffer's line height.
@@ -59,7 +62,9 @@
   //         "buffer_line_height": {
   //           "custom": 2
   //         },
-  "buffer_line_height": "comfortable",
+  "buffer_line_height": {
+    "custom": 1.8,
+  },
   // The name of a font to use for rendering text in the UI
   // You can set this to ".SystemUIFont" to use the system font
   // ".ZedSans" currently aliases to "IBM Plex Sans", but this may
@@ -397,7 +402,7 @@
   //
   // The colors that are used for different indentation levels are defined in the theme (theme key: `accents`).
   // They can be customized by using theme overrides.
-  "colorize_brackets": false,
+  "colorize_brackets": true,
   // When to show the scrollbar in the completion menu.
   // This setting can take four values:
   //
@@ -790,13 +795,13 @@
     // 1. "disabled"
     // 2. "fixed"
     // 3. "indent_aware"
-    "coloring": "fixed",
+    "coloring": "indent_aware",
     // Determines how indent guide backgrounds are colored.
     // This setting can take the following two values:
     //
     // 1. "disabled"
     // 2. "indent_aware"
-    "background_coloring": "disabled",
+    "background_coloring": "indent_aware",
   },
   // Whether the editor will scroll beyond the last line.
   "scroll_beyond_last_line": "one_page",
@@ -868,7 +873,7 @@
     // Whether to show a background for inlay hints.
     //
     // If set to `true`, the background will use the `hint.background` color from the current theme.
-    "show_background": false,
+    "show_background": true,
     // Time to wait after editing the buffer, before requesting the hints,
     // set to 0 to disable debouncing.
     "edit_debounce_ms": 700,
@@ -2116,7 +2121,8 @@
     //     }
     "shell": "system",
     // Where to dock terminals panel. Can be `left`, `right`, `bottom`.
-    "dock": "right",
+    // Zenith: bottom, as in PhpStorm.
+    "dock": "bottom",
     // Whether the terminal panel should open on startup.
     //
     // Default: false
@@ -2265,6 +2271,7 @@
     // Set the terminal's font size. If this option is not included,
     // the terminal will default to matching the buffer's font size.
     // "font_size": 15,
+    "font_size": 16,
     // Set the terminal's font family. If this option is not included,
     // the terminal will default to matching the buffer's font family.
     // "font_family": ".ZedMono",
@@ -2417,7 +2424,9 @@
   // and change the value to `false`.
   "auto_install_extensions": {
     "html": true,
-    "archipelago-icons": true,
+    "php": true,
+    "blade": true,
+    "scss": true,
   },
   // Whether to suggest installing extensions based on the files you open.
   "suggest_extensions": true,
@@ -2578,6 +2587,7 @@
     },
     "JavaScript": {
       "language_servers": ["!typescript-language-server", "vtsls", "..."],
+      "semantic_tokens": "combined",
       "prettier": {
         "allowed": true,
       },
@@ -2620,7 +2630,7 @@
       },
     },
     "PHP": {
-      "language_servers": ["phpactor", "!intelephense", "!phptools", "!phpantom", "..."],
+      "language_servers": ["intelephense", "phpactor", "!phptools", "!phpantom", "..."],
       "prettier": {
         "allowed": true,
         "plugins": ["@prettier/plugin-php"],
@@ -2683,6 +2693,7 @@
     },
     "TSX": {
       "language_servers": ["!typescript-language-server", "vtsls", "..."],
+      "semantic_tokens": "combined",
       "prettier": {
         "allowed": true,
       },
@@ -2694,6 +2705,7 @@
     },
     "TypeScript": {
       "language_servers": ["!typescript-language-server", "vtsls", "..."],
+      "semantic_tokens": "combined",
       "prettier": {
         "allowed": true,
       },
@@ -2885,7 +2897,21 @@
     // ]
     //
     // Default rules are viewable via the "zed: show default semantic token rules" action.
-    "semantic_token_rules": [],
+    // Zenith: JS/TS colours from the theme's ts.* styles (WebStorm look).
+    "semantic_token_rules": [
+      { "token_type": "variable", "token_modifiers": ["local"], "style": ["ts.variable.local"] },
+      { "token_type": "variable", "style": ["ts.variable"] },
+      { "token_type": "parameter", "style": ["ts.parameter"] },
+      { "token_type": "property", "style": ["ts.property"], "font_style": "normal" },
+      { "token_type": "function", "style": ["ts.function"] },
+      { "token_type": "member", "style": ["ts.function"] },
+      { "token_type": "class", "style": ["ts.type"] },
+      { "token_type": "interface", "style": ["ts.type"] },
+      { "token_type": "type", "style": ["ts.type"] },
+      { "token_type": "typeParameter", "style": ["ts.type"] },
+      { "token_type": "enum", "style": ["ts.type"] },
+      { "token_type": "enumMember", "style": ["ts.enum_member"] },
+    ],
   },
   // Jupyter settings
   "jupyter": {

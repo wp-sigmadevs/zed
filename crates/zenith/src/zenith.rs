@@ -18,4 +18,6 @@ pub fn init(cx: &mut App) {
     zenith_php_tools::init(cx);
     #[cfg(feature = "inspections")]
     zenith_inspections::init(cx);
+    #[cfg(feature = "look")]
+    zenith_look::init(cx);
 }

@@ -22874,6 +22874,7 @@ dependencies = [
  "gpui",
  "onboarding",
  "zenith_inspections",
+ "zenith_look",
  "zenith_php_tools",
  "zenith_rails",
  "zenith_search",
@@ -22903,6 +22904,21 @@ dependencies = [
  "workspace",
  "zed_actions",
  "zenith_php_tools",
+]
+
+[[package]]
+name = "zenith_look"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "assets",
+ "gpui",
+ "paths",
+ "serde_json",
+ "tempfile",
+ "theme",
+ "theme_settings",
+ "util",
 ]
 
 [[package]]
