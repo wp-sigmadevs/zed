@@ -167,22 +167,24 @@ pub struct PhpInfo {
 }
 
 /// The first candidate whose `php -v` answers.
-pub fn find_php(candidates: &[PathBuf]) -> Option<(PathBuf, String)> {
-    candidates
-        .iter()
-        .filter(|candidate| candidate.is_file())
-        .find_map(|candidate| {
-            let output = std::process::Command::new(candidate)
-                .arg("-v")
-                .output()
-                .ok()?;
-            let version = parse_php_version(&String::from_utf8_lossy(&output.stdout))?;
-            Some((candidate.clone(), version))
-        })
+pub async fn find_php(candidates: &[PathBuf]) -> Option<(PathBuf, String)> {
+    for candidate in candidates.iter().filter(|candidate| candidate.is_file()) {
+        let Ok(output) = util::command::new_command(candidate)
+            .arg("-v")
+            .output()
+            .await
+        else {
+            continue;
+        };
+        if let Some(version) = parse_php_version(&String::from_utf8_lossy(&output.stdout)) {
+            return Some((candidate.clone(), version));
+        }
+    }
+    None
 }
 
-pub fn detect_php(root: &Path, candidates: &[PathBuf]) -> PhpInfo {
-    let found = find_php(candidates);
+pub async fn detect_php(root: &Path, candidates: &[PathBuf]) -> PhpInfo {
+    let found = find_php(candidates).await;
     PhpInfo {
         kind: detect_project(root),
         version: found.as_ref().map(|(_, version)| version.clone()),
@@ -284,7 +286,7 @@ fn show_status(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<
         let report = cx
             .background_spawn(async move {
                 let (candidates, path_dirs) = environment();
-                status_report(&root, &detect_php(&root, &candidates), &path_dirs)
+                status_report(&root, &detect_php(&root, &candidates).await, &path_dirs)
             })
             .await;
         workspace
@@ -332,7 +334,11 @@ impl PhpStatus {
         cx.spawn(async move |this, cx| {
             let info = cx
                 .background_spawn(async move {
-                    looks_like_php(&root).then(|| detect_php(&root, &environment().0))
+                    if looks_like_php(&root) {
+                        Some(detect_php(&root, &environment().0).await)
+                    } else {
+                        None
+                    }
                 })
                 .await;
             this.update(cx, |this, cx| {
@@ -499,19 +505,19 @@ mod tests {
         let project = tempfile::tempdir().unwrap();
         write(project.path(), "composer.json", "{}");
 
-        let info = detect_php(
+        let info = futures::executor::block_on(detect_php(
             project.path(),
             &[
                 PathBuf::from("/nonexistent/php"),
                 broken_php,
                 working_php.clone(),
             ],
-        );
+        ));
         assert_eq!(info.version.as_deref(), Some("8.5.0"));
         assert_eq!(info.php_path, Some(working_php));
         assert!(looks_like_php(project.path()));
 
-        let none = detect_php(project.path(), &[]);
+        let none = futures::executor::block_on(detect_php(project.path(), &[]));
         assert_eq!(none.version, None);
         let report = status_report(project.path(), &none, &[]);
         assert!(report.contains("PHP: not found"));
@@ -541,7 +547,6 @@ mod tests {
 
     #[gpui::test]
     async fn test_status_item_shows_in_php_projects_only(cx: &mut gpui::TestAppContext) {
-        use gpui::AppContext as _;
         let app_state = cx.update(|cx| {
             let app_state = workspace::AppState::test(cx);
             theme_settings::init(theme::LoadThemes::JustBase, cx);

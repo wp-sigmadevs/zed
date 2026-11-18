@@ -22882,6 +22882,7 @@ dependencies = [
 name = "zenith_php_tools"
 version = "0.1.0"
 dependencies = [
+ "futures 0.3.34",
  "gpui",
  "project",
  "serde_json",
@@ -22890,6 +22891,7 @@ dependencies = [
  "theme",
  "theme_settings",
  "ui",
+ "util",
  "workspace",
 ]
 
