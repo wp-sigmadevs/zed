@@ -4,7 +4,7 @@
 
 use anyhow::{Context as _, Result};
 use gpui::{App, AppContext as _, Entity};
-use language::{Buffer, BufferEvent, Diagnostic, DiagnosticEntry, DiagnosticSourceKind};
+use language::{Buffer, BufferEvent, DiagnosticSourceKind};
 use lsp::{DiagnosticSeverity, LanguageServerId, NumberOrString};
 use project::{Project, WorktreeId, buffer_store::BufferStoreEvent};
 use serde::Deserialize;
@@ -14,7 +14,6 @@ use std::{
     ffi::OsString,
     path::{Path, PathBuf},
 };
-use text::{PointUtf16, Unclipped};
 use util::ResultExt as _;
 use workspace::Workspace;
 use zenith_php_tools::{ProjectKind, Tool};
@@ -66,16 +65,6 @@ impl Analyzer {
         }
     }
 
-    /// shortcut: group ids share one space per buffer with the language servers',
-    /// which count up from 0; starting far above keeps them apart. Upgrade if upstream
-    /// exposes its counter.
-    fn first_group_id(self) -> usize {
-        match self {
-            Analyzer::Phpcs => 1 << 60,
-            Analyzer::Phpstan => (1 << 60) + (1 << 40),
-        }
-    }
-
     pub fn parse(self, output: &str) -> Result<Vec<Problem>> {
         match self {
             Analyzer::Phpcs => parse_phpcs(output),
@@ -112,7 +101,7 @@ impl Analyzer {
 
 /// The standard for projects without a ruleset of their own.
 fn phpcs_standard(root: &Path, kind: ProjectKind) -> Option<OsString> {
-    if has_any(root, PHPCS_CONFIGS) {
+    if find_phpcs_ruleset(root).is_some() {
         return None;
     }
     let standard = match kind {
@@ -175,6 +164,16 @@ const PHPSTAN_CONFIGS: &[&str] = &["phpstan.neon", "phpstan.neon.dist", "phpstan
 
 fn has_any(root: &Path, names: &[&str]) -> bool {
     names.iter().any(|name| root.join(name).is_file())
+}
+
+/// PHPCS looks for a ruleset in the working folder and then its parents.
+fn find_phpcs_ruleset(root: &Path) -> Option<PathBuf> {
+    root.ancestors().find_map(|folder| {
+        PHPCS_CONFIGS
+            .iter()
+            .map(|name| folder.join(name))
+            .find(|path| path.is_file())
+    })
 }
 
 /// PHP prints deprecation notices and PHPStan its config note to stdout ahead of
@@ -253,6 +252,13 @@ struct PhpstanMessage {
 pub fn parse_phpstan(output: &str) -> Result<Vec<Problem>> {
     let json: serde_json::Value =
         serde_json::from_str(json_part(output)).context("phpstan output")?;
+    // Top-level errors are config or bootstrap failures, not findings.
+    if let Some(errors) = json.get("errors").and_then(|errors| errors.as_array())
+        && !errors.is_empty()
+    {
+        let messages: Vec<&str> = errors.iter().filter_map(|error| error.as_str()).collect();
+        anyhow::bail!("phpstan: {}", messages.join("; "));
+    }
     if json.get("files").is_some_and(|files| files.is_array()) {
         return Ok(Vec::new());
     }
@@ -279,9 +285,10 @@ pub fn parse_phpstan(output: &str) -> Result<Vec<Problem>> {
 }
 
 /// PHPCS counts a tab as up to `tab_width` columns; the editor counts characters.
+/// Returns the editor's UTF-16 column, so characters outside the BMP count twice.
 pub fn char_column(line: &str, column: u32, tab_width: u32) -> u32 {
     let mut expanded = 1;
-    let mut chars = 1;
+    let mut utf16 = 1;
     for character in line.chars() {
         if expanded >= column {
             break;
@@ -291,17 +298,16 @@ pub fn char_column(line: &str, column: u32, tab_width: u32) -> u32 {
         } else {
             1
         };
-        chars += 1;
+        utf16 += character.len_utf16() as u32;
     }
-    chars
+    utf16
 }
 
 /// The project ruleset's `<arg name="tab-width" value="N"/>`, else PHPCS's default.
 pub fn ruleset_tab_width(root: &Path) -> u32 {
-    PHPCS_CONFIGS
-        .iter()
-        .filter_map(|name| std::fs::read_to_string(root.join(name)).ok())
-        .find_map(|xml| tab_width_in(&xml))
+    find_phpcs_ruleset(root)
+        .and_then(|ruleset| std::fs::read_to_string(ruleset).ok())
+        .and_then(|xml| tab_width_in(&xml))
         .unwrap_or(PHPCS_TAB_WIDTH)
 }
 
@@ -327,54 +333,80 @@ fn fix_tab_columns(problems: &mut [Problem], text: &str, tab_width: u32) {
 /// PHPCS's default, and the WordPress ruleset's.
 const PHPCS_TAB_WIDTH: u32 = 4;
 
-/// Problems as diagnostics. Disk-based, so they follow edits made after the save.
-pub fn diagnostic_entries(
+/// Problems as an LSP publish for `path`. `update_diagnostic_entries` would be
+/// simpler but only exists in test builds; this is the path real servers take,
+/// and it numbers the diagnostic groups from Zed's own counter.
+pub fn publish_params(
     analyzer: Analyzer,
+    path: &Path,
     problems: &[Problem],
-) -> Vec<DiagnosticEntry<Unclipped<PointUtf16>>> {
-    problems
+) -> Option<lsp::PublishDiagnosticsParams> {
+    let uri = lsp::Uri::from_file_path(path).ok()?;
+    let diagnostics = problems
         .iter()
-        .enumerate()
-        .map(|(ix, problem)| {
-            let point = Unclipped(PointUtf16::new(
+        .map(|problem| {
+            let position = lsp::Position::new(
                 problem.line.saturating_sub(1),
                 problem.column.saturating_sub(1),
-            ));
-            DiagnosticEntry::new(
-                point..point,
-                Diagnostic {
-                    source: Some(analyzer.name().to_string()),
-                    code: problem.rule.clone().map(NumberOrString::String),
-                    severity: match problem.severity {
-                        Severity::Error => DiagnosticSeverity::ERROR,
-                        Severity::Warning => DiagnosticSeverity::WARNING,
-                    },
-                    message: problem.message.clone().into(),
-                    group_id: analyzer.first_group_id() + ix,
-                    is_primary: true,
-                    is_disk_based: true,
-                    source_kind: DiagnosticSourceKind::Other,
-                    underline: true,
-                    ..Diagnostic::default()
-                },
-            )
+            );
+            lsp::Diagnostic {
+                range: lsp::Range::new(position, position),
+                severity: Some(match problem.severity {
+                    Severity::Error => DiagnosticSeverity::ERROR,
+                    Severity::Warning => DiagnosticSeverity::WARNING,
+                }),
+                code: problem.rule.clone().map(NumberOrString::String),
+                source: Some(analyzer.name().to_string()),
+                message: lsp::DiagnosticMessage::String(problem.message.clone()),
+                ..lsp::Diagnostic::default()
+            }
         })
-        .collect()
+        .collect();
+    Some(lsp::PublishDiagnosticsParams {
+        uri,
+        diagnostics,
+        version: None,
+    })
+}
+
+/// Replaces `analyzer`'s diagnostics for `path`. Disk-based, so they follow
+/// edits made after the save.
+pub fn push_diagnostics(
+    lsp_store: &mut project::LspStore,
+    analyzer: Analyzer,
+    path: &Path,
+    problems: &[Problem],
+    cx: &mut gpui::Context<project::LspStore>,
+) -> Result<()> {
+    let params = publish_params(analyzer, path, problems).context("diagnostic path")?;
+    let sources = [analyzer.name().to_string()];
+    lsp_store.merge_lsp_diagnostics(
+        DiagnosticSourceKind::Other,
+        vec![project::lsp_store::DocumentDiagnosticsUpdate {
+            diagnostics: params,
+            result_id: None,
+            registration_id: None,
+            server_id: analyzer.server_id(),
+            disk_based_sources: std::borrow::Cow::Borrowed(&sources),
+        }],
+        |_, _, _| false,
+        cx,
+    )
 }
 
 /// `vendor/bin` tools are PHP scripts: run them with the PHP Zenith found, since
 /// an app started from the Dock may not have it on `PATH`.
 pub fn launch(php: &Path, tool: &Path) -> (PathBuf, Vec<OsString>) {
-    let first_line = std::fs::read(tool)
-        .ok()
-        .and_then(|bytes| {
-            let end = bytes
-                .iter()
-                .position(|b| *b == b'\n')
-                .unwrap_or(bytes.len());
-            String::from_utf8(bytes[..end.min(256)].to_vec()).ok()
-        })
-        .unwrap_or_default();
+    // A .phar can be tens of megabytes; the first line is all that matters.
+    let mut head = Vec::new();
+    std::fs::File::open(tool)
+        .and_then(|file| std::io::Read::read_to_end(&mut std::io::Read::take(file, 256), &mut head))
+        .log_err();
+    let end = head
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .unwrap_or(head.len());
+    let first_line = String::from_utf8_lossy(&head[..end]);
     if (first_line.starts_with("#!") && first_line.contains("php"))
         || first_line.starts_with("<?php")
     {
@@ -487,17 +519,59 @@ pub fn changed_php_files(root: &Path, status: &str) -> Vec<PathBuf> {
     files
 }
 
-/// Starts each job only when fewer than `limit` of its batch are running.
-async fn run_limited<Job, Fut>(jobs: Vec<Job>, limit: usize)
+/// Runs at most `limit` jobs at once, starting the next as each one finishes.
+async fn run_limited<Job, Fut, Output>(jobs: Vec<Job>, limit: usize) -> Vec<Output>
 where
     Job: FnOnce() -> Fut,
-    Fut: std::future::Future<Output = ()>,
+    Fut: std::future::Future<Output = Output>,
 {
-    let mut jobs = jobs.into_iter().peekable();
-    while jobs.peek().is_some() {
-        let batch: Vec<Fut> = jobs.by_ref().take(limit).map(|job| job()).collect();
-        futures::future::join_all(batch).await;
+    use futures::StreamExt as _;
+    futures::stream::iter(jobs.into_iter().map(|job| job()))
+        .buffer_unordered(limit.max(1))
+        .collect()
+        .await
+}
+
+/// Git's toplevel and porcelain status for a folder, or a message why not.
+async fn git_changes(root: &Path) -> Result<(PathBuf, String), String> {
+    let git = |args: &'static [&'static str]| {
+        let root = root.to_path_buf();
+        async move {
+            util::command::new_command("git")
+                .args(args)
+                .current_dir(&root)
+                .output()
+                .await
+        }
+    };
+    let toplevel = match git(&["rev-parse", "--show-toplevel"]).await {
+        Ok(output) if output.status.success() => {
+            PathBuf::from(String::from_utf8_lossy(&output.stdout).trim())
+        }
+        Ok(_) => return Err("This folder is not a git repository.".into()),
+        Err(error) => return Err(format!("Could not run git: {error}")),
+    };
+    match git(&["status", "--porcelain=v1", "-z", "--untracked-files=all"]).await {
+        Ok(output) if output.status.success() => Ok((
+            toplevel,
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+        )),
+        Ok(output) => Err(String::from_utf8_lossy(&output.stderr).trim().to_string()),
+        Err(error) => Err(format!("Could not run git: {error}")),
     }
+}
+
+/// Changed PHP files inside `root`; git reports them from the repository's top.
+pub fn changed_php_files_in(root: &Path, toplevel: &Path, status: &str) -> Vec<PathBuf> {
+    // Git prints the resolved toplevel; compare in the same form.
+    let real_root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    changed_php_files(toplevel, status)
+        .into_iter()
+        .filter_map(|path| {
+            let relative = path.strip_prefix(&real_root).ok()?;
+            Some(root.join(relative))
+        })
+        .collect()
 }
 
 fn inspect_changed_files(
@@ -513,73 +587,136 @@ fn inspect_changed_files(
             cx,
         );
     }
-    let Some(worktree) = project.read(cx).visible_worktrees(cx).next() else {
-        return;
-    };
-    if !zenith_php_tools::worktree_trusted(&project, worktree.read(cx).id(), cx) {
-        return notify(
-            workspace,
-            "Trust this project to run its PHP tools.".into(),
-            cx,
-        );
+    let worktrees: Vec<(WorktreeId, PathBuf)> = project
+        .read(cx)
+        .visible_worktrees(cx)
+        .map(|worktree| {
+            (
+                worktree.read(cx).id(),
+                worktree.read(cx).abs_path().to_path_buf(),
+            )
+        })
+        .collect();
+    let trusted: Vec<(WorktreeId, PathBuf)> = worktrees
+        .iter()
+        .filter(|(id, _)| zenith_php_tools::worktree_trusted(&project, *id, cx))
+        .cloned()
+        .collect();
+    if trusted.is_empty() {
+        let message = if worktrees.is_empty() {
+            "Open a folder first."
+        } else {
+            "Trust this project to run its PHP tools."
+        };
+        return notify(workspace, message.into(), cx);
     }
-    let worktree_id = worktree.read(cx).id();
-    let root = worktree.read(cx).abs_path().to_path_buf();
     let max_parallel = InspectionSettings::get_global(cx).max_parallel;
     cx.spawn_in(window, async move |workspace, cx| {
-        let status = cx
-            .background_spawn({
-                let root = root.clone();
-                async move {
-                    util::command::new_command("git")
-                        .args(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
-                        .current_dir(&root)
-                        .output()
-                        .await
-                }
-            })
-            .await;
-        let (message, files) = match status {
-            Ok(output) if output.status.success() => {
-                let files = changed_php_files(&root, &String::from_utf8_lossy(&output.stdout));
-                let message = match files.len() {
-                    0 => "No changed PHP files.".to_string(),
-                    1 => "Inspecting 1 changed PHP file.".to_string(),
-                    count => format!("Inspecting {count} changed PHP files."),
-                };
-                (message, files)
+        let mut files = Vec::new();
+        let mut problems = Vec::new();
+        for (worktree_id, root) in trusted {
+            let changes = cx
+                .background_spawn({
+                    let root = root.clone();
+                    async move { git_changes(&root).await }
+                })
+                .await;
+            match changes {
+                Ok((toplevel, status)) => files.extend(
+                    changed_php_files_in(&root, &toplevel, &status)
+                        .into_iter()
+                        .map(|file| (worktree_id, file)),
+                ),
+                Err(message) => problems.push(message),
             }
-            Ok(_) => ("This folder is not a git repository.".to_string(), Vec::new()),
-            Err(error) => (format!("Could not run git: {error}"), Vec::new()),
+        }
+        let message = match (files.len(), problems.first()) {
+            (0, Some(problem)) => problem.clone(),
+            (0, None) => "No changed PHP files.".to_string(),
+            (1, _) => "Inspecting 1 changed PHP file.".to_string(),
+            (count, _) => format!("Inspecting {count} changed PHP files."),
         };
         workspace
-            .update(cx, |workspace, cx| {
-                workspace.show_notification(
-                    workspace::notifications::NotificationId::unique::<InspectChangedFiles>(),
-                    cx,
-                    |cx| cx.new(|cx| workspace::notifications::simple_message_notification::MessageNotification::new(message, cx)),
-                );
-            })
+            .update(cx, |workspace, cx| notify(workspace, message, cx))
             .log_err();
-        run_limited(
+        let errors: Vec<String> = run_limited(
             files
                 .into_iter()
-                .map(|file| {
+                .map(|(worktree_id, file)| {
                     let (project, mut cx) = (project.clone(), cx.clone());
                     move || async move {
-                        if let Ok(task) =
-                            cx.update(|_, cx| inspect_path(&project, worktree_id, file, cx))
-                        {
-                            task.await;
+                        match cx.update(|_, cx| inspect_path(&project, worktree_id, file, cx)) {
+                            Ok(task) => task.await,
+                            Err(_) => Vec::new(),
                         }
                     }
                 })
                 .collect(),
             max_parallel,
         )
-        .await;
+        .await
+        .into_iter()
+        .flatten()
+        .collect();
+        workspace
+            .update(cx, |workspace, cx| report_errors(workspace, errors, cx))
+            .log_err();
     })
     .detach();
+}
+
+/// Shows each distinct tool failure once per session, so a broken ruleset does not
+/// raise a notification on every save.
+fn report_errors(
+    workspace: &mut Workspace,
+    errors: Vec<String>,
+    cx: &mut gpui::Context<Workspace>,
+) {
+    let shown = &mut cx.default_global::<ShownErrors>().0;
+    let new: Vec<String> = errors
+        .into_iter()
+        .filter(|error| shown.insert(error.clone()))
+        .collect();
+    if !new.is_empty() {
+        workspace.show_notification(
+            workspace::notifications::NotificationId::unique::<ShownErrors>(),
+            cx,
+            |cx| {
+                cx.new(|cx| {
+                    workspace::notifications::simple_message_notification::MessageNotification::new(
+                        format!("PHP inspections failed: {}", new.join("\n")),
+                        cx,
+                    )
+                })
+            },
+        );
+    }
+}
+
+#[derive(Default)]
+struct ShownErrors(std::collections::HashSet<String>);
+
+impl gpui::Global for ShownErrors {}
+
+/// Where to look for PHP and tools; tests set it instead of changing `PATH`.
+#[derive(Clone)]
+pub struct ToolEnvironment {
+    pub php_candidates: Vec<PathBuf>,
+    pub path_dirs: Vec<PathBuf>,
+}
+
+impl gpui::Global for ToolEnvironment {}
+
+fn tool_environment(cx: &App) -> ToolEnvironment {
+    cx.try_global::<ToolEnvironment>()
+        .cloned()
+        .unwrap_or_else(|| {
+            let (php_candidates, path_dirs) = zenith_php_tools::environment();
+            ToolEnvironment {
+                php_candidates,
+                path_dirs,
+            }
+        })
 }
 
 fn notify(workspace: &mut Workspace, message: String, cx: &mut gpui::Context<Workspace>) {
@@ -676,7 +813,14 @@ fn fix_current_file(
             .update(cx, |workspace, cx| {
                 notify(workspace, message, cx);
                 if matches!(result, Ok(FixOutcome::Fixed | FixOutcome::FixedSome)) {
-                    inspect_path(&project, worktree_id, abs_path, cx).detach();
+                    let run = inspect_path(&project, worktree_id, abs_path, cx);
+                    cx.spawn(async move |workspace, cx| {
+                        let errors = run.await;
+                        workspace
+                            .update(cx, |workspace, cx| report_errors(workspace, errors, cx))
+                            .ok();
+                    })
+                    .detach();
                 }
             })
             .log_err();
@@ -702,7 +846,7 @@ pub fn init(cx: &mut App) {
             if let BufferStoreEvent::BufferAdded(buffer) = event {
                 let project = project.clone();
                 cx.subscribe(buffer, move |_, buffer, event, cx| {
-                    on_buffer_event(&project, &buffer, event, cx)
+                    on_buffer_event(&project, &buffer, event, cx.entity().downgrade(), cx)
                 })
                 .detach();
             }
@@ -717,49 +861,75 @@ fn on_buffer_event(
     project: &Entity<Project>,
     buffer: &Entity<Buffer>,
     event: &BufferEvent,
+    workspace: gpui::WeakEntity<Workspace>,
     cx: &mut App,
 ) {
     if matches!(event, BufferEvent::Saved) && InspectionSettings::get_global(cx).run_on_save {
-        inspect(project, buffer, cx);
+        inspect(project, buffer, workspace, cx);
     }
 }
 
-/// Save counter per file, so a slow older run cannot overwrite a newer one.
+/// The latest run per file, numbered from one counter for all files so a number is
+/// never reused; a slow older run sees a different number and drops its results.
 #[derive(Default)]
-struct Generations(std::collections::HashMap<PathBuf, u64>);
+struct Generations {
+    next: u64,
+    latest: std::collections::HashMap<PathBuf, u64>,
+}
 
 impl gpui::Global for Generations {}
 
 fn next_generation(path: &Path, cx: &mut App) -> u64 {
-    let count = cx
-        .default_global::<Generations>()
-        .0
-        .entry(path.to_path_buf())
-        .or_default();
-    *count += 1;
-    *count
+    let generations = cx.default_global::<Generations>();
+    generations.next += 1;
+    let generation = generations.next;
+    generations.latest.insert(path.to_path_buf(), generation);
+    generation
 }
 
 fn current_generation(path: &Path, cx: &App) -> u64 {
     cx.try_global::<Generations>()
-        .and_then(|generations| generations.0.get(path).copied())
+        .and_then(|generations| generations.latest.get(path).copied())
         .unwrap_or(0)
 }
 
+/// Forgets a file once its latest run has finished.
+fn finish_generation(path: &Path, generation: u64, cx: &mut App) {
+    let latest = &mut cx.default_global::<Generations>().latest;
+    if latest.get(path) == Some(&generation) {
+        latest.remove(path);
+    }
+}
+
 /// Runs the analyzers on a saved PHP file in a trusted local worktree.
-pub fn inspect(project: &Entity<Project>, buffer: &Entity<Buffer>, cx: &mut App) {
+pub fn inspect(
+    project: &Entity<Project>,
+    buffer: &Entity<Buffer>,
+    workspace: gpui::WeakEntity<Workspace>,
+    cx: &mut App,
+) {
     let Some(file) = buffer.read(cx).file().cloned() else {
         return;
     };
-    if file.path().extension() != Some("php") {
-        return;
-    }
     let worktree_id = file.worktree_id(cx);
     let Some(worktree) = project.read(cx).worktree_for_id(worktree_id, cx) else {
         return;
     };
+    // A file opened on its own is its worktree's root, with an empty relative path.
     let abs_path = worktree.read(cx).abs_path().join(file.path().as_std_path());
-    let task = inspect_path(project, worktree_id, abs_path.clone(), cx);
+    if abs_path
+        .extension()
+        .is_none_or(|extension| extension != "php")
+    {
+        return;
+    }
+    let run = inspect_path(project, worktree_id, abs_path.clone(), cx);
+    let task = cx.spawn(async move |cx| {
+        let errors = run.await;
+        workspace
+            .update(cx, |workspace, cx| report_errors(workspace, errors, cx))
+            .ok();
+    });
     // Replacing the previous run drops it, which kills its tool processes.
     cx.default_global::<Running>().0.insert(abs_path, task);
 }
@@ -776,24 +946,28 @@ pub fn inspect_path(
     worktree_id: WorktreeId,
     abs_path: PathBuf,
     cx: &mut App,
-) -> gpui::Task<()> {
+) -> gpui::Task<Vec<String>> {
     let Some(worktree) = project.read(cx).worktree_for_id(worktree_id, cx) else {
-        return gpui::Task::ready(());
+        return gpui::Task::ready(Vec::new());
     };
     // Remote paths are not local files, and local tools must not run on them.
     if !project.read(cx).is_local() || !zenith_php_tools::worktree_trusted(project, worktree_id, cx)
     {
-        return gpui::Task::ready(());
+        return gpui::Task::ready(Vec::new());
     }
     let root = worktree.read(cx).abs_path().to_path_buf();
+    let environment = tool_environment(cx);
     let lsp_store = project.read(cx).lsp_store();
     let analyzers = InspectionSettings::get_global(cx).analyzers();
     let generation = next_generation(&abs_path, cx);
     cx.spawn(async move |cx| {
         let results = cx
             .background_spawn(async move {
-                let (candidates, path_dirs) = zenith_php_tools::environment();
-                let (php, _) = zenith_php_tools::find_php(&candidates).await?;
+                let path_dirs = environment.path_dirs;
+                let Some((php, _)) = zenith_php_tools::find_php(&environment.php_candidates).await
+                else {
+                    return Err(abs_path);
+                };
                 let managed = std::env::var_os("HOME").map(|home| {
                     let kind = zenith_php_tools::detect_project(&root);
                     zenith_php_tools::managed_bin(
@@ -828,17 +1002,23 @@ pub fn inspect_path(
                         results.push((analyzer, result));
                     }
                 }
-                Some((abs_path, results))
+                Ok((abs_path, results))
             })
             .await;
-        let Some((abs_path, results)) = results else {
-            return;
+        let (abs_path, results) = match results {
+            Ok(found) => found,
+            Err(abs_path) => {
+                cx.update(|cx| finish_generation(&abs_path, generation, cx));
+                return vec!["PHP was not found.".to_string()];
+            }
         };
+        let mut errors = Vec::new();
         lsp_store.update(cx, |lsp_store, cx| {
             // A newer save of this file is running; its results win.
             if current_generation(&abs_path, cx) != generation {
                 return;
             }
+            finish_generation(&abs_path, generation, cx);
             for analyzer in [Analyzer::Phpcs, Analyzer::Phpstan] {
                 // An analyzer that did not run (switched off, no tool, no config)
                 // clears its old findings; a failed run keeps them.
@@ -847,21 +1027,14 @@ pub fn inspect_path(
                     Some((_, Ok(problems))) => problems.clone(),
                     Some((_, Err(error))) => {
                         log::warn!("{}: {error:#}", analyzer.name());
+                        errors.push(format!("{}: {error:#}", analyzer.name()));
                         continue;
                     }
                 };
-                lsp_store
-                    .update_diagnostic_entries(
-                        analyzer.server_id(),
-                        abs_path.clone(),
-                        None,
-                        None,
-                        diagnostic_entries(analyzer, &mine),
-                        cx,
-                    )
-                    .log_err();
+                push_diagnostics(lsp_store, analyzer, &abs_path, &mine, cx).log_err();
             }
         });
+        errors
     })
 }
 

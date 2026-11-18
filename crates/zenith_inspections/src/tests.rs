@@ -171,16 +171,14 @@ async fn test_each_analyzer_replaces_only_its_own_diagnostics(cx: &mut TestAppCo
     let push = |analyzer: Analyzer, problems: Vec<Problem>, cx: &mut TestAppContext| {
         project.update(cx, |project, cx| {
             project.lsp_store().update(cx, |lsp_store, cx| {
-                lsp_store
-                    .update_diagnostic_entries(
-                        analyzer.server_id(),
-                        PathBuf::from("/project/a.php"),
-                        None,
-                        None,
-                        diagnostic_entries(analyzer, &problems),
-                        cx,
-                    )
-                    .unwrap();
+                push_diagnostics(
+                    lsp_store,
+                    analyzer,
+                    &PathBuf::from("/project/a.php"),
+                    &problems,
+                    cx,
+                )
+                .unwrap();
             })
         });
     };
@@ -331,7 +329,10 @@ async fn test_run_limited_never_exceeds_the_limit(cx: &mut TestAppContext) {
 async fn test_saving_a_php_file_shows_phpcs_findings(cx: &mut TestAppContext) {
     assert_eq!(
         saved_php_diagnostics(cx, serde_json::json!({})).await,
-        [(text::Point::new(1, 0), "Missing doc comment".to_string())]
+        (
+            vec![(text::Point::new(1, 0), "Missing doc comment".to_string())],
+            true
+        )
     );
 }
 
@@ -340,19 +341,19 @@ async fn test_switched_off_analyzers_and_saving_show_nothing(cx: &mut TestAppCon
     // Switched off: its old findings are cleared.
     assert_eq!(
         saved_php_diagnostics(cx, serde_json::json!({ "phpcs": false })).await,
-        []
+        (Vec::new(), false)
     );
     // Not run at all: the old findings stay.
     assert_eq!(
         saved_php_diagnostics(cx, serde_json::json!({ "run_on_save": false })).await,
-        [(text::Point::new(0, 0), "stale".to_string())]
+        (vec![(text::Point::new(0, 0), "stale".to_string())], false)
     );
 }
 
 async fn saved_php_diagnostics(
     cx: &mut TestAppContext,
     inspections: serde_json::Value,
-) -> Vec<(text::Point, String)> {
+) -> (Vec<(text::Point, String)>, bool) {
     let root = tempfile::tempdir().unwrap();
     let root_path = root.path().to_str().unwrap().to_string();
     let bin = root.path().join("vendor/bin");
@@ -363,17 +364,21 @@ async fn saved_php_diagnostics(
             fs::canonicalize(root.path()).unwrap().to_str().unwrap(),
         );
     let phpcs = bin.join("phpcs");
-    fs::write(&phpcs, format!("#!/bin/sh\necho '{report}'\nexit 2\n")).unwrap();
+    // Leaves a marker, so a test can tell "not run" from "ran and found nothing".
+    let marker = root.path().join("phpcs-ran");
+    fs::write(
+        &phpcs,
+        format!(
+            "#!/bin/sh\n: > '{}'\necho '{report}'\nexit 2\n",
+            marker.display()
+        ),
+    )
+    .unwrap();
     fs::set_permissions(&phpcs, fs::Permissions::from_mode(0o755)).unwrap();
     let path_dir = tempfile::tempdir().unwrap();
     let stub_php = path_dir.path().join("php");
     fs::write(&stub_php, "#!/bin/sh\necho 'PHP 8.3.0 (cli)'\n").unwrap();
     fs::set_permissions(&stub_php, fs::Permissions::from_mode(0o755)).unwrap();
-    // The stub first, then the system directories other tests' shell scripts need.
-    // SAFETY: nothing else in this crate's tests reads PATH for its result.
-    let _restore = RestoreEnv("PATH", std::env::var_os("PATH"));
-    let path = format!("{}:/usr/bin:/bin", path_dir.path().display());
-    unsafe { std::env::set_var("PATH", path) };
     fs::write(root.path().join("a.php"), "<?php\nfunction foo() {}\n").unwrap();
 
     cx.update(|cx| {
@@ -385,6 +390,10 @@ async fn saved_php_diagnostics(
             )
             .unwrap();
         cx.set_global(settings);
+        cx.set_global(ToolEnvironment {
+            php_candidates: vec![stub_php.clone()],
+            path_dirs: Vec::new(),
+        });
     });
     let fake = project::FakeFs::new(cx.executor());
     fake.insert_tree(
@@ -410,20 +419,43 @@ async fn saved_php_diagnostics(
                 message: "stale".into(),
                 rule: None,
             };
-            lsp_store
-                .update_diagnostic_entries(
-                    Analyzer::Phpcs.server_id(),
-                    root.path().join("a.php"),
-                    None,
-                    None,
-                    diagnostic_entries(Analyzer::Phpcs, &[stale]),
-                    cx,
-                )
-                .unwrap();
+            push_diagnostics(
+                lsp_store,
+                Analyzer::Phpcs,
+                &root.path().join("a.php"),
+                &[stale],
+                cx,
+            )
+            .unwrap();
         })
     });
     cx.executor().allow_parking();
-    cx.update(|cx| on_buffer_event(&project, &buffer, &BufferEvent::Saved, cx));
+    cx.update(|cx| {
+        on_buffer_event(
+            &project,
+            &buffer,
+            &BufferEvent::Saved,
+            gpui::WeakEntity::new_invalid(),
+            cx,
+        )
+    });
+    let read = |cx: &mut TestAppContext| {
+        buffer.read_with(cx, |buffer, _| {
+            let snapshot = buffer.snapshot();
+            snapshot
+                .diagnostics_in_range::<_, text::Point>(0..snapshot.len(), false)
+                .map(|entry| (entry.range.start, entry.diagnostic.message.to_string()))
+                .collect::<Vec<_>>()
+        })
+    };
+    // Nothing in flight means nothing will change; no need to wait.
+    cx.run_until_parked();
+    if cx.update(|cx| {
+        cx.try_global::<Running>()
+            .is_none_or(|running| running.0.is_empty())
+    }) {
+        return (read(cx), marker.exists());
+    }
     let mut messages = Vec::new();
     for _ in 0..100 {
         cx.run_until_parked();
@@ -439,40 +471,7 @@ async fn saved_php_diagnostics(
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    messages
-}
-
-/// Puts an environment variable back when dropped, even if the test fails.
-struct RestoreEnv(&'static str, Option<std::ffi::OsString>);
-
-impl Drop for RestoreEnv {
-    fn drop(&mut self) {
-        // SAFETY: as where the tests set it.
-        unsafe {
-            match &self.1 {
-                Some(value) => std::env::set_var(self.0, value),
-                None => std::env::remove_var(self.0),
-            }
-        }
-    }
-}
-
-#[test]
-fn test_restore_env_puts_the_variable_back() {
-    let name = "ZENITH_INSPECTIONS_TEST_VARIABLE";
-    // SAFETY: a variable no other test touches.
-    unsafe { std::env::set_var(name, "before") };
-    {
-        let _restore = RestoreEnv(name, std::env::var_os(name));
-        unsafe { std::env::set_var(name, "during") };
-        assert_eq!(std::env::var(name).unwrap(), "during");
-    }
-    assert_eq!(std::env::var(name).unwrap(), "before");
-    {
-        let _restore = RestoreEnv(name, None);
-        unsafe { std::env::set_var(name, "during") };
-    }
-    assert!(std::env::var_os(name).is_none());
+    (messages, marker.exists())
 }
 
 fn settings_from(json: serde_json::Value) -> InspectionSettings {
