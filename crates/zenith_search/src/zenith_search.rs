@@ -97,7 +97,7 @@ pub fn init(cx: &mut App) {
             SearchEverywhere::open(workspace, Tab::Locations, window, cx)
         });
         workspace.register_action(|workspace, _: &RecentFiles, window, cx| {
-            SearchEverywhere::open(workspace, Tab::Files, window, cx)
+            SearchEverywhere::open(workspace, Tab::Recent, window, cx)
         });
     })
     .detach();
@@ -113,6 +113,8 @@ enum Tab {
     Actions,
     /// Recent Locations: opened by its own key, not part of the tab strip.
     Locations,
+    /// Recent Files (⌘E): PhpStorm's popup with tool windows beside the files.
+    Recent,
 }
 
 impl Tab {
@@ -134,6 +136,7 @@ impl Tab {
             Tab::Hooks => "Hooks",
             Tab::Actions => "Actions",
             Tab::Locations => "Recent Locations",
+            Tab::Recent => "Recent Files",
         }
     }
 
@@ -144,6 +147,7 @@ impl Tab {
             Tab::Symbols => "Search symbols…",
             Tab::Actions => "Search actions…",
             Tab::Locations => "Search recent locations…",
+            Tab::Recent => "Search recent files…",
             Tab::All | Tab::Hooks => "Classes, files, symbols, actions",
         }
     }
@@ -169,6 +173,33 @@ impl Tab {
 
 pub struct SearchEverywhere {
     picker: Entity<Picker<SearchDelegate>>,
+    /// Recent Files' left column: every panel, as PhpStorm lists tool windows.
+    tool_windows: Vec<ToolWindow>,
+}
+
+struct ToolWindow {
+    name: SharedString,
+    icon: IconName,
+    toggle: Box<dyn Action>,
+}
+
+fn tool_windows(workspace: &Workspace, window: &Window, cx: &App) -> Vec<ToolWindow> {
+    [workspace.left_dock(), workspace.bottom_dock(), workspace.right_dock()]
+        .into_iter()
+        .flat_map(|dock| dock.read(cx).zenith_panels().cloned().collect::<Vec<_>>())
+        .filter(|panel| panel.enabled(cx))
+        .filter_map(|panel| {
+            Some(ToolWindow {
+                name: panel
+                    .icon_tooltip(window, cx)?
+                    .trim_end_matches(" Panel")
+                    .to_string()
+                    .into(),
+                icon: panel.icon(window, cx)?,
+                toggle: panel.toggle_action(window, cx),
+            })
+        })
+        .collect()
 }
 
 impl ModalView for SearchEverywhere {}
@@ -205,8 +236,9 @@ impl SearchEverywhere {
             .map(|(project_path, _)| project_path)
             .collect();
         let recent_locations = recent_locations(workspace, cx);
+        let tool_windows = tool_windows(workspace, window, cx);
         workspace.toggle_modal(window, cx, move |window, cx| {
-            Self::new(
+            let mut this = Self::new(
                 tab,
                 workspace_handle,
                 project,
@@ -215,7 +247,9 @@ impl SearchEverywhere {
                 previous_focus_handle,
                 window,
                 cx,
-            )
+            );
+            this.tool_windows = tool_windows;
+            this
         });
     }
 
@@ -254,9 +288,13 @@ impl SearchEverywhere {
             latest_query: String::new(),
             file_target: None,
             cancel_flag: Arc::new(AtomicBool::new(false)),
+            edited_only: false,
         };
         let picker = cx.new(|cx| Picker::uniform_list(delegate, window, cx).embedded());
-        Self { picker }
+        Self {
+            picker,
+            tool_windows: Vec::new(),
+        }
     }
 
     fn switch_tab(&mut self, tab: Tab, window: &mut Window, cx: &mut Context<Self>) {
@@ -277,33 +315,110 @@ impl SearchEverywhere {
 impl Render for SearchEverywhere {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let current_tab = self.picker.read(cx).delegate.tab;
+        let border = cx.theme().colors().border_variant;
+        let header = match current_tab {
+            Tab::Recent | Tab::Locations => self.render_popup_header(current_tab, cx).into_any_element(),
+            _ => h_flex()
+                .p_1()
+                .gap_1()
+                .border_b_1()
+                .border_color(border)
+                .children(Tab::ORDER.into_iter().map(|tab| {
+                    Button::new(tab.label(), tab.label())
+                        .label_size(LabelSize::Small)
+                        .toggle_state(tab == current_tab)
+                        .selected_style(ButtonStyle::Tinted(TintColor::Accent))
+                        .disabled(!tab.is_ready())
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.switch_tab(tab, window, cx)
+                        }))
+                }))
+                .into_any_element(),
+        };
+        let body = if current_tab == Tab::Recent {
+            h_flex()
+                .items_start()
+                .child(self.render_tool_windows(cx))
+                .child(div().flex_1().min_w_0().child(self.picker.clone()))
+                .into_any_element()
+        } else {
+            self.picker.clone().into_any_element()
+        };
         v_flex()
             .key_context("SearchEverywhere")
             .on_action(cx.listener(|this, _: &NextTab, window, cx| this.cycle_tab(1, window, cx)))
             .on_action(
                 cx.listener(|this, _: &PreviousTab, window, cx| this.cycle_tab(-1, window, cx)),
             )
-            .w(rems(38.))
+            .w(if current_tab == Tab::Recent {
+                rems(48.)
+            } else {
+                rems(38.)
+            })
             .elevation_3(cx)
             .overflow_hidden()
+            .child(header)
+            .child(body)
+    }
+}
+
+impl SearchEverywhere {
+    /// PhpStorm's popup title row: "Recent Files  [ ] Show edited only".
+    fn render_popup_header(&self, tab: Tab, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let edited_only = self.picker.read(cx).delegate.edited_only;
+        h_flex()
+            .debug_selector(|| "zenith-popup-header".into())
+            .h_9()
+            .px_3()
+            .justify_between()
+            .border_b_1()
+            .border_color(cx.theme().colors().border_variant)
             .child(
-                h_flex()
-                    .p_1()
-                    .gap_1()
-                    .border_b_1()
-                    .border_color(cx.theme().colors().border_variant)
-                    .children(Tab::ORDER.into_iter().map(|tab| {
-                        Button::new(tab.label(), tab.label())
-                            .label_size(LabelSize::Small)
-                            .toggle_state(tab == current_tab)
-                            .selected_style(ButtonStyle::Tinted(TintColor::Accent))
-                            .disabled(!tab.is_ready())
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.switch_tab(tab, window, cx)
-                            }))
-                    })),
+                Label::new(tab.label())
+                    .size(LabelSize::Small)
+                    .weight(gpui::FontWeight::SEMIBOLD),
             )
-            .child(self.picker.clone())
+            .when(tab == Tab::Recent, |this| {
+                this.child(
+                    ui::Checkbox::new("zenith-edited-only", edited_only.into())
+                        .label("Show edited only")
+                        .label_size(LabelSize::Small)
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.picker.update(cx, |picker, cx| {
+                                picker.delegate.edited_only = !picker.delegate.edited_only;
+                                picker.refresh(window, cx);
+                            });
+                            cx.notify();
+                        })),
+                )
+            })
+    }
+
+    /// PhpStorm lists the tool windows beside the recent files.
+    fn render_tool_windows(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        v_flex()
+            .debug_selector(|| "zenith-tool-windows".into())
+            .w(rems(12.))
+            .flex_none()
+            .py_1()
+            .border_r_1()
+            .border_color(cx.theme().colors().border_variant)
+            .children(self.tool_windows.iter().enumerate().map(|(ix, tool_window)| {
+                let toggle = tool_window.toggle.boxed_clone();
+                ListItem::new(("zenith-tool-window", ix))
+                    .inset(true)
+                    .spacing(ListItemSpacing::Sparse)
+                    .start_slot(
+                        Icon::new(tool_window.icon)
+                            .size(IconSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .child(Label::new(tool_window.name.clone()).size(LabelSize::Small))
+                    .on_click(cx.listener(move |_, _, window, cx| {
+                        cx.emit(DismissEvent);
+                        window.dispatch_action(toggle.boxed_clone(), cx);
+                    }))
+            }))
     }
 }
 
@@ -398,6 +513,8 @@ pub struct SearchDelegate {
     /// Where to land from a `file:row:column` or `file:start-end` query.
     file_target: Option<FileTarget>,
     cancel_flag: Arc<AtomicBool>,
+    /// Recent Files' "Show edited only".
+    edited_only: bool,
 }
 
 impl SearchDelegate {
@@ -563,6 +680,72 @@ impl SearchDelegate {
             .into_iter()
             .map(|string_match| SearchMatch::Location {
                 ix: string_match.candidate_id,
+                label: string_match.string,
+                positions: string_match.positions,
+            })
+            .collect()
+        })
+    }
+
+    /// Recent Files: the recently opened files, fuzzy-filtered by the query; with
+    /// "Show edited only", just those changed this session.
+    fn search_recent(&self, query: String, cx: &mut Context<Picker<Self>>) -> Task<Vec<SearchMatch>> {
+        let project = self.project.read(cx);
+        let path_style = project.path_style(cx);
+        let include_root_name = project.visible_worktrees(cx).count() > 1;
+        let recent = self
+            .recent_files
+            .iter()
+            .filter(|project_path| {
+                !self.edited_only
+                    || project.get_open_buffer(project_path, cx).is_some_and(|buffer| {
+                        let buffer = buffer.read(cx);
+                        buffer.is_dirty() || buffer.peek_undo_stack().is_some()
+                    })
+            })
+            .filter_map(|project_path| {
+                let worktree = project.worktree_for_id(project_path.worktree_id, cx)?;
+                let worktree = worktree.read(cx);
+                let prefix: &RelPath = if include_root_name || worktree.is_single_file() {
+                    worktree.root_name()
+                } else {
+                    RelPath::empty()
+                };
+                Some((
+                    project_path.clone(),
+                    SharedString::from(file_label(prefix, &project_path.path, path_style)),
+                ))
+            })
+            .collect::<Vec<_>>();
+        if query.is_empty() {
+            return Task::ready(
+                recent
+                    .into_iter()
+                    .map(|(project_path, label)| SearchMatch::File {
+                        project_path,
+                        label,
+                        positions: Vec::new(),
+                    })
+                    .collect(),
+            );
+        }
+        let candidates = recent
+            .iter()
+            .enumerate()
+            .map(|(ix, (_, label))| StringMatchCandidate::new(ix, label))
+            .collect::<Vec<_>>();
+        let executor = cx.background_executor().clone();
+        cx.background_spawn(async move {
+            fuzzy_nucleo::match_strings_async(
+                &candidates,
+                &query,
+                StringMatchOptions::default(),
+                executor,
+            )
+            .await
+            .into_iter()
+            .map(|string_match| SearchMatch::File {
+                project_path: recent[string_match.candidate_id].0.clone(),
                 label: string_match.string,
                 positions: string_match.positions,
             })
@@ -888,6 +1071,17 @@ impl PickerDelegate for SearchDelegate {
         if tab == Tab::Hooks {
             self.set_matches(Vec::new(), Vec::new(), true, cx);
             return Task::ready(());
+        }
+        if tab == Tab::Recent {
+            let recent = self.search_recent(query, cx);
+            return cx.spawn_in(window, async move |picker, cx| {
+                let matches = recent.await;
+                picker
+                    .update(cx, |picker, cx| {
+                        picker.delegate.set_matches(Vec::new(), matches, true, cx)
+                    })
+                    .log_err();
+            });
         }
         if tab == Tab::Locations {
             let locations = self.search_locations(query, cx);
@@ -1416,6 +1610,86 @@ mod tests {
                 .collect::<Vec<_>>();
             assert_eq!(labels, [path!("src/main.rs")]);
         });
+    }
+
+    #[gpui::test]
+    async fn test_recent_files_popup(cx: &mut TestAppContext) {
+        let app_state = init_test(cx);
+        app_state
+            .fs
+            .as_fake()
+            .insert_tree(
+                path!("/root"),
+                json!({ "src": { "main.rs": "", "lib.rs": "" }, "README.md": "" }),
+            )
+            .await;
+        let project = Project::test(app_state.fs.clone(), [path!("/root").as_ref()], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        cx.run_until_parked();
+        let worktree_id = workspace.read_with(cx, |workspace, cx| {
+            workspace.project().read(cx).worktrees(cx).next().unwrap().read(cx).id()
+        });
+        for file in ["src/main.rs", "src/lib.rs"] {
+            workspace
+                .update_in(cx, |workspace, window, cx| {
+                    let path = ProjectPath {
+                        worktree_id,
+                        path: RelPath::from_unix_str(file).unwrap().into(),
+                    };
+                    workspace.open_path(path, None, true, window, cx)
+                })
+                .await
+                .unwrap();
+        }
+        // Edit lib.rs, the active file.
+        let editor = workspace.read_with(cx, |workspace, cx| {
+            workspace.active_item_as::<Editor>(cx).unwrap()
+        });
+        editor.update_in(cx, |editor, window, cx| editor.insert("x", window, cx));
+        cx.run_until_parked();
+
+        let file_labels = |picker: &Entity<Picker<SearchDelegate>>, cx: &mut VisualTestContext| {
+            picker.read_with(cx, |picker, _| {
+                picker
+                    .delegate
+                    .matches
+                    .iter()
+                    .filter_map(|search_match| match search_match {
+                        SearchMatch::File { label, .. } => Some(label.to_string()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            })
+        };
+
+        open_on(Tab::Recent, &workspace, cx);
+        let picker = open_picker(&workspace, cx);
+        assert!(cx.debug_bounds("zenith-popup-header").is_some(), "title row");
+        assert!(cx.debug_bounds("zenith-tool-windows").is_some(), "tool windows column");
+        // Only what was opened, newest first; README was never opened.
+        assert_eq!(
+            file_labels(&picker, cx),
+            [path!("src/lib.rs"), path!("src/main.rs")]
+        );
+
+        cx.simulate_input("main");
+        cx.run_until_parked();
+        assert_eq!(file_labels(&picker, cx), [path!("src/main.rs")]);
+        // Typing filters the recent files only, never the whole project.
+        picker.update_in(cx, |picker, window, cx| picker.set_query("readme", window, cx));
+        cx.run_until_parked();
+        assert!(file_labels(&picker, cx).is_empty());
+
+        // "Show edited only".
+        picker.update_in(cx, |picker, window, cx| {
+            picker.set_query("", window, cx);
+            picker.delegate.edited_only = true;
+            picker.refresh(window, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(file_labels(&picker, cx), [path!("src/lib.rs")]);
     }
 
     #[gpui::test]

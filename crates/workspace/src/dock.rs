@@ -1791,6 +1791,11 @@ pub mod test {
 
 // Zenith: PhpStorm-style tool window header ("Project  ×") on panels that draw none.
 impl Dock {
+    /// Every panel in this dock, for Zenith's Recent Files tool window list.
+    pub fn zenith_panels(&self) -> impl Iterator<Item = &Arc<dyn PanelHandle>> {
+        self.panel_entries.iter().map(|entry| &entry.panel)
+    }
+
     fn zenith_panel_body(
         &self,
         panel: &Arc<dyn PanelHandle>,
