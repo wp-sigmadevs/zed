@@ -22900,6 +22900,8 @@ dependencies = [
  "settings",
  "tempfile",
  "text",
+ "theme",
+ "theme_settings",
  "util",
  "workspace",
  "zed_actions",

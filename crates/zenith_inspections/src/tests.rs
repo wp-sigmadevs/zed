@@ -873,3 +873,109 @@ async fn test_project_php_files_cover_every_folder(cx: &mut TestAppContext) {
     );
     assert_eq!(untrusted, 0);
 }
+
+/// Opens `a.php` in a workspace with a fake project PHPCS, dispatches `action`
+/// and waits for findings. `run_on_save` is off, so only the action can run it.
+async fn dispatched_inspection(
+    cx: &mut TestAppContext,
+    action: Box<dyn gpui::Action>,
+) -> (Vec<(text::Point, String)>, bool) {
+    let root = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(root.keep()).unwrap();
+    let root_path = root.to_str().unwrap().to_string();
+    let bin = root.join("vendor/bin");
+    fs::create_dir_all(&bin).unwrap();
+    let report = r#"{"totals":{"errors":1,"warnings":0,"fixable":0},"files":{"ROOT/a.php":{"errors":1,"warnings":0,"messages":[{"message":"Missing doc comment","source":"Squiz.Commenting.FunctionComment.Missing","severity":5,"fixable":false,"type":"ERROR","line":2,"column":1}]}}}"#
+        .replace("ROOT", &root_path);
+    let marker = root.join("phpcs-ran");
+    fs::write(
+        bin.join("phpcs"),
+        format!("#!/bin/sh\n: > '{}'\necho '{report}'\nexit 2\n", marker.display()),
+    )
+    .unwrap();
+    fs::set_permissions(bin.join("phpcs"), fs::Permissions::from_mode(0o755)).unwrap();
+    let stub_php = root.join("php-stub");
+    fs::write(&stub_php, "#!/bin/sh\necho 'PHP 8.3.0 (cli)'\n").unwrap();
+    fs::set_permissions(&stub_php, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::write(root.join("a.php"), "<?php\nfunction foo() {}\n").unwrap();
+
+    use gpui::BorrowAppContext as _;
+    let app_state = cx.update(|cx| {
+        let app_state = workspace::AppState::test(cx);
+        theme_settings::init(theme::LoadThemes::JustBase, cx);
+        editor::init(cx);
+        workspace::init(app_state.clone(), cx);
+        init(cx);
+        cx.update_global::<settings::SettingsStore, _>(|store, cx| {
+            store
+                .set_user_settings(
+                    &serde_json::json!({ "zenith": { "inspections": { "run_on_save": false, "phpstan": false } } })
+                        .to_string(),
+                    cx,
+                )
+                .unwrap();
+        });
+        cx.set_global(ToolEnvironment {
+            php_candidates: vec![stub_php.clone()],
+            path_dirs: Vec::new(),
+        });
+        app_state
+    });
+    app_state
+        .fs
+        .as_fake()
+        .insert_tree(&root_path, serde_json::json!({ "a.php": "<?php\nfunction foo() {}\n" }))
+        .await;
+    let project = Project::test(app_state.fs.clone(), [Path::new(&root_path)], cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| workspace::MultiWorkspace::test_new(project.clone(), window, cx));
+    let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+    let item = workspace
+        .update_in(cx, |workspace, window, cx| {
+            workspace.open_abs_path(root.join("a.php"), workspace::OpenOptions::default(), window, cx)
+        })
+        .await
+        .unwrap();
+    let editor = item.downcast::<editor::Editor>().unwrap();
+    cx.run_until_parked();
+
+    cx.executor().allow_parking();
+    cx.update(|window, cx| window.dispatch_action(action, cx));
+    let read = |cx: &mut gpui::VisualTestContext| {
+        editor.read_with(cx, |editor, cx| {
+            let buffer = editor.buffer().read(cx).as_singleton().unwrap();
+            let snapshot = buffer.read(cx).snapshot();
+            snapshot
+                .diagnostics_in_range::<_, text::Point>(0..snapshot.len(), false)
+                .map(|entry| (entry.range.start, entry.diagnostic.message.to_string()))
+                .collect::<Vec<_>>()
+        })
+    };
+    // Real processes run; wait for the finding (or give up after ~5 s).
+    for _ in 0..250 {
+        cx.run_until_parked();
+        if !read(cx).is_empty() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let result = (read(cx), marker.exists());
+    fs::remove_dir_all(&root).ok();
+    result
+}
+
+#[gpui::test]
+async fn test_inspect_current_file_action(cx: &mut TestAppContext) {
+    assert_eq!(
+        dispatched_inspection(cx, Box::new(InspectCurrentFile)).await,
+        (vec![(text::Point::new(1, 0), "Missing doc comment".to_string())], true)
+    );
+}
+
+#[gpui::test]
+async fn test_inspect_project_action(cx: &mut TestAppContext) {
+    assert_eq!(
+        dispatched_inspection(cx, Box::new(InspectProject)).await,
+        (vec![(text::Point::new(1, 0), "Missing doc comment".to_string())], true)
+    );
+}
