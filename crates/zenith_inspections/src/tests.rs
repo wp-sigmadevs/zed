@@ -258,6 +258,21 @@ fn test_phpcs_tab_columns_become_character_columns() {
         message: String::new(),
         rule: None,
     }];
-    fix_tab_columns(&mut problems, "<?php\n\t\t$x = 1;\n");
+    fix_tab_columns(&mut problems, "<?php\n\t\t$x = 1;\n", 4);
     assert_eq!(problems[0].column, 3);
+}
+
+#[test]
+fn test_tab_width_comes_from_the_project_ruleset() {
+    let root = tempfile::tempdir().unwrap();
+    assert_eq!(ruleset_tab_width(root.path()), 4);
+    fs::write(
+        root.path().join("phpcs.xml"),
+        r#"<ruleset><arg name="tab-width" value="2"/><rule ref="PSR12"/></ruleset>"#,
+    )
+    .unwrap();
+    assert_eq!(ruleset_tab_width(root.path()), 2);
+    assert_eq!(tab_width_in(r#"<arg name="tab-width" value="0"/>"#), None);
+    assert_eq!(tab_width_in("<ruleset/>"), None);
+    assert_eq!(char_column("\t$x", 3, 2), 2);
 }

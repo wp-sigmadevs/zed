@@ -246,11 +246,30 @@ pub fn char_column(line: &str, column: u32, tab_width: u32) -> u32 {
     chars
 }
 
-fn fix_tab_columns(problems: &mut [Problem], text: &str) {
+/// The project ruleset's `<arg name="tab-width" value="N"/>`, else PHPCS's default.
+pub fn ruleset_tab_width(root: &Path) -> u32 {
+    PHPCS_CONFIGS
+        .iter()
+        .filter_map(|name| std::fs::read_to_string(root.join(name)).ok())
+        .find_map(|xml| tab_width_in(&xml))
+        .unwrap_or(PHPCS_TAB_WIDTH)
+}
+
+fn tab_width_in(xml: &str) -> Option<u32> {
+    let after = &xml[xml.find("name=\"tab-width\"")?..];
+    let tag = &after[..after.find('>')?];
+    let value = &tag[tag.find("value=\"")? + 7..];
+    value[..value.find('"')?]
+        .parse()
+        .ok()
+        .filter(|width| *width > 0)
+}
+
+fn fix_tab_columns(problems: &mut [Problem], text: &str, tab_width: u32) {
     let lines: Vec<&str> = text.lines().collect();
     for problem in problems {
         if let Some(line) = lines.get(problem.line.saturating_sub(1) as usize) {
-            problem.column = char_column(line, problem.column, PHPCS_TAB_WIDTH);
+            problem.column = char_column(line, problem.column, tab_width);
         }
     }
 }
@@ -343,7 +362,7 @@ pub async fn run(
         if analyzer == Analyzer::Phpcs
             && let Ok(text) = std::fs::read_to_string(file)
         {
-            fix_tab_columns(&mut problems, &text);
+            fix_tab_columns(&mut problems, &text, ruleset_tab_width(root));
         }
         Ok(problems)
     }))
