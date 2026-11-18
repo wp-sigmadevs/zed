@@ -1821,16 +1821,77 @@ impl Dock {
                             .weight(gpui::FontWeight::SEMIBOLD),
                     )
                     .child(
-                        IconButton::new("zenith-panel-hide", IconName::Close)
-                            .icon_size(IconSize::Small)
-                            .tooltip(Tooltip::text("Hide"))
-                            .on_click(cx.listener(|dock, _, window, cx| {
-                                dock.set_open(false, window, cx)
-                            })),
+                        h_flex()
+                            .gap_0p5()
+                            .child(zenith_panel_menu(panel.clone(), cx.entity().downgrade()))
+                            .child(
+                                IconButton::new("zenith-panel-hide", IconName::Close)
+                                    .icon_size(IconSize::Small)
+                                    .tooltip(Tooltip::text("Hide"))
+                                    .on_click(cx.listener(|dock, _, window, cx| {
+                                        dock.set_open(false, window, cx)
+                                    })),
+                            ),
                     ),
             )
             .child(div().flex_1().min_h_0().child(body))
             .into_any_element()
+    }
+}
+
+/// The header's "···" menu: the panel's own collapse action, where to dock it, hide.
+fn zenith_panel_menu(panel: Arc<dyn PanelHandle>, dock: WeakEntity<Dock>) -> impl IntoElement {
+    ui::PopoverMenu::new("zenith-panel-menu")
+        .trigger(
+            IconButton::new("zenith-panel-menu-button", IconName::Ellipsis)
+                .icon_size(IconSize::Small),
+        )
+        .menu(move |window, cx| {
+            let panel = panel.clone();
+            let dock = dock.clone();
+            Some(ContextMenu::build(window, cx, move |mut menu, window, cx| {
+                for &(label, action) in zenith_panel_menu_actions(panel.persistent_name()) {
+                    let Ok(action) = cx.build_action(action, None) else {
+                        continue;
+                    };
+                    let focus = panel.panel_focus_handle(cx);
+                    menu = menu.entry(label, None, move |window, cx| {
+                        window.focus(&focus, cx);
+                        window.dispatch_action(action.boxed_clone(), cx);
+                    });
+                }
+                menu = menu.separator();
+                let current = panel.position(window, cx);
+                for position in [DockPosition::Left, DockPosition::Right, DockPosition::Bottom] {
+                    if !panel.position_is_valid(position, cx) {
+                        continue;
+                    }
+                    let panel = panel.clone();
+                    menu = menu.toggleable_entry(
+                        format!("Dock {}", position.label()),
+                        position == current,
+                        IconPosition::Start,
+                        None,
+                        move |window, cx| panel.set_position(position, window, cx),
+                    );
+                }
+                menu.separator().entry("Hide", None, move |window, cx| {
+                    dock.update(cx, |dock, cx| dock.set_open(false, window, cx))
+                        .ok();
+                })
+            }))
+        })
+}
+
+/// Panel actions for the "···" menu, by action name so this crate needs no panel dependency.
+pub fn zenith_panel_menu_actions(persistent_name: &str) -> &'static [(&'static str, &'static str)] {
+    match persistent_name {
+        "Project Panel" => &[("Collapse All", "project_panel::CollapseAllEntries")],
+        "Outline Panel" => &[
+            ("Expand All", "outline_panel::ExpandAllEntries"),
+            ("Collapse All", "outline_panel::CollapseAllEntries"),
+        ],
+        _ => &[],
     }
 }
 
@@ -1850,5 +1911,15 @@ mod zenith_tests {
         assert_eq!(super::zenith_panel_title("Project Panel"), Some("Project"));
         assert_eq!(super::zenith_panel_title("Outline Panel"), Some("Structure"));
         assert_eq!(super::zenith_panel_title("Git Panel"), None);
+    }
+
+    #[test]
+    fn test_panel_menu_action_names_are_namespaced() {
+        for name in ["Project Panel", "Outline Panel"] {
+            for (_, action) in super::zenith_panel_menu_actions(name) {
+                assert!(action.contains("::"), "{action}");
+            }
+        }
+        assert!(super::zenith_panel_menu_actions("Git Panel").is_empty());
     }
 }

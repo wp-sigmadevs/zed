@@ -32,7 +32,7 @@ impl IndentIndicator {
 
 impl Render for IndentIndicator {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        div().when_some(self.label(cx), |this, label| {
+        div().debug_selector(|| "zenith-indent".into()).when_some(self.label(cx), |this, label| {
             this.child(Label::new(label).size(LabelSize::Small).color(Color::Muted))
         })
     }

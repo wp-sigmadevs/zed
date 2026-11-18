@@ -81,3 +81,54 @@ fn test_indent_label() {
     assert_eq!(indent_label(2, false), "2 spaces");
     assert_eq!(indent_label(4, true), "Tab");
 }
+
+#[gpui::test]
+fn test_indent_item_follows_the_active_editor(cx: &mut gpui::TestAppContext) {
+    use gpui::{AppContext as _, BorrowAppContext as _};
+    use workspace::StatusItemView as _;
+    cx.update(|cx| {
+        let store = settings::SettingsStore::test(cx);
+        cx.set_global(store);
+        assets::Assets.load_test_fonts(cx);
+        theme_settings::init(theme::LoadThemes::JustBase, cx);
+        editor::init(cx);
+    });
+    // The pane owns the editor in the app; this root view owns it here.
+    let (root, cx) = cx.add_window_view(|window, cx| {
+        let editor = cx.new(|cx| editor::Editor::multi_line(window, cx));
+        let indicator = cx.new(|cx| {
+            let mut indicator = IndentIndicator::default();
+            indicator.set_active_pane_item(Some(&editor), window, cx);
+            indicator
+        });
+        Root { editor, indicator }
+    });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("zenith-indent").is_some(), "drawn");
+    let indicator = root.read_with(cx, |root, _| root.indicator.clone());
+    assert_eq!(indicator.read_with(cx, |item, cx| item.label(cx)).as_deref(), Some("4 spaces"));
+
+    cx.update(|_, cx| {
+        cx.update_global::<settings::SettingsStore, _>(|store, cx| {
+            store.update_user_settings(cx, |settings| {
+                settings.project.all_languages.defaults.hard_tabs = Some(true);
+            });
+        });
+    });
+    assert_eq!(indicator.read_with(cx, |item, cx| item.label(cx)).as_deref(), Some("Tab"));
+}
+
+struct Root {
+    editor: gpui::Entity<editor::Editor>,
+    indicator: gpui::Entity<IndentIndicator>,
+}
+
+impl gpui::Render for Root {
+    fn render(&mut self, _: &mut gpui::Window, _: &mut gpui::Context<Self>) -> impl gpui::IntoElement {
+        use gpui::{ParentElement as _, Styled as _};
+        gpui::div()
+            .size_full()
+            .child(self.editor.clone())
+            .child(self.indicator.clone())
+    }
+}

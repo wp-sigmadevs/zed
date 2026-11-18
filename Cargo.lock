@@ -22916,6 +22916,7 @@ dependencies = [
  "gpui",
  "paths",
  "serde_json",
+ "settings",
  "tempfile",
  "theme",
  "theme_settings",

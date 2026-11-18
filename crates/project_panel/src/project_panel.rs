@@ -6824,11 +6824,13 @@ impl ProjectPanel {
                                             .into_any_element(),
                                     )
                                     .children(zenith_root_path.map(|path| {
-                                        Label::new(path)
-                                            .single_line()
-                                            .size(LabelSize::Small)
-                                            .color(Color::Muted)
-                                            .ml_2()
+                                        div().debug_selector(|| "zenith-root-path".into()).child(
+                                            Label::new(path)
+                                                .single_line()
+                                                .size(LabelSize::Small)
+                                                .color(Color::Muted)
+                                                .ml_2(),
+                                        )
                                     })),
                             })
                     })
@@ -8481,7 +8483,55 @@ fn zenith_tilde_path(path: &Path, home: &Path) -> String {
 
 #[cfg(test)]
 mod zenith_tests {
+    use super::*;
+    use gpui::{TestAppContext, VisualTestContext};
+    use project::FakeFs;
+    use serde_json::json;
     use std::path::Path;
+    use workspace::MultiWorkspace;
+
+    async fn open_panel(cx: &mut TestAppContext, zenith_chrome: bool) -> VisualTestContext {
+        crate::project_panel_tests::init_test(cx);
+        if zenith_chrome {
+            cx.update(|cx| {
+                cx.set_global(workspace::IslandsActive);
+                cx.set_global(workspace::dock::RailsActive);
+            });
+        }
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/sites/gallery", json!({ "a.php": "" })).await;
+        let project = Project::test(fs, ["/sites/gallery".as_ref()], cx).await;
+        let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        let workspace = window.read_with(cx, |mw, _| mw.workspace().clone()).unwrap();
+        let cx = &mut VisualTestContext::from_window(window.into(), cx);
+        let panel = workspace.update_in(cx, ProjectPanel::new);
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.add_panel(panel, window, cx);
+            workspace.open_panel::<ProjectPanel>(window, cx);
+        });
+        cx.run_until_parked();
+        cx.clone()
+    }
+
+    #[gpui::test]
+    async fn test_zenith_panel_chrome(cx: &mut TestAppContext) {
+        let cx = &mut open_panel(cx, true).await;
+        assert!(cx.debug_bounds("zenith-panel-header").is_some(), "header");
+        assert!(cx.debug_bounds("zenith-root-path").is_some(), "root location");
+        // The header menu builds these by name; they must exist.
+        cx.update(|_, cx| {
+            for &(_, action) in workspace::dock::zenith_panel_menu_actions("Project Panel") {
+                cx.build_action(action, None).expect(action);
+            }
+        });
+    }
+
+    #[gpui::test]
+    async fn test_no_zenith_panel_chrome_without_rails(cx: &mut TestAppContext) {
+        let cx = &mut open_panel(cx, false).await;
+        assert!(cx.debug_bounds("zenith-panel-header").is_none());
+        assert!(cx.debug_bounds("zenith-root-path").is_none());
+    }
 
     #[test]
     fn test_tilde_path() {
