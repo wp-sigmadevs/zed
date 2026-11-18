@@ -337,12 +337,16 @@ async fn test_saving_a_php_file_shows_phpcs_findings(cx: &mut TestAppContext) {
 
 #[gpui::test]
 async fn test_switched_off_analyzers_and_saving_show_nothing(cx: &mut TestAppContext) {
-    for off in [
-        serde_json::json!({ "phpcs": false }),
-        serde_json::json!({ "run_on_save": false }),
-    ] {
-        assert_eq!(saved_php_diagnostics(cx, off).await, []);
-    }
+    // Switched off: its old findings are cleared.
+    assert_eq!(
+        saved_php_diagnostics(cx, serde_json::json!({ "phpcs": false })).await,
+        []
+    );
+    // Not run at all: the old findings stay.
+    assert_eq!(
+        saved_php_diagnostics(cx, serde_json::json!({ "run_on_save": false })).await,
+        [(text::Point::new(0, 0), "stale".to_string())]
+    );
 }
 
 async fn saved_php_diagnostics(
@@ -354,7 +358,10 @@ async fn saved_php_diagnostics(
     let bin = root.path().join("vendor/bin");
     fs::create_dir_all(&bin).unwrap();
     let report = r#"{"totals":{"errors":1,"warnings":0,"fixable":0},"files":{"ROOT/a.php":{"errors":1,"warnings":0,"messages":[{"message":"Missing doc comment","source":"Squiz.Commenting.FunctionComment.Missing","severity":5,"fixable":false,"type":"ERROR","line":2,"column":1}]}}}"#
-        .replace("ROOT", &root_path);
+        .replace(
+            "ROOT",
+            fs::canonicalize(root.path()).unwrap().to_str().unwrap(),
+        );
     let phpcs = bin.join("phpcs");
     fs::write(&phpcs, format!("#!/bin/sh\necho '{report}'\nexit 2\n")).unwrap();
     fs::set_permissions(&phpcs, fs::Permissions::from_mode(0o755)).unwrap();
@@ -392,6 +399,29 @@ async fn saved_php_diagnostics(
         })
         .await
         .unwrap();
+    // A finding from an earlier run, which this run must replace or clear.
+    project.update(cx, |project, cx| {
+        project.lsp_store().update(cx, |lsp_store, cx| {
+            let stale = Problem {
+                path: root.path().join("a.php"),
+                line: 1,
+                column: 1,
+                severity: Severity::Error,
+                message: "stale".into(),
+                rule: None,
+            };
+            lsp_store
+                .update_diagnostic_entries(
+                    Analyzer::Phpcs.server_id(),
+                    root.path().join("a.php"),
+                    None,
+                    None,
+                    diagnostic_entries(Analyzer::Phpcs, &[stale]),
+                    cx,
+                )
+                .unwrap();
+        })
+    });
     cx.executor().allow_parking();
     cx.update(|cx| on_buffer_event(&project, &buffer, &BufferEvent::Saved, cx));
     let mut messages = Vec::new();
@@ -404,7 +434,7 @@ async fn saved_php_diagnostics(
                 .map(|entry| (entry.range.start, entry.diagnostic.message.to_string()))
                 .collect::<Vec<_>>()
         });
-        if !messages.is_empty() {
+        if messages.iter().all(|(_, message)| message != "stale") {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(20));

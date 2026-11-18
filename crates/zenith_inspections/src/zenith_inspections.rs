@@ -158,6 +158,7 @@ pub async fn run_fix(
     let output = util::command::new_command(&program)
         .args(args)
         .current_dir(root)
+        .kill_on_drop(true)
         .output()
         .await
         .context("running phpcbf");
@@ -400,6 +401,7 @@ pub async fn run(
     let result = util::command::new_command(&program)
         .args(full_args)
         .current_dir(root)
+        .kill_on_drop(true)
         .output()
         .await
         .with_context(|| format!("running {}", analyzer.name()));
@@ -504,9 +506,23 @@ fn inspect_changed_files(
     cx: &mut gpui::Context<Workspace>,
 ) {
     let project = workspace.project().clone();
+    if !project.read(cx).is_local() {
+        return notify(
+            workspace,
+            "PHP tools run on local projects only.".into(),
+            cx,
+        );
+    }
     let Some(worktree) = project.read(cx).visible_worktrees(cx).next() else {
         return;
     };
+    if !zenith_php_tools::worktree_trusted(&project, worktree.read(cx).id(), cx) {
+        return notify(
+            workspace,
+            "Trust this project to run its PHP tools.".into(),
+            cx,
+        );
+    }
     let worktree_id = worktree.read(cx).id();
     let root = worktree.read(cx).abs_path().to_path_buf();
     let max_parallel = InspectionSettings::get_global(cx).max_parallel;
@@ -586,6 +602,13 @@ fn fix_current_file(
     cx: &mut gpui::Context<Workspace>,
 ) {
     let project = workspace.project().clone();
+    if !project.read(cx).is_local() {
+        return notify(
+            workspace,
+            "PHP tools run on local projects only.".into(),
+            cx,
+        );
+    }
     let Some(item) = workspace.active_item(cx) else {
         return;
     };
@@ -735,15 +758,17 @@ pub fn inspect(project: &Entity<Project>, buffer: &Entity<Buffer>, cx: &mut App)
     let Some(worktree) = project.read(cx).worktree_for_id(worktree_id, cx) else {
         return;
     };
-    let root = worktree.read(cx).abs_path().to_path_buf();
-    inspect_path(
-        project,
-        worktree_id,
-        root.join(file.path().as_std_path()),
-        cx,
-    )
-    .detach();
+    let abs_path = worktree.read(cx).abs_path().join(file.path().as_std_path());
+    let task = inspect_path(project, worktree_id, abs_path.clone(), cx);
+    // Replacing the previous run drops it, which kills its tool processes.
+    cx.default_global::<Running>().0.insert(abs_path, task);
 }
+
+/// The latest on-save run per file.
+#[derive(Default)]
+struct Running(std::collections::HashMap<PathBuf, gpui::Task<()>>);
+
+impl gpui::Global for Running {}
 
 /// Runs the analyzers on one file under a worktree root, open or not.
 pub fn inspect_path(
@@ -755,7 +780,9 @@ pub fn inspect_path(
     let Some(worktree) = project.read(cx).worktree_for_id(worktree_id, cx) else {
         return gpui::Task::ready(());
     };
-    if !zenith_php_tools::worktree_trusted(project, worktree_id, cx) {
+    // Remote paths are not local files, and local tools must not run on them.
+    if !project.read(cx).is_local() || !zenith_php_tools::worktree_trusted(project, worktree_id, cx)
+    {
         return gpui::Task::ready(());
     }
     let root = worktree.read(cx).abs_path().to_path_buf();
@@ -786,6 +813,18 @@ pub fn inspect_path(
                     )
                     .await
                     {
+                        // Tools report real paths; a symlinked root (macOS /var) differs.
+                        let real = std::fs::canonicalize(&abs_path).ok();
+                        let result = result.map(|problems| {
+                            problems
+                                .into_iter()
+                                .filter(|problem| {
+                                    problem.path == abs_path
+                                        || real.is_some()
+                                            && std::fs::canonicalize(&problem.path).ok() == real
+                                })
+                                .collect::<Vec<_>>()
+                        });
                         results.push((analyzer, result));
                     }
                 }
@@ -800,18 +839,17 @@ pub fn inspect_path(
             if current_generation(&abs_path, cx) != generation {
                 return;
             }
-            for (analyzer, result) in results {
-                let problems = match result {
-                    Ok(problems) => problems,
-                    Err(error) => {
+            for analyzer in [Analyzer::Phpcs, Analyzer::Phpstan] {
+                // An analyzer that did not run (switched off, no tool, no config)
+                // clears its old findings; a failed run keeps them.
+                let mine = match results.iter().find(|(ran, _)| *ran == analyzer) {
+                    None => Vec::new(),
+                    Some((_, Ok(problems))) => problems.clone(),
+                    Some((_, Err(error))) => {
                         log::warn!("{}: {error:#}", analyzer.name());
                         continue;
                     }
                 };
-                let mine: Vec<Problem> = problems
-                    .into_iter()
-                    .filter(|problem| problem.path == abs_path)
-                    .collect();
                 lsp_store
                     .update_diagnostic_entries(
                         analyzer.server_id(),
