@@ -451,6 +451,8 @@ struct Location {
     project_path: ProjectPath,
     row: u32,
     label: SharedString,
+    /// The code on that line, shown under it as PhpStorm does (open files only).
+    snippet: Option<SharedString>,
 }
 
 /// Every place the panes' navigation histories recorded, newest first, one per
@@ -491,10 +493,27 @@ fn recent_locations(workspace: &Workspace, cx: &App) -> Vec<Location> {
                 row + 1
             )
             .into(),
+            snippet: workspace
+                .project()
+                .read(cx)
+                .get_open_buffer(&project_path, cx)
+                .and_then(|buffer| line_snippet(&buffer.read(cx).snapshot(), row)),
             project_path,
             row,
         })
         .collect()
+}
+
+/// Line `row` without its indent, or `None` when it is blank or past the end.
+fn line_snippet(snapshot: &text::BufferSnapshot, row: u32) -> Option<SharedString> {
+    if row > snapshot.max_point().row {
+        return None;
+    }
+    let line = snapshot
+        .text_for_range(Point::new(row, 0)..Point::new(row, snapshot.line_len(row)))
+        .collect::<String>();
+    let line = line.trim();
+    (!line.is_empty()).then(|| line.to_string().into())
 }
 
 pub struct SearchDelegate {
@@ -1349,24 +1368,46 @@ impl PickerDelegate for SearchDelegate {
                 )
             }
         };
-        Some(
-            item.start_slot::<gpui::AnyElement>(icon).child(
-                h_flex()
-                    .gap_2()
+        let title = h_flex()
+            .gap_2()
+            .min_w_0()
+            .child(
+                HighlightedLabel::new(name, positions)
+                    .weight(gpui::FontWeight::MEDIUM)
+                    .truncate(),
+            )
+            .children(detail.map(|detail| {
+                Label::new(detail)
+                    .size(LabelSize::Small)
+                    .color(Color::Muted)
+                    .truncate()
+            }));
+        // Recent Locations: the code line under each place. Every row gets the
+        // second line, so the list keeps one row height.
+        let content = match search_match {
+            SearchMatch::Location { ix, .. } => {
+                let snippet = self
+                    .recent_locations
+                    .get(*ix)
+                    .and_then(|location| location.snippet.clone())
+                    .unwrap_or_default();
+                v_flex()
                     .min_w_0()
+                    .child(title)
                     .child(
-                        HighlightedLabel::new(name, positions)
-                            .weight(gpui::FontWeight::MEDIUM)
-                            .truncate(),
+                        div().debug_selector(|| "zenith-location-snippet".into()).child(
+                            Label::new(snippet)
+                                .size(LabelSize::Small)
+                                .color(Color::Muted)
+                                .buffer_font(cx)
+                                .truncate(),
+                        ),
                     )
-                    .children(detail.map(|detail| {
-                        Label::new(detail)
-                            .size(LabelSize::Small)
-                            .color(Color::Muted)
-                            .truncate()
-                    })),
-            ),
-        )
+                    .into_any_element()
+            }
+            _ => title.into_any_element(),
+        };
+        Some(item.start_slot::<gpui::AnyElement>(icon).child(content))
     }
 }
 
@@ -1745,7 +1786,19 @@ mod tests {
                 })
                 .collect::<Vec<_>>();
             assert_eq!(labels, ["main.rs:21", "main.rs:11", "main.rs:1"]);
+            // Each place shows its line of code, as in PhpStorm.
+            let snippets = picker
+                .delegate
+                .recent_locations
+                .iter()
+                .map(|location| location.snippet.as_deref().map(str::to_string))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                snippets,
+                [Some("line 20".into()), Some("line 10".into()), Some("line 0".into())]
+            );
         });
+        assert!(cx.debug_bounds("zenith-location-snippet").is_some());
 
         // Picking the older place jumps back to it.
         cx.dispatch_action(menu::SelectNext);
