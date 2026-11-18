@@ -250,6 +250,7 @@ members = [
     "crates/zed_credentials_provider",
     "crates/zed_env_vars",
     "crates/zenith",
+    "crates/zenith_inspections",
     "crates/zenith_php_tools",
     "crates/zenith_rails",
     "crates/zenith_search",
@@ -528,6 +529,7 @@ zed_actions = { path = "crates/zed_actions" }
 zed_credentials_provider = { path = "crates/zed_credentials_provider" }
 zed_env_vars = { path = "crates/zed_env_vars" }
 zenith = { path = "crates/zenith" }
+zenith_inspections = { path = "crates/zenith_inspections" }
 zenith_php_tools = { path = "crates/zenith_php_tools" }
 zenith_rails = { path = "crates/zenith_rails" }
 zenith_search = { path = "crates/zenith_search" }

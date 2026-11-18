@@ -483,7 +483,7 @@ use gpui::{
     Action as _, App, AppContext as _, Context, Entity, IntoElement, Render, WeakEntity, Window,
     actions,
 };
-use project::Project;
+use project::{Project, WorktreeId};
 use ui::{Button, ButtonCommon as _, ButtonSize, Clickable as _, LabelSize, Tooltip, prelude::*};
 use workspace::{
     HideStatusItem, ItemHandle, StatusItemView, Workspace,
@@ -514,7 +514,8 @@ pub fn init(cx: &mut App) {
     .detach();
 }
 
-fn environment() -> (Vec<PathBuf>, Vec<PathBuf>) {
+/// PHP candidates and the `PATH` directories.
+pub fn environment() -> (Vec<PathBuf>, Vec<PathBuf>) {
     let path_dirs: Vec<PathBuf> = std::env::var_os("PATH")
         .map(|path| std::env::split_paths(&path).collect())
         .unwrap_or_default();
@@ -689,6 +690,18 @@ fn find_composer(path_dirs: &[PathBuf]) -> Option<PathBuf> {
         .find(|candidate| candidate.is_file())
 }
 
+/// Running a project's tools runs its code: only in a worktree the user trusts.
+/// True when the trust feature is off.
+pub fn worktree_trusted(project: &Entity<Project>, worktree_id: WorktreeId, cx: &mut App) -> bool {
+    let Some(store) = project::trusted_worktrees::TrustedWorktrees::try_get_global(cx) else {
+        return true;
+    };
+    let worktree_store = project.read(cx).worktree_store();
+    store.update(cx, |store, cx| {
+        store.can_trust(&worktree_store, worktree_id, cx)
+    })
+}
+
 /// Offers to install the profile's tools: once per session until answered, and
 /// only in a trusted local project with PHP and Composer present and no tool found.
 fn maybe_offer(
@@ -719,18 +732,7 @@ fn maybe_offer(
         .visible_worktrees(cx)
         .next()
         .map(|worktree| worktree.read(cx).id());
-    let trusted = match (
-        project::trusted_worktrees::TrustedWorktrees::try_get_global(cx),
-        worktree_id,
-    ) {
-        (Some(store), Some(worktree_id)) => {
-            let worktree_store = project.read(cx).worktree_store();
-            store.update(cx, |store, cx| {
-                store.can_trust(&worktree_store, worktree_id, cx)
-            })
-        }
-        _ => true,
-    };
+    let trusted = worktree_id.is_none_or(|id| worktree_trusted(&project, id, cx));
     let Some(php) = info.php_path.clone() else {
         return;
     };

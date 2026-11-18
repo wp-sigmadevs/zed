@@ -16,4 +16,6 @@ pub fn init(cx: &mut App) {
     zenith_rails::init(cx);
     #[cfg(feature = "php")]
     zenith_php_tools::init(cx);
+    #[cfg(feature = "inspections")]
+    zenith_inspections::init(cx);
 }

@@ -22872,10 +22872,31 @@ version = "0.1.0"
 dependencies = [
  "gpui",
  "onboarding",
+ "zenith_inspections",
  "zenith_php_tools",
  "zenith_rails",
  "zenith_search",
  "zenith_welcome",
+]
+
+[[package]]
+name = "zenith_inspections"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "gpui",
+ "language",
+ "log",
+ "lsp",
+ "project",
+ "serde",
+ "serde_json",
+ "settings",
+ "tempfile",
+ "text",
+ "util",
+ "workspace",
+ "zenith_php_tools",
 ]
 
 [[package]]
