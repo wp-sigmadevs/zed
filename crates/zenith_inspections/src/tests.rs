@@ -838,3 +838,38 @@ async fn test_suppress_actions_for_findings_on_the_cursor_line(cx: &mut TestAppC
         "<?php\n// new\n// phpcs:ignore A.B\necho $a;\necho $b;\n"
     );
 }
+
+#[gpui::test]
+async fn test_project_php_files_cover_every_folder(cx: &mut TestAppContext) {
+    cx.update(|cx| {
+        let settings = settings::SettingsStore::test(cx);
+        cx.set_global(settings);
+    });
+    let fake = project::FakeFs::new(cx.executor());
+    fake.insert_tree(
+        "/one",
+        serde_json::json!({
+            ".git": {},
+            ".gitignore": "*.cache.php\n",
+            "a.php": "<?php",
+            "x.cache.php": "<?php",
+            "src": { "b.php": "<?php", "c.js": "" },
+        }),
+    )
+    .await;
+    fake.insert_tree("/two", serde_json::json!({ "d.php": "<?php" })).await;
+    let project = Project::test(fake, [Path::new("/one"), Path::new("/two")], cx).await;
+    cx.run_until_parked();
+    let (files, untrusted) = cx.update(|cx| project_php_files(&project, cx));
+    let mut paths: Vec<_> = files.into_iter().map(|(_, path)| path).collect();
+    paths.sort();
+    assert_eq!(
+        paths,
+        [
+            PathBuf::from("/one/a.php"),
+            PathBuf::from("/one/src/b.php"),
+            PathBuf::from("/two/d.php"),
+        ]
+    );
+    assert_eq!(untrusted, 0);
+}

@@ -514,7 +514,12 @@ gpui::actions!(
         /// Runs PHPCS and PHPStan on every PHP file git reports as changed.
         InspectChangedFiles,
         /// Fixes the formatting problems in the current PHP file with PHPCBF.
-        FixFileWithPhpcbf
+        FixFileWithPhpcbf,
+        /// Runs PHPCS and PHPStan on the current PHP file now (PhpStorm's
+        /// Inspect Code on a file), whatever `run_on_save` says.
+        InspectCurrentFile,
+        /// Runs PHPCS and PHPStan on every PHP file in the project's trusted folders.
+        InspectProject
     ]
 );
 
@@ -770,6 +775,117 @@ fn inspect_folder(
     .detach();
 }
 
+fn inspect_current_file(
+    workspace: &mut Workspace,
+    window: &mut gpui::Window,
+    cx: &mut gpui::Context<Workspace>,
+) {
+    let project = workspace.project().clone();
+    if !project.read(cx).is_local() {
+        return notify(
+            workspace,
+            "PHP tools run on local projects only.".into(),
+            cx,
+        );
+    }
+    let Some(item) = workspace.active_item(cx) else {
+        return;
+    };
+    let Some(project_path) = item.project_path(cx) else {
+        return;
+    };
+    if project_path.path.extension() != Some("php") {
+        return notify(workspace, "PHPCS and PHPStan inspect PHP files.".into(), cx);
+    }
+    if item.is_dirty(cx) {
+        return notify(
+            workspace,
+            "Save the file first; the tools read the saved file.".into(),
+            cx,
+        );
+    }
+    if !zenith_php_tools::worktree_trusted(&project, project_path.worktree_id, cx) {
+        return notify(
+            workspace,
+            "Trust this project to run its PHP tools.".into(),
+            cx,
+        );
+    }
+    let Some(abs_path) = project.read(cx).absolute_path(&project_path, cx) else {
+        return;
+    };
+    let name = abs_path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let files = vec![(project_path.worktree_id, abs_path)];
+    let max_parallel = InspectionSettings::get_global(cx).max_parallel;
+    cx.spawn_in(window, async move |workspace, cx| {
+        inspect_files(project, files, format!("Inspecting {name}."), max_parallel, workspace, cx)
+            .await;
+    })
+    .detach();
+}
+
+/// Every PHP file in the project's trusted local folders.
+pub fn project_php_files(
+    project: &Entity<Project>,
+    cx: &mut App,
+) -> (Vec<(WorktreeId, PathBuf)>, usize) {
+    let mut files = Vec::new();
+    let mut untrusted = 0;
+    let worktree_ids = project
+        .read(cx)
+        .visible_worktrees(cx)
+        .map(|worktree| worktree.read(cx).id())
+        .collect::<Vec<_>>();
+    for worktree_id in worktree_ids {
+        if !zenith_php_tools::worktree_trusted(project, worktree_id, cx) {
+            untrusted += 1;
+            continue;
+        }
+        let root = ProjectPath {
+            worktree_id,
+            path: util::rel_path::RelPath::empty().into(),
+        };
+        files.extend(folder_php_files(project, &root, cx));
+    }
+    (files, untrusted)
+}
+
+fn inspect_project(
+    workspace: &mut Workspace,
+    window: &mut gpui::Window,
+    cx: &mut gpui::Context<Workspace>,
+) {
+    let project = workspace.project().clone();
+    if !project.read(cx).is_local() {
+        return notify(
+            workspace,
+            "PHP tools run on local projects only.".into(),
+            cx,
+        );
+    }
+    let (files, untrusted) = project_php_files(&project, cx);
+    if files.is_empty() && untrusted > 0 {
+        return notify(
+            workspace,
+            "Trust this project to run its PHP tools.".into(),
+            cx,
+        );
+    }
+    let message = match files.len() {
+        0 => "No PHP files in this project.".to_string(),
+        1 => "Inspecting 1 PHP file.".to_string(),
+        count => format!("Inspecting {count} PHP files."),
+    };
+    let max_parallel = InspectionSettings::get_global(cx).max_parallel;
+    cx.spawn_in(window, async move |workspace, cx| {
+        inspect_files(project, files, message, max_parallel, workspace, cx).await;
+    })
+    .detach();
+}
+
 /// Shows each distinct tool failure once per session, so a broken ruleset does not
 /// raise a notification on every save.
 fn report_errors(
@@ -970,6 +1086,12 @@ pub fn init(cx: &mut App) {
         });
         workspace.register_action(|workspace, _: &InspectChangedFiles, window, cx| {
             inspect_changed_files(workspace, window, cx)
+        });
+        workspace.register_action(|workspace, _: &InspectCurrentFile, window, cx| {
+            inspect_current_file(workspace, window, cx)
+        });
+        workspace.register_action(|workspace, _: &InspectProject, window, cx| {
+            inspect_project(workspace, window, cx)
         });
         workspace.register_action(
             |workspace, _: &zed_actions::zenith_inspections::InspectFolder, window, cx| {
