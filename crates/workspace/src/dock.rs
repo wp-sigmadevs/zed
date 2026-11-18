@@ -1359,6 +1359,9 @@ impl Render for Dock {
                     DockPosition::Right => this.border_l_1(),
                     DockPosition::Bottom => this.border_t_1(),
                 })
+                .when(cx.has_global::<crate::IslandsActive>(), |this| {
+                    this.border_1().rounded_lg()
+                })
                 .child(
                     div()
                         .map(|this| match self.position().axis() {

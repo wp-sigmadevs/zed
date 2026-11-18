@@ -178,6 +178,11 @@ pub const MAX_RECENT_SELECTIONS: usize = 20;
 /// Zenith: width of the icon rails.
 pub const RAIL_WIDTH: Pixels = px(36.);
 
+/// Set when Zenith draws panels as rounded, separated islands.
+pub struct IslandsActive;
+
+impl Global for IslandsActive {}
+
 /// Which optional window-title variables are actually referenced by the active
 /// template. Used to skip expensive lookups when the template doesn't need them.
 struct WindowTitleNeeds {
@@ -9156,6 +9161,7 @@ impl Workspace {
             .flex()
             .overflow_hidden()
             .flex_none()
+            .when(cx.has_global::<IslandsActive>(), |this| this.p_0p5())
             .child(dock.clone())
             .children(leader_border);
 
@@ -9363,13 +9369,31 @@ impl Workspace {
                 this.track_focus(&self.region_focus_handles.editor)
             })
             .size_full()
-            .child(self.center.render(
-                self.zoomed.as_ref(),
-                self.maximized_pane.as_ref(),
-                render_cx,
-                window,
-                cx,
-            ))
+            .when(cx.has_global::<IslandsActive>(), |this| this.p_0p5())
+            .child({
+                let islands = cx.has_global::<IslandsActive>();
+                let island_border = cx.theme().colors().border;
+                let center = self.center.render(
+                    self.zoomed.as_ref(),
+                    self.maximized_pane.as_ref(),
+                    render_cx,
+                    window,
+                    cx,
+                );
+                if islands {
+                    div()
+                        .debug_selector(|| "zenith-center-island".into())
+                        .size_full()
+                        .rounded_lg()
+                        .overflow_hidden()
+                        .border_1()
+                        .border_color(island_border)
+                        .child(center)
+                        .into_any_element()
+                } else {
+                    center.into_any_element()
+                }
+            })
     }
 
     pub fn for_window(window: &Window, cx: &App) -> Option<Entity<Workspace>> {
@@ -10285,7 +10309,11 @@ impl Render for Workspace {
                     .child(
                         div()
                             .id("workspace")
-                            .bg(colors.background)
+                            .bg(if cx.has_global::<IslandsActive>() {
+                                colors.title_bar_background
+                            } else {
+                                colors.background
+                            })
                             .relative()
                             .flex_1()
                             .w_full()

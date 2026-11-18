@@ -7,12 +7,13 @@ use gpui::{App, Context, Entity, IntoElement, Render, Window};
 use theme::ActiveTheme as _;
 use ui::prelude::*;
 use workspace::{
-    Workspace,
+    IslandsActive, Workspace,
     dock::{DockPosition, PanelButtons, RailsActive},
 };
 
 pub fn init(cx: &mut App) {
     cx.set_global(RailsActive);
+    cx.set_global(IslandsActive);
     cx.observe_new(|workspace: &mut Workspace, window, cx| {
         if window.is_none() {
             return;
@@ -106,6 +107,7 @@ mod tests {
         assert_eq!(left.size.width, workspace::RAIL_WIDTH);
         assert_eq!(right.size.width, workspace::RAIL_WIDTH);
         assert!(left.right() <= right.left());
+        assert!(cx.debug_bounds("zenith-center-island").is_some());
     }
 
     #[gpui::test]
@@ -113,5 +115,6 @@ mod tests {
         let cx = &mut open_window(cx, false).await;
         assert!(cx.debug_bounds("zenith-left-rail").is_none());
         assert!(cx.debug_bounds("zenith-right-rail").is_none());
+        assert!(cx.debug_bounds("zenith-center-island").is_none());
     }
 }
