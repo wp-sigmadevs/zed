@@ -52,6 +52,15 @@ actions!(
         Toggle,
         /// Opens Search Everywhere on the Actions tab (PhpStorm's Find Action).
         FindAction,
+        /// Opens Search Everywhere on the Classes tab (PhpStorm's Go to Class).
+        GoToClass,
+        /// Opens Search Everywhere on the Files tab (PhpStorm's Go to File).
+        GoToFile,
+        /// Opens Search Everywhere on the Symbols tab (PhpStorm's Go to Symbol).
+        GoToSymbol,
+        /// Opens Search Everywhere on the Files tab, which lists recent files
+        /// first (PhpStorm's Recent Files).
+        RecentFiles,
         /// Moves to the next Search Everywhere tab.
         NextTab,
         /// Moves to the previous Search Everywhere tab.
@@ -71,6 +80,18 @@ pub fn init(cx: &mut App) {
         });
         workspace.register_action(|workspace, _: &FindAction, window, cx| {
             SearchEverywhere::open(workspace, Tab::Actions, window, cx)
+        });
+        workspace.register_action(|workspace, _: &GoToClass, window, cx| {
+            SearchEverywhere::open(workspace, Tab::Classes, window, cx)
+        });
+        workspace.register_action(|workspace, _: &GoToFile, window, cx| {
+            SearchEverywhere::open(workspace, Tab::Files, window, cx)
+        });
+        workspace.register_action(|workspace, _: &GoToSymbol, window, cx| {
+            SearchEverywhere::open(workspace, Tab::Symbols, window, cx)
+        });
+        workspace.register_action(|workspace, _: &RecentFiles, window, cx| {
+            SearchEverywhere::open(workspace, Tab::Files, window, cx)
         });
     })
     .detach();
@@ -1518,6 +1539,11 @@ mod tests {
             assert!(bound_to(&FindAction, &["a"]));
             assert!(bound_to(&NextTab, &["tab"]));
             assert!(bound_to(&PreviousTab, &["tab"]));
+            // PhpStorm's Go to Class / File / Symbol and Recent Files.
+            assert!(bound_to(&GoToClass, &["o"]));
+            assert!(bound_to(&GoToFile, &["o"]));
+            assert!(bound_to(&GoToSymbol, &["o"]));
+            assert!(bound_to(&RecentFiles, &["e"]));
         });
     }
 }
