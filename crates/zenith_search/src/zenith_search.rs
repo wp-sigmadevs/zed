@@ -34,7 +34,7 @@ use std::{
     time::Duration,
 };
 use text::Point;
-use ui::{HighlightedLabel, KeyBinding, ListItem, ListItemSpacing, prelude::*};
+use ui::{Divider, HighlightedLabel, ListItem, ListItemSpacing, TintColor, prelude::*};
 use util::{
     ResultExt as _,
     paths::{PathStyle, PathWithPosition},
@@ -144,7 +144,7 @@ impl Tab {
             Tab::Symbols => "Search symbols…",
             Tab::Actions => "Search actions…",
             Tab::Locations => "Search recent locations…",
-            Tab::All | Tab::Hooks => "Search everywhere…",
+            Tab::All | Tab::Hooks => "Classes, files, symbols, actions",
         }
     }
 
@@ -296,6 +296,7 @@ impl Render for SearchEverywhere {
                         Button::new(tab.label(), tab.label())
                             .label_size(LabelSize::Small)
                             .toggle_state(tab == current_tab)
+                            .selected_style(ButtonStyle::Tinted(TintColor::Accent))
                             .disabled(!tab.is_ready())
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 this.switch_tab(tab, window, cx)
@@ -1025,45 +1026,91 @@ impl PickerDelegate for SearchDelegate {
         self.modal.update(cx, |_, cx| cx.emit(DismissEvent)).ok();
     }
 
+    fn render_editor(
+        &self,
+        editor: &Arc<dyn picker::ErasedEditor>,
+        window: &mut Window,
+        cx: &mut Context<Picker<Self>>,
+    ) -> Option<gpui::Div> {
+        let colors = cx.theme().colors();
+        Some(
+            v_flex()
+                .child(
+                    h_flex()
+                        .debug_selector(|| "zenith-search-field".into())
+                        .h_10()
+                        .px_3()
+                        .gap_2()
+                        .flex_none()
+                        .child(
+                            Icon::new(IconName::MagnifyingGlass)
+                                .size(IconSize::Small)
+                                .color(Color::Muted),
+                        )
+                        .child(div().flex_1().child(editor.render(window, cx)))
+                        .child(
+                            div()
+                                .px_1()
+                                .rounded_sm()
+                                .border_1()
+                                .border_color(colors.border_variant)
+                                .child(
+                                    Label::new("esc")
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Muted),
+                                ),
+                        ),
+                )
+                .child(Divider::horizontal()),
+        )
+    }
+
     fn render_match(
         &self,
         ix: usize,
         selected: bool,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Picker<Self>>,
     ) -> Option<Self::ListItem> {
         let search_match = self.matches.get(ix)?;
+        // PhpStorm labels each group once, on its first row.
+        let kind = self.kind_label(search_match);
+        let group_starts = starts_group(
+            ix.checked_sub(1)
+                .and_then(|previous| self.matches.get(previous))
+                .map(|previous| self.kind_label(previous)),
+            kind,
+        );
         let item = ListItem::new(ix)
             .inset(true)
             .spacing(ListItemSpacing::Sparse)
             .toggle_state(selected)
-            .end_slot::<Label>((self.tab == Tab::All).then(|| {
-                Label::new(self.kind_label(search_match))
-                    .size(LabelSize::Small)
+            .end_slot::<Label>((self.tab == Tab::All && group_starts).then(|| {
+                Label::new(kind.to_uppercase())
+                    .size(LabelSize::XSmall)
                     .color(Color::Muted)
             }));
-        match search_match {
+        let file_icon = |path: &str, cx: &App| {
+            FileFinderSettings::get_global(cx)
+                .file_icons
+                .then(|| FileIcons::get_icon(Path::new(path), cx))
+                .flatten()
+                .map(|icon| Icon::from_path(icon).color(Color::Muted).into_any_element())
+        };
+        let (icon, name, positions, detail) = match search_match {
             SearchMatch::Action(string_match) => {
                 let command = self.commands.get(string_match.candidate_id)?;
-                Some(
-                    item.child(
-                        h_flex()
-                            .w_full()
-                            .justify_between()
-                            .gap_2()
-                            .child(
-                                HighlightedLabel::new(
-                                    command.name.clone(),
-                                    string_match.positions.clone(),
-                                )
-                                .truncate(),
-                            )
-                            .child(KeyBinding::for_action_in(
-                                &*command.action,
-                                &self.previous_focus_handle,
-                                cx,
-                            )),
+                let keys = ui::text_for_action(&*command.action, window, cx);
+                (
+                    Some(
+                        Icon::new(IconName::Command)
+                            .size(IconSize::Small)
+                            .color(Color::Muted)
+                            .into_any_element(),
                     ),
+                    command.name.clone(),
+                    string_match.positions.clone(),
+                    keys,
                 )
             }
             SearchMatch::Symbol(string_match) => {
@@ -1084,61 +1131,123 @@ impl PickerDelegate for SearchDelegate {
                         abs_path.to_string_lossy().into_owned()
                     }
                 };
-                Some(
-                    item.child(
-                        h_flex()
-                            .w_full()
-                            .justify_between()
-                            .gap_2()
-                            .child(
-                                HighlightedLabel::new(
-                                    symbol.label.text.clone(),
-                                    string_match.positions.clone(),
-                                )
-                                .truncate(),
-                            )
-                            .child(
-                                Label::new(format!("{location}:{}", symbol.range.start.0.row + 1))
-                                    .size(LabelSize::Small)
-                                    .color(Color::Muted)
-                                    .truncate(),
-                            ),
-                    ),
+                let file_name = location.rsplit(['/', '\\']).next().unwrap_or(&location);
+                (
+                    Some(symbol_badge(symbol.kind, cx).into_any_element()),
+                    symbol.label.text.clone().into(),
+                    string_match.positions.clone(),
+                    Some(format!("{file_name}:{}", symbol.range.start.0.row + 1)),
                 )
             }
             SearchMatch::Location {
                 label, positions, ..
-            } => Some(
-                item.start_slot::<Icon>(
-                    FileFinderSettings::get_global(cx)
-                        .file_icons
-                        .then(|| {
-                            let file = label
-                                .rsplit_once(':')
-                                .map_or(label.as_ref(), |(file, _)| file);
-                            FileIcons::get_icon(Path::new(file), cx)
-                        })
-                        .flatten()
-                        .map(|icon| Icon::from_path(icon).color(Color::Muted)),
-                )
-                .child(HighlightedLabel::new(label.clone(), positions.clone()).truncate()),
-            ),
-            SearchMatch::File {
+            }
+            | SearchMatch::File {
                 label, positions, ..
-            } => Some(
-                item.start_slot::<Icon>(
-                    FileFinderSettings::get_global(cx)
-                        .file_icons
-                        .then(|| FileIcons::get_icon(Path::new(label.as_ref()), cx))
-                        .flatten()
-                        .map(|icon| Icon::from_path(icon).color(Color::Muted)),
+            } => {
+                let (name, dir, name_positions) = split_path_label(label, positions);
+                let file = name.rsplit_once(':').map_or(name.as_str(), |(file, _)| file);
+                (
+                    file_icon(file, cx),
+                    name.clone().into(),
+                    name_positions,
+                    Some(dir.unwrap_or_else(|| "project root".to_string())),
                 )
-                .child(HighlightedLabel::new(label.clone(), positions.clone()).truncate()),
+            }
+        };
+        Some(
+            item.start_slot::<gpui::AnyElement>(icon).child(
+                h_flex()
+                    .gap_2()
+                    .min_w_0()
+                    .child(
+                        HighlightedLabel::new(name, positions)
+                            .weight(gpui::FontWeight::MEDIUM)
+                            .truncate(),
+                    )
+                    .children(detail.map(|detail| {
+                        Label::new(detail)
+                            .size(LabelSize::Small)
+                            .color(Color::Muted)
+                            .truncate()
+                    })),
             ),
-        }
+        )
     }
 }
 
+
+/// A row opens a group when the row before it is of another kind (or there is none).
+fn starts_group(previous_kind: Option<&str>, kind: &str) -> bool {
+    previous_kind != Some(kind)
+}
+
+/// "dir/sub/file.php" → ("file.php", Some("dir/sub"), positions inside the name).
+fn split_path_label(label: &str, positions: &[usize]) -> (String, Option<String>, Vec<usize>) {
+    match label.rfind(['/', '\\']) {
+        Some(separator) => {
+            let start = separator + 1;
+            (
+                label[start..].to_string(),
+                Some(label[..separator].to_string()),
+                positions
+                    .iter()
+                    .filter(|&&position| position >= start)
+                    .map(|position| position - start)
+                    .collect(),
+            )
+        }
+        None => (label.to_string(), None, positions.to_vec()),
+    }
+}
+
+/// PhpStorm's round kind badge: C class, I interface, E enum, T trait, m method, f function…
+fn symbol_badge(kind: SymbolKind, cx: &App) -> impl IntoElement + use<> {
+    let (letter, color) = symbol_badge_letter(kind);
+    let color = match color {
+        BadgeColor::Type => cx.theme().colors().text_accent,
+        BadgeColor::Member => cx.theme().status().success,
+        BadgeColor::Value => cx.theme().status().warning,
+    };
+    div()
+        .size(rems(1.))
+        .flex_none()
+        .rounded_full()
+        .bg(color.opacity(0.25))
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(
+            Label::new(letter)
+                .size(LabelSize::XSmall)
+                .weight(gpui::FontWeight::BOLD)
+                .color(Color::Custom(color)),
+        )
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum BadgeColor {
+    Type,
+    Member,
+    Value,
+}
+
+fn symbol_badge_letter(kind: SymbolKind) -> (&'static str, BadgeColor) {
+    match kind {
+        SymbolKind::Class | SymbolKind::Struct | SymbolKind::Object => ("C", BadgeColor::Type),
+        SymbolKind::Interface => ("I", BadgeColor::Type),
+        SymbolKind::Enum => ("E", BadgeColor::Type),
+        // PHP traits arrive as Module (Intelephense).
+        SymbolKind::Module | SymbolKind::Namespace | SymbolKind::Package => ("T", BadgeColor::Type),
+        SymbolKind::Method | SymbolKind::Constructor => ("m", BadgeColor::Member),
+        SymbolKind::Function | SymbolKind::Operator => ("f", BadgeColor::Member),
+        SymbolKind::Property | SymbolKind::Field | SymbolKind::EnumMember => {
+            ("p", BadgeColor::Value)
+        }
+        SymbolKind::Constant => ("c", BadgeColor::Value),
+        _ => ("v", BadgeColor::Value),
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1262,6 +1371,8 @@ mod tests {
         open_on(Tab::Files, &workspace, cx);
         let picker = open_picker(&workspace, cx);
         picker.read_with(cx, |picker, _| assert_eq!(picker.delegate.tab, Tab::Files));
+        // The board's search field: magnifier, query, `esc` hint.
+        assert!(cx.debug_bounds("zenith-search-field").is_some());
 
         cx.simulate_input("mainrs");
         cx.run_until_parked();
@@ -1916,5 +2027,41 @@ mod tests {
                 }
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod zenith_look_tests {
+    use super::*;
+
+    #[test]
+    fn test_split_path_label() {
+        assert_eq!(
+            split_path_label("includes/Core/Assets.php", &[0, 9, 14, 15]),
+            ("Assets.php".to_string(), Some("includes/Core".to_string()), vec![0, 1])
+        );
+        assert_eq!(
+            split_path_label("composer.json", &[0, 1]),
+            ("composer.json".to_string(), None, vec![0, 1])
+        );
+    }
+
+    #[test]
+    fn test_symbol_badges() {
+        assert_eq!(symbol_badge_letter(SymbolKind::Class), ("C", BadgeColor::Type));
+        assert_eq!(symbol_badge_letter(SymbolKind::Interface).0, "I");
+        assert_eq!(symbol_badge_letter(SymbolKind::Module).0, "T");
+        assert_eq!(symbol_badge_letter(SymbolKind::Method), ("m", BadgeColor::Member));
+        assert_eq!(symbol_badge_letter(SymbolKind::Function).0, "f");
+        assert_eq!(symbol_badge_letter(SymbolKind::Property).0, "p");
+    }
+
+    #[test]
+    fn test_group_label_only_on_first_row_of_a_kind() {
+        let kinds = ["Class", "Class", "File", "File", "Action"];
+        let starts: Vec<bool> = (0..kinds.len())
+            .map(|ix| starts_group(ix.checked_sub(1).map(|p| kinds[p]), kinds[ix]))
+            .collect();
+        assert_eq!(starts, [true, false, true, false, true]);
     }
 }
