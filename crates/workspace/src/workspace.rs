@@ -175,6 +175,8 @@ use crate::{
 
 pub const SERIALIZATION_THROTTLE_TIME: Duration = Duration::from_millis(200);
 pub const MAX_RECENT_SELECTIONS: usize = 20;
+/// Zenith: width of the icon rails.
+pub const RAIL_WIDTH: Pixels = px(36.);
 
 /// Which optional window-title variables are actually referenced by the active
 /// template. Used to skip expensive lookups when the template doesn't need them.
@@ -1673,6 +1675,8 @@ pub struct Workspace {
     toast_layer: Entity<ToastLayer>,
     titlebar_item: Option<AnyView>,
     window_tabs_item: Option<AnyView>,
+    /// Zenith: icon rails down each side of the window.
+    rails: Option<(AnyView, AnyView)>,
     titlebar_focus_handle: FocusHandle,
     region_focus_handles: RegionFocusHandles,
     notifications: Notifications,
@@ -2183,6 +2187,7 @@ impl Workspace {
             toast_layer,
             titlebar_item: None,
             window_tabs_item: None,
+            rails: None,
             titlebar_focus_handle: cx.focus_handle(),
             region_focus_handles: RegionFocusHandles::new(cx),
             notifications: Notifications::default(),
@@ -3523,6 +3528,12 @@ impl Workspace {
 
     pub fn client(&self) -> &Arc<Client> {
         &self.app_state.client
+    }
+
+    /// Zenith: puts icon rails left and right of the docks and editor.
+    pub fn set_rails(&mut self, left: AnyView, right: AnyView, cx: &mut Context<Self>) {
+        self.rails = Some((left, right));
+        cx.notify();
     }
 
     pub fn set_titlebar_item(&mut self, item: AnyView, _: &mut Window, cx: &mut Context<Self>) {
@@ -10284,6 +10295,13 @@ impl Render for Workspace {
                             .border_t_1()
                             .border_b_1()
                             .border_color(colors.border)
+                            .when_some(self.rails.clone(), |this, (left, right)| {
+                                this.px(RAIL_WIDTH)
+                                    .child(div().absolute().top_0().bottom_0().left_0().child(left))
+                                    .child(
+                                        div().absolute().top_0().bottom_0().right_0().child(right),
+                                    )
+                            })
                             .child({
                                 let this = cx.entity();
                                 canvas(

@@ -12,4 +12,6 @@ pub fn init(cx: &mut App) {
     zenith_welcome::init(cx);
     #[cfg(feature = "search")]
     zenith_search::init(cx);
+    #[cfg(feature = "rails")]
+    zenith_rails::init(cx);
 }

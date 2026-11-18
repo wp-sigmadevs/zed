@@ -1,0 +1,26 @@
+[package]
+name = "zenith_rails"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/zenith_rails.rs"
+doctest = false
+
+[dependencies]
+gpui.workspace = true
+theme.workspace = true
+ui.workspace = true
+workspace.workspace = true
+
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }
+project = { workspace = true, features = ["test-support"] }
+settings.workspace = true
+theme_settings.workspace = true
+workspace = { workspace = true, features = ["test-support"] }

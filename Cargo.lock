@@ -22872,8 +22872,22 @@ version = "0.1.0"
 dependencies = [
  "gpui",
  "onboarding",
+ "zenith_rails",
  "zenith_search",
  "zenith_welcome",
+]
+
+[[package]]
+name = "zenith_rails"
+version = "0.1.0"
+dependencies = [
+ "gpui",
+ "project",
+ "settings",
+ "theme",
+ "theme_settings",
+ "ui",
+ "workspace",
 ]
 
 [[package]]

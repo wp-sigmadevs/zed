@@ -388,6 +388,8 @@ struct PanelEntry {
 
 pub struct PanelButtons {
     dock: Entity<Dock>,
+    /// Zenith rails: the buttons stack vertically.
+    vertical: bool,
     _settings_subscription: Subscription,
 }
 
@@ -1388,10 +1390,22 @@ impl PanelButtons {
         let settings_subscription = cx.observe_global::<SettingsStore>(|_, cx| cx.notify());
         Self {
             dock,
+            vertical: false,
             _settings_subscription: settings_subscription,
         }
     }
+
+    /// Stacks the buttons top to bottom, for a Zenith rail.
+    pub fn vertical(mut self) -> Self {
+        self.vertical = true;
+        self
+    }
 }
+
+/// Set when Zenith's rails show the dock buttons: the status bar's copies draw nothing.
+pub struct RailsActive;
+
+impl gpui::Global for RailsActive {}
 
 impl Render for PanelButtons {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1569,24 +1583,29 @@ impl Render for PanelButtons {
             })
             .collect();
 
-        if dock_position == DockPosition::Right {
+        if dock_position == DockPosition::Right && !self.vertical {
             buttons.reverse();
         }
 
         let has_buttons = !buttons.is_empty();
+        if !self.vertical && cx.has_global::<RailsActive>() {
+            return div();
+        }
 
-        h_flex()
+        (if self.vertical { v_flex() } else { h_flex() })
             .gap_1()
             .when(
-                has_buttons
+                !self.vertical
+                    && has_buttons
                     && (dock.position == DockPosition::Bottom
                         || dock.position == DockPosition::Right),
                 |this| this.child(Divider::vertical().color(DividerColor::Border)),
             )
             .children(buttons)
-            .when(has_buttons && dock.position == DockPosition::Left, |this| {
-                this.child(Divider::vertical().color(DividerColor::Border))
-            })
+            .when(
+                !self.vertical && has_buttons && dock.position == DockPosition::Left,
+                |this| this.child(Divider::vertical().color(DividerColor::Border)),
+            )
     }
 }
 
