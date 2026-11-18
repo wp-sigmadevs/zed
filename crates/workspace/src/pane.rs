@@ -2955,6 +2955,9 @@ impl Pane {
                 ClosePosition::Right => ui::TabCloseSide::End,
             })
             .toggle_state(is_active)
+            .when(is_active && cx.has_global::<crate::IslandsActive>(), |tab| {
+                tab.child(zenith_active_tab_line(cx))
+            })
             .on_click(cx.listener({
                 let item_handle = item.boxed_clone();
                 move |pane: &mut Self, event: &ClickEvent, window, cx| {
@@ -9994,5 +9997,56 @@ mod tests {
                 harness.check_invariants(&oracle.current);
             }
         }
+    }
+}
+
+/// Zenith: accent line under the active tab, as on the Main board and in PhpStorm.
+fn zenith_active_tab_line(cx: &App) -> gpui::Div {
+    div()
+        .debug_selector(|| "zenith-active-tab-line".into())
+        .absolute()
+        .left_0()
+        .right_0()
+        .bottom_0()
+        .h(px(2.))
+        .bg(cx.theme().colors().text_accent)
+}
+
+#[cfg(test)]
+mod zenith_tests {
+    use crate::{Workspace, item::test::TestItem};
+    use gpui::{AppContext as _, TestAppContext};
+    use project::{FakeFs, Project};
+    use settings::SettingsStore;
+
+    async fn active_tab_line(cx: &mut TestAppContext, islands: bool) -> bool {
+        cx.update(|cx| {
+            let store = SettingsStore::test(cx);
+            cx.set_global(store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            if islands {
+                cx.set_global(crate::IslandsActive);
+            }
+        });
+        let project = Project::test(FakeFs::new(cx.executor()), None, cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+        let pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+        pane.update_in(cx, |pane, window, cx| {
+            let item = Box::new(cx.new(|cx| TestItem::new(cx).with_label("a.php")));
+            pane.add_item(item, true, true, None, window, cx);
+        });
+        cx.run_until_parked();
+        cx.debug_bounds("zenith-active-tab-line").is_some()
+    }
+
+    #[gpui::test]
+    async fn test_active_tab_line_with_islands(cx: &mut TestAppContext) {
+        assert!(active_tab_line(cx, true).await);
+    }
+
+    #[gpui::test]
+    async fn test_no_active_tab_line_without_islands(cx: &mut TestAppContext) {
+        assert!(!active_tab_line(cx, false).await);
     }
 }

@@ -6143,6 +6143,7 @@ impl ProjectPanel {
         }
 
         let filename_text_color = details.filename_text_color;
+        let zenith_root_path = self.zenith_root_path(&details, cx);
         let diagnostic_severity = details.diagnostic_severity;
         let diagnostic_mark = details.diagnostic_mark;
         let reserves_chevron_slot = details.reserves_chevron_slot;
@@ -6811,16 +6812,24 @@ impl ProjectPanel {
                                     ))
                                 }
 
-                                None => this.child(
-                                    Label::new(file_name)
-                                        .single_line()
-                                        .color(filename_text_color)
-                                        .when(
-                                            settings.bold_folder_labels && kind.is_dir(),
-                                            |this| this.weight(FontWeight::SEMIBOLD),
-                                        )
-                                        .into_any_element(),
-                                ),
+                                None => this
+                                    .child(
+                                        Label::new(file_name)
+                                            .single_line()
+                                            .color(filename_text_color)
+                                            .when(
+                                                settings.bold_folder_labels && kind.is_dir(),
+                                                |this| this.weight(FontWeight::SEMIBOLD),
+                                            )
+                                            .into_any_element(),
+                                    )
+                                    .children(zenith_root_path.map(|path| {
+                                        Label::new(path)
+                                            .single_line()
+                                            .size(LabelSize::Small)
+                                            .color(Color::Muted)
+                                            .ml_2()
+                                    })),
                             })
                     })
                     .on_secondary_mouse_down(cx.listener(
@@ -8444,3 +8453,41 @@ fn explain_move_error(err: anyhow::Error, names: Option<&(String, String)>) -> a
 #[cfg(test)]
 mod project_panel_tests;
 mod tests;
+
+// Zenith: the project root shows where it lives ("~/Sites/…"), as in PhpStorm.
+impl ProjectPanel {
+    fn zenith_root_path(&self, details: &EntryDetails, cx: &App) -> Option<String> {
+        if !cx.has_global::<workspace::IslandsActive>() || !details.path.is_empty() {
+            return None;
+        }
+        let worktree = self.project.read(cx).worktree_for_id(details.worktree_id, cx)?;
+        let worktree = worktree.read(cx);
+        if worktree.is_single_file() {
+            return None;
+        }
+        let parent = worktree.abs_path().parent()?.to_path_buf();
+        Some(zenith_tilde_path(&parent, util::paths::home_dir()))
+    }
+}
+
+/// `path` with the home folder shown as `~`.
+fn zenith_tilde_path(path: &Path, home: &Path) -> String {
+    match path.strip_prefix(home) {
+        Ok(rest) if rest.as_os_str().is_empty() => "~".to_string(),
+        Ok(rest) => format!("~/{}", rest.display()),
+        Err(_) => path.display().to_string(),
+    }
+}
+
+#[cfg(test)]
+mod zenith_tests {
+    use std::path::Path;
+
+    #[test]
+    fn test_tilde_path() {
+        let home = Path::new("/Users/me");
+        assert_eq!(super::zenith_tilde_path(Path::new("/Users/me/Sites"), home), "~/Sites");
+        assert_eq!(super::zenith_tilde_path(Path::new("/Users/me"), home), "~");
+        assert_eq!(super::zenith_tilde_path(Path::new("/opt/www"), home), "/opt/www");
+    }
+}
