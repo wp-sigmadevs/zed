@@ -1546,4 +1546,85 @@ mod tests {
             assert!(bound_to(&RecentFiles, &["e"]));
         });
     }
+
+    /// The real key presses, resolved across the keymap files in load order and the
+    /// contexts they are pressed in: Editor, terminal and project panel.
+    #[gpui::test]
+    fn test_jetbrains_keys_win_in_every_context(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            settings::init(cx);
+            workspace::init(AppState::test(cx), cx);
+            init(cx);
+            // Partial load: the default keymap names actions from crates this test
+            // doesn't link, which are skipped. The ones competing for these keys are
+            // linked (dev-dependencies); the first assertions below prove it.
+            let load = |bindings: &mut Vec<_>, path: &str| {
+                bindings.extend(
+                    KeymapFile::load_asset_allow_partial_failure(path, cx).expect("keymap loads"),
+                );
+            };
+            let jetbrains = settings::BaseKeymap::JetBrains
+                .asset_path()
+                .expect("JetBrains keymap path");
+            let mut base = Vec::new();
+            load(&mut base, settings::DEFAULT_KEYMAP_PATH);
+            load(&mut base, jetbrains);
+            let mut all = base.clone();
+            // Same order as `load_default_keymap`.
+            load(&mut all, settings::ZENITH_KEYMAP_PATH);
+            load(&mut all, settings::SPECIFIC_OVERRIDES_KEYMAP_PATH);
+            let (base, all) = (gpui::Keymap::new(base), gpui::Keymap::new(all));
+
+            let os = if cfg!(target_os = "macos") {
+                gpui::OperatingSystem::Mac
+            } else {
+                gpui::OperatingSystem::Linux
+            };
+            let resolve = |keymap: &gpui::Keymap, keys: &str, contexts: &[&str]| {
+                let stack: Vec<_> = contexts
+                    .iter()
+                    .map(|context| gpui::KeyContext::parse(context).expect("context"))
+                    .collect();
+                let text = format!("secondary-{keys}");
+                let keystroke = gpui::Keystroke::parse_with_os(&text, os).expect("keystroke");
+                let (found, _) = keymap.bindings_for_input(&[keystroke], &stack);
+                // Highest precedence first.
+                found
+                    .first()
+                    .map(|binding| binding.action().name().to_string())
+            };
+            let editor = ["Workspace", "Pane", "Editor mode=full"];
+            let terminal = ["Workspace", "Pane", "Terminal"];
+            let project_panel = ["Workspace", "ProjectPanel"];
+
+            // Not vacuous: without Zenith's file the competing bindings are in force.
+            assert_eq!(
+                resolve(&base, "e", &editor).as_deref(),
+                Some("file_finder::Toggle")
+            );
+            assert_eq!(
+                resolve(&base, "shift-o", &editor).as_deref(),
+                Some("file_finder::Toggle")
+            );
+            assert_eq!(
+                resolve(&base, "o", &editor).as_deref(),
+                Some("project_symbols::Toggle")
+            );
+
+            for contexts in [&editor[..], &terminal, &project_panel] {
+                for (keys, action) in [
+                    ("o", "zenith_search::GoToClass"),
+                    ("shift-o", "zenith_search::GoToFile"),
+                    ("alt-o", "zenith_search::GoToSymbol"),
+                    ("e", "zenith_search::RecentFiles"),
+                ] {
+                    assert_eq!(
+                        resolve(&all, keys, contexts).as_deref(),
+                        Some(action),
+                        "secondary-{keys} in {contexts:?}"
+                    );
+                }
+            }
+        });
+    }
 }
