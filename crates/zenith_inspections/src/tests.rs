@@ -224,3 +224,15 @@ async fn test_each_analyzer_replaces_only_its_own_diagnostics(cx: &mut TestAppCo
         ]
     );
 }
+
+#[gpui::test]
+fn test_older_run_is_stale_after_a_newer_save(cx: &mut TestAppContext) {
+    cx.update(|cx| {
+        let first = next_generation(Path::new("/a.php"), cx);
+        let second = next_generation(Path::new("/a.php"), cx);
+        let other = next_generation(Path::new("/b.php"), cx);
+        assert_ne!(current_generation(Path::new("/a.php"), cx), first);
+        assert_eq!(current_generation(Path::new("/a.php"), cx), second);
+        assert_eq!(current_generation(Path::new("/b.php"), cx), other);
+    });
+}

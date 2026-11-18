@@ -336,6 +336,28 @@ pub fn init(cx: &mut App) {
     .detach();
 }
 
+/// Save counter per file, so a slow older run cannot overwrite a newer one.
+#[derive(Default)]
+struct Generations(std::collections::HashMap<PathBuf, u64>);
+
+impl gpui::Global for Generations {}
+
+fn next_generation(path: &Path, cx: &mut App) -> u64 {
+    let count = cx
+        .default_global::<Generations>()
+        .0
+        .entry(path.to_path_buf())
+        .or_default();
+    *count += 1;
+    *count
+}
+
+fn current_generation(path: &Path, cx: &App) -> u64 {
+    cx.try_global::<Generations>()
+        .and_then(|generations| generations.0.get(path).copied())
+        .unwrap_or(0)
+}
+
 /// Runs the analyzers on a saved PHP file in a trusted local worktree.
 pub fn inspect(project: &Entity<Project>, buffer: &Entity<Buffer>, cx: &mut App) {
     let Some(file) = buffer.read(cx).file().cloned() else {
@@ -354,6 +376,7 @@ pub fn inspect(project: &Entity<Project>, buffer: &Entity<Buffer>, cx: &mut App)
     let root = worktree.read(cx).abs_path().to_path_buf();
     let abs_path = root.join(file.path().as_std_path());
     let lsp_store = project.read(cx).lsp_store();
+    let generation = next_generation(&abs_path, cx);
     cx.spawn(async move |cx| {
         let results = cx
             .background_spawn(async move {
@@ -388,6 +411,10 @@ pub fn inspect(project: &Entity<Project>, buffer: &Entity<Buffer>, cx: &mut App)
             return;
         };
         lsp_store.update(cx, |lsp_store, cx| {
+            // A newer save of this file is running; its results win.
+            if current_generation(&abs_path, cx) != generation {
+                return;
+            }
             for (analyzer, result) in results {
                 let problems = match result {
                     Ok(problems) => problems,
