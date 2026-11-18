@@ -34,7 +34,7 @@ use std::{
     time::Duration,
 };
 use text::Point;
-use ui::{Divider, HighlightedLabel, ListItem, ListItemSpacing, TintColor, prelude::*};
+use ui::{HighlightedLabel, ListItem, ListItemSpacing, TintColor, prelude::*};
 use util::{
     ResultExt as _,
     paths::{PathStyle, PathWithPosition},
@@ -1239,45 +1239,6 @@ impl PickerDelegate for SearchDelegate {
         self.modal.update(cx, |_, cx| cx.emit(DismissEvent)).ok();
     }
 
-    fn render_editor(
-        &self,
-        editor: &Arc<dyn picker::ErasedEditor>,
-        window: &mut Window,
-        cx: &mut Context<Picker<Self>>,
-    ) -> Option<gpui::Div> {
-        let colors = cx.theme().colors();
-        Some(
-            v_flex()
-                .child(
-                    h_flex()
-                        .debug_selector(|| "zenith-search-field".into())
-                        .h_10()
-                        .px_3()
-                        .gap_2()
-                        .flex_none()
-                        .child(
-                            Icon::new(IconName::MagnifyingGlass)
-                                .size(IconSize::Small)
-                                .color(Color::Muted),
-                        )
-                        .child(div().flex_1().child(editor.render(window, cx)))
-                        .child(
-                            div()
-                                .px_1()
-                                .rounded_sm()
-                                .border_1()
-                                .border_color(colors.border_variant)
-                                .child(
-                                    Label::new("esc")
-                                        .size(LabelSize::XSmall)
-                                        .color(Color::Muted),
-                                ),
-                        ),
-                )
-                .child(Divider::horizontal()),
-        )
-    }
-
     fn render_match(
         &self,
         ix: usize,
@@ -1502,6 +1463,8 @@ mod tests {
             workspace::init(app_state.clone(), cx);
             command_palette::init(cx);
             init(cx);
+            // Zenith's chrome is on in the app (zenith_rails sets it).
+            cx.set_global(workspace::IslandsActive);
             cx.bind_keys(KeymapFile::load_panic_on_failure(
                 r#"[{ "bindings": { "enter": "menu::Confirm" } }]"#,
                 cx,
