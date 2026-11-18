@@ -998,3 +998,15 @@ pub mod git_panel {
         ]
     );
 }
+
+pub mod zenith_inspections {
+    use gpui::actions;
+
+    actions!(
+        zenith_inspections,
+        [
+            /// Runs the PHP inspections on every PHP file in the selected folder.
+            InspectFolder,
+        ]
+    );
+}

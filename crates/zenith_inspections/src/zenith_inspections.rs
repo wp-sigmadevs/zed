@@ -6,7 +6,7 @@ use anyhow::{Context as _, Result};
 use gpui::{App, AppContext as _, Entity};
 use language::{Buffer, BufferEvent, DiagnosticSourceKind};
 use lsp::{DiagnosticSeverity, LanguageServerId, NumberOrString};
-use project::{Project, WorktreeId, buffer_store::BufferStoreEvent};
+use project::{Project, ProjectPath, WorktreeId, buffer_store::BufferStoreEvent};
 use serde::Deserialize;
 use settings::{RegisterSetting, Settings, SettingsContent};
 use std::{
@@ -668,31 +668,101 @@ fn inspect_changed_files(
             (1, _) => "Inspecting 1 changed PHP file.".to_string(),
             (count, _) => format!("Inspecting {count} changed PHP files."),
         };
-        workspace
-            .update(cx, |workspace, cx| notify(workspace, message, cx))
-            .log_err();
-        let errors: Vec<String> = run_limited(
-            files
-                .into_iter()
-                .map(|(worktree_id, file)| {
-                    let (project, mut cx) = (project.clone(), cx.clone());
-                    move || async move {
-                        match cx.update(|_, cx| inspect_path(&project, worktree_id, file, cx)) {
-                            Ok(task) => task.await,
-                            Err(_) => Vec::new(),
-                        }
+        inspect_files(project, files, message, max_parallel, workspace, cx).await;
+    })
+    .detach();
+}
+
+/// Announces the run, inspects `files` at most `max_parallel` at a time, then shows
+/// any tool failures.
+async fn inspect_files(
+    project: Entity<Project>,
+    files: Vec<(WorktreeId, PathBuf)>,
+    message: String,
+    max_parallel: usize,
+    workspace: gpui::WeakEntity<Workspace>,
+    cx: &mut gpui::AsyncWindowContext,
+) {
+    workspace
+        .update(cx, |workspace, cx| notify(workspace, message, cx))
+        .log_err();
+    let errors: Vec<String> = run_limited(
+        files
+            .into_iter()
+            .map(|(worktree_id, file)| {
+                let (project, mut cx) = (project.clone(), cx.clone());
+                move || async move {
+                    match cx.update(|_, cx| inspect_path(&project, worktree_id, file, cx)) {
+                        Ok(task) => task.await,
+                        Err(_) => Vec::new(),
                     }
-                })
-                .collect(),
-            max_parallel,
-        )
-        .await
-        .into_iter()
-        .flatten()
-        .collect();
-        workspace
-            .update(cx, |workspace, cx| report_errors(workspace, errors, cx))
-            .log_err();
+                }
+            })
+            .collect(),
+        max_parallel,
+    )
+    .await
+    .into_iter()
+    .flatten()
+    .collect();
+    workspace
+        .update(cx, |workspace, cx| report_errors(workspace, errors, cx))
+        .log_err();
+}
+
+/// PHP files in a folder of the project, skipping git-ignored ones (`vendor`).
+pub fn folder_php_files(
+    project: &Entity<Project>,
+    folder: &ProjectPath,
+    cx: &App,
+) -> Vec<(WorktreeId, PathBuf)> {
+    let Some(worktree) = project.read(cx).worktree_for_id(folder.worktree_id, cx) else {
+        return Vec::new();
+    };
+    let worktree = worktree.read(cx);
+    worktree
+        .traverse_from_path(true, false, false, &folder.path)
+        .take_while(|entry| entry.path.starts_with(&folder.path))
+        .filter(|entry| entry.path.extension() == Some("php"))
+        .map(|entry| (folder.worktree_id, worktree.absolutize(&entry.path)))
+        .collect()
+}
+
+fn inspect_folder(
+    workspace: &mut Workspace,
+    window: &mut gpui::Window,
+    cx: &mut gpui::Context<Workspace>,
+) {
+    let project = workspace.project().clone();
+    let Some(folder) = workspace
+        .panel::<project_panel::ProjectPanel>(cx)
+        .and_then(|panel| panel.read(cx).selected_entry_project_path(cx))
+    else {
+        return;
+    };
+    if !project.read(cx).is_local() {
+        return notify(
+            workspace,
+            "PHP tools run on local projects only.".into(),
+            cx,
+        );
+    }
+    if !zenith_php_tools::worktree_trusted(&project, folder.worktree_id, cx) {
+        return notify(
+            workspace,
+            "Trust this project to run its PHP tools.".into(),
+            cx,
+        );
+    }
+    let files = folder_php_files(&project, &folder, cx);
+    let message = match files.len() {
+        0 => "No PHP files in this folder.".to_string(),
+        1 => "Inspecting 1 PHP file.".to_string(),
+        count => format!("Inspecting {count} PHP files."),
+    };
+    let max_parallel = InspectionSettings::get_global(cx).max_parallel;
+    cx.spawn_in(window, async move |workspace, cx| {
+        inspect_files(project, files, message, max_parallel, workspace, cx).await;
     })
     .detach();
 }
@@ -892,6 +962,11 @@ pub fn init(cx: &mut App) {
         workspace.register_action(|workspace, _: &InspectChangedFiles, window, cx| {
             inspect_changed_files(workspace, window, cx)
         });
+        workspace.register_action(
+            |workspace, _: &zed_actions::zenith_inspections::InspectFolder, window, cx| {
+                inspect_folder(workspace, window, cx)
+            },
+        );
         let project = workspace.project().clone();
         if !project.read(cx).is_local() {
             return;

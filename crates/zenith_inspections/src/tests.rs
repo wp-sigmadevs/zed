@@ -641,3 +641,59 @@ fn test_failures_show_once_until_a_run_works() {
     forget(&mut shown, "phpcs");
     assert_eq!(unseen_errors(&mut shown, failure()), failure());
 }
+
+#[gpui::test]
+async fn test_folder_php_files_skip_other_folders_and_ignored(cx: &mut TestAppContext) {
+    cx.update(|cx| {
+        let settings = settings::SettingsStore::test(cx);
+        cx.set_global(settings);
+    });
+    let fake = project::FakeFs::new(cx.executor());
+    fake.insert_tree(
+        "/project",
+        serde_json::json!({
+            ".git": {},
+            ".gitignore": "vendor/\n*.cache.php\n",
+            "src": {
+                "a.php": "<?php",
+                "routes.cache.php": "<?php",
+                "notes.txt": "",
+                "sub": { "b.php": "<?php" },
+            },
+            "src-other": { "c.php": "<?php" },
+            "vendor": { "d.php": "<?php" },
+        }),
+    )
+    .await;
+    let project = Project::test(fake, [Path::new("/project")], cx).await;
+    cx.run_until_parked();
+    let worktree_id = project.read_with(cx, |project, cx| {
+        project.worktrees(cx).next().unwrap().read(cx).id()
+    });
+    let paths = |path: &str, cx: &mut TestAppContext| {
+        let folder = ProjectPath {
+            worktree_id,
+            path: util::rel_path::rel_path(path).into(),
+        };
+        cx.update(|cx| folder_php_files(&project, &folder, cx))
+            .into_iter()
+            .map(|(_, path)| path)
+            .collect::<Vec<_>>()
+    };
+    let files = (paths("src", cx), paths("", cx));
+    assert_eq!(
+        files.0,
+        [
+            PathBuf::from("/project/src/a.php"),
+            PathBuf::from("/project/src/sub/b.php")
+        ]
+    );
+    assert_eq!(
+        files.1,
+        [
+            PathBuf::from("/project/src/a.php"),
+            PathBuf::from("/project/src/sub/b.php"),
+            PathBuf::from("/project/src-other/c.php")
+        ]
+    );
+}

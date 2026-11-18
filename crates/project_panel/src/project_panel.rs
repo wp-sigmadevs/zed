@@ -1221,6 +1221,12 @@ impl ProjectPanel {
                                 menu.separator()
                                     .action("Find in Folder…", Box::new(NewSearchInDirectory))
                             })
+                            .when(is_dir && is_local, |menu| {
+                                menu.action(
+                                    "Inspect PHP Files",
+                                    Box::new(zed_actions::zenith_inspections::InspectFolder),
+                                )
+                            })
                             .when(is_unfoldable, |menu| {
                                 menu.action("Unfold Directory", Box::new(UnfoldDirectory))
                             })

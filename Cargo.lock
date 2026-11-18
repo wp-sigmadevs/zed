@@ -22890,6 +22890,8 @@ dependencies = [
  "log",
  "lsp",
  "project",
+ "project_panel",
+ "remote_connection",
  "serde",
  "serde_json",
  "settings",
@@ -22897,6 +22899,7 @@ dependencies = [
  "text",
  "util",
  "workspace",
+ "zed_actions",
  "zenith_php_tools",
 ]
 
