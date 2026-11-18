@@ -311,6 +311,7 @@ impl SearchEverywhere {
             cancel_flag: Arc::new(AtomicBool::new(false)),
             edited_only: false,
             select_previous_file: false,
+            all_filter: AllFilter::default(),
         };
         let picker = cx.new(|cx| Picker::uniform_list(delegate, window, cx).embedded());
         Self {
@@ -360,6 +361,14 @@ impl Render for SearchEverywhere {
                             this.switch_tab(tab, window, cx)
                         }))
                 }))
+                .child(div().flex_1())
+                .when(current_tab == Tab::All, |this| {
+                    this.child(
+                        div()
+                            .debug_selector(|| "zenith-search-filter".into())
+                            .child(self.render_filter_menu(cx)),
+                    )
+                })
                 .into_any_element(),
         };
         let body = if current_tab == Tab::Recent {
@@ -391,6 +400,54 @@ impl Render for SearchEverywhere {
 }
 
 impl SearchEverywhere {
+    /// The All tab's filter: which groups to show, as PhpStorm's funnel menu.
+    fn render_filter_menu(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let modal = cx.entity().downgrade();
+        let filter = self.picker.read(cx).delegate.all_filter;
+        ui::PopoverMenu::new("zenith-search-filter")
+            .trigger(
+                IconButton::new("zenith-search-filter-button", IconName::Filter)
+                    .icon_size(IconSize::Small)
+                    .toggle_state(filter != AllFilter::default())
+                    .tooltip(ui::Tooltip::text("Filter")),
+            )
+            .menu(move |window, cx| {
+                let modal = modal.clone();
+                Some(ui::ContextMenu::build(window, cx, move |mut menu, _, _| {
+                    let groups: [(&str, fn(&mut AllFilter) -> &mut bool); 4] = [
+                        ("Classes", |filter| &mut filter.classes),
+                        ("Files", |filter| &mut filter.files),
+                        ("Symbols", |filter| &mut filter.symbols),
+                        ("Actions", |filter| &mut filter.actions),
+                    ];
+                    for (label, field) in groups {
+                        let mut current = filter;
+                        let on = *field(&mut current);
+                        let modal = modal.clone();
+                        menu = menu.toggleable_entry(
+                            label,
+                            on,
+                            ui::IconPosition::Start,
+                            None,
+                            move |window, cx| {
+                                modal
+                                    .update(cx, |modal, cx| {
+                                        modal.picker.update(cx, |picker, cx| {
+                                            let flag = field(&mut picker.delegate.all_filter);
+                                            *flag = !*flag;
+                                            picker.refresh(window, cx);
+                                        });
+                                        cx.notify();
+                                    })
+                                    .ok();
+                            },
+                        );
+                    }
+                    menu
+                }))
+            })
+    }
+
     /// Switcher: letting go of ⌃ opens the picked file, as in PhpStorm.
     fn modifiers_changed(
         &mut self,
@@ -584,6 +641,8 @@ pub struct SearchDelegate {
     edited_only: bool,
     /// Switcher: start on the second recent file (the one before the current).
     select_previous_file: bool,
+    /// Groups the All tab shows.
+    all_filter: AllFilter,
 }
 
 impl SearchDelegate {
@@ -994,23 +1053,46 @@ fn merge_all_tab(
     symbol_matches: Vec<StringMatch>,
     files: Vec<SearchMatch>,
     actions: Vec<SearchMatch>,
+    filter: AllFilter,
 ) -> Vec<SearchMatch> {
     let (classes, other_symbols): (Vec<_>, Vec<_>) = symbol_matches
         .into_iter()
         .partition(|string_match| is_class_like(&symbols[string_match.candidate_id]));
-    classes
-        .into_iter()
-        .map(SearchMatch::Symbol)
-        .take(ALL_TAB_GROUP_LIMIT)
-        .chain(files.into_iter().take(ALL_TAB_GROUP_LIMIT))
-        .chain(
-            other_symbols
-                .into_iter()
-                .map(SearchMatch::Symbol)
-                .take(ALL_TAB_GROUP_LIMIT),
-        )
-        .chain(actions.into_iter().take(ALL_TAB_GROUP_LIMIT))
-        .collect()
+    let keep = |on: bool, group: Vec<SearchMatch>| {
+        if on {
+            group.into_iter().take(ALL_TAB_GROUP_LIMIT).collect()
+        } else {
+            Vec::new()
+        }
+    };
+    let mut merged = keep(filter.classes, classes.into_iter().map(SearchMatch::Symbol).collect());
+    merged.extend(keep(filter.files, files));
+    merged.extend(keep(
+        filter.symbols,
+        other_symbols.into_iter().map(SearchMatch::Symbol).collect(),
+    ));
+    merged.extend(keep(filter.actions, actions));
+    merged
+}
+
+/// Which groups the All tab shows (its filter menu, as in PhpStorm).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AllFilter {
+    classes: bool,
+    files: bool,
+    symbols: bool,
+    actions: bool,
+}
+
+impl Default for AllFilter {
+    fn default() -> Self {
+        Self {
+            classes: true,
+            files: true,
+            symbols: true,
+            actions: true,
+        }
+    }
 }
 
 /// What the Classes tab keeps. LSP has no trait kind: PHPantom reports PHP
@@ -1184,12 +1266,14 @@ impl PickerDelegate for SearchDelegate {
         } else {
             Task::ready(Default::default())
         };
+        let all_filter = self.all_filter;
         cx.spawn_in(window, async move |picker, cx| {
             let files = files.await;
             let actions = actions.await;
             if tab == Tab::All && !is_empty_query {
                 // Files and actions are local; show them before the language server answers.
-                let matches = merge_all_tab(&[], Vec::new(), files.clone(), actions.clone());
+                let matches =
+                    merge_all_tab(&[], Vec::new(), files.clone(), actions.clone(), all_filter);
                 picker
                     .update(cx, |picker, cx| {
                         picker.delegate.set_matches(Vec::new(), matches, true, cx)
@@ -1198,7 +1282,7 @@ impl PickerDelegate for SearchDelegate {
             }
             let (symbols, symbol_matches) = symbols.await;
             let matches = if tab == Tab::All {
-                merge_all_tab(&symbols, symbol_matches, files, actions)
+                merge_all_tab(&symbols, symbol_matches, files, actions, all_filter)
             } else {
                 files
                     .into_iter()
@@ -2277,6 +2361,11 @@ mod tests {
             SearchEverywhere::open(workspace, Tab::Files, window, cx);
             assert!(workspace.active_modal::<SearchEverywhere>(cx).is_some());
         });
+        cx.run_until_parked();
+        // The funnel shows on All only.
+        assert!(cx.debug_bounds("zenith-search-filter").is_none());
+        open_on(Tab::All, &workspace, cx);
+        assert!(cx.debug_bounds("zenith-search-filter").is_some());
     }
 
     #[gpui::test]
@@ -2431,5 +2520,53 @@ mod zenith_look_tests {
             .map(|ix| starts_group(ix.checked_sub(1).map(|p| kinds[p]), kinds[ix]))
             .collect();
         assert_eq!(starts, [true, false, true, false, true]);
+    }
+}
+
+#[cfg(test)]
+mod zenith_filter_tests {
+    use super::*;
+
+    fn file(name: &str) -> SearchMatch {
+        SearchMatch::File {
+            project_path: ProjectPath {
+                worktree_id: WorktreeId::from_usize(0),
+                path: RelPath::empty().into(),
+            },
+            label: name.to_string().into(),
+            positions: Vec::new(),
+        }
+    }
+
+    fn action(name: &str) -> SearchMatch {
+        SearchMatch::Action(StringMatch {
+            candidate_id: 0,
+            score: 0.,
+            positions: Vec::new(),
+            string: name.to_string().into(),
+        })
+    }
+
+    fn kinds(matches: &[SearchMatch]) -> Vec<&'static str> {
+        matches
+            .iter()
+            .map(|search_match| match search_match {
+                SearchMatch::File { .. } => "file",
+                SearchMatch::Action(_) => "action",
+                _ => "other",
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_all_tab_filter_hides_groups() {
+        let all = merge_all_tab(&[], Vec::new(), vec![file("a")], vec![action("b")], AllFilter::default());
+        assert_eq!(kinds(&all), ["file", "action"]);
+        let no_files = AllFilter {
+            files: false,
+            ..AllFilter::default()
+        };
+        let filtered = merge_all_tab(&[], Vec::new(), vec![file("a")], vec![action("b")], no_files);
+        assert_eq!(kinds(&filtered), ["action"]);
     }
 }
