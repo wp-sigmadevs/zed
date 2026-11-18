@@ -22878,6 +22878,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "zenith_php_tools"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "zenith_rails"
 version = "0.1.0"
 dependencies = [
