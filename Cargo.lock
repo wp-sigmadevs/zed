@@ -22018,6 +22018,7 @@ dependencies = [
  "menu",
  "node_runtime",
  "parking_lot",
+ "paths",
  "postage",
  "pretty_assertions",
  "project",
@@ -22884,6 +22885,7 @@ name = "zenith_inspections"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "editor",
  "futures 0.3.34",
  "gpui",
  "language",
