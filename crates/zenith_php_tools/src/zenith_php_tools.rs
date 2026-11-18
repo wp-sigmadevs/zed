@@ -2,9 +2,11 @@
 //! functions over paths, so they test against temp directories; nothing here
 //! downloads or runs a tool.
 
+use http_client::HttpClient;
 use std::{
     fs,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -412,6 +414,69 @@ where
     .await
 }
 
+// ---- Composer for users who have none ----
+
+pub const COMPOSER_PHAR_URL: &str = "https://getcomposer.org/download/latest-stable/composer.phar";
+
+/// Where Zenith keeps its own copy of Composer.
+pub fn composer_phar(home: &Path) -> PathBuf {
+    managed_root(home).join("composer.phar")
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest as _, Sha256};
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+async fn fetch(client: &Arc<dyn HttpClient>, url: &str) -> Result<Vec<u8>, String> {
+    use futures::AsyncReadExt as _;
+    let mut response = client
+        .get(url, http_client::AsyncBody::empty(), true)
+        .await
+        .map_err(|error| format!("Could not download {url}: {error}"))?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "Could not download {url}: HTTP {}",
+            response.status()
+        ));
+    }
+    let mut bytes = Vec::new();
+    response
+        .body_mut()
+        .read_to_end(&mut bytes)
+        .await
+        .map_err(|error| format!("Could not read {url}: {error}"))?;
+    Ok(bytes)
+}
+
+/// Downloads `composer.phar` and keeps it only if its SHA-256 matches the one
+/// Composer publishes next to it.
+pub async fn download_composer(
+    client: Arc<dyn HttpClient>,
+    home: &Path,
+) -> Result<PathBuf, String> {
+    let phar = fetch(&client, COMPOSER_PHAR_URL).await?;
+    let published = fetch(&client, &format!("{COMPOSER_PHAR_URL}.sha256")).await?;
+    let expected = String::from_utf8_lossy(&published)
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .to_lowercase();
+    let actual = sha256_hex(&phar);
+    if expected != actual {
+        return Err(format!(
+            "composer.phar does not match its published checksum (expected {expected}, got {actual}); not installed"
+        ));
+    }
+    let path = composer_phar(home);
+    fs::create_dir_all(managed_root(home)).map_err(|error| error.to_string())?;
+    fs::write(&path, phar).map_err(|error| format!("Could not save composer.phar: {error}"))?;
+    Ok(path)
+}
+
 // ---- status bar item and "PHP tools: status" ----
 
 use gpui::{
@@ -666,13 +731,21 @@ fn maybe_offer(
         }
         _ => true,
     };
-    let (Some(php), Some(composer)) = (info.php_path.clone(), find_composer(&path_dirs)) else {
+    let Some(php) = info.php_path.clone() else {
         return;
     };
+    // None: Zenith downloads Composer itself when you click Install.
+    let composer = find_composer(&path_dirs)
+        .or_else(|| composer_phar(&home).is_file().then(|| composer_phar(&home)));
     if !should_offer(load_consent(&home, profile), trusted, local, has_any_tool) {
         return;
     }
     let weak = cx.entity().downgrade();
+    let download_note = if composer.is_none() {
+        " It will also download Composer, checked against its published checksum."
+    } else {
+        ""
+    };
     let label = match profile {
         Profile::WordPress => "WordPress tools: PHPCS with the WordPress standards, PHPStan",
         Profile::Laravel => "Laravel tools: Pint, PHPStan with Larastan",
@@ -681,7 +754,7 @@ fn maybe_offer(
     workspace.show_notification(BannerId::unique::<InstallBanner>(), cx, |cx| {
         cx.new(|cx| {
             MessageNotification::new(
-                format!("Zenith can set up {label}, in its own folder. Closing this asks again next time."),
+                format!("Zenith can set up {label}, in its own folder.{download_note} Closing this asks again next time."),
                 cx,
             )
             .primary_message("Install")
@@ -718,10 +791,11 @@ fn start_install(
     workspace: &mut Workspace,
     profile: Profile,
     php: PathBuf,
-    composer: PathBuf,
+    composer: Option<PathBuf>,
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
+    let http: Arc<dyn HttpClient> = workspace.client().http_client();
     workspace.dismiss_notification(&BannerId::unique::<InstallBanner>(), cx);
     workspace.show_notification(BannerId::unique::<InstallProgress>(), cx, |cx| {
         cx.new(|cx| MessageNotification::new("Installing PHP tools…", cx))
@@ -732,7 +806,11 @@ fn start_install(
         let (run_php, run_composer) = (php.clone(), composer.clone());
         let result = cx
             .background_spawn(async move {
-                install(&home, profile, &run_php, &run_composer, run_command).await
+                let composer = match run_composer {
+                    Some(composer) => composer,
+                    None => download_composer(http, &home).await?,
+                };
+                install(&home, profile, &run_php, &composer, run_command).await
             })
             .await;
         let log = install_log(&home_dir(), profile);
@@ -1186,5 +1264,47 @@ mod tests {
             install_log(Path::new("/Users/a"), Profile::Php),
             Path::new("/Users/a/.local/share/zenith/tools/php/php/install.log")
         );
+    }
+
+    #[test]
+    fn test_composer_download_is_kept_only_when_the_checksum_matches() {
+        let phar = b"#!/usr/bin/env php\n<?php // pretend composer".to_vec();
+        let good = sha256_hex(&phar);
+        let serve = |checksum: String| {
+            let phar = phar.clone();
+            http_client::FakeHttpClient::create(move |request| {
+                let body = if request.uri().to_string().ends_with(".sha256") {
+                    format!("{checksum}  composer.phar\n").into_bytes()
+                } else {
+                    phar.clone()
+                };
+                async move {
+                    Ok(http_client::Response::builder()
+                        .status(200)
+                        .body(http_client::AsyncBody::from(body))
+                        .unwrap())
+                }
+            })
+        };
+
+        let home = tempfile::tempdir().unwrap();
+        let path =
+            futures::executor::block_on(download_composer(serve(good), home.path())).unwrap();
+        assert_eq!(path, composer_phar(home.path()));
+        assert_eq!(fs::read(&path).unwrap(), phar);
+
+        let other = tempfile::tempdir().unwrap();
+        let error =
+            futures::executor::block_on(download_composer(serve("0".repeat(64)), other.path()))
+                .unwrap_err();
+        assert!(error.contains("does not match"), "{error}");
+        assert!(!composer_phar(other.path()).exists());
+
+        let missing = futures::executor::block_on(download_composer(
+            http_client::FakeHttpClient::with_404_response(),
+            other.path(),
+        ))
+        .unwrap_err();
+        assert!(missing.contains("HTTP 404"), "{missing}");
     }
 }

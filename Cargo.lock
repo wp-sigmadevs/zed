@@ -22884,9 +22884,11 @@ version = "0.1.0"
 dependencies = [
  "futures 0.3.34",
  "gpui",
+ "http_client",
  "project",
  "serde_json",
  "settings",
+ "sha2",
  "tempfile",
  "theme",
  "theme_settings",
