@@ -105,7 +105,9 @@ pub fn init(cx: &mut App) {
         workspace.register_action(|workspace, _: &Switcher, window, cx| {
             if let Some(modal) = workspace.active_modal::<SearchEverywhere>(cx) {
                 modal.update(cx, |modal, cx| {
-                    modal.picker.update(cx, |picker, cx| picker.select_next(&menu::SelectNext, window, cx))
+                    modal.picker.update(cx, |picker, cx| {
+                        picker.select_next(&menu::SelectNext, window, cx)
+                    })
                 });
                 return;
             }
@@ -114,7 +116,9 @@ pub fn init(cx: &mut App) {
                 let modifiers = window.modifiers();
                 modal.update(cx, |modal, cx| {
                     modal.init_modifiers = modifiers.modified().then_some(modifiers);
-                    modal.picker.update(cx, |picker, _| picker.delegate.select_previous_file = true);
+                    modal
+                        .picker
+                        .update(cx, |picker, _| picker.delegate.select_previous_file = true);
                 });
             }
         });
@@ -205,22 +209,26 @@ struct ToolWindow {
 }
 
 fn tool_windows(workspace: &Workspace, window: &Window, cx: &App) -> Vec<ToolWindow> {
-    [workspace.left_dock(), workspace.bottom_dock(), workspace.right_dock()]
-        .into_iter()
-        .flat_map(|dock| dock.read(cx).zenith_panels().cloned().collect::<Vec<_>>())
-        .filter(|panel| panel.enabled(cx))
-        .filter_map(|panel| {
-            Some(ToolWindow {
-                name: panel
-                    .icon_tooltip(window, cx)?
-                    .trim_end_matches(" Panel")
-                    .to_string()
-                    .into(),
-                icon: panel.icon(window, cx)?,
-                toggle: panel.toggle_action(window, cx),
-            })
+    [
+        workspace.left_dock(),
+        workspace.bottom_dock(),
+        workspace.right_dock(),
+    ]
+    .into_iter()
+    .flat_map(|dock| dock.read(cx).zenith_panels().cloned().collect::<Vec<_>>())
+    .filter(|panel| panel.enabled(cx))
+    .filter_map(|panel| {
+        Some(ToolWindow {
+            name: panel
+                .icon_tooltip(window, cx)?
+                .trim_end_matches(" Panel")
+                .to_string()
+                .into(),
+            icon: panel.icon(window, cx)?,
+            toggle: panel.toggle_action(window, cx),
         })
-        .collect()
+    })
+    .collect()
 }
 
 impl ModalView for SearchEverywhere {}
@@ -257,9 +265,23 @@ impl SearchEverywhere {
             .map(|(project_path, _)| project_path)
             .collect();
         let recent_locations = recent_locations(workspace, cx);
-        let tool_windows = tool_windows(workspace, window, cx);
+        // Deferred: some panels' `icon` (e.g. the terminal's) read the workspace,
+        // which is mid-update here and would panic.
+        let workspace_for_tools = workspace_handle.clone();
+        window.defer(cx, move |window, cx| {
+            let Some(workspace) = workspace_for_tools.upgrade() else {
+                return;
+            };
+            let tool_windows = tool_windows(workspace.read(cx), window, cx);
+            if let Some(modal) = workspace.read(cx).active_modal::<Self>(cx) {
+                modal.update(cx, |modal, cx| {
+                    modal.tool_windows = tool_windows;
+                    cx.notify();
+                });
+            }
+        });
         workspace.toggle_modal(window, cx, move |window, cx| {
-            let mut this = Self::new(
+            let this = Self::new(
                 tab,
                 workspace_handle,
                 project,
@@ -269,7 +291,6 @@ impl SearchEverywhere {
                 window,
                 cx,
             );
-            this.tool_windows = tool_windows;
             if tab == Tab::Locations {
                 this.load_closed_file_snippets(cx);
             }
@@ -335,7 +356,10 @@ impl SearchEverywhere {
 
     fn cycle_tab(&mut self, step: isize, window: &mut Window, cx: &mut Context<Self>) {
         // The Recent popups have no tab strip: Tab must not leave them.
-        if matches!(self.picker.read(cx).delegate.tab, Tab::Recent | Tab::Locations) {
+        if matches!(
+            self.picker.read(cx).delegate.tab,
+            Tab::Recent | Tab::Locations
+        ) {
             return;
         }
         let tab = self.picker.read(cx).delegate.tab.cycle(step);
@@ -347,33 +371,36 @@ impl Render for SearchEverywhere {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let current_tab = self.picker.read(cx).delegate.tab;
         let border = cx.theme().colors().border_variant;
-        let header = match current_tab {
-            Tab::Recent | Tab::Locations => self.render_popup_header(current_tab, cx).into_any_element(),
-            _ => h_flex()
-                .p_1()
-                .gap_1()
-                .border_b_1()
-                .border_color(border)
-                .children(Tab::ORDER.into_iter().map(|tab| {
-                    Button::new(tab.label(), tab.label())
-                        .label_size(LabelSize::Small)
-                        .toggle_state(tab == current_tab)
-                        .selected_style(ButtonStyle::Tinted(TintColor::Accent))
-                        .disabled(!tab.is_ready())
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.switch_tab(tab, window, cx)
-                        }))
-                }))
-                .child(div().flex_1())
-                .when(current_tab == Tab::All, |this| {
-                    this.child(
-                        div()
-                            .debug_selector(|| "zenith-search-filter".into())
-                            .child(self.render_filter_menu(cx)),
-                    )
-                })
-                .into_any_element(),
-        };
+        let header =
+            match current_tab {
+                Tab::Recent | Tab::Locations => {
+                    self.render_popup_header(current_tab, cx).into_any_element()
+                }
+                _ => h_flex()
+                    .p_1()
+                    .gap_1()
+                    .border_b_1()
+                    .border_color(border)
+                    .children(Tab::ORDER.into_iter().map(|tab| {
+                        Button::new(tab.label(), tab.label())
+                            .label_size(LabelSize::Small)
+                            .toggle_state(tab == current_tab)
+                            .selected_style(ButtonStyle::Tinted(TintColor::Accent))
+                            .disabled(!tab.is_ready())
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.switch_tab(tab, window, cx)
+                            }))
+                    }))
+                    .child(div().flex_1())
+                    .when(current_tab == Tab::All, |this| {
+                        this.child(
+                            div()
+                                .debug_selector(|| "zenith-search-filter".into())
+                                .child(self.render_filter_menu(cx)),
+                        )
+                    })
+                    .into_any_element(),
+            };
         let body = if current_tab == Tab::Recent {
             h_flex()
                 .items_start()
@@ -416,7 +443,11 @@ impl SearchEverywhere {
             .enumerate()
             .filter(|(_, location)| location.snippet.is_none())
             .filter_map(|(ix, location)| {
-                Some((ix, project.absolute_path(&location.project_path, cx)?, location.row))
+                Some((
+                    ix,
+                    project.absolute_path(&location.project_path, cx)?,
+                    location.row,
+                ))
             })
             .collect::<Vec<_>>();
         if jobs.is_empty() {
@@ -564,22 +595,27 @@ impl SearchEverywhere {
             .py_1()
             .border_r_1()
             .border_color(cx.theme().colors().border_variant)
-            .children(self.tool_windows.iter().enumerate().map(|(ix, tool_window)| {
-                let toggle = tool_window.toggle.boxed_clone();
-                ListItem::new(("zenith-tool-window", ix))
-                    .inset(true)
-                    .spacing(ListItemSpacing::Sparse)
-                    .start_slot(
-                        Icon::new(tool_window.icon)
-                            .size(IconSize::Small)
-                            .color(Color::Muted),
-                    )
-                    .child(Label::new(tool_window.name.clone()).size(LabelSize::Small))
-                    .on_click(cx.listener(move |_, _, window, cx| {
-                        cx.emit(DismissEvent);
-                        window.dispatch_action(toggle.boxed_clone(), cx);
-                    }))
-            }))
+            .children(
+                self.tool_windows
+                    .iter()
+                    .enumerate()
+                    .map(|(ix, tool_window)| {
+                        let toggle = tool_window.toggle.boxed_clone();
+                        ListItem::new(("zenith-tool-window", ix))
+                            .inset(true)
+                            .spacing(ListItemSpacing::Sparse)
+                            .start_slot(
+                                Icon::new(tool_window.icon)
+                                    .size(IconSize::Small)
+                                    .color(Color::Muted),
+                            )
+                            .child(Label::new(tool_window.name.clone()).size(LabelSize::Small))
+                            .on_click(cx.listener(move |_, _, window, cx| {
+                                cx.emit(DismissEvent);
+                                window.dispatch_action(toggle.boxed_clone(), cx);
+                            }))
+                    }),
+            )
     }
 }
 
@@ -873,7 +909,11 @@ impl SearchDelegate {
 
     /// Recent Files: the recently opened files, fuzzy-filtered by the query; with
     /// "Show edited only", just those changed this session.
-    fn search_recent(&self, query: String, cx: &mut Context<Picker<Self>>) -> Task<Vec<SearchMatch>> {
+    fn search_recent(
+        &self,
+        query: String,
+        cx: &mut Context<Picker<Self>>,
+    ) -> Task<Vec<SearchMatch>> {
         let project = self.project.read(cx);
         let path_style = project.path_style(cx);
         let include_root_name = project.visible_worktrees(cx).count() > 1;
@@ -882,10 +922,12 @@ impl SearchDelegate {
             .iter()
             .filter(|project_path| {
                 !self.edited_only
-                    || project.get_open_buffer(project_path, cx).is_some_and(|buffer| {
-                        let buffer = buffer.read(cx);
-                        buffer.is_dirty() || buffer.peek_undo_stack().is_some()
-                    })
+                    || project
+                        .get_open_buffer(project_path, cx)
+                        .is_some_and(|buffer| {
+                            let buffer = buffer.read(cx);
+                            buffer.is_dirty() || buffer.peek_undo_stack().is_some()
+                        })
             })
             .filter_map(|project_path| {
                 let worktree = project.worktree_for_id(project_path.worktree_id, cx)?;
@@ -1121,7 +1163,10 @@ fn merge_all_tab(
             Vec::new()
         }
     };
-    let mut merged = keep(filter.classes, classes.into_iter().map(SearchMatch::Symbol).collect());
+    let mut merged = keep(
+        filter.classes,
+        classes.into_iter().map(SearchMatch::Symbol).collect(),
+    );
     merged.extend(keep(filter.files, files));
     merged.extend(keep(
         filter.symbols,
@@ -1512,7 +1557,9 @@ impl PickerDelegate for SearchDelegate {
                 label, positions, ..
             } => {
                 let (name, dir, name_positions) = split_path_label(label, positions);
-                let file = name.rsplit_once(':').map_or(name.as_str(), |(file, _)| file);
+                let file = name
+                    .rsplit_once(':')
+                    .map_or(name.as_str(), |(file, _)| file);
                 (
                     file_icon(file, cx),
                     name.clone().into(),
@@ -1548,13 +1595,15 @@ impl PickerDelegate for SearchDelegate {
                     .min_w_0()
                     .child(title)
                     .child(
-                        div().debug_selector(|| "zenith-location-snippet".into()).child(
-                            Label::new(snippet)
-                                .size(LabelSize::Small)
-                                .color(Color::Muted)
-                                .buffer_font(cx)
-                                .truncate(),
-                        ),
+                        div()
+                            .debug_selector(|| "zenith-location-snippet".into())
+                            .child(
+                                Label::new(snippet)
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted)
+                                    .buffer_font(cx)
+                                    .truncate(),
+                            ),
                     )
                     .into_any_element()
             }
@@ -1563,7 +1612,6 @@ impl PickerDelegate for SearchDelegate {
         Some(item.start_slot::<gpui::AnyElement>(icon).child(content))
     }
 }
-
 
 /// A row opens a group when the row before it is of another kind (or there is none).
 fn starts_group(previous_kind: Option<&str>, kind: &str) -> bool {
@@ -1825,7 +1873,14 @@ mod tests {
         let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
         cx.run_until_parked();
         let worktree_id = workspace.read_with(cx, |workspace, cx| {
-            workspace.project().read(cx).worktrees(cx).next().unwrap().read(cx).id()
+            workspace
+                .project()
+                .read(cx)
+                .worktrees(cx)
+                .next()
+                .unwrap()
+                .read(cx)
+                .id()
         });
         for file in ["src/main.rs", "src/lib.rs"] {
             workspace
@@ -1862,8 +1917,14 @@ mod tests {
 
         open_on(Tab::Recent, &workspace, cx);
         let picker = open_picker(&workspace, cx);
-        assert!(cx.debug_bounds("zenith-popup-header").is_some(), "title row");
-        assert!(cx.debug_bounds("zenith-tool-windows").is_some(), "tool windows column");
+        assert!(
+            cx.debug_bounds("zenith-popup-header").is_some(),
+            "title row"
+        );
+        assert!(
+            cx.debug_bounds("zenith-tool-windows").is_some(),
+            "tool windows column"
+        );
         // Only what was opened, newest first; README was never opened.
         assert_eq!(
             file_labels(&picker, cx),
@@ -1874,7 +1935,9 @@ mod tests {
         cx.run_until_parked();
         assert_eq!(file_labels(&picker, cx), [path!("src/main.rs")]);
         // Typing filters the recent files only, never the whole project.
-        picker.update_in(cx, |picker, window, cx| picker.set_query("readme", window, cx));
+        picker.update_in(cx, |picker, window, cx| {
+            picker.set_query("readme", window, cx)
+        });
         cx.run_until_parked();
         assert!(file_labels(&picker, cx).is_empty());
 
@@ -1976,7 +2039,11 @@ mod tests {
                 .collect::<Vec<_>>();
             assert_eq!(
                 snippets,
-                [Some("line 20".into()), Some("line 10".into()), Some("line 0".into())]
+                [
+                    Some("line 20".into()),
+                    Some("line 10".into()),
+                    Some("line 0".into())
+                ]
             );
         });
         assert!(cx.debug_bounds("zenith-location-snippet").is_some());
@@ -2055,6 +2122,96 @@ mod tests {
                 .map(|location| location.snippet.as_deref().map(str::to_string))
                 .collect::<Vec<_>>();
             assert_eq!(snippets, [Some("b".into()), Some("a".into())]);
+        });
+    }
+
+    /// Reads its workspace in `icon`, like the terminal panel does.
+    struct WorkspaceReadingPanel {
+        workspace: WeakEntity<Workspace>,
+        focus_handle: FocusHandle,
+    }
+
+    impl EventEmitter<workspace::dock::PanelEvent> for WorkspaceReadingPanel {}
+
+    impl Focusable for WorkspaceReadingPanel {
+        fn focus_handle(&self, _: &App) -> FocusHandle {
+            self.focus_handle.clone()
+        }
+    }
+
+    impl Render for WorkspaceReadingPanel {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+        }
+    }
+
+    impl workspace::dock::Panel for WorkspaceReadingPanel {
+        fn persistent_name() -> &'static str {
+            "WorkspaceReadingPanel"
+        }
+        fn panel_key() -> &'static str {
+            "WorkspaceReadingPanel"
+        }
+        fn position(&self, _: &Window, _: &App) -> workspace::dock::DockPosition {
+            workspace::dock::DockPosition::Bottom
+        }
+        fn position_is_valid(&self, _: workspace::dock::DockPosition) -> bool {
+            true
+        }
+        fn set_position(
+            &mut self,
+            _: workspace::dock::DockPosition,
+            _: &mut Window,
+            _: &mut Context<Self>,
+        ) {
+        }
+        fn default_size(&self, _: &Window, _: &App) -> Pixels {
+            px(300.)
+        }
+        fn icon(&self, _: &Window, cx: &App) -> Option<IconName> {
+            let workspace = self.workspace.upgrade()?;
+            workspace.read(cx);
+            Some(IconName::Terminal)
+        }
+        fn icon_tooltip(&self, _: &Window, _: &App) -> Option<&'static str> {
+            Some("Reader")
+        }
+        fn toggle_action(&self) -> Box<dyn Action> {
+            menu::Cancel.boxed_clone()
+        }
+        fn activation_priority(&self) -> u32 {
+            99
+        }
+    }
+
+    #[gpui::test]
+    async fn test_opens_with_a_panel_that_reads_the_workspace(cx: &mut TestAppContext) {
+        let app_state = init_test(cx);
+        let project = Project::test(app_state.fs.clone(), [], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        workspace.update_in(cx, |workspace, window, cx| {
+            let weak_workspace = cx.entity().downgrade();
+            let panel = cx.new(|cx| WorkspaceReadingPanel {
+                workspace: weak_workspace,
+                focus_handle: cx.focus_handle(),
+            });
+            workspace.add_panel(panel, window, cx);
+        });
+
+        open_on(Tab::Locations, &workspace, cx);
+        workspace.update(cx, |workspace, cx| {
+            let modal = workspace
+                .active_modal::<SearchEverywhere>(cx)
+                .expect("Search Everywhere is open");
+            assert!(
+                modal
+                    .read(cx)
+                    .tool_windows
+                    .iter()
+                    .any(|tool_window| tool_window.name.as_ref() == "Reader")
+            );
         });
     }
 
@@ -2445,6 +2602,11 @@ mod tests {
         assert!(cx.debug_bounds("zenith-search-filter").is_some());
     }
 
+    // zenith.json binds actions from sibling crates this test binary doesn't link.
+    mod zenith_todo {
+        gpui::actions!(zenith_todo, [ToggleFocus]);
+    }
+
     #[gpui::test]
     fn test_keymap_opens_search_like_phpstorm(cx: &mut TestAppContext) {
         cx.update(|cx| {
@@ -2572,7 +2734,11 @@ mod zenith_look_tests {
     fn test_split_path_label() {
         assert_eq!(
             split_path_label("includes/Core/Assets.php", &[0, 9, 14, 15]),
-            ("Assets.php".to_string(), Some("includes/Core".to_string()), vec![0, 1])
+            (
+                "Assets.php".to_string(),
+                Some("includes/Core".to_string()),
+                vec![0, 1]
+            )
         );
         assert_eq!(
             split_path_label("composer.json", &[0, 1]),
@@ -2582,10 +2748,16 @@ mod zenith_look_tests {
 
     #[test]
     fn test_symbol_badges() {
-        assert_eq!(symbol_badge_letter(SymbolKind::Class), ("C", BadgeColor::Type));
+        assert_eq!(
+            symbol_badge_letter(SymbolKind::Class),
+            ("C", BadgeColor::Type)
+        );
         assert_eq!(symbol_badge_letter(SymbolKind::Interface).0, "I");
         assert_eq!(symbol_badge_letter(SymbolKind::Module).0, "T");
-        assert_eq!(symbol_badge_letter(SymbolKind::Method), ("m", BadgeColor::Member));
+        assert_eq!(
+            symbol_badge_letter(SymbolKind::Method),
+            ("m", BadgeColor::Member)
+        );
         assert_eq!(symbol_badge_letter(SymbolKind::Function).0, "f");
         assert_eq!(symbol_badge_letter(SymbolKind::Property).0, "p");
     }
@@ -2637,13 +2809,25 @@ mod zenith_filter_tests {
 
     #[test]
     fn test_all_tab_filter_hides_groups() {
-        let all = merge_all_tab(&[], Vec::new(), vec![file("a")], vec![action("b")], AllFilter::default());
+        let all = merge_all_tab(
+            &[],
+            Vec::new(),
+            vec![file("a")],
+            vec![action("b")],
+            AllFilter::default(),
+        );
         assert_eq!(kinds(&all), ["file", "action"]);
         let no_files = AllFilter {
             files: false,
             ..AllFilter::default()
         };
-        let filtered = merge_all_tab(&[], Vec::new(), vec![file("a")], vec![action("b")], no_files);
+        let filtered = merge_all_tab(
+            &[],
+            Vec::new(),
+            vec![file("a")],
+            vec![action("b")],
+            no_files,
+        );
         assert_eq!(kinds(&filtered), ["action"]);
     }
 }
