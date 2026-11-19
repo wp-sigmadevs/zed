@@ -1,3 +1,5 @@
+use std::collections::{BTreeMap, HashSet};
+
 use editor::{Editor, SelectionEffects, scroll::Autoscroll};
 use gpui::{
     Action, App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable,
@@ -5,12 +7,12 @@ use gpui::{
 };
 use language::{Buffer, BufferEvent};
 use project::{
-    Project, SearchResults,
+    Project, ProjectItem as _, ProjectPath, SearchResults,
     buffer_store::BufferStoreEvent,
     search::{SearchQuery, SearchResult},
 };
 use text::{Anchor, Point, ToOffset as _, ToPoint as _};
-use ui::{IconName, Label, ListItem, ListItemSpacing, prelude::*};
+use ui::{ListItem, ListItemSpacing, prelude::*};
 use util::{ResultExt as _, paths::PathMatcher};
 use workspace::{
     Workspace,
@@ -27,7 +29,7 @@ actions!(
     ]
 );
 
-// shortcut: fixed patterns, no `zenith.todo` setting yet; add one to settings_content in slice 2.
+// shortcut: fixed patterns, no `zenith.todo` setting yet; add one to settings_content when its recompile fits the disk budget.
 const PATTERN: &str = r"\bTODO\b|\bFIXME\b|\bHACK\b|\bXXX\b|@todo|shortcut:";
 
 pub fn init(cx: &mut App) {
@@ -53,16 +55,31 @@ fn has_comment_marker(prefix: &str) -> bool {
             .any(|marker| prefix.contains(marker))
 }
 
-struct TodoItem {
-    anchor: Anchor,
-    row: u32,
-    text: SharedString,
+/// The group name for a matched marker: `todo:` and `Todo` both group under `TODO`.
+fn pattern_label(matched: &str) -> SharedString {
+    matched.trim_end_matches(':').to_uppercase().into()
 }
 
-struct FileGroup {
-    path: SharedString,
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Scope {
+    Project,
+    CurrentFile,
+    ChangedFiles,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GroupBy {
+    File,
+    Pattern,
+}
+
+struct TodoItem {
     buffer: Entity<Buffer>,
-    items: Vec<TodoItem>,
+    path: SharedString,
+    anchor: Anchor,
+    row: u32,
+    pattern: SharedString,
+    text: SharedString,
 }
 
 pub struct TodoPanel {
@@ -70,11 +87,13 @@ pub struct TodoPanel {
     workspace: WeakEntity<Workspace>,
     focus_handle: FocusHandle,
     position: DockPosition,
-    groups: Vec<FileGroup>,
+    scope: Scope,
+    group_by: GroupBy,
+    items: Vec<TodoItem>,
     scanned: bool,
     scanning: bool,
     limit_reached: bool,
-    error: Option<SharedString>,
+    message: Option<SharedString>,
     scan_task: Task<()>,
 }
 
@@ -93,22 +112,83 @@ impl TodoPanel {
             }
         })
         .detach();
+        if let Some(workspace_entity) = workspace.weak_handle().upgrade() {
+            cx.subscribe(&workspace_entity, |this, _, event, cx| {
+                if matches!(event, workspace::Event::ActiveItemChanged)
+                    && this.scanned
+                    && this.scope == Scope::CurrentFile
+                {
+                    this.rescan(cx);
+                }
+            })
+            .detach();
+        }
         Self {
             project,
             workspace: workspace.weak_handle(),
             focus_handle: cx.focus_handle(),
             position: DockPosition::Bottom,
-            groups: Vec::new(),
+            scope: Scope::Project,
+            group_by: GroupBy::File,
+            items: Vec::new(),
             scanned: false,
             scanning: false,
             limit_reached: false,
-            error: None,
+            message: None,
             scan_task: Task::ready(()),
         }
     }
 
+    fn set_scope(&mut self, scope: Scope, cx: &mut Context<Self>) {
+        self.scope = scope;
+        self.rescan(cx);
+    }
+
+    fn active_buffer(&self, cx: &App) -> Option<Entity<Buffer>> {
+        self.workspace
+            .upgrade()?
+            .read(cx)
+            .active_item_as::<Editor>(cx)?
+            .read(cx)
+            .buffer()
+            .read(cx)
+            .as_singleton()
+    }
+
+    fn changed_paths(&self, cx: &App) -> HashSet<ProjectPath> {
+        let git_store = self.project.read(cx).git_store().read(cx);
+        git_store
+            .repositories()
+            .values()
+            .flat_map(|repository| {
+                let repository = repository.read(cx);
+                repository
+                    .cached_status()
+                    .filter(|entry| !entry.status.is_deleted())
+                    .filter_map(|entry| repository.repo_path_to_project_path(&entry.repo_path, cx))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
     fn rescan(&mut self, cx: &mut Context<Self>) {
         self.scanned = true;
+        self.message = None;
+        let buffers = match self.scope {
+            Scope::CurrentFile => match self.active_buffer(cx) {
+                Some(buffer) => Some(vec![buffer]),
+                None => {
+                    self.finish(Vec::new(), false, Some("No file is open.".into()), cx);
+                    return;
+                }
+            },
+            Scope::Project | Scope::ChangedFiles => None,
+        };
+        let changed_paths = (self.scope == Scope::ChangedFiles).then(|| self.changed_paths(cx));
+        if changed_paths.as_ref().is_some_and(|paths| paths.is_empty()) {
+            self.finish(Vec::new(), false, Some("No changed files.".into()), cx);
+            return;
+        }
         let query = match SearchQuery::regex(
             PATTERN,
             false,
@@ -118,12 +198,11 @@ impl TodoPanel {
             PathMatcher::default(),
             PathMatcher::default(),
             false,
-            None,
+            buffers,
         ) {
             Ok(query) => query,
             Err(error) => {
-                self.error = Some(error.to_string().into());
-                cx.notify();
+                self.finish(Vec::new(), false, Some(error.to_string().into()), cx);
                 return;
             }
         };
@@ -131,9 +210,8 @@ impl TodoPanel {
             .project
             .update(cx, |project, cx| project.search(query, cx));
         self.scanning = true;
-        self.error = None;
         cx.notify();
-        // shortcut: rescans the whole project on every save; scan just the saved file if it gets slow on big repos.
+        // shortcut: rescans the whole scope on every save; scan just the saved file if it gets slow on big repos.
         self.scan_task = cx.spawn(async move |this, cx| {
             let _search = task_handle;
             let mut found = Vec::new();
@@ -146,17 +224,37 @@ impl TodoPanel {
                 }
             }
             this.update(cx, |this, cx| {
-                this.groups = found
+                let items = found
                     .into_iter()
-                    .filter_map(|(buffer, ranges)| file_group(buffer, ranges, cx))
+                    .filter(|(buffer, _)| {
+                        changed_paths.as_ref().is_none_or(|paths| {
+                            buffer
+                                .read(cx)
+                                .project_path(cx)
+                                .is_some_and(|path| paths.contains(&path))
+                        })
+                    })
+                    .flat_map(|(buffer, ranges)| todo_items(buffer, ranges, cx))
                     .collect();
-                this.groups.sort_by(|a, b| a.path.cmp(&b.path));
-                this.limit_reached = limit_reached;
-                this.scanning = false;
-                cx.notify();
+                this.finish(items, limit_reached, None, cx);
             })
             .log_err();
         });
+    }
+
+    fn finish(
+        &mut self,
+        mut items: Vec<TodoItem>,
+        limit_reached: bool,
+        message: Option<SharedString>,
+        cx: &mut Context<Self>,
+    ) {
+        items.sort_by(|a, b| a.path.cmp(&b.path).then(a.row.cmp(&b.row)));
+        self.items = items;
+        self.limit_reached = limit_reached;
+        self.message = message;
+        self.scanning = false;
+        cx.notify();
     }
 
     fn open(&self, buffer: Entity<Buffer>, anchor: Anchor, window: &mut Window, cx: &mut App) {
@@ -180,21 +278,31 @@ impl TodoPanel {
             });
         });
     }
+
+    fn groups(&self) -> BTreeMap<SharedString, Vec<&TodoItem>> {
+        let mut groups: BTreeMap<SharedString, Vec<&TodoItem>> = BTreeMap::new();
+        for item in &self.items {
+            let key = match self.group_by {
+                GroupBy::File => item.path.clone(),
+                GroupBy::Pattern => item.pattern.clone(),
+            };
+            groups.entry(key).or_default().push(item);
+        }
+        groups
+    }
 }
 
-fn file_group(
+fn todo_items(
     buffer: Entity<Buffer>,
     ranges: Vec<std::ops::Range<Anchor>>,
     cx: &App,
-) -> Option<FileGroup> {
+) -> Vec<TodoItem> {
     let snapshot = buffer.read(cx).snapshot();
-    let path = buffer
-        .read(cx)
-        .file()?
-        .full_path(cx)
-        .to_string_lossy()
-        .into_owned();
-    let items: Vec<TodoItem> = ranges
+    let Some(file) = buffer.read(cx).file() else {
+        return Vec::new();
+    };
+    let path: SharedString = file.full_path(cx).to_string_lossy().into_owned().into();
+    ranges
         .into_iter()
         .filter_map(|range| {
             let point = range.start.to_point(&snapshot);
@@ -212,55 +320,127 @@ fn file_group(
                         .map(|name| name.starts_with("comment"))
                 })
                 .unwrap_or(false);
-            (in_comment_scope || has_comment_marker(prefix)).then(|| TodoItem {
+            if !in_comment_scope && !has_comment_marker(prefix) {
+                return None;
+            }
+            let matched: String = snapshot.text_for_range(range.clone()).collect();
+            Some(TodoItem {
+                buffer: buffer.clone(),
+                path: path.clone(),
                 anchor: range.start,
                 row: point.row,
+                pattern: pattern_label(&matched),
                 text: line.trim().to_string().into(),
             })
         })
-        .collect();
-    (!items.is_empty()).then(|| FileGroup {
-        path: path.into(),
-        buffer,
-        items,
-    })
+        .collect()
 }
 
 impl Render for TodoPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let count: usize = self.groups.iter().map(|group| group.items.len()).sum();
+        let groups = self.groups();
+        let file_count = self
+            .items
+            .iter()
+            .map(|item| &item.path)
+            .collect::<HashSet<_>>()
+            .len();
         let status = if self.scanning {
             "Scanning…".to_string()
-        } else if let Some(error) = &self.error {
-            error.to_string()
-        } else if self.limit_reached {
-            format!(
-                "{count} TODO items in {} files (limit reached)",
-                self.groups.len()
-            )
+        } else if let Some(message) = &self.message {
+            message.to_string()
         } else {
-            format!("{count} TODO items in {} files", self.groups.len())
+            let limit = if self.limit_reached {
+                " (limit reached)"
+            } else {
+                ""
+            };
+            format!(
+                "{} TODO items in {file_count} files{limit}",
+                self.items.len()
+            )
         };
+        let scope_button = |id: &'static str, label: &'static str, scope: Scope| {
+            Button::new(id, label)
+                .style(ButtonStyle::Subtle)
+                .toggle_state(self.scope == scope)
+                .on_click(cx.listener(move |this, _, _, cx| this.set_scope(scope, cx)))
+        };
+        let group_button = |id: &'static str, label: &'static str, group_by: GroupBy| {
+            Button::new(id, label)
+                .style(ButtonStyle::Subtle)
+                .toggle_state(self.group_by == group_by)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.group_by = group_by;
+                    cx.notify();
+                }))
+        };
+        let toolbar = h_flex()
+            .px_2()
+            .py_1()
+            .gap_1()
+            .child(scope_button(
+                "zenith-todo-project",
+                "Project",
+                Scope::Project,
+            ))
+            .child(scope_button(
+                "zenith-todo-current",
+                "Current File",
+                Scope::CurrentFile,
+            ))
+            .child(scope_button(
+                "zenith-todo-changed",
+                "Changed Files",
+                Scope::ChangedFiles,
+            ))
+            .child(div().w_2())
+            .child(group_button(
+                "zenith-todo-by-file",
+                "By File",
+                GroupBy::File,
+            ))
+            .child(group_button(
+                "zenith-todo-by-pattern",
+                "By Pattern",
+                GroupBy::Pattern,
+            ))
+            .child(div().flex_1())
+            .child(Label::new(status).color(Color::Muted))
+            .child(
+                IconButton::new("zenith-todo-refresh", IconName::RotateCw)
+                    .tooltip(ui::Tooltip::text("Refresh"))
+                    .on_click(cx.listener(|this, _, _, cx| this.rescan(cx))),
+            );
+
+        let show_path = self.group_by == GroupBy::Pattern;
         let mut list = v_flex()
             .id("zenith-todo-items")
             .flex_1()
             .overflow_y_scroll();
-        for (group_index, group) in self.groups.iter().enumerate() {
+        let mut row_index = 0usize;
+        for (key, items) in &groups {
             list = list.child(
-                ListItem::new(("todo-file", group_index))
+                ListItem::new(("todo-group", row_index))
                     .spacing(ListItemSpacing::Dense)
                     .child(
                         h_flex()
                             .gap_2()
-                            .child(Label::new(group.path.clone()))
-                            .child(Label::new(group.items.len().to_string()).color(Color::Muted)),
+                            .child(Label::new(key.clone()))
+                            .child(Label::new(items.len().to_string()).color(Color::Muted)),
                     ),
             );
-            for (item_index, item) in group.items.iter().enumerate() {
-                let buffer = group.buffer.clone();
+            row_index += 1;
+            for item in items {
+                let buffer = item.buffer.clone();
                 let anchor = item.anchor;
+                let location = if show_path {
+                    format!("{}:{}", item.path, item.row + 1)
+                } else {
+                    (item.row + 1).to_string()
+                };
                 list = list.child(
-                    ListItem::new(("todo-item", group_index * 100_000 + item_index))
+                    ListItem::new(("todo-item", row_index))
                         .spacing(ListItemSpacing::Dense)
                         .indent_level(1)
                         .on_click(cx.listener(move |this, _, window, cx| {
@@ -269,10 +449,11 @@ impl Render for TodoPanel {
                         .child(
                             h_flex()
                                 .gap_2()
-                                .child(Label::new(format!("{}", item.row + 1)).color(Color::Muted))
+                                .child(Label::new(location).color(Color::Muted))
                                 .child(Label::new(item.text.clone()).truncate()),
                         ),
                 );
+                row_index += 1;
             }
         }
         v_flex()
@@ -280,18 +461,7 @@ impl Render for TodoPanel {
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(|this, _: &Refresh, _, cx| this.rescan(cx)))
             .size_full()
-            .child(
-                h_flex()
-                    .px_2()
-                    .py_1()
-                    .justify_between()
-                    .child(Label::new(status).color(Color::Muted))
-                    .child(
-                        IconButton::new("zenith-todo-refresh", IconName::RotateCw)
-                            .tooltip(ui::Tooltip::text("Refresh"))
-                            .on_click(cx.listener(|this, _, _, cx| this.rescan(cx))),
-                    ),
-            )
+            .child(toolbar)
             .child(list)
     }
 }
@@ -387,5 +557,13 @@ mod tests {
         for text in ["TODO_LIST", "todos", "hacker"] {
             assert!(!regex.is_match(text), "{text:?}");
         }
+    }
+
+    #[test]
+    fn pattern_labels_group_case_and_colon() {
+        assert_eq!(pattern_label("todo"), pattern_label("TODO"));
+        assert_eq!(pattern_label("Fixme"), "FIXME");
+        assert_eq!(pattern_label("shortcut:"), "SHORTCUT");
+        assert_eq!(pattern_label("@todo"), "@TODO");
     }
 }
