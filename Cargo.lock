@@ -23010,6 +23010,7 @@ name = "zenith_todo"
 version = "0.1.0"
 dependencies = [
  "editor",
+ "fs",
  "gpui",
  "language",
  "project",

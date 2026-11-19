@@ -55,4 +55,24 @@ pub struct ZenithTodoSettingsContent {
     ///
     /// Default: true
     pub highlight: Option<bool>,
+    /// Which files the TODO panel lists when it opens.
+    ///
+    /// Default: project
+    pub scope: Option<ZenithTodoScope>,
+    /// Where the TODO panel docks.
+    ///
+    /// Default: bottom
+    pub dock: Option<crate::DockPosition>,
+}
+
+/// Which files the TODO panel lists.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+#[serde(rename_all = "snake_case")]
+pub enum ZenithTodoScope {
+    /// Every file in the project.
+    Project,
+    /// The file in the active editor.
+    CurrentFile,
+    /// Files git reports as changed.
+    ChangedFiles,
 }

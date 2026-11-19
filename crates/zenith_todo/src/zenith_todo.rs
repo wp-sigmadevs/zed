@@ -1,12 +1,15 @@
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
+    future::Future,
+    sync::Arc,
     ops::Range,
     time::Duration,
 };
 
+use fs::Fs;
 use editor::{Editor, EditorEvent, HighlightKey, SelectionEffects, scroll::Autoscroll};
 use gpui::{
-    Action, App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable,
+    Action, App, AppContext as _, Context, Entity, EntityId, EventEmitter, FocusHandle, Focusable,
     FontWeight, HighlightStyle, IntoElement, ParentElement, Pixels, Render, Styled, Task,
     WeakEntity, Window, actions, px,
 };
@@ -19,7 +22,7 @@ use project::{
 use text::{Anchor, Point, ToOffset as _, ToPoint as _};
 use ui::{ListItem, ListItemSpacing, prelude::*};
 use regex::{Regex, RegexBuilder};
-use settings::{RegisterSetting, Settings, SettingsContent, SettingsStore};
+use settings::{RegisterSetting, Settings, SettingsContent, SettingsStore, ZenithTodoScope};
 use util::{ResultExt as _, paths::PathMatcher};
 use workspace::{
     Workspace,
@@ -52,6 +55,8 @@ const MAX_HIGHLIGHT_BYTES: usize = 1_000_000;
 pub struct TodoSettings {
     pub patterns: Vec<String>,
     pub highlight: bool,
+    pub scope: Scope,
+    pub dock: DockPosition,
 }
 
 impl Settings for TodoSettings {
@@ -65,6 +70,16 @@ impl Settings for TodoSettings {
                 .and_then(|todo| todo.patterns.clone())
                 .unwrap_or_default(),
             highlight: todo.and_then(|todo| todo.highlight).unwrap_or(true),
+            scope: match todo.and_then(|todo| todo.scope) {
+                Some(ZenithTodoScope::CurrentFile) => Scope::CurrentFile,
+                Some(ZenithTodoScope::ChangedFiles) => Scope::ChangedFiles,
+                Some(ZenithTodoScope::Project) | None => Scope::Project,
+            },
+            dock: match todo.and_then(|todo| todo.dock) {
+                Some(settings::DockPosition::Left) => DockPosition::Left,
+                Some(settings::DockPosition::Right) => DockPosition::Right,
+                Some(settings::DockPosition::Bottom) | None => DockPosition::Bottom,
+            },
         }
     }
 }
@@ -112,10 +127,34 @@ pub fn init(cx: &mut App) {
 /// Text before a match that marks it as a comment, for languages whose grammar has no
 /// comment override scope (e.g. the PHP extension).
 fn has_comment_marker(prefix: &str) -> bool {
-    prefix.trim_start().starts_with('*')
-        || ["//", "#", "/*", "<!--", "{#"]
-            .iter()
-            .any(|marker| prefix.contains(marker))
+    if prefix.trim_start().starts_with('*') {
+        return true;
+    }
+    ["//", "#", "/*", "<!--", "{#"].iter().any(|marker| {
+        prefix
+            .match_indices(marker)
+            .any(|(index, _)| !inside_string(&prefix[..index]))
+    })
+}
+
+/// Whether text ending here leaves a `"` or `'` string open; backslash escapes are skipped.
+fn inside_string(text: &str) -> bool {
+    let mut open: Option<char> = None;
+    let mut escaped = false;
+    for character in text.chars() {
+        if escaped {
+            escaped = false;
+        } else if character == '\\' {
+            escaped = true;
+        } else if let Some(quote) = open {
+            if character == quote {
+                open = None;
+            }
+        } else if character == '"' || character == '\'' {
+            open = Some(character);
+        }
+    }
+    open.is_some()
 }
 
 /// Whether a match at `offset` sits in a comment: the grammar's comment scope, or a
@@ -275,8 +314,8 @@ fn pattern_label(matched: &str) -> SharedString {
     matched.trim_end_matches(':').to_uppercase().into()
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Scope {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Scope {
     Project,
     CurrentFile,
     ChangedFiles,
@@ -301,7 +340,7 @@ pub struct TodoPanel {
     project: Entity<Project>,
     workspace: WeakEntity<Workspace>,
     focus_handle: FocusHandle,
-    position: DockPosition,
+    fs: Arc<dyn Fs>,
     scope: Scope,
     group_by: GroupBy,
     items: Vec<TodoItem>,
@@ -310,6 +349,7 @@ pub struct TodoPanel {
     limit_reached: bool,
     message: Option<SharedString>,
     scan_task: Task<()>,
+    buffer_tasks: HashMap<EntityId, Task<()>>,
 }
 
 impl TodoPanel {
@@ -318,23 +358,27 @@ impl TodoPanel {
         let buffer_store = project.read(cx).buffer_store().clone();
         cx.subscribe(&buffer_store, |_, _, event, cx| {
             if let BufferStoreEvent::BufferAdded(buffer) = event {
-                cx.subscribe(buffer, |this: &mut Self, _, event, cx| {
+                cx.subscribe(buffer, |this: &mut Self, buffer, event, cx| {
                     if matches!(event, BufferEvent::Saved) && this.scanned {
-                        this.rescan(cx);
+                        this.rescan_buffer(buffer, cx);
                     }
                 })
                 .detach();
             }
         })
         .detach();
-        let mut last_patterns = TodoSettings::get_global(cx).patterns.clone();
+        let settings = TodoSettings::get_global(cx).clone();
+        let mut last_settings = settings.clone();
         cx.observe_global::<SettingsStore>(move |this, cx| {
-            let patterns = &TodoSettings::get_global(cx).patterns;
-            if *patterns != last_patterns {
-                last_patterns = patterns.clone();
-                if this.scanned {
-                    this.rescan(cx);
-                }
+            let settings = TodoSettings::get_global(cx).clone();
+            let rescan = settings.patterns != last_settings.patterns
+                || settings.scope != last_settings.scope;
+            if settings.scope != last_settings.scope {
+                this.scope = settings.scope;
+            }
+            last_settings = settings;
+            if rescan && this.scanned {
+                this.rescan(cx);
             }
         })
         .detach();
@@ -352,9 +396,9 @@ impl TodoPanel {
         Self {
             project,
             workspace: workspace.weak_handle(),
+            fs: workspace.app_state().fs.clone(),
             focus_handle: cx.focus_handle(),
-            position: DockPosition::Bottom,
-            scope: Scope::Project,
+            scope: settings.scope,
             group_by: GroupBy::File,
             items: Vec::new(),
             scanned: false,
@@ -362,6 +406,7 @@ impl TodoPanel {
             limit_reached: false,
             message: None,
             scan_task: Task::ready(()),
+            buffer_tasks: HashMap::default(),
         }
     }
 
@@ -397,9 +442,48 @@ impl TodoPanel {
             .collect()
     }
 
+    /// Starts a project search for the configured patterns, limited to `buffers` when given.
+    fn search(
+        &self,
+        buffers: Option<Vec<Entity<Buffer>>>,
+        cx: &mut Context<Self>,
+    ) -> Result<impl Future<Output = (Vec<(Entity<Buffer>, Vec<Range<Anchor>>)>, bool)> + use<>, SharedString>
+    {
+        let pattern = combined_pattern(&TodoSettings::get_global(cx).patterns);
+        let query = SearchQuery::regex(
+            pattern,
+            false,
+            false,
+            false,
+            true,
+            PathMatcher::default(),
+            PathMatcher::default(),
+            false,
+            buffers,
+        )
+        .map_err(|error| SharedString::from(error.to_string()))?;
+        let SearchResults { task_handle, rx } = self
+            .project
+            .update(cx, |project, cx| project.search(query, cx));
+        Ok(async move {
+            let _search = task_handle;
+            let mut found = Vec::new();
+            let mut limit_reached = false;
+            while let Ok(result) = rx.recv().await {
+                match result {
+                    SearchResult::Buffer { buffer, ranges } => found.push((buffer, ranges)),
+                    SearchResult::LimitReached => limit_reached = true,
+                    SearchResult::WaitingForScan | SearchResult::Searching => {}
+                }
+            }
+            (found, limit_reached)
+        })
+    }
+
     fn rescan(&mut self, cx: &mut Context<Self>) {
         self.scanned = true;
         self.message = None;
+        self.buffer_tasks.clear();
         let buffers = match self.scope {
             Scope::CurrentFile => match self.active_buffer(cx) {
                 Some(buffer) => Some(vec![buffer]),
@@ -415,41 +499,17 @@ impl TodoPanel {
             self.finish(Vec::new(), false, Some("No changed files.".into()), cx);
             return;
         }
-        let pattern = combined_pattern(&TodoSettings::get_global(cx).patterns);
-        let query = match SearchQuery::regex(
-            pattern,
-            false,
-            false,
-            false,
-            true,
-            PathMatcher::default(),
-            PathMatcher::default(),
-            false,
-            buffers,
-        ) {
-            Ok(query) => query,
+        let search = match self.search(buffers, cx) {
+            Ok(search) => search,
             Err(error) => {
-                self.finish(Vec::new(), false, Some(error.to_string().into()), cx);
+                self.finish(Vec::new(), false, Some(error), cx);
                 return;
             }
         };
-        let SearchResults { task_handle, rx } = self
-            .project
-            .update(cx, |project, cx| project.search(query, cx));
         self.scanning = true;
         cx.notify();
-        // shortcut: rescans the whole scope on every save; scan just the saved file if it gets slow on big repos.
         self.scan_task = cx.spawn(async move |this, cx| {
-            let _search = task_handle;
-            let mut found = Vec::new();
-            let mut limit_reached = false;
-            while let Ok(result) = rx.recv().await {
-                match result {
-                    SearchResult::Buffer { buffer, ranges } => found.push((buffer, ranges)),
-                    SearchResult::LimitReached => limit_reached = true,
-                    SearchResult::WaitingForScan | SearchResult::Searching => {}
-                }
-            }
+            let (found, limit_reached) = search.await;
             this.update(cx, |this, cx| {
                 let items = found
                     .into_iter()
@@ -467,6 +527,47 @@ impl TodoPanel {
             })
             .log_err();
         });
+    }
+
+    /// After a save, searches only the saved file and swaps its rows in place.
+    fn rescan_buffer(&mut self, buffer: Entity<Buffer>, cx: &mut Context<Self>) {
+        let buffer_id = buffer.entity_id();
+        let in_scope = match self.scope {
+            Scope::Project => true,
+            Scope::CurrentFile => self.active_buffer(cx).as_ref() == Some(&buffer),
+            // shortcut: git status may lag the save, so a newly changed file shows after Refresh; rescan on git events if that bites.
+            Scope::ChangedFiles => buffer
+                .read(cx)
+                .project_path(cx)
+                .is_some_and(|path| self.changed_paths(cx).contains(&path)),
+        };
+        if !in_scope {
+            self.items.retain(|item| item.buffer.entity_id() != buffer_id);
+            cx.notify();
+            return;
+        }
+        let Ok(search) = self.search(Some(vec![buffer]), cx) else {
+            return;
+        };
+        let task = cx.spawn(async move |this, cx| {
+            let (found, _) = search.await;
+            this.update(cx, |this, cx| {
+                let mut items: Vec<TodoItem> = std::mem::take(&mut this.items)
+                    .into_iter()
+                    .filter(|item| item.buffer.entity_id() != buffer_id)
+                    .collect();
+                items.extend(
+                    found
+                        .into_iter()
+                        .flat_map(|(buffer, ranges)| todo_items(buffer, ranges, cx)),
+                );
+                let (limit_reached, message) = (this.limit_reached, this.message.clone());
+                this.finish(items, limit_reached, message, cx);
+                this.buffer_tasks.remove(&buffer_id);
+            })
+            .log_err();
+        });
+        self.buffer_tasks.insert(buffer_id, task);
     }
 
     fn finish(
@@ -702,18 +803,28 @@ impl Panel for TodoPanel {
         "TodoPanel"
     }
 
-    fn position(&self, _: &Window, _: &App) -> DockPosition {
-        self.position
+    fn position(&self, _: &Window, cx: &App) -> DockPosition {
+        TodoSettings::get_global(cx).dock
     }
 
     fn position_is_valid(&self, _: DockPosition) -> bool {
         true
     }
 
-    // shortcut: position is not saved across restarts; persist it when the setting lands.
     fn set_position(&mut self, position: DockPosition, _: &mut Window, cx: &mut Context<Self>) {
-        self.position = position;
-        cx.notify();
+        settings::update_settings_file(self.fs.clone(), cx, move |settings, _| {
+            let dock = match position {
+                DockPosition::Left => settings::DockPosition::Left,
+                DockPosition::Bottom => settings::DockPosition::Bottom,
+                DockPosition::Right => settings::DockPosition::Right,
+            };
+            settings
+                .zenith
+                .get_or_insert_default()
+                .todo
+                .get_or_insert_default()
+                .dock = Some(dock);
+        });
     }
 
     fn default_size(&self, _: &Window, _: &App) -> Pixels {
@@ -749,10 +860,27 @@ mod tests {
 
     #[test]
     fn comment_markers() {
-        for prefix in ["// ", "    # ", "/* ", " * ", "<!-- ", "{# ", "$a = 1; // "] {
+        for prefix in [
+            "// ",
+            "    # ",
+            "/* ",
+            " * ",
+            "<!-- ",
+            "{# ",
+            "$a = 1; // ",
+            "$s = 'x'; # ",
+            "// don't ",
+        ] {
             assert!(has_comment_marker(prefix), "{prefix:?}");
         }
-        for prefix in ["", "let todo_list = ", "fn "] {
+        for prefix in [
+            "",
+            "let todo_list = ",
+            "fn ",
+            "$s = \"# ",
+            "url = 'http://",
+            "$s = \"a\\\" // ",
+        ] {
             assert!(!has_comment_marker(prefix), "{prefix:?}");
         }
     }
