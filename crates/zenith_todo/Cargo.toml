@@ -1,0 +1,26 @@
+[package]
+name = "zenith_todo"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/zenith_todo.rs"
+doctest = false
+
+[dependencies]
+editor.workspace = true
+gpui.workspace = true
+language.workspace = true
+project.workspace = true
+text.workspace = true
+ui.workspace = true
+util.workspace = true
+workspace.workspace = true
+
+[dev-dependencies]
+regex.workspace = true

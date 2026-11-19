@@ -22878,6 +22878,7 @@ dependencies = [
  "zenith_php_tools",
  "zenith_rails",
  "zenith_search",
+ "zenith_todo",
  "zenith_welcome",
 ]
 
@@ -23002,6 +23003,21 @@ dependencies = [
  "workspace",
  "zed_actions",
  "zenith_search",
+]
+
+[[package]]
+name = "zenith_todo"
+version = "0.1.0"
+dependencies = [
+ "editor",
+ "gpui",
+ "language",
+ "project",
+ "regex",
+ "text",
+ "ui",
+ "util",
+ "workspace",
 ]
 
 [[package]]

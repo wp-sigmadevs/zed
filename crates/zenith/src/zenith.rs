@@ -20,4 +20,6 @@ pub fn init(cx: &mut App) {
     zenith_inspections::init(cx);
     #[cfg(feature = "look")]
     zenith_look::init(cx);
+    #[cfg(feature = "todo")]
+    zenith_todo::init(cx);
 }
