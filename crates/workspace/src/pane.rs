@@ -5850,6 +5850,8 @@ mod tests {
     #[gpui::test]
     async fn test_separate_pinned_row_disabled_by_default(cx: &mut TestAppContext) {
         init_test(cx);
+        // Zenith defaults the separate row on; this test covers the single-row layout.
+        set_pinned_tabs_separate_row(cx, false);
         let fs = FakeFs::new(cx.executor());
 
         let project = Project::test(fs, None, cx).await;
@@ -5980,6 +5982,8 @@ mod tests {
     #[gpui::test]
     async fn test_separate_pinned_row_toggles_between_layouts(cx: &mut TestAppContext) {
         init_test(cx);
+        // Zenith defaults the separate row on; this test starts from the single row.
+        set_pinned_tabs_separate_row(cx, false);
         let fs = FakeFs::new(cx.executor());
 
         let project = Project::test(fs, None, cx).await;
@@ -8869,6 +8873,8 @@ mod tests {
     #[gpui::test]
     async fn test_pinned_tabs_scroll_to_item_uses_correct_index(cx: &mut TestAppContext) {
         init_test(cx);
+        // Zenith defaults the separate row on; this test scrolls the single row.
+        set_pinned_tabs_separate_row(cx, false);
         let fs = FakeFs::new(cx.executor());
 
         let project = Project::test(fs, None, cx).await;

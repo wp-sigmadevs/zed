@@ -1517,8 +1517,9 @@
     "show_tab_bar_buttons": true,
     // Whether or not to show pinned tabs in a separate row.
     // When enabled, pinned tabs appear in a top row and unpinned tabs in a bottom row.
-    // When disabled, all tabs appear in a single row (default behavior).
-    "show_pinned_tabs_in_separate_row": false,
+    // When disabled, all tabs appear in a single row.
+    // Zenith: on, so pinned tabs sit in a top row as in PhpStorm.
+    "show_pinned_tabs_in_separate_row": true,
   },
   // Settings related to the tab switcher (Ctrl-Tab).
   "tab_switcher": {
