@@ -23,3 +23,11 @@ rustflags = ["-C", "link-arg=-fuse-ld=lld"]
 [env]
 MACOSX_DEPLOYMENT_TARGET = "12.0"
 ZED_UPDATE_EXPLANATION = "Zenith updates are installed by rebuilding from source (script/bundle-mac -i)."
+
+# Zenith (plan 17): smaller dev/test artifacts; backtraces still show file:line.
+# `cargo build --profile dbg` keeps full debug info when a debugger needs it.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.build-override]
+debug = "line-tables-only"
