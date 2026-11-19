@@ -22878,6 +22878,7 @@ dependencies = [
  "zenith_php_tools",
  "zenith_rails",
  "zenith_search",
+ "zenith_splash",
  "zenith_todo",
  "zenith_welcome",
 ]
@@ -22989,6 +22990,16 @@ dependencies = [
  "theme_settings",
  "ui",
  "util",
+ "workspace",
+]
+
+[[package]]
+name = "zenith_splash"
+version = "0.1.0"
+dependencies = [
+ "gpui",
+ "release_channel",
+ "semver",
  "workspace",
 ]
 

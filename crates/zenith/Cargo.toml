@@ -14,7 +14,7 @@ test = false
 doctest = false
 
 [features]
-default = ["welcome", "search", "rails", "php", "inspections", "look", "todo"]
+default = ["welcome", "search", "rails", "php", "inspections", "look", "todo", "splash"]
 welcome = ["dep:zenith_welcome"]
 search = ["dep:zenith_search"]
 rails = ["dep:zenith_rails"]
@@ -22,6 +22,7 @@ php = ["dep:zenith_php_tools"]
 inspections = ["dep:zenith_inspections"]
 look = ["dep:zenith_look"]
 todo = ["dep:zenith_todo"]
+splash = ["dep:zenith_splash"]
 
 [dependencies]
 gpui.workspace = true
@@ -31,5 +32,6 @@ zenith_look = { workspace = true, optional = true }
 zenith_php_tools = { workspace = true, optional = true }
 zenith_rails = { workspace = true, optional = true }
 zenith_search = { workspace = true, optional = true }
+zenith_splash = { workspace = true, optional = true }
 zenith_todo = { workspace = true, optional = true }
 zenith_welcome = { workspace = true, optional = true }

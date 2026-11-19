@@ -5,6 +5,14 @@ pub use onboarding::show_onboarding_view;
 #[cfg(feature = "welcome")]
 pub use zenith_welcome::show_onboarding_view;
 
+/// Shows the startup card; call right after `release_channel::init`.
+pub fn show_splash(cx: &mut App) {
+    #[cfg(feature = "splash")]
+    zenith_splash::show(cx);
+    #[cfg(not(feature = "splash"))]
+    let _ = cx;
+}
+
 /// Must run after `onboarding::init` so Zenith's global action listeners
 /// take precedence over upstream ones.
 pub fn init(cx: &mut App) {
