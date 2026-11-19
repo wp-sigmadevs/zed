@@ -33,6 +33,7 @@ use std::{
     },
     time::Duration,
 };
+mod find_in_files;
 use text::Point;
 use ui::{HighlightedLabel, ListItem, ListItemSpacing, TintColor, prelude::*};
 use util::{
@@ -66,6 +67,10 @@ actions!(
         /// PhpStorm's Switcher (⌃Tab): Recent Files with the previous file picked;
         /// Tab moves while ⌃ is held, releasing ⌃ opens the pick.
         Switcher,
+        /// PhpStorm's Find in Files popup (⌘⇧F).
+        FindInFiles,
+        /// PhpStorm's Replace in Files popup (⌘⇧R).
+        ReplaceInFiles,
         /// Moves to the next Search Everywhere tab.
         NextTab,
         /// Moves to the previous Search Everywhere tab.
@@ -86,6 +91,12 @@ pub fn init(cx: &mut App) {
         });
         workspace.register_action(|workspace, _: &FindAction, window, cx| {
             SearchEverywhere::open(workspace, Tab::Actions, window, cx)
+        });
+        workspace.register_action(|workspace, _: &FindInFiles, window, cx| {
+            find_in_files::FindInFilesModal::open(workspace, false, window, cx)
+        });
+        workspace.register_action(|workspace, _: &ReplaceInFiles, window, cx| {
+            find_in_files::FindInFilesModal::open(workspace, true, window, cx)
         });
         workspace.register_action(|workspace, _: &GoToClass, window, cx| {
             SearchEverywhere::open(workspace, Tab::Classes, window, cx)
@@ -2739,6 +2750,48 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_find_in_files_lists_matching_lines(cx: &mut TestAppContext) {
+        let app_state = init_test(cx);
+        app_state
+            .fs
+            .as_fake()
+            .insert_tree(
+                "/root",
+                serde_json::json!({
+                    "a.php": "<?php\nadd_action('init', 'x');\n",
+                    "b.js": "add_action('nope');\n",
+                    "c.php": "nothing here\n",
+                }),
+            )
+            .await;
+        let project = Project::test(app_state.fs.clone(), ["/root".as_ref()], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        workspace.update_in(cx, |workspace, window, cx| {
+            find_in_files::FindInFilesModal::open(workspace, false, window, cx)
+        });
+        cx.run_until_parked();
+        let modal = workspace.update(cx, |workspace, cx| {
+            workspace
+                .active_modal::<find_in_files::FindInFilesModal>(cx)
+                .expect("open")
+        });
+        let picker = modal.read_with(cx, |modal, _| modal.picker().clone());
+        // Nothing typed: nothing listed.
+        assert_eq!(picker.read_with(cx, |p, _| p.delegate.match_count()), 0);
+        picker.update_in(cx, |picker, window, cx| {
+            picker.set_query("add_action", window, cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(picker.read_with(cx, |p, _| p.delegate.match_count()), 2);
+        // The mask narrows it to PHP.
+        modal.update_in(cx, |modal, window, cx| modal.set_mask("*.php", window, cx));
+        cx.run_until_parked();
+        assert_eq!(picker.read_with(cx, |p, _| p.delegate.match_count()), 1);
+    }
+
+    #[gpui::test]
     async fn test_popup_moves_when_its_header_is_dragged(cx: &mut TestAppContext) {
         let app_state = init_test(cx);
         let project = Project::test(app_state.fs.clone(), [], cx).await;
@@ -2894,6 +2947,23 @@ mod tests {
                 Some("pane::RevealInProjectPanel")
             );
 
+            // ⌘⇧F / ⌘⇧R open PhpStorm's popups, not the project search tab.
+            assert_eq!(
+                resolve(&base, "shift-r", &editor).as_deref(),
+                Some("pane::DeploySearch")
+            );
+            for contexts in [&editor[..], &terminal] {
+                for (keys, action) in [
+                    ("shift-f", "zenith_search::FindInFiles"),
+                    ("shift-r", "zenith_search::ReplaceInFiles"),
+                ] {
+                    assert_eq!(
+                        resolve(&all, keys, contexts).as_deref(),
+                        Some(action),
+                        "secondary-{keys} in {contexts:?}"
+                    );
+                }
+            }
             // ⌥⌘← / ⌥⌘→ are previous/next tab in Zed's own keymap; Zenith's file turns them
             // into Back / Forward, whatever the base keymap is.
             let mut zed_only = Vec::new();

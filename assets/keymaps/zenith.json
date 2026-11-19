@@ -18,6 +18,8 @@
       "ctrl-tab": "zenith_search::Switcher",
       // TODO tool window. PhpStorm has no default key for it and gives ⌘6 to Problems, so ⇧ is added.
       "secondary-shift-6": "zenith_todo::ToggleFocus",
+      "secondary-shift-f": "zenith_search::FindInFiles",
+      "secondary-shift-r": "zenith_search::ReplaceInFiles",
     },
   },
   {
@@ -28,6 +30,9 @@
     "bindings": {
       "secondary-alt-left": "pane::GoBack",
       "secondary-alt-right": "pane::GoForward",
+      // PhpStorm's Find in Files and Replace in Files are popups, not a search tab.
+      "secondary-shift-f": "zenith_search::FindInFiles",
+      "secondary-shift-r": "zenith_search::ReplaceInFiles",
     },
   },
   {
