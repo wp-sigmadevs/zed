@@ -839,7 +839,7 @@ impl Panel for TodoPanel {
     }
 
     fn icon(&self, _: &Window, _: &App) -> Option<IconName> {
-        Some(IconName::ListTodo)
+        Some(IconName::ZenithListChecks)
     }
 
     fn icon_tooltip(&self, _: &Window, _: &App) -> Option<&'static str> {

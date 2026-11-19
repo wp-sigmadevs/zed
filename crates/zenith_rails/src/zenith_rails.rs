@@ -84,7 +84,7 @@ fn problems_button() -> impl IntoElement {
     div()
         .debug_selector(|| "zenith-rail-problems".into())
         .child(
-            IconButton::new("zenith-rail-problems", IconName::Warning)
+            IconButton::new("zenith-rail-problems", IconName::ZenithAlert)
                 .icon_size(IconSize::Small)
                 .size(ButtonSize::Medium)
                 .width(px(28.))

@@ -1790,7 +1790,7 @@ impl Panel for TerminalPanel {
         if (self.is_enabled(cx) || !self.has_no_terminals(cx))
             && TerminalSettings::get_global(cx).button
         {
-            Some(IconName::TerminalAlt)
+            Some(IconName::ZenithTerminal)
         } else {
             None
         }

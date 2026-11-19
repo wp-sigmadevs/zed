@@ -8295,7 +8295,7 @@ impl Panel for ProjectPanel {
     fn icon(&self, _: &Window, cx: &App) -> Option<IconName> {
         ProjectPanelSettings::get_global(cx)
             .button
-            .then_some(IconName::FileTree)
+            .then_some(IconName::ZenithFolder)
     }
 
     fn icon_tooltip(&self, _window: &Window, _cx: &App) -> Option<&'static str> {

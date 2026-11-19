@@ -161,7 +161,7 @@ fn agent_chip() -> impl IntoElement {
                 .rounded_full()
                 .bg(orange.opacity(0.14))
                 .child(
-                    Icon::new(IconName::Sparkle)
+                    Icon::new(IconName::ZenithBot)
                         .size(IconSize::XSmall)
                         .color(Color::Custom(orange)),
                 )
