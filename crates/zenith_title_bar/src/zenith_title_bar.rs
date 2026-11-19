@@ -10,20 +10,22 @@ pub fn project_badge(project_name: &str, cx: &App) -> Option<impl IntoElement + 
     let colors = cx.theme().colors();
     // The Zenith mark leads the title bar, as on the Main board.
     let mark = Vector::square(VectorName::ZedLogo, rems(1.));
-    Some(h_flex().flex_none().gap_2().child(mark).child(
-        div()
-            .flex_none()
-            .px_1()
-            .rounded_sm()
-            .border_1()
-            .border_color(colors.border_variant)
-            .bg(colors.element_background)
-            .child(
-                Label::new(initials)
-                    .size(LabelSize::XSmall)
-                    .weight(FontWeight::BOLD),
-            ),
-    ))
+    Some(
+        h_flex().flex_none().gap_2().child(mark).child(
+            div()
+                .flex_none()
+                .px_1()
+                .rounded_sm()
+                .border_1()
+                .border_color(colors.border_variant)
+                .bg(colors.element_background)
+                .child(
+                    Label::new(initials)
+                        .size(LabelSize::XSmall)
+                        .weight(FontWeight::BOLD),
+                ),
+        ),
+    )
 }
 
 /// Zenith's title bar middle: search, run controls, agent chip. One element, because
@@ -51,7 +53,7 @@ fn search_box(action: Box<dyn gpui::Action>) -> impl IntoElement {
         .style(ButtonStyle::Filled)
         .child(
             h_flex()
-                .w_48()
+                .w_80()
                 .min_w_0()
                 .gap_1()
                 .child(
@@ -60,11 +62,13 @@ fn search_box(action: Box<dyn gpui::Action>) -> impl IntoElement {
                         .color(Color::Muted),
                 )
                 .child(
-                    Label::new("Search Everywhere")
+                    Label::new("Search everywhere")
                         .size(LabelSize::Small)
                         .color(Color::Muted)
                         .truncate(),
-                ),
+                )
+                .child(div().flex_1())
+                .child(Label::new("⇧⇧").size(LabelSize::XSmall).color(Color::Muted)),
         )
         .tooltip({
             let action = action.boxed_clone();
