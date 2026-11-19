@@ -176,7 +176,7 @@ use crate::{
 pub const SERIALIZATION_THROTTLE_TIME: Duration = Duration::from_millis(200);
 pub const MAX_RECENT_SELECTIONS: usize = 20;
 /// Zenith: width of the icon rails.
-pub const RAIL_WIDTH: Pixels = px(36.);
+pub const RAIL_WIDTH: Pixels = px(40.);
 
 /// Set when Zenith draws panels as rounded, separated islands.
 pub struct IslandsActive;
@@ -9161,7 +9161,7 @@ impl Workspace {
             .flex()
             .overflow_hidden()
             .flex_none()
-            .when(cx.has_global::<IslandsActive>(), |this| this.p_0p5())
+            .when(cx.has_global::<IslandsActive>(), |this| this.p(px(2.5)))
             .child(dock.clone())
             .children(leader_border);
 
@@ -9369,7 +9369,7 @@ impl Workspace {
                 this.track_focus(&self.region_focus_handles.editor)
             })
             .size_full()
-            .when(cx.has_global::<IslandsActive>(), |this| this.p_0p5())
+            .when(cx.has_global::<IslandsActive>(), |this| this.p(px(2.5)))
             .child({
                 let islands = cx.has_global::<IslandsActive>();
                 let island_border = cx.theme().colors().border;
@@ -9384,7 +9384,7 @@ impl Workspace {
                     div()
                         .debug_selector(|| "zenith-center-island".into())
                         .size_full()
-                        .rounded_lg()
+                        .rounded(px(10.))
                         .overflow_hidden()
                         .border_1()
                         .border_color(island_border)

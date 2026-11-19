@@ -1361,7 +1361,7 @@ impl Render for Dock {
                     DockPosition::Bottom => this.border_t_1(),
                 })
                 .when(cx.has_global::<crate::IslandsActive>(), |this| {
-                    this.border_1().rounded_lg()
+                    this.border_1().rounded(px(10.))
                 })
                 .child(
                     div()
@@ -1418,6 +1418,7 @@ impl Render for PanelButtons {
             DockPosition::Bottom | DockPosition::Right => (Anchor::BottomRight, Anchor::TopRight),
         };
 
+        let vertical = self.vertical;
         let dock_entity = self.dock.clone();
         let workspace = dock.workspace.clone();
         let mut buttons: Vec<_> = dock
@@ -1556,6 +1557,7 @@ impl Render for PanelButtons {
                                 .icon_size(IconSize::Small)
                                 .toggle_state(is_active_button)
                                 .tab_index(0isize)
+                                .when(vertical, |this| this.size(ButtonSize::Medium).width(px(28.)))
                                 .aria_label(icon_tooltip)
                                 .on_click({
                                     let action = action.boxed_clone();

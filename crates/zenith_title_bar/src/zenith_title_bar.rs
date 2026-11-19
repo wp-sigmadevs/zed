@@ -5,25 +5,24 @@ use project::{Inventory, Project};
 use ui::{ButtonLike, IconButton, Tooltip, Vector, VectorName, prelude::*};
 
 /// Two-letter badge shown before the project name, e.g. "LG" for `lumen-gallery`.
-pub fn project_badge(project_name: &str, cx: &App) -> Option<impl IntoElement + use<>> {
+pub fn project_badge(project_name: &str, _cx: &App) -> Option<impl IntoElement + use<>> {
     let initials = initials(project_name)?;
-    let colors = cx.theme().colors();
-    // The Zenith mark leads the title bar, as on the Main board.
-    let mark = Vector::square(VectorName::ZedLogo, rems(1.));
+    // Board: 22 px mark, then a 20 px #4a5b8c badge, radius 5, 9.5 px bold white.
+    let mark = Vector::square(VectorName::ZedLogo, rems_from_px(22_f32));
     Some(
-        h_flex().flex_none().gap_2().child(mark).child(
+        h_flex().flex_none().gap(px(8.)).child(mark).child(
             div()
                 .flex_none()
-                .px_1()
-                .rounded_sm()
-                .border_1()
-                .border_color(colors.border_variant)
-                .bg(colors.element_background)
-                .child(
-                    Label::new(initials)
-                        .size(LabelSize::XSmall)
-                        .weight(FontWeight::BOLD),
-                ),
+                .size(px(20.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(5.))
+                .bg(gpui::rgb(0x4a5b8c))
+                .text_color(gpui::white())
+                .text_size(px(9.5))
+                .font_weight(FontWeight::BOLD)
+                .child(initials),
         ),
     )
 }
@@ -31,11 +30,15 @@ pub fn project_badge(project_name: &str, cx: &App) -> Option<impl IntoElement + 
 /// Zenith's title bar middle: search, run controls, agent chip. One element, because
 /// the upstream title bar holds its sections in a fixed-size `ArrayVec`.
 pub fn middle(project: &Entity<Project>, cx: &App) -> impl IntoElement + use<> {
+    // Board gaps: run controls 2 px apart, 8 px before the chip, 4 px before settings.
     h_flex()
-        .gap_2()
+        .gap(px(2.))
         .child(search_box(Box::new(zenith_search::Toggle)))
+        .child(div().w(px(10.)))
         .child(run_controls(project, cx))
+        .child(div().w(px(8.)))
         .child(agent_chip())
+        .child(div().w(px(4.)))
         .child(
             IconButton::new("zenith-settings", IconName::Settings)
                 .icon_size(IconSize::Small)
@@ -49,26 +52,46 @@ pub fn middle(project: &Entity<Project>, cx: &App) -> impl IntoElement + use<> {
 
 /// "Search Everywhere" box for the middle of the title bar; dispatches `action`.
 fn search_box(action: Box<dyn gpui::Action>) -> impl IntoElement {
+    // Board: 340×28, radius 7, #31343a, 12.5 px placeholder #8c8f96, ⇧⇧ key cap.
     ButtonLike::new("zenith-search-everywhere")
-        .style(ButtonStyle::Filled)
+        .style(ButtonStyle::Transparent)
         .child(
             h_flex()
-                .w_80()
+                .w(px(340.))
+                .h(px(28.))
                 .min_w_0()
-                .gap_1()
+                .pl(px(10.))
+                .pr(px(8.))
+                .gap(px(8.))
+                .rounded(px(7.))
+                .bg(gpui::rgb(0x31343a))
                 .child(
                     Icon::new(IconName::MagnifyingGlass)
-                        .size(IconSize::XSmall)
-                        .color(Color::Muted),
+                        .size(IconSize::Small)
+                        .color(Color::Placeholder),
                 )
                 .child(
-                    Label::new("Search everywhere")
-                        .size(LabelSize::Small)
-                        .color(Color::Muted)
-                        .truncate(),
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .text_size(px(12.5))
+                        .text_color(gpui::rgb(0x8c8f96))
+                        .child("Search everywhere"),
                 )
-                .child(div().flex_1())
-                .child(Label::new("⇧⇧").size(LabelSize::XSmall).color(Color::Muted)),
+                .child(
+                    div()
+                        .h(px(18.))
+                        .px(px(5.))
+                        .flex()
+                        .items_center()
+                        .rounded(px(4.))
+                        .border_1()
+                        .border_color(gpui::rgb(0x393b40))
+                        .bg(gpui::rgb(0x2b2d30))
+                        .text_size(px(11.))
+                        .text_color(gpui::rgb(0x8c8f96))
+                        .child("⇧⇧"),
+                ),
         )
         .tooltip({
             let action = action.boxed_clone();
@@ -126,24 +149,28 @@ pub const AGENT_ORANGE: u32 = 0xff7a3d;
 /// Agent chip; toggles the agent panel. Live "1 running · review 2" counts come with plan 22.
 fn agent_chip() -> impl IntoElement {
     let orange: Hsla = gpui::rgb(AGENT_ORANGE).into();
+    // Board: 26 px pill, rgba(255,122,61,.14), 12 px / 500 orange text.
     ButtonLike::new("zenith-agent-chip")
+        .style(ButtonStyle::Transparent)
         .child(
             h_flex()
-                .gap_1()
-                .px_1()
-                .rounded_sm()
-                .border_1()
-                .border_color(orange.opacity(0.5))
-                .bg(orange.opacity(0.12))
+                .h(px(26.))
+                .pl(px(9.))
+                .pr(px(9.))
+                .gap(px(6.))
+                .rounded_full()
+                .bg(orange.opacity(0.14))
                 .child(
                     Icon::new(IconName::Sparkle)
                         .size(IconSize::XSmall)
                         .color(Color::Custom(orange)),
                 )
                 .child(
-                    Label::new("Agents")
-                        .size(LabelSize::Small)
-                        .color(Color::Custom(orange)),
+                    div()
+                        .text_size(px(12.))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(orange)
+                        .child("Agents"),
                 ),
         )
         .tooltip(action_tooltip(

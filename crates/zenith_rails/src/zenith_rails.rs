@@ -59,13 +59,12 @@ impl Render for Rail {
             .h_full()
             .w(workspace::RAIL_WIDTH)
             .flex_none()
-            .py_1()
+            // Board: rails sit on the window background, no border; 4 px top, 6 px bottom.
+            .pt(px(4.))
+            .pb(px(6.))
             .items_center()
             .justify_between()
-            .bg(colors.status_bar_background)
-            .border_color(colors.border_variant)
-            .when(left, |this| this.border_r_1())
-            .when(!left, |this| this.border_l_1())
+            .bg(colors.title_bar_background)
             .child(self.top.clone())
             .when(left, |this| {
                 this.child(
@@ -82,17 +81,21 @@ impl Render for Rail {
 /// PhpStorm's Problems tool window: Zed's project diagnostics, which also hold
 /// the inspections' findings. Built by name so this crate needs no `diagnostics` dependency.
 fn problems_button() -> impl IntoElement {
-    div().debug_selector(|| "zenith-rail-problems".into()).child(
-        IconButton::new("zenith-rail-problems", IconName::Warning)
-            .icon_size(IconSize::Small)
-            .aria_label("Problems")
-            .tooltip(Tooltip::text("Problems"))
-            .on_click(|_, window, cx| {
-                if let Ok(action) = cx.build_action("diagnostics::Deploy", None) {
-                    window.dispatch_action(action, cx);
-                }
-            }),
-    )
+    div()
+        .debug_selector(|| "zenith-rail-problems".into())
+        .child(
+            IconButton::new("zenith-rail-problems", IconName::Warning)
+                .icon_size(IconSize::Small)
+                .size(ButtonSize::Medium)
+                .width(px(28.))
+                .aria_label("Problems")
+                .tooltip(Tooltip::text("Problems"))
+                .on_click(|_, window, cx| {
+                    if let Ok(action) = cx.build_action("diagnostics::Deploy", None) {
+                        window.dispatch_action(action, cx);
+                    }
+                }),
+        )
 }
 
 #[cfg(test)]
