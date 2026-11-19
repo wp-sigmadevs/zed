@@ -1,13 +1,13 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     future::Future,
-    sync::Arc,
     ops::Range,
+    sync::Arc,
     time::Duration,
 };
 
-use fs::Fs;
 use editor::{Editor, EditorEvent, HighlightKey, SelectionEffects, scroll::Autoscroll};
+use fs::Fs;
 use gpui::{
     Action, App, AppContext as _, Context, Entity, EntityId, EventEmitter, FocusHandle, Focusable,
     FontWeight, HighlightStyle, IntoElement, ParentElement, Pixels, Render, Styled, Task,
@@ -19,10 +19,10 @@ use project::{
     buffer_store::BufferStoreEvent,
     search::{SearchQuery, SearchResult},
 };
-use text::{Anchor, Point, ToOffset as _, ToPoint as _};
-use ui::{ListItem, ListItemSpacing, prelude::*};
 use regex::{Regex, RegexBuilder};
 use settings::{RegisterSetting, Settings, SettingsContent, SettingsStore, ZenithTodoScope};
+use text::{Anchor, Point, ToOffset as _, ToPoint as _};
+use ui::{ListItem, ListItemSpacing, prelude::*};
 use util::{ResultExt as _, paths::PathMatcher};
 use workspace::{
     Workspace,
@@ -107,7 +107,7 @@ pub fn init(cx: &mut App) {
     TodoSettings::register(cx);
     cx.observe_new(|editor: &mut Editor, _, cx| {
         if editor.mode().is_full() && editor.project().is_some() {
-            install_highlighter(cx);
+            install_highlighter(editor, cx);
         }
     })
     .detach();
@@ -204,31 +204,39 @@ fn build_regex(pattern: &str) -> Option<Regex> {
 }
 
 /// Colours TODO markers in a full editor; reruns on edits, reparse and settings changes.
-fn install_highlighter(cx: &mut Context<Editor>) {
+fn install_highlighter(editor: &Editor, cx: &mut Context<Editor>) {
     let mut pending = Task::ready(());
-    cx.subscribe_self(move |_, event: &EditorEvent, cx| {
+    cx.subscribe_self(move |editor, event: &EditorEvent, cx| {
         if matches!(event, EditorEvent::BufferEdited | EditorEvent::Reparsed(_)) {
             // Replacing the task drops, and so cancels, the previous run.
-            drop(std::mem::replace(&mut pending, schedule_highlight(cx)));
+            drop(std::mem::replace(
+                &mut pending,
+                schedule_highlight(editor, cx),
+            ));
         }
     })
     .detach();
     let mut last_settings = TodoSettings::get_global(cx).clone();
     let mut pending_settings = Task::ready(());
-    cx.observe_global::<SettingsStore>(move |_, cx| {
+    cx.observe_global::<SettingsStore>(move |editor, cx| {
         let settings = TodoSettings::get_global(cx);
         if *settings != last_settings {
             last_settings = settings.clone();
-            drop(std::mem::replace(&mut pending_settings, schedule_highlight(cx)));
+            drop(std::mem::replace(
+                &mut pending_settings,
+                schedule_highlight(editor, cx),
+            ));
         }
     })
     .detach();
-    schedule_highlight(cx).detach();
+    schedule_highlight(editor, cx).detach();
 }
 
-fn schedule_highlight(cx: &mut Context<Editor>) -> Task<()> {
+// Takes the editor by reference: during `observe_new` and its own events it is mid-update,
+// so reading it back through `cx.entity()` panics.
+fn schedule_highlight(editor: &Editor, cx: &mut Context<Editor>) -> Task<()> {
     let settings = TodoSettings::get_global(cx);
-    let buffer = cx.entity().read(cx).buffer().read(cx).as_singleton();
+    let buffer = editor.buffer().read(cx).as_singleton();
     let regex = settings
         .highlight
         .then(|| build_regex(&combined_pattern(&settings.patterns)))
@@ -447,8 +455,10 @@ impl TodoPanel {
         &self,
         buffers: Option<Vec<Entity<Buffer>>>,
         cx: &mut Context<Self>,
-    ) -> Result<impl Future<Output = (Vec<(Entity<Buffer>, Vec<Range<Anchor>>)>, bool)> + use<>, SharedString>
-    {
+    ) -> Result<
+        impl Future<Output = (Vec<(Entity<Buffer>, Vec<Range<Anchor>>)>, bool)> + use<>,
+        SharedString,
+    > {
         let pattern = combined_pattern(&TodoSettings::get_global(cx).patterns);
         let query = SearchQuery::regex(
             pattern,
@@ -542,7 +552,8 @@ impl TodoPanel {
                 .is_some_and(|path| self.changed_paths(cx).contains(&path)),
         };
         if !in_scope {
-            self.items.retain(|item| item.buffer.entity_id() != buffer_id);
+            self.items
+                .retain(|item| item.buffer.entity_id() != buffer_id);
             cx.notify();
             return;
         }
@@ -620,11 +631,7 @@ impl TodoPanel {
     }
 }
 
-fn todo_items(
-    buffer: Entity<Buffer>,
-    ranges: Vec<Range<Anchor>>,
-    cx: &App,
-) -> Vec<TodoItem> {
+fn todo_items(buffer: Entity<Buffer>, ranges: Vec<Range<Anchor>>, cx: &App) -> Vec<TodoItem> {
     let snapshot = buffer.read(cx).snapshot();
     let Some(file) = buffer.read(cx).file() else {
         return Vec::new();
@@ -926,6 +933,53 @@ mod tests {
         assert_eq!(colour_class("HACK"), 1);
         assert_eq!(colour_class("TODO"), 2);
         assert_eq!(colour_class("SHORTCUT"), 3);
+    }
+
+    // Opening a file creates an editor inside `observe_new`; the highlighter must not read
+    // that editor back (it panicked at startup in `3ed32bfd4e`).
+    #[gpui::test]
+    async fn opening_a_file_colours_its_markers(cx: &mut gpui::TestAppContext) {
+        let app_state = cx.update(|cx| {
+            let app_state = workspace::AppState::test(cx);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            editor::init(cx);
+            workspace::init(app_state.clone(), cx);
+            init(cx);
+            app_state
+        });
+        app_state
+            .fs
+            .as_fake()
+            .insert_tree(
+                "/project",
+                serde_json::json!({ "a.txt": "// TODO: one\nplain todo\n" }),
+            )
+            .await;
+        let project = Project::test(app_state.fs.clone(), [std::path::Path::new("/project")], cx).await;
+        let (multi_workspace, cx) = cx
+            .add_window_view(|window, cx| workspace::MultiWorkspace::test_new(project, window, cx));
+        let workspace = multi_workspace.read_with(cx, |multi, _| multi.workspace().clone());
+        let editor = workspace
+            .update_in(cx, |workspace, window, cx| {
+                workspace.open_abs_path(
+                    "/project/a.txt".into(),
+                    workspace::OpenOptions::default(),
+                    window,
+                    cx,
+                )
+            })
+            .await
+            .expect("file opens")
+            .downcast::<Editor>()
+            .expect("an editor");
+        cx.executor().advance_clock(Duration::from_millis(400));
+        cx.run_until_parked();
+        editor.update(cx, |editor, cx| {
+            let (_, ranges) = editor
+                .text_highlights(HighlightKey::ZenithTodo(2), cx)
+                .expect("TODO coloured");
+            assert_eq!(ranges.len(), 1);
+        });
     }
 
     #[gpui::test]
