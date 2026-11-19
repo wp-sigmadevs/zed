@@ -200,13 +200,51 @@ pub struct SearchEverywhere {
     tool_windows: Vec<ToolWindow>,
     /// Switcher: the modifiers held when it opened; releasing them opens the pick.
     init_modifiers: Option<gpui::Modifiers>,
+    /// How far the popup has been dragged from where the modal layer put it.
+    offset: gpui::Point<Pixels>,
+    /// Last pointer position of the drag in progress.
+    drag_last: Option<gpui::Point<Pixels>>,
+}
+
+/// Dragging the header moves the popup, as in PhpStorm.
+struct DragPopup;
+
+struct NoDragPreview;
+
+impl Render for NoDragPreview {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+    }
 }
 
 struct ToolWindow {
     name: SharedString,
     icon: IconName,
     toggle: Box<dyn Action>,
+    /// The key that toggles it, as text ("⌘1"); empty when unbound.
+    shortcut: String,
 }
+
+/// PhpStorm tints each tool window's icon; the ones Zenith has get the same hue.
+fn tool_window_color(name: &str) -> Color {
+    let hue = match name {
+        "Commit" => 0xe5a948,
+        "Project" => 0x4fb8c4,
+        "Git" | "Pull Requests" => 0x6c9cf0,
+        "Structure" | "Outline" => 0xe5c05a,
+        "Problems" => 0xe0705a,
+        "Terminal" => 0xb08ad8,
+        "Services" | "Run" => 0x6db083,
+        "TODO" => 0xc9a27a,
+        "Agents" | "Agent" => 0xff7a3d,
+        _ => return Color::Muted,
+    };
+    Color::Custom(gpui::rgb(hue).into())
+}
+
+/// PhpStorm's popup palette: a lighter title band and footer over the list.
+const POPUP_BAND: u32 = 0x393b40;
+const POPUP_FOOTER: u32 = 0x303236;
 
 fn tool_windows(workspace: &Workspace, window: &Window, cx: &App) -> Vec<ToolWindow> {
     [
@@ -225,6 +263,7 @@ fn tool_windows(workspace: &Workspace, window: &Window, cx: &App) -> Vec<ToolWin
                 .to_string()
                 .into(),
             icon: panel.icon(window, cx)?,
+            shortcut: window.keystroke_text_for(&*panel.toggle_action(window, cx), cx),
             toggle: panel.toggle_action(window, cx),
         })
     })
@@ -342,7 +381,23 @@ impl SearchEverywhere {
             picker,
             tool_windows: Vec::new(),
             init_modifiers: None,
+            offset: gpui::Point::default(),
+            drag_last: None,
         }
+    }
+
+    /// Moves the popup with the pointer, keeping it within reach of the window.
+    fn drag_to(&mut self, position: gpui::Point<Pixels>, window: &Window, cx: &mut Context<Self>) {
+        if let Some(last) = self.drag_last {
+            let viewport = window.viewport_size();
+            let offset = self.offset + (position - last);
+            self.offset = gpui::point(
+                offset.x.clamp(-viewport.width / 2., viewport.width / 2.),
+                offset.y.clamp(-viewport.height / 4., viewport.height / 2.),
+            );
+            cx.notify();
+        }
+        self.drag_last = Some(position);
     }
 
     fn switch_tab(&mut self, tab: Tab, window: &mut Window, cx: &mut Context<Self>) {
@@ -410,8 +465,26 @@ impl Render for SearchEverywhere {
         } else {
             self.picker.clone().into_any_element()
         };
+        let header = div()
+            .id("zenith-popup-drag")
+            .debug_selector(|| "zenith-popup-drag".into())
+            .cursor_grab()
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(|this, _, _, _| this.drag_last = None),
+            )
+            .on_drag(DragPopup, |_, _, _, cx| cx.new(|_| NoDragPreview))
+            .child(header);
         v_flex()
             .key_context("SearchEverywhere")
+            .relative()
+            .left(self.offset.x)
+            .top(self.offset.y)
+            .on_drag_move::<DragPopup>(cx.listener(
+                |this, event: &gpui::DragMoveEvent<DragPopup>, window, cx| {
+                    this.drag_to(event.event.position, window, cx)
+                },
+            ))
             .on_modifiers_changed(cx.listener(Self::modifiers_changed))
             .on_action(cx.listener(|this, _: &NextTab, window, cx| this.cycle_tab(1, window, cx)))
             .on_action(
@@ -560,28 +633,36 @@ impl SearchEverywhere {
         let edited_only = self.picker.read(cx).delegate.edited_only;
         h_flex()
             .debug_selector(|| "zenith-popup-header".into())
-            .h_9()
-            .px_3()
+            .h_11()
+            .px_4()
             .justify_between()
-            .border_b_1()
-            .border_color(cx.theme().colors().border_variant)
-            .child(
-                Label::new(tab.label())
-                    .size(LabelSize::Small)
-                    .weight(gpui::FontWeight::SEMIBOLD),
-            )
+            .bg(gpui::rgb(POPUP_BAND))
+            .child(Label::new(tab.label()).weight(gpui::FontWeight::SEMIBOLD))
             .when(tab == Tab::Recent, |this| {
                 this.child(
-                    ui::Checkbox::new("zenith-edited-only", edited_only.into())
-                        .label("Show edited only")
-                        .label_size(LabelSize::Small)
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.picker.update(cx, |picker, cx| {
-                                picker.delegate.edited_only = !picker.delegate.edited_only;
-                                picker.refresh(window, cx);
-                            });
-                            cx.notify();
-                        })),
+                    h_flex()
+                        .gap_2()
+                        .child(
+                            ui::Checkbox::new("zenith-edited-only", edited_only.into())
+                                .label("Show edited only")
+                                .label_size(LabelSize::Small)
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.picker.update(cx, |picker, cx| {
+                                        picker.delegate.edited_only = !picker.delegate.edited_only;
+                                        picker.refresh(window, cx);
+                                    });
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            Label::new(if cfg!(target_os = "macos") {
+                                "⌘E"
+                            } else {
+                                "Ctrl+E"
+                            })
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                        ),
                 )
             })
     }
@@ -607,14 +688,40 @@ impl SearchEverywhere {
                             .start_slot(
                                 Icon::new(tool_window.icon)
                                     .size(IconSize::Small)
-                                    .color(Color::Muted),
+                                    .color(tool_window_color(&tool_window.name)),
                             )
-                            .child(Label::new(tool_window.name.clone()).size(LabelSize::Small))
+                            .child(Label::new(tool_window.name.clone()))
+                            .end_slot(Label::new(tool_window.shortcut.clone()).color(Color::Muted))
                             .on_click(cx.listener(move |_, _, window, cx| {
                                 cx.emit(DismissEvent);
                                 window.dispatch_action(toggle.boxed_clone(), cx);
                             }))
                     }),
+            )
+            .child(
+                div()
+                    .mt_1()
+                    .pt_1()
+                    .border_t_1()
+                    .border_color(cx.theme().colors().border_variant)
+                    .child(
+                        ListItem::new("zenith-recent-locations")
+                            .inset(true)
+                            .spacing(ListItemSpacing::Sparse)
+                            .child(Label::new("Recent Locations"))
+                            .end_slot(
+                                Label::new(if cfg!(target_os = "macos") {
+                                    "⇧⌘E"
+                                } else {
+                                    "Ctrl+Shift+E"
+                                })
+                                .color(Color::Muted),
+                            )
+                            .on_click(cx.listener(|_, _, window, cx| {
+                                cx.emit(DismissEvent);
+                                window.dispatch_action(RecentLocations.boxed_clone(), cx);
+                            })),
+                    ),
             )
     }
 }
@@ -1476,6 +1583,41 @@ impl PickerDelegate for SearchDelegate {
         self.modal.update(cx, |_, cx| cx.emit(DismissEvent)).ok();
     }
 
+    /// PhpStorm's footer: the selected file's full path, and how to open it beside.
+    fn render_footer(&self, _: &mut Window, cx: &mut Context<Picker<Self>>) -> Option<AnyElement> {
+        let SearchMatch::File { project_path, .. } = self.matches.get(self.selected_ix)? else {
+            return None;
+        };
+        let path = self.project.read(cx).absolute_path(project_path, cx)?;
+        let path = util::paths::PathExt::compact(&path);
+        let split_hint = self.tab != Tab::Recent;
+        Some(
+            h_flex()
+                .debug_selector(|| "zenith-popup-footer".into())
+                .h_8()
+                .px_3()
+                .gap_3()
+                .justify_between()
+                .bg(gpui::rgb(POPUP_FOOTER))
+                .border_t_1()
+                .border_color(cx.theme().colors().border_variant)
+                .child(
+                    Label::new(path.to_string_lossy().into_owned())
+                        .size(LabelSize::Small)
+                        .color(Color::Muted)
+                        .truncate(),
+                )
+                .when(split_hint, |this| {
+                    this.child(
+                        Label::new("Open In Right Split")
+                            .size(LabelSize::Small)
+                            .color(Color::Accent),
+                    )
+                })
+                .into_any_element(),
+        )
+    }
+
     fn render_match(
         &self,
         ix: usize,
@@ -1496,11 +1638,24 @@ impl PickerDelegate for SearchDelegate {
             .inset(true)
             .spacing(ListItemSpacing::Sparse)
             .toggle_state(selected)
-            .end_slot::<Label>((self.tab == Tab::All && group_starts).then(|| {
-                Label::new(kind.to_uppercase())
-                    .size(LabelSize::XSmall)
-                    .color(Color::Muted)
-            }));
+            .end_slot::<AnyElement>(if self.tab == Tab::All && group_starts {
+                Some(
+                    Label::new(kind.to_uppercase())
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted)
+                        .into_any_element(),
+                )
+            } else if selected && matches!(search_match, SearchMatch::File { .. }) {
+                // PhpStorm marks the picked file with the split it would open in.
+                Some(
+                    Icon::new(IconName::ZenithColumns)
+                        .size(IconSize::Small)
+                        .color(Color::Custom(gpui::rgb(0x6c9cf0).into()))
+                        .into_any_element(),
+                )
+            } else {
+                None
+            });
         let file_icon = |path: &str, cx: &App| {
             FileFinderSettings::get_global(cx)
                 .file_icons
@@ -2581,6 +2736,38 @@ mod tests {
                 })
             )
         );
+    }
+
+    #[gpui::test]
+    async fn test_popup_moves_when_its_header_is_dragged(cx: &mut TestAppContext) {
+        let app_state = init_test(cx);
+        let project = Project::test(app_state.fs.clone(), [], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        open_on(Tab::Files, &workspace, cx);
+        let start = cx
+            .debug_bounds("zenith-popup-drag")
+            .expect("the header is a drag handle")
+            .center();
+        let modal = workspace.update(cx, |workspace, cx| {
+            workspace
+                .active_modal::<SearchEverywhere>(cx)
+                .expect("open")
+        });
+        assert_eq!(
+            modal.read_with(cx, |modal, _| modal.offset),
+            gpui::Point::default()
+        );
+        let none = gpui::Modifiers::none();
+        cx.simulate_mouse_down(start, gpui::MouseButton::Left, none);
+        for step in 1..=4 {
+            let delta = gpui::point(px(30. * step as f32), px(20. * step as f32));
+            cx.simulate_mouse_move(start + delta, gpui::MouseButton::Left, none);
+        }
+        cx.simulate_mouse_up(start, gpui::MouseButton::Left, none);
+        let offset = modal.read_with(cx, |modal, _| modal.offset);
+        assert!(offset.x > px(0.) && offset.y > px(0.), "{offset:?}");
     }
 
     #[gpui::test]

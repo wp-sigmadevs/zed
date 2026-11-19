@@ -323,6 +323,7 @@ pub enum IconName {
     ZenithExpandAll,
     ZenithCollapseAll,
     ZenithMoreVertical,
+    ZenithColumns,
 }
 
 impl IconName {
