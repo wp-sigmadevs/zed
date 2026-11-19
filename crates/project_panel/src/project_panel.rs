@@ -1197,124 +1197,157 @@ impl ProjectPanel {
                             menu.action("Search Inside", Box::new(NewSearchInDirectory))
                         })
                     } else {
-                        menu.action("New File", Box::new(NewFile))
-                            .action("New Folder", Box::new(NewDirectory))
-                            .separator()
-                            .when(is_local, |menu| {
-                                menu.action(
-                                    ui::utils::reveal_in_file_manager_label(is_remote),
-                                    Box::new(RevealInFileManager),
-                                )
-                            })
-                            .when(is_local, |menu| {
-                                menu.action("Open in Default App", Box::new(OpenWithSystem))
-                            })
-                            .action("Open in Terminal", Box::new(OpenInTerminal))
-                            .when(is_markdown, |menu| {
-                                menu.action("Open Markdown Preview", Box::new(OpenMarkdownPreview))
-                            })
-                            .when(is_svg, |menu| {
-                                menu.action("Open SVG Preview", Box::new(OpenSvgPreview))
-                            })
-                            .when(is_dir, |menu| {
-                                menu.separator()
-                                    .action("Find in Folder…", Box::new(NewSearchInDirectory))
-                            })
-                            .when(is_dir && is_local, |menu| {
-                                menu.action(
-                                    "Inspect PHP Files",
-                                    Box::new(zed_actions::zenith_inspections::InspectFolder),
-                                )
-                            })
-                            .when(is_unfoldable, |menu| {
-                                menu.action("Unfold Directory", Box::new(UnfoldDirectory))
-                            })
-                            .when(is_foldable, |menu| {
-                                menu.action("Fold Directory", Box::new(FoldDirectory))
-                            })
-                            .when(should_show_compare, |menu| {
-                                menu.separator()
-                                    .action("Compare Marked Files", Box::new(CompareMarkedFiles))
-                            })
-                            .separator()
-                            .action("Cut", Box::new(Cut))
-                            .action("Copy", Box::new(Copy))
-                            .action("Duplicate", Box::new(Duplicate))
-                            .action_disabled_when(!has_pasteable_content, "Paste", Box::new(Paste))
-                            .when(!is_collab, |menu| {
-                                let can_undo = self.undo_manager.can_undo();
-                                let can_redo = self.undo_manager.can_redo();
-
-                                menu.action_disabled_when(!can_undo, "Undo", Box::new(Undo))
-                                    .action_disabled_when(!can_redo, "Redo", Box::new(Redo))
-                            })
-                            .when(is_remote, |menu| {
-                                menu.separator()
-                                    .action("Download...", Box::new(DownloadFromRemote))
-                            })
-                            .separator()
-                            .action("Copy Path", Box::new(zed_actions::workspace::CopyPath))
-                            .action(
-                                "Copy Relative Path",
-                                Box::new(zed_actions::workspace::CopyRelativePath),
-                            )
-                            .when(has_git_repo, |menu| {
-                                menu.separator()
-                                    .when(!is_dir && self.has_git_changes(entry_id), |menu| {
-                                        menu.action(
-                                            "Restore File",
-                                            Box::new(git::RestoreFile { skip_prompt: false }),
-                                        )
-                                    })
-                                    .action("Add to .gitignore", Box::new(git::AddToGitignore))
+                        // PhpStorm's order: New, clipboard, search and inspect, rename and delete,
+                        // Open In, Git, compare, then folding and project membership.
+                        let focus = self.focus_handle.clone();
+                        let has_changes = !is_dir && self.has_git_changes(entry_id);
+                        let can_undo = self.undo_manager.can_undo();
+                        let can_redo = self.undo_manager.can_redo();
+                        menu.submenu("New", {
+                            let focus = focus.clone();
+                            move |menu, _, _| {
+                                menu.context(focus.clone())
+                                    .action("File", Box::new(NewFile))
+                                    .action("Directory", Box::new(NewDirectory))
+                            }
+                        })
+                        .separator()
+                        .action("Cut", Box::new(Cut))
+                        .action("Copy", Box::new(Copy))
+                        .submenu("Copy Path/Reference…", {
+                            let focus = focus.clone();
+                            move |menu, _, _| {
+                                menu.context(focus.clone())
                                     .action(
-                                        "Add to .git/info/exclude",
-                                        Box::new(git::AddToGitInfoExclude),
+                                        "Absolute Path",
+                                        Box::new(zed_actions::workspace::CopyPath),
                                     )
-                                    .when(has_history, |menu| {
-                                        menu.action("View History", Box::new(git::FileHistory))
-                                    })
-                                    .when(!is_dir, |menu| {
+                                    .action(
+                                        "Path From Project Root",
+                                        Box::new(zed_actions::workspace::CopyRelativePath),
+                                    )
+                                    .when(!is_dir && has_git_repo, |menu| {
                                         menu.action(
-                                            "Open File Permalink",
-                                            git::OpenFilePermalink.boxed_clone(),
-                                        )
-                                        .action(
-                                            "Copy File Permalink",
+                                            "File Permalink",
                                             git::CopyFilePermalink.boxed_clone(),
                                         )
                                     })
-                            })
-                            .when(!should_hide_rename, |menu| {
-                                menu.separator().action("Rename", Box::new(Rename))
-                            })
-                            .when(!is_root && !is_collab, |menu| {
-                                menu.action("Trash", Box::new(Trash { skip_prompt: false }))
-                            })
-                            .when(!is_root, |menu| {
-                                menu.action("Delete", Box::new(Delete { skip_prompt: false }))
-                            })
-                            .when(!is_collab && is_root, |menu| {
-                                menu.separator()
-                                    .action(
-                                        "Add Folders to Project…",
-                                        Box::new(workspace::AddFolderToProject),
+                            }
+                        })
+                        .action_disabled_when(!has_pasteable_content, "Paste", Box::new(Paste))
+                        .action("Duplicate", Box::new(Duplicate))
+                        .when(!is_collab, |menu| {
+                            menu.action_disabled_when(!can_undo, "Undo", Box::new(Undo))
+                                .action_disabled_when(!can_redo, "Redo", Box::new(Redo))
+                        })
+                        .when(is_dir, |menu| {
+                            menu.separator()
+                                .action("Find in Files…", Box::new(NewSearchInDirectory))
+                                .when(is_local, |menu| {
+                                    menu.action(
+                                        "Inspect Code…",
+                                        Box::new(zed_actions::zenith_inspections::InspectFolder),
                                     )
-                                    .action("Remove from Project", Box::new(RemoveFromProject))
+                                })
+                        })
+                        .separator()
+                        .when(!should_hide_rename, |menu| {
+                            menu.action("Rename…", Box::new(Rename))
+                        })
+                        .when(!is_root && !is_collab, |menu| {
+                            menu.action("Trash", Box::new(Trash { skip_prompt: false }))
+                        })
+                        .when(!is_root, |menu| {
+                            menu.action("Delete…", Box::new(Delete { skip_prompt: false }))
+                        })
+                        .separator()
+                        .submenu("Open In", {
+                            let focus = focus.clone();
+                            move |menu, _, _| {
+                                menu.context(focus.clone())
+                                    .when(is_local, |menu| {
+                                        menu.action(
+                                            ui::utils::reveal_in_file_manager_label(is_remote),
+                                            Box::new(RevealInFileManager),
+                                        )
+                                    })
+                                    .when(is_local, |menu| {
+                                        menu.action("Default App", Box::new(OpenWithSystem))
+                                    })
+                                    .action("Terminal", Box::new(OpenInTerminal))
+                                    .when(is_markdown, |menu| {
+                                        menu.action(
+                                            "Markdown Preview",
+                                            Box::new(OpenMarkdownPreview),
+                                        )
+                                    })
+                                    .when(is_svg, |menu| {
+                                        menu.action("SVG Preview", Box::new(OpenSvgPreview))
+                                    })
+                            }
+                        })
+                        .when(has_git_repo, |menu| {
+                            menu.submenu("Git", {
+                                let focus = focus.clone();
+                                move |menu, _, _| {
+                                    menu.context(focus.clone())
+                                        .when(has_changes, |menu| {
+                                            menu.action(
+                                                "Restore File",
+                                                Box::new(git::RestoreFile { skip_prompt: false }),
+                                            )
+                                        })
+                                        .action("Add to .gitignore", Box::new(git::AddToGitignore))
+                                        .action(
+                                            "Add to .git/info/exclude",
+                                            Box::new(git::AddToGitInfoExclude),
+                                        )
+                                        .when(has_history, |menu| {
+                                            menu.action("Show History", Box::new(git::FileHistory))
+                                        })
+                                        .when(!is_dir, |menu| {
+                                            menu.action(
+                                                "Open File Permalink",
+                                                git::OpenFilePermalink.boxed_clone(),
+                                            )
+                                        })
+                                }
                             })
-                            .when(is_dir && !is_root, |menu| {
-                                menu.separator()
-                                    .action("Expand All", Box::new(ExpandSelectedEntryAndChildren))
-                                    .action(
-                                        "Collapse All",
-                                        Box::new(CollapseSelectedEntryAndChildren),
-                                    )
-                            })
-                            .when(is_dir && is_root, |menu| {
-                                menu.separator()
-                                    .action("Expand All", Box::new(ExpandAllEntries))
-                                    .action("Collapse All", Box::new(CollapseAllEntries))
-                            })
+                        })
+                        .when(should_show_compare, |menu| {
+                            menu.separator()
+                                .action("Compare With…", Box::new(CompareMarkedFiles))
+                        })
+                        .when(is_unfoldable, |menu| {
+                            menu.separator()
+                                .action("Unfold Directory", Box::new(UnfoldDirectory))
+                        })
+                        .when(is_foldable, |menu| {
+                            menu.separator()
+                                .action("Fold Directory", Box::new(FoldDirectory))
+                        })
+                        .when(is_remote, |menu| {
+                            menu.separator()
+                                .action("Download...", Box::new(DownloadFromRemote))
+                        })
+                        .when(!is_collab && is_root, |menu| {
+                            menu.separator()
+                                .action(
+                                    "Add Folders to Project…",
+                                    Box::new(workspace::AddFolderToProject),
+                                )
+                                .action("Remove from Project", Box::new(RemoveFromProject))
+                        })
+                        .when(is_dir && !is_root, |menu| {
+                            menu.separator()
+                                .action("Expand All", Box::new(ExpandSelectedEntryAndChildren))
+                                .action("Collapse All", Box::new(CollapseSelectedEntryAndChildren))
+                        })
+                        .when(is_dir && is_root, |menu| {
+                            menu.separator()
+                                .action("Expand All", Box::new(ExpandAllEntries))
+                                .action("Collapse All", Box::new(CollapseAllEntries))
+                        })
                     }
                 })
             });
@@ -6154,8 +6187,13 @@ impl ProjectPanel {
         let depth = details.depth;
         let worktree_id = details.worktree_id;
 
+        let zenith_tint = (!is_sticky && cx.has_global::<workspace::dock::RailsActive>())
+            .then(|| zenith_row_tint(details.path.as_unix_str(), details.is_ignored))
+            .flatten();
         let bg_color = if is_marked {
             item_colors.marked
+        } else if let Some(tint) = zenith_tint {
+            tint
         } else {
             item_colors.default
         };
@@ -8459,7 +8497,10 @@ impl ProjectPanel {
         if !cx.has_global::<workspace::IslandsActive>() || !details.path.is_empty() {
             return None;
         }
-        let worktree = self.project.read(cx).worktree_for_id(details.worktree_id, cx)?;
+        let worktree = self
+            .project
+            .read(cx)
+            .worktree_for_id(details.worktree_id, cx)?;
         let worktree = worktree.read(cx);
         if worktree.is_single_file() {
             return None;
@@ -8478,9 +8519,68 @@ fn zenith_tilde_path(path: &Path, home: &Path) -> String {
     }
 }
 
+/// PhpStorm tints rows for test sources (green) and excluded or library folders (brown).
+const ZENITH_TEST_TINT: Hsla = Hsla {
+    h: 0.33,
+    s: 0.35,
+    l: 0.5,
+    a: 0.14,
+};
+const ZENITH_IGNORED_TINT: Hsla = Hsla {
+    h: 0.08,
+    s: 0.45,
+    l: 0.5,
+    a: 0.14,
+};
+
+fn zenith_row_tint(path: &str, is_ignored: bool) -> Option<Hsla> {
+    if is_ignored {
+        return Some(ZENITH_IGNORED_TINT);
+    }
+    let is_test_dir = path
+        .split('/')
+        .any(|part| matches!(part, "tests" | "test" | "__tests__" | "spec" | "e2e"));
+    let name = path.rsplit('/').next().unwrap_or(path);
+    let is_test_file = name.contains(".test.")
+        || name.contains(".spec.")
+        || name.ends_with("Test.php")
+        || name.ends_with("_test.rs");
+    (is_test_dir || is_test_file).then_some(ZENITH_TEST_TINT)
+}
+
 #[cfg(test)]
 mod zenith_tests {
     use super::*;
+
+    #[test]
+    fn test_row_tint() {
+        // Tests green, ignored (node_modules, vendor) brown, everything else untinted.
+        assert_eq!(zenith_row_tint("tests/Unit", false), Some(ZENITH_TEST_TINT));
+        assert_eq!(
+            zenith_row_tint("src/__tests__/a.ts", false),
+            Some(ZENITH_TEST_TINT)
+        );
+        assert_eq!(
+            zenith_row_tint("src/Cart.test.ts", false),
+            Some(ZENITH_TEST_TINT)
+        );
+        assert_eq!(
+            zenith_row_tint("src/CartTest.php", false),
+            Some(ZENITH_TEST_TINT)
+        );
+        assert_eq!(
+            zenith_row_tint("node_modules", true),
+            Some(ZENITH_IGNORED_TINT)
+        );
+        // An ignored test folder is still marked as ignored, the stronger signal.
+        assert_eq!(
+            zenith_row_tint("tests/cache", true),
+            Some(ZENITH_IGNORED_TINT)
+        );
+        assert_eq!(zenith_row_tint("src/Cart.php", false), None);
+        assert_eq!(zenith_row_tint("latest/app.php", false), None);
+    }
+
     use gpui::{TestAppContext, VisualTestContext};
     use project::FakeFs;
     use serde_json::json;
@@ -8496,10 +8596,13 @@ mod zenith_tests {
             });
         }
         let fs = FakeFs::new(cx.executor());
-        fs.insert_tree("/sites/gallery", json!({ "a.php": "" })).await;
+        fs.insert_tree("/sites/gallery", json!({ "a.php": "" }))
+            .await;
         let project = Project::test(fs, ["/sites/gallery".as_ref()], cx).await;
         let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project, window, cx));
-        let workspace = window.read_with(cx, |mw, _| mw.workspace().clone()).unwrap();
+        let workspace = window
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
         let cx = &mut VisualTestContext::from_window(window.into(), cx);
         let panel = workspace.update_in(cx, ProjectPanel::new);
         workspace.update_in(cx, |workspace, window, cx| {
@@ -8514,7 +8617,10 @@ mod zenith_tests {
     async fn test_zenith_panel_chrome(cx: &mut TestAppContext) {
         let cx = &mut open_panel(cx, true).await;
         assert!(cx.debug_bounds("zenith-panel-header").is_some(), "header");
-        assert!(cx.debug_bounds("zenith-root-path").is_some(), "root location");
+        assert!(
+            cx.debug_bounds("zenith-root-path").is_some(),
+            "root location"
+        );
         // The header menu builds these by name; they must exist.
         cx.update(|_, cx| {
             for &(_, action) in workspace::dock::zenith_panel_menu_actions("Project Panel") {
@@ -8533,8 +8639,14 @@ mod zenith_tests {
     #[test]
     fn test_tilde_path() {
         let home = Path::new("/Users/me");
-        assert_eq!(super::zenith_tilde_path(Path::new("/Users/me/Sites"), home), "~/Sites");
+        assert_eq!(
+            super::zenith_tilde_path(Path::new("/Users/me/Sites"), home),
+            "~/Sites"
+        );
         assert_eq!(super::zenith_tilde_path(Path::new("/Users/me"), home), "~");
-        assert_eq!(super::zenith_tilde_path(Path::new("/opt/www"), home), "/opt/www");
+        assert_eq!(
+            super::zenith_tilde_path(Path::new("/opt/www"), home),
+            "/opt/www"
+        );
     }
 }
