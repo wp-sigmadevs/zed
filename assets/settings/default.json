@@ -2124,8 +2124,8 @@
     //     }
     "shell": "system",
     // Where to dock terminals panel. Can be `left`, `right`, `bottom`.
-    // Zenith: bottom, as in PhpStorm.
-    "dock": "bottom",
+    // Zenith: right, so its rail button sits on the right bar; drag the button to move it.
+    "dock": "right",
     // Whether the terminal panel should open on startup.
     //
     // Default: false

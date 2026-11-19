@@ -3,12 +3,12 @@
 //! dock's at the foot; the right rail holds the right dock's panels. They reuse
 //! the status bar's panel buttons, which then stop drawing there.
 
-use gpui::{App, Context, Entity, IntoElement, Render, Window};
+use gpui::{AnyElement, App, Context, Entity, IntoElement, Render, Window};
 use theme::ActiveTheme as _;
 use ui::{Tooltip, prelude::*};
 use workspace::{
     IslandsActive, Workspace,
-    dock::{DockPosition, PanelButtons, RailsActive},
+    dock::{DockPosition, DraggedPanelButton, PanelButtons, RailsActive},
 };
 
 pub fn init(cx: &mut App) {
@@ -65,17 +65,52 @@ impl Render for Rail {
             .items_center()
             .justify_between()
             .bg(colors.title_bar_background)
-            .child(self.top.clone())
+            .child(drop_zone(
+                self.side,
+                "top",
+                true,
+                self.top.clone().into_any_element(),
+                cx,
+            ))
             .when(left, |this| {
-                this.child(
+                this.child(drop_zone(
+                    DockPosition::Bottom,
+                    "foot",
+                    false,
                     v_flex()
                         .items_center()
                         .gap_1()
                         .child(problems_button())
-                        .children(self.foot.clone()),
-                )
+                        .children(self.foot.clone())
+                        .into_any_element(),
+                    cx,
+                ))
             })
     }
+}
+
+/// A stretch of rail that takes a dragged tool-window button and docks its panel at
+/// `position`, as PhpStorm moves tool windows between its bars.
+fn drop_zone(
+    position: DockPosition,
+    id: &'static str,
+    grow: bool,
+    child: AnyElement,
+    cx: &App,
+) -> impl IntoElement {
+    let hint = cx.theme().colors().drop_target_background;
+    v_flex()
+        .id(SharedString::from(format!("zenith-drop-{position:?}-{id}")))
+        .items_center()
+        .w_full()
+        .when(grow, |this| this.flex_1())
+        .drag_over::<DraggedPanelButton>(move |style, _, _, _| style.bg(hint))
+        .on_drop(move |dragged: &DraggedPanelButton, window, cx| {
+            if dragged.panel.position_is_valid(position, cx) {
+                dragged.panel.set_position(position, window, cx);
+            }
+        })
+        .child(child)
 }
 
 /// PhpStorm's Problems tool window: Zed's project diagnostics, which also hold

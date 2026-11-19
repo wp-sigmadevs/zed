@@ -386,6 +386,23 @@ struct PanelEntry {
     _subscriptions: [Subscription; 4],
 }
 
+/// A rail button being dragged; dropping it on another rail docks its panel there.
+#[derive(Clone)]
+pub struct DraggedPanelButton {
+    pub panel: Arc<dyn PanelHandle>,
+    icon: IconName,
+}
+
+impl Render for DraggedPanelButton {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .p_1()
+            .rounded_md()
+            .bg(cx.theme().colors().elevated_surface_background)
+            .child(Icon::new(self.icon).size(IconSize::Small))
+    }
+}
+
 pub struct PanelButtons {
     dock: Entity<Dock>,
     /// Zenith rails: the buttons stack vertically.
@@ -1457,6 +1474,10 @@ impl Render for PanelButtons {
 
                 let focus_handle = dock.panel_button_focus_handle(window, cx);
                 let icon_label = entry.panel.icon_label(window, cx);
+                let dragged = DraggedPanelButton {
+                    panel: entry.panel.clone(),
+                    icon,
+                };
 
                 Some(
                     right_click_menu(name)
@@ -1574,13 +1595,22 @@ impl Render for PanelButtons {
                                     })
                                 });
 
-                            div().relative().child(button).when_some(
-                                icon_label
-                                    .clone()
-                                    .filter(|_| !is_active_button)
-                                    .and_then(|label| label.parse::<usize>().ok()),
-                                |this, count| this.child(CountBadge::new(count)),
-                            )
+                            div()
+                                .id(SharedString::from(format!("zenith-drag-{name}")))
+                                .relative()
+                                .when(vertical, |this| {
+                                    this.on_drag(dragged.clone(), |dragged, _, _, cx| {
+                                        cx.new(|_| dragged.clone())
+                                    })
+                                })
+                                .child(button)
+                                .when_some(
+                                    icon_label
+                                        .clone()
+                                        .filter(|_| !is_active_button)
+                                        .and_then(|label| label.parse::<usize>().ok()),
+                                    |this, count| this.child(CountBadge::new(count)),
+                                )
                         }),
                 )
             })
