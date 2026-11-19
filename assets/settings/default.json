@@ -2989,6 +2989,13 @@
       // Files "Inspect changed files" analyzes at once.
       "max_parallel": 2,
     },
+    // TODO panel (⌘⇧6) and editor colouring of TODO markers.
+    "todo": {
+      // Regexes matched case-insensitively inside comments.
+      "patterns": ["\\bTODO\\b", "\\bFIXME\\b", "\\bHACK\\b", "\\bXXX\\b", "@todo", "shortcut:"],
+      // Colour TODO markers in the editor.
+      "highlight": true,
+    },
   },
   // The server to connect to. If the environment variable
   // ZED_SERVER_URL is set, it will override this setting.

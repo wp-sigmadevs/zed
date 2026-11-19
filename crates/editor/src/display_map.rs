@@ -190,6 +190,7 @@ pub enum HighlightKey {
     SelectedTextHighlight,
     SyntaxTreeView(usize),
     VimExchange,
+    ZenithTodo(usize),
 }
 
 pub trait ToDisplayPoint {

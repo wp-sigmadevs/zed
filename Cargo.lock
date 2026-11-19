@@ -23014,6 +23014,7 @@ dependencies = [
  "language",
  "project",
  "regex",
+ "settings",
  "text",
  "ui",
  "util",

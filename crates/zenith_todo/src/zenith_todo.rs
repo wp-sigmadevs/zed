@@ -1,11 +1,16 @@
-use std::collections::{BTreeMap, HashSet};
+use std::{
+    collections::{BTreeMap, HashSet},
+    ops::Range,
+    time::Duration,
+};
 
-use editor::{Editor, SelectionEffects, scroll::Autoscroll};
+use editor::{Editor, EditorEvent, HighlightKey, SelectionEffects, scroll::Autoscroll};
 use gpui::{
     Action, App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable,
-    IntoElement, ParentElement, Pixels, Render, Styled, Task, WeakEntity, Window, actions, px,
+    FontWeight, HighlightStyle, IntoElement, ParentElement, Pixels, Render, Styled, Task,
+    WeakEntity, Window, actions, px,
 };
-use language::{Buffer, BufferEvent};
+use language::{Buffer, BufferEvent, BufferSnapshot};
 use project::{
     Project, ProjectItem as _, ProjectPath, SearchResults,
     buffer_store::BufferStoreEvent,
@@ -13,6 +18,8 @@ use project::{
 };
 use text::{Anchor, Point, ToOffset as _, ToPoint as _};
 use ui::{ListItem, ListItemSpacing, prelude::*};
+use regex::{Regex, RegexBuilder};
+use settings::{RegisterSetting, Settings, SettingsContent, SettingsStore};
 use util::{ResultExt as _, paths::PathMatcher};
 use workspace::{
     Workspace,
@@ -29,10 +36,66 @@ actions!(
     ]
 );
 
-// shortcut: fixed patterns, no `zenith.todo` setting yet; add one to settings_content when its recompile fits the disk budget.
-const PATTERN: &str = r"\bTODO\b|\bFIXME\b|\bHACK\b|\bXXX\b|@todo|shortcut:";
+const DEFAULT_PATTERNS: [&str; 6] = [
+    r"\bTODO\b",
+    r"\bFIXME\b",
+    r"\bHACK\b",
+    r"\bXXX\b",
+    "@todo",
+    "shortcut:",
+];
+
+// Files larger than this are not coloured; scanning them on every edit would lag.
+const MAX_HIGHLIGHT_BYTES: usize = 1_000_000;
+
+#[derive(Clone, Debug, PartialEq, RegisterSetting)]
+pub struct TodoSettings {
+    pub patterns: Vec<String>,
+    pub highlight: bool,
+}
+
+impl Settings for TodoSettings {
+    fn from_settings(content: &SettingsContent) -> Self {
+        let todo = content
+            .zenith
+            .as_ref()
+            .and_then(|zenith| zenith.todo.as_ref());
+        Self {
+            patterns: todo
+                .and_then(|todo| todo.patterns.clone())
+                .unwrap_or_default(),
+            highlight: todo.and_then(|todo| todo.highlight).unwrap_or(true),
+        }
+    }
+}
+
+/// One regex for all patterns; an empty list falls back to the defaults.
+fn combined_pattern(patterns: &[String]) -> String {
+    let patterns: Vec<&str> = patterns
+        .iter()
+        .map(String::as_str)
+        .filter(|pattern| !pattern.trim().is_empty())
+        .collect();
+    let patterns = if patterns.is_empty() {
+        DEFAULT_PATTERNS.to_vec()
+    } else {
+        patterns
+    };
+    patterns
+        .iter()
+        .map(|pattern| format!("(?:{pattern})"))
+        .collect::<Vec<_>>()
+        .join("|")
+}
 
 pub fn init(cx: &mut App) {
+    TodoSettings::register(cx);
+    cx.observe_new(|editor: &mut Editor, _, cx| {
+        if editor.mode().is_full() && editor.project().is_some() {
+            install_highlighter(cx);
+        }
+    })
+    .detach();
     cx.observe_new(|workspace: &mut Workspace, window, cx| {
         workspace.register_action(|workspace, _: &ToggleFocus, window, cx| {
             workspace.toggle_panel_focus::<TodoPanel>(window, cx);
@@ -53,6 +116,158 @@ fn has_comment_marker(prefix: &str) -> bool {
         || ["//", "#", "/*", "<!--", "{#"]
             .iter()
             .any(|marker| prefix.contains(marker))
+}
+
+/// Whether a match at `offset` sits in a comment: the grammar's comment scope, or a
+/// comment marker before it on the line.
+fn is_comment(snapshot: &BufferSnapshot, offset: usize, line_prefix: &str) -> bool {
+    snapshot
+        .language_scope_at(offset)
+        .and_then(|scope| {
+            scope
+                .override_name()
+                .map(|name| name.starts_with("comment"))
+        })
+        .unwrap_or(false)
+        || has_comment_marker(line_prefix)
+}
+
+/// Theme colour slot per marker: 0 error, 1 warning, 2 info, 3 hint.
+fn colour_class(label: &str) -> usize {
+    match label {
+        "FIXME" | "XXX" => 0,
+        "HACK" => 1,
+        "TODO" | "@TODO" => 2,
+        _ => 3,
+    }
+}
+
+/// Byte ranges and colour classes of the markers inside comments.
+fn find_markers(snapshot: &BufferSnapshot, regex: &Regex) -> Vec<(Range<usize>, usize)> {
+    let text = snapshot.text();
+    regex
+        .find_iter(&text)
+        .filter_map(|found| {
+            let row = snapshot.offset_to_point(found.start()).row;
+            let line_start = snapshot.point_to_offset(Point::new(row, 0));
+            let prefix = text.get(line_start..found.start()).unwrap_or_default();
+            is_comment(snapshot, found.start(), prefix)
+                .then(|| (found.range(), colour_class(&pattern_label(found.as_str()))))
+        })
+        .collect()
+}
+
+fn build_regex(pattern: &str) -> Option<Regex> {
+    RegexBuilder::new(pattern)
+        .case_insensitive(true)
+        .build()
+        .log_err()
+}
+
+/// Colours TODO markers in a full editor; reruns on edits, reparse and settings changes.
+fn install_highlighter(cx: &mut Context<Editor>) {
+    let mut pending = Task::ready(());
+    cx.subscribe_self(move |_, event: &EditorEvent, cx| {
+        if matches!(event, EditorEvent::BufferEdited | EditorEvent::Reparsed(_)) {
+            // Replacing the task drops, and so cancels, the previous run.
+            drop(std::mem::replace(&mut pending, schedule_highlight(cx)));
+        }
+    })
+    .detach();
+    let mut last_settings = TodoSettings::get_global(cx).clone();
+    let mut pending_settings = Task::ready(());
+    cx.observe_global::<SettingsStore>(move |_, cx| {
+        let settings = TodoSettings::get_global(cx);
+        if *settings != last_settings {
+            last_settings = settings.clone();
+            drop(std::mem::replace(&mut pending_settings, schedule_highlight(cx)));
+        }
+    })
+    .detach();
+    schedule_highlight(cx).detach();
+}
+
+fn schedule_highlight(cx: &mut Context<Editor>) -> Task<()> {
+    let settings = TodoSettings::get_global(cx);
+    let buffer = cx.entity().read(cx).buffer().read(cx).as_singleton();
+    let regex = settings
+        .highlight
+        .then(|| build_regex(&combined_pattern(&settings.patterns)))
+        .flatten();
+    let (Some(buffer), Some(regex)) = (buffer, regex) else {
+        return cx.spawn(async move |editor, cx| {
+            editor
+                .update(cx, |editor, cx| apply_markers(editor, Vec::new(), cx))
+                .log_err();
+        });
+    };
+    let snapshot = buffer.read(cx).snapshot();
+    cx.spawn(async move |editor, cx| {
+        cx.background_executor()
+            .timer(Duration::from_millis(300))
+            .await;
+        let (snapshot, markers) = cx
+            .background_spawn(async move {
+                let markers = if snapshot.len() > MAX_HIGHLIGHT_BYTES {
+                    Vec::new()
+                } else {
+                    find_markers(&snapshot, &regex)
+                };
+                (snapshot, markers)
+            })
+            .await;
+        editor
+            .update(cx, |editor, cx| {
+                let markers = markers
+                    .into_iter()
+                    .map(|(range, class)| {
+                        (
+                            snapshot.anchor_after(range.start)..snapshot.anchor_before(range.end),
+                            class,
+                        )
+                    })
+                    .collect();
+                apply_markers(editor, markers, cx)
+            })
+            .log_err();
+    })
+}
+
+fn apply_markers(
+    editor: &mut Editor,
+    markers: Vec<(Range<Anchor>, usize)>,
+    cx: &mut Context<Editor>,
+) {
+    let status = cx.theme().status();
+    let colours = [status.error, status.warning, status.info, status.hint];
+    let multibuffer_snapshot = editor.buffer().read(cx).snapshot(cx);
+    for (class, colour) in colours.into_iter().enumerate() {
+        let ranges: Vec<_> = markers
+            .iter()
+            .filter(|(_, marker_class)| *marker_class == class)
+            .filter_map(|(range, _)| {
+                Some(
+                    multibuffer_snapshot.anchor_in_buffer(range.start)?
+                        ..multibuffer_snapshot.anchor_in_buffer(range.end)?,
+                )
+            })
+            .collect();
+        let key = HighlightKey::ZenithTodo(class);
+        if ranges.is_empty() {
+            editor.clear_highlights(key, cx);
+        } else {
+            editor.highlight_text(
+                key,
+                ranges,
+                HighlightStyle {
+                    color: Some(colour),
+                    font_weight: Some(FontWeight::BOLD),
+                    ..HighlightStyle::default()
+                },
+                cx,
+            );
+        }
+    }
 }
 
 /// The group name for a matched marker: `todo:` and `Todo` both group under `TODO`.
@@ -109,6 +324,17 @@ impl TodoPanel {
                     }
                 })
                 .detach();
+            }
+        })
+        .detach();
+        let mut last_patterns = TodoSettings::get_global(cx).patterns.clone();
+        cx.observe_global::<SettingsStore>(move |this, cx| {
+            let patterns = &TodoSettings::get_global(cx).patterns;
+            if *patterns != last_patterns {
+                last_patterns = patterns.clone();
+                if this.scanned {
+                    this.rescan(cx);
+                }
             }
         })
         .detach();
@@ -189,8 +415,9 @@ impl TodoPanel {
             self.finish(Vec::new(), false, Some("No changed files.".into()), cx);
             return;
         }
+        let pattern = combined_pattern(&TodoSettings::get_global(cx).patterns);
         let query = match SearchQuery::regex(
-            PATTERN,
+            pattern,
             false,
             false,
             false,
@@ -294,7 +521,7 @@ impl TodoPanel {
 
 fn todo_items(
     buffer: Entity<Buffer>,
-    ranges: Vec<std::ops::Range<Anchor>>,
+    ranges: Vec<Range<Anchor>>,
     cx: &App,
 ) -> Vec<TodoItem> {
     let snapshot = buffer.read(cx).snapshot();
@@ -312,15 +539,7 @@ fn todo_items(
                 )
                 .collect();
             let prefix = line.get(..point.column as usize).unwrap_or_default();
-            let in_comment_scope = snapshot
-                .language_scope_at(range.start.to_offset(&snapshot))
-                .and_then(|scope| {
-                    scope
-                        .override_name()
-                        .map(|name| name.starts_with("comment"))
-                })
-                .unwrap_or(false);
-            if !in_comment_scope && !has_comment_marker(prefix) {
+            if !is_comment(&snapshot, range.start.to_offset(&snapshot), prefix) {
                 return None;
             }
             let matched: String = snapshot.text_for_range(range.clone()).collect();
@@ -540,10 +759,7 @@ mod tests {
 
     #[test]
     fn pattern_matches_markers_only() {
-        let regex = regex::RegexBuilder::new(PATTERN)
-            .case_insensitive(true)
-            .build()
-            .expect("valid pattern");
+        let regex = build_regex(&combined_pattern(&[])).expect("valid pattern");
         for text in [
             "TODO: x",
             "fixme",
@@ -565,5 +781,39 @@ mod tests {
         assert_eq!(pattern_label("Fixme"), "FIXME");
         assert_eq!(pattern_label("shortcut:"), "SHORTCUT");
         assert_eq!(pattern_label("@todo"), "@TODO");
+    }
+
+    #[test]
+    fn custom_patterns_replace_defaults() {
+        let regex =
+            build_regex(&combined_pattern(&["NOTE".into(), " ".into()])).expect("valid pattern");
+        assert!(regex.is_match("note: x"));
+        assert!(!regex.is_match("TODO"));
+        assert!(!regex.is_match(" "));
+    }
+
+    #[test]
+    fn colour_per_marker() {
+        assert_eq!(colour_class("FIXME"), 0);
+        assert_eq!(colour_class("HACK"), 1);
+        assert_eq!(colour_class("TODO"), 2);
+        assert_eq!(colour_class("SHORTCUT"), 3);
+    }
+
+    #[gpui::test]
+    fn markers_only_inside_comments(cx: &mut gpui::TestAppContext) {
+        let buffer = cx.new(|cx| {
+            Buffer::local(
+                "let todo = 1; // TODO: one\n/* FIXME two */\nlet s = \"HACK\";\n",
+                cx,
+            )
+        });
+        let snapshot = buffer.read_with(cx, |buffer, _| buffer.snapshot());
+        let regex = build_regex(&combined_pattern(&[])).expect("valid pattern");
+        let found: Vec<(String, usize)> = find_markers(&snapshot, &regex)
+            .into_iter()
+            .map(|(range, class)| (snapshot.text_for_range(range).collect(), class))
+            .collect();
+        assert_eq!(found, [("TODO".into(), 2), ("FIXME".into(), 0)]);
     }
 }

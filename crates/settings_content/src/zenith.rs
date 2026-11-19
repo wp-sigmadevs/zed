@@ -9,6 +9,8 @@ pub struct ZenithSettingsContent {
     pub welcome: Option<ZenithWelcomeSettingsContent>,
     /// Settings for PHP inspections (PHPCS and PHPStan).
     pub inspections: Option<ZenithInspectionsSettingsContent>,
+    /// Settings for the TODO panel.
+    pub todo: Option<ZenithTodoSettingsContent>,
 }
 
 /// Settings for the Zenith welcome screen.
@@ -40,4 +42,17 @@ pub struct ZenithInspectionsSettingsContent {
     ///
     /// Default: 2
     pub max_parallel: Option<u32>,
+}
+
+/// Settings for the TODO panel.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+pub struct ZenithTodoSettingsContent {
+    /// Regex patterns, matched case-insensitively inside comments.
+    ///
+    /// Default: ["\\bTODO\\b", "\\bFIXME\\b", "\\bHACK\\b", "\\bXXX\\b", "@todo", "shortcut:"]
+    pub patterns: Option<Vec<String>>,
+    /// Whether TODO markers are coloured in the editor.
+    ///
+    /// Default: true
+    pub highlight: Option<bool>,
 }

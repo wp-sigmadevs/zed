@@ -16,6 +16,8 @@
       "secondary-shift-e": "zenith_search::RecentLocations",
       // PhpStorm's Switcher: hold ⌃, Tab to step, let go to open.
       "ctrl-tab": "zenith_search::Switcher",
+      // TODO tool window. PhpStorm has no default key for it and gives ⌘6 to Problems, so ⇧ is added.
+      "secondary-shift-6": "zenith_todo::ToggleFocus",
     },
   },
   {
