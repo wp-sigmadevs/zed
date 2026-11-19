@@ -1921,8 +1921,8 @@ fn zenith_header_buttons(
         .collect()
 }
 
-/// The header's ⋮ menu: the project panel's sort and appearance settings, where to dock the
-/// panel, hide.
+/// The header's ⋮ menu, in PhpStorm's order. Entries whose feature Zenith lacks (scopes, tab
+/// groups, view modes, the "Help" link) are left out rather than shown dead.
 fn zenith_panel_menu(panel: Arc<dyn PanelHandle>, dock: WeakEntity<Dock>) -> impl IntoElement {
     ui::PopoverMenu::new("zenith-panel-menu")
         .trigger(
@@ -1933,33 +1933,68 @@ fn zenith_panel_menu(panel: Arc<dyn PanelHandle>, dock: WeakEntity<Dock>) -> imp
         .menu(move |window, cx| {
             let panel = panel.clone();
             let dock = dock.clone();
-            Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+            let position = panel.position(window, cx);
+            Some(ContextMenu::build(window, cx, move |mut menu, _, cx| {
                 if panel.persistent_name() == "Project Panel" {
                     menu = zenith_project_panel_menu(menu).separator();
                 }
                 let docking = panel.clone();
                 menu = menu.submenu("Move to", move |mut submenu, window, cx| {
                     let current = docking.position(window, cx);
-                    for position in [
-                        DockPosition::Left,
-                        DockPosition::Right,
-                        DockPosition::Bottom,
+                    // PhpStorm's names: the left rail's top, its bottom half, the right rail.
+                    for (label, target) in [
+                        ("Left Top", DockPosition::Left),
+                        ("Left Bottom", DockPosition::Bottom),
+                        ("Right Top", DockPosition::Right),
                     ] {
-                        if !docking.position_is_valid(position, cx) {
+                        if !docking.position_is_valid(target, cx) {
                             continue;
                         }
                         let panel = docking.clone();
                         submenu = submenu.toggleable_entry(
-                            position.label(),
-                            position == current,
+                            label,
+                            target == current,
                             IconPosition::Start,
                             None,
-                            move |window, cx| panel.set_position(position, window, cx),
+                            move |window, cx| panel.set_position(target, window, cx),
                         );
                     }
                     submenu
                 });
-                menu.separator().entry("Hide", None, move |window, cx| {
+                let resizing = panel.clone();
+                menu = menu.submenu("Resize", move |mut submenu, _, _| {
+                    let (grow, shrink) = match position {
+                        DockPosition::Left => ("Stretch to Right", "Stretch to Left"),
+                        DockPosition::Right => ("Stretch to Left", "Stretch to Right"),
+                        DockPosition::Bottom => ("Stretch to Top", "Stretch to Bottom"),
+                    };
+                    for (label, grows) in [(grow, true), (shrink, false)] {
+                        let panel = resizing.clone();
+                        submenu = submenu.entry(label, None, move |window, cx| {
+                            let focus = panel.panel_focus_handle(cx);
+                            window.focus(&focus, cx);
+                            let action: Box<dyn Action> = if grows {
+                                Box::new(crate::IncreaseActiveDockSize { px: 40 })
+                            } else {
+                                Box::new(crate::DecreaseActiveDockSize { px: 40 })
+                            };
+                            window.dispatch_action(action, cx);
+                        });
+                    }
+                    let panel = resizing.clone();
+                    submenu
+                        .separator()
+                        .entry("Maximize Tool Window", None, move |window, cx| {
+                            let focus = panel.panel_focus_handle(cx);
+                            window.focus(&focus, cx);
+                            window.dispatch_action(Box::new(crate::ToggleZoom), cx);
+                        })
+                });
+                menu = menu.separator();
+                if let Some(hide) = panel.hide_button_setting(cx) {
+                    menu = menu.entry("Remove from Sidebar", None, move |_, cx| hide.apply(cx));
+                }
+                menu.entry("Hide", None, move |window, cx| {
                     dock.update(cx, |dock, cx| dock.set_open(false, window, cx))
                         .ok();
                 })
@@ -1967,65 +2002,174 @@ fn zenith_panel_menu(panel: Arc<dyn PanelHandle>, dock: WeakEntity<Dock>) -> imp
         })
 }
 
-/// "Sort By" and "Appearance", which write the project panel's settings.
+type SettingGet = fn(&settings::SettingsContent) -> bool;
+type SettingSet = fn(&mut settings::SettingsContent, bool);
+
+/// A checked menu item for a boolean setting; choosing it writes the opposite.
+fn setting_entry(
+    menu: ContextMenu,
+    label: &'static str,
+    get: SettingGet,
+    set: SettingSet,
+    cx: &App,
+) -> ContextMenu {
+    let checked = get(cx.global::<SettingsStore>().merged_settings());
+    menu.toggleable_entry(label, checked, IconPosition::Start, None, move |_, cx| {
+        let fs = <dyn fs::Fs>::global(cx);
+        settings::update_settings_file(fs, cx, move |content, _| set(content, !checked));
+    })
+}
+
+/// Behavior, Appearance and Sort By: each writes a project-panel or tab setting.
 fn zenith_project_panel_menu(menu: ContextMenu) -> ContextMenu {
-    use settings::{ProjectPanelSettingsContent as Content, ProjectPanelSortMode as Sort};
-    let project_panel = |cx: &App| {
-        cx.global::<SettingsStore>()
+    use settings::{ProjectPanelSortMode as Sort, ProjectPanelSortOrder as Order};
+    menu.submenu("Behavior", |submenu, _, cx| {
+        let submenu = setting_entry(
+            submenu,
+            "Enable Preview Tab",
+            |s| {
+                s.preview_tabs
+                    .as_ref()
+                    .and_then(|p| p.enabled)
+                    .unwrap_or(false)
+            },
+            |s, on| s.preview_tabs.get_or_insert_default().enabled = Some(on),
+            cx,
+        );
+        let submenu = setting_entry(
+            submenu,
+            "Open Files with Single Click",
+            |s| {
+                s.preview_tabs
+                    .as_ref()
+                    .and_then(|p| p.enable_preview_from_project_panel)
+                    .unwrap_or(false)
+            },
+            |s, on| {
+                s.preview_tabs
+                    .get_or_insert_default()
+                    .enable_preview_from_project_panel = Some(on)
+            },
+            cx,
+        );
+        setting_entry(
+            submenu,
+            "Always Select Opened File",
+            |s| {
+                s.project_panel
+                    .as_ref()
+                    .and_then(|p| p.auto_reveal_entries)
+                    .unwrap_or(false)
+            },
+            |s, on| s.project_panel.get_or_insert_default().auto_reveal_entries = Some(on),
+            cx,
+        )
+    })
+    .submenu("Appearance", |submenu, _, cx| {
+        let mut submenu = submenu.header("Show");
+        let toggles: [(&'static str, SettingGet, SettingSet); 6] = [
+            (
+                "Hidden Files",
+                |s| !project_panel_flag(s, |p| p.hide_hidden),
+                |s, on| s.project_panel.get_or_insert_default().hide_hidden = Some(!on),
+            ),
+            (
+                "Ignored Files",
+                |s| !project_panel_flag(s, |p| p.hide_gitignore),
+                |s, on| s.project_panel.get_or_insert_default().hide_gitignore = Some(!on),
+            ),
+            (
+                "File Icons",
+                |s| project_panel_flag(s, |p| p.file_icons),
+                |s, on| s.project_panel.get_or_insert_default().file_icons = Some(on),
+            ),
+            (
+                "Git Status",
+                |s| project_panel_flag(s, |p| p.git_status),
+                |s, on| s.project_panel.get_or_insert_default().git_status = Some(on),
+            ),
+            (
+                "Diagnostic Badges",
+                |s| project_panel_flag(s, |p| p.diagnostic_badges),
+                |s, on| s.project_panel.get_or_insert_default().diagnostic_badges = Some(on),
+            ),
+            (
+                "Compact Folders",
+                |s| project_panel_flag(s, |p| p.auto_fold_dirs),
+                |s, on| s.project_panel.get_or_insert_default().auto_fold_dirs = Some(on),
+            ),
+        ];
+        for (label, get, set) in toggles {
+            submenu = setting_entry(submenu, label, get, set, cx);
+        }
+        submenu
+    })
+    .submenu("Sort By", move |mut submenu, _, cx| {
+        let content = cx
+            .global::<SettingsStore>()
             .merged_settings()
             .project_panel
             .clone()
-            .unwrap_or_default()
-    };
-    menu.submenu("Sort By", move |mut submenu, _, cx| {
-        let current = project_panel(cx).sort_mode.unwrap_or_default();
-        for (label, mode) in [
-            ("Directories First", Sort::DirectoriesFirst),
-            ("Mixed", Sort::Mixed),
-            ("Files First", Sort::FilesFirst),
+            .unwrap_or_default();
+        let order = content.sort_order.unwrap_or_default();
+        let mode = content.sort_mode.unwrap_or_default();
+        for (label, value) in [
+            ("Name", Order::Default),
+            ("Name (Uppercase First)", Order::Upper),
+            ("Name (Lowercase First)", Order::Lower),
+            ("Name (Unicode)", Order::Unicode),
         ] {
             submenu = submenu.toggleable_entry(
                 label,
-                current == mode,
+                order == value,
                 IconPosition::Start,
                 None,
                 move |_, cx| {
                     let fs = <dyn fs::Fs>::global(cx);
                     settings::update_settings_file(fs, cx, move |content, _| {
-                        content.project_panel.get_or_insert_default().sort_mode = Some(mode);
+                        content.project_panel.get_or_insert_default().sort_order = Some(value);
                     });
                 },
             );
         }
-        submenu
-    })
-    .submenu("Appearance", move |mut submenu, _, cx| {
-        type Field = fn(&mut Content) -> &mut Option<bool>;
-        // (label, setting, shown when the setting is off)
-        let toggles: [(&str, Field, bool); 4] = [
-            ("Show Hidden Files", |p| &mut p.hide_hidden, true),
-            ("Git Status", |p| &mut p.git_status, false),
-            ("File Icons", |p| &mut p.file_icons, false),
-            ("Diagnostic Badges", |p| &mut p.diagnostic_badges, false),
-        ];
-        for (label, field, inverted) in toggles {
-            let mut settings = project_panel(cx);
-            let value = field(&mut settings).unwrap_or(false);
-            submenu = submenu.toggleable_entry(
-                label,
-                value != inverted,
-                IconPosition::Start,
-                None,
-                move |_, cx| {
+        submenu = submenu.separator();
+        for (label, on, off, target) in [
+            (
+                "Folders Always on Top",
+                mode == Sort::DirectoriesFirst,
+                Sort::Mixed,
+                Sort::DirectoriesFirst,
+            ),
+            (
+                "Files First",
+                mode == Sort::FilesFirst,
+                Sort::DirectoriesFirst,
+                Sort::FilesFirst,
+            ),
+        ] {
+            submenu =
+                submenu.toggleable_entry(label, on, IconPosition::Start, None, move |_, cx| {
                     let fs = <dyn fs::Fs>::global(cx);
                     settings::update_settings_file(fs, cx, move |content, _| {
-                        *field(content.project_panel.get_or_insert_default()) = Some(!value);
+                        content.project_panel.get_or_insert_default().sort_mode =
+                            Some(if on { off } else { target });
                     });
-                },
-            );
+                });
         }
         submenu
     })
+}
+
+/// A project-panel boolean from the merged settings, false when unset.
+fn project_panel_flag(
+    settings: &settings::SettingsContent,
+    field: fn(&settings::ProjectPanelSettingsContent) -> Option<bool>,
+) -> bool {
+    settings
+        .project_panel
+        .as_ref()
+        .and_then(field)
+        .unwrap_or(false)
 }
 
 /// Panel actions for the "···" menu, by action name so this crate needs no panel dependency.
