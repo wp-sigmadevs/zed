@@ -2,7 +2,7 @@
 //! closed when the first workspace window opens. Board: `mockups/zenith-splash.html`.
 //! Draws with fixed colours and the system font, so it needs no theme or settings.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gpui::{
     Animation, AnimationExt as _, AnyWindowHandle, App, Bounds, Context, FontWeight, Global,
@@ -17,18 +17,23 @@ const WIDTH: f32 = 640.;
 const HEIGHT: f32 = 400.;
 /// Safety net: a start that never opens a workspace must not leave the card up.
 const MAX_SHOWN: Duration = Duration::from_secs(20);
+/// A card that flashes by looks like a glitch; hold it at least this long.
+const MIN_SHOWN: Duration = Duration::from_millis(1500);
 
-struct Splash(AnyWindowHandle);
+struct Splash(AnyWindowHandle, Instant);
 
 impl Global for Splash {}
 
 /// Shows the card and arranges for it to close with the first workspace window.
 pub fn show(cx: &mut App) {
     let bounds = Bounds::centered(None, size(px(WIDTH), px(HEIGHT)), cx);
+    let v = AppVersion::global(cx);
     let version = format!(
-        "{} {}",
+        "{} {}.{}.{}",
         ReleaseChannel::global(cx).display_name(),
-        AppVersion::global(cx)
+        v.major,
+        v.minor,
+        v.patch
     );
     let handle = cx.open_window(
         WindowOptions {
@@ -46,9 +51,9 @@ pub fn show(cx: &mut App) {
         move |_, cx| cx.new(|_| SplashView { version }),
     );
     let Ok(handle) = handle else { return };
-    cx.set_global(Splash(handle.into()));
+    cx.set_global(Splash(handle.into(), Instant::now()));
 
-    cx.observe_new(|_: &mut Workspace, _, cx| close(cx))
+    cx.observe_new(|_: &mut Workspace, _, cx| close_soon(cx))
         .detach();
     cx.spawn(async move |cx| {
         cx.background_executor().timer(MAX_SHOWN).await;
@@ -57,10 +62,27 @@ pub fn show(cx: &mut App) {
     .detach();
 }
 
+/// Closes the card once it has been up for `MIN_SHOWN`.
+fn close_soon(cx: &mut App) {
+    let Some(shown) = cx.try_global::<Splash>().map(|splash| splash.1) else {
+        return;
+    };
+    let remaining = MIN_SHOWN.saturating_sub(shown.elapsed());
+    if remaining.is_zero() {
+        close(cx);
+    } else {
+        cx.spawn(async move |cx| {
+            cx.background_executor().timer(remaining).await;
+            cx.update(close);
+        })
+        .detach();
+    }
+}
+
 /// Closes the card if it is still up.
 pub fn close(cx: &mut App) {
     if cx.has_global::<Splash>() {
-        let Splash(handle) = cx.remove_global::<Splash>();
+        let Splash(handle, _) = cx.remove_global::<Splash>();
         handle
             .update(cx, |_, window, _| window.remove_window())
             .ok();
@@ -121,7 +143,7 @@ impl Render for SplashView {
                     .top(px(150.))
                     .text_size(px(15.))
                     .text_color(white(0.7))
-                    .child(format!("Version {}", self.version)),
+                    .child(self.version.clone()),
             )
             .child(
                 div()
