@@ -318,6 +318,11 @@ pub enum IconName {
     ZenithHook,
     ZenithListChecks,
     ZenithTerminal,
+    ZenithPlus,
+    ZenithMinus,
+    ZenithExpandAll,
+    ZenithCollapseAll,
+    ZenithMoreVertical,
 }
 
 impl IconName {

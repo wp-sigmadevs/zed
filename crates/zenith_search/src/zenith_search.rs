@@ -2707,6 +2707,39 @@ mod tests {
                 Some("pane::RevealInProjectPanel")
             );
 
+            // ⌥⌘← / ⌥⌘→ are previous/next tab in Zed's own keymap; Zenith's file turns them
+            // into Back / Forward, whatever the base keymap is.
+            let mut zed_only = Vec::new();
+            load(&mut zed_only, settings::DEFAULT_KEYMAP_PATH);
+            let mut zed_with_zenith = zed_only.clone();
+            load(&mut zed_with_zenith, settings::ZENITH_KEYMAP_PATH);
+            load(
+                &mut zed_with_zenith,
+                settings::SPECIFIC_OVERRIDES_KEYMAP_PATH,
+            );
+            let (zed_only, zed_with_zenith) = (
+                gpui::Keymap::new(zed_only),
+                gpui::Keymap::new(zed_with_zenith),
+            );
+            assert_eq!(
+                resolve(&zed_only, "alt-left", &editor).as_deref(),
+                Some("pane::ActivatePreviousItem")
+            );
+            for keymap in [&zed_with_zenith, &all] {
+                for contexts in [&editor[..], &terminal] {
+                    for (keys, action) in [
+                        ("alt-left", "pane::GoBack"),
+                        ("alt-right", "pane::GoForward"),
+                    ] {
+                        assert_eq!(
+                            resolve(keymap, keys, contexts).as_deref(),
+                            Some(action),
+                            "secondary-{keys} in {contexts:?}"
+                        );
+                    }
+                }
+            }
+
             for contexts in [&editor[..], &terminal, &project_panel] {
                 for (keys, action) in [
                     ("o", "zenith_search::GoToClass"),

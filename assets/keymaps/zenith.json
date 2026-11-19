@@ -21,6 +21,16 @@
     },
   },
   {
+    // PhpStorm's Back / Forward through the navigation history (go to definition, search
+    // results, recent places). Zed binds these keys to previous/next tab in "Pane", the
+    // same depth, so they are repeated here where the later-loaded keymap wins.
+    "context": "Pane",
+    "bindings": {
+      "secondary-alt-left": "pane::GoBack",
+      "secondary-alt-right": "pane::GoForward",
+    },
+  },
+  {
     // The editor binds ⌘E (use selection for find) and ⌘⇧O (outline) itself, so
     // the same keys are repeated here, where they win.
     "context": "Editor && mode == full",

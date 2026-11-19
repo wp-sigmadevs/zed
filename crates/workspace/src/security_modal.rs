@@ -800,13 +800,21 @@ mod zenith_tests {
 
     #[gpui::test]
     async fn test_legacy_folder_not_named_when_absent(cx: &mut gpui::TestAppContext) {
-        let text = review_text(json!({ ".zenith": { "settings.json": "{}" }, "a.php": "" }), cx).await;
+        let text = review_text(
+            json!({ ".zenith": { "settings.json": "{}" }, "a.php": "" }),
+            cx,
+        )
+        .await;
         assert!(!text.contains(".zed/"), "{text}");
     }
 
     #[gpui::test]
     async fn test_legacy_folder_named_when_present(cx: &mut gpui::TestAppContext) {
-        let text = review_text(json!({ ".zed": { "settings.json": "{}" }, "a.php": "" }), cx).await;
+        let text = review_text(
+            json!({ ".zed": { "settings.json": "{}" }, "a.php": "" }),
+            cx,
+        )
+        .await;
         assert!(text.contains(".zed/settings.json"), "{text}");
     }
 }

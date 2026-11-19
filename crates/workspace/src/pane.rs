@@ -2955,9 +2955,10 @@ impl Pane {
                 ClosePosition::Right => ui::TabCloseSide::End,
             })
             .toggle_state(is_active)
-            .when(is_active && cx.has_global::<crate::IslandsActive>(), |tab| {
-                tab.child(zenith_active_tab_line(cx))
-            })
+            .when(
+                is_active && cx.has_global::<crate::IslandsActive>(),
+                |tab| tab.child(zenith_active_tab_line(cx)),
+            )
             .on_click(cx.listener({
                 let item_handle = item.boxed_clone();
                 move |pane: &mut Self, event: &ClickEvent, window, cx| {

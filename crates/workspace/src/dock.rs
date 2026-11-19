@@ -1557,7 +1557,9 @@ impl Render for PanelButtons {
                                 .icon_size(IconSize::Small)
                                 .toggle_state(is_active_button)
                                 .tab_index(0isize)
-                                .when(vertical, |this| this.size(ButtonSize::Medium).width(px(28.)))
+                                .when(vertical, |this| {
+                                    this.size(ButtonSize::Medium).width(px(28.))
+                                })
                                 .aria_label(icon_tooltip)
                                 .on_click({
                                     let action = action.boxed_clone();
@@ -1830,10 +1832,12 @@ impl Dock {
                     .child(
                         h_flex()
                             .gap_0p5()
+                            .children(zenith_header_buttons(panel, cx))
                             .child(zenith_panel_menu(panel.clone(), cx.entity().downgrade()))
                             .child(
-                                IconButton::new("zenith-panel-hide", IconName::Close)
+                                IconButton::new("zenith-panel-hide", IconName::ZenithMinus)
                                     .icon_size(IconSize::Small)
+                                    .icon_color(Color::Custom(gpui::rgb(HEADER_YELLOW).into()))
                                     .tooltip(Tooltip::text("Hide"))
                                     .on_click(cx.listener(|dock, _, window, cx| {
                                         dock.set_open(false, window, cx)
@@ -1846,42 +1850,85 @@ impl Dock {
     }
 }
 
-/// The header's "···" menu: the panel's own collapse action, where to dock it, hide.
+/// PhpStorm's coloured tool-window toolbar: teal ＋, pink expand/collapse, yellow ⋮ and –.
+const HEADER_TEAL: u32 = 0x4fc3c7;
+const HEADER_PINK: u32 = 0xf0a6c8;
+const HEADER_YELLOW: u32 = 0xe5c05a;
+
+/// Icon and colour for a header button, by the panel action's label.
+fn zenith_header_icon(label: &str) -> Option<(IconName, u32)> {
+    match label {
+        "New File" => Some((IconName::ZenithPlus, HEADER_TEAL)),
+        "Expand All" => Some((IconName::ZenithExpandAll, HEADER_PINK)),
+        "Collapse All" => Some((IconName::ZenithCollapseAll, HEADER_PINK)),
+        _ => None,
+    }
+}
+
+/// One icon button per panel action, before the ⋮ menu.
+fn zenith_header_buttons(
+    panel: &Arc<dyn PanelHandle>,
+    cx: &mut Context<Dock>,
+) -> Vec<gpui::AnyElement> {
+    zenith_panel_menu_actions(panel.persistent_name())
+        .iter()
+        .filter_map(|&(label, action)| {
+            let (icon, color) = zenith_header_icon(label)?;
+            let action = cx.build_action(action, None).ok()?;
+            let focus = panel.panel_focus_handle(cx);
+            Some(
+                IconButton::new(SharedString::from(format!("zenith-header-{label}")), icon)
+                    .icon_size(IconSize::Small)
+                    .icon_color(Color::Custom(gpui::rgb(color).into()))
+                    .tooltip(Tooltip::text(label))
+                    .on_click(move |_, window, cx| {
+                        window.focus(&focus, cx);
+                        window.dispatch_action(action.boxed_clone(), cx);
+                    })
+                    .into_any_element(),
+            )
+        })
+        .collect()
+}
+
+/// The header's ⋮ menu: the project panel's sort and appearance settings, where to dock the
+/// panel, hide.
 fn zenith_panel_menu(panel: Arc<dyn PanelHandle>, dock: WeakEntity<Dock>) -> impl IntoElement {
     ui::PopoverMenu::new("zenith-panel-menu")
         .trigger(
-            IconButton::new("zenith-panel-menu-button", IconName::Ellipsis)
-                .icon_size(IconSize::Small),
+            IconButton::new("zenith-panel-menu-button", IconName::ZenithMoreVertical)
+                .icon_size(IconSize::Small)
+                .icon_color(Color::Custom(gpui::rgb(HEADER_YELLOW).into())),
         )
         .menu(move |window, cx| {
             let panel = panel.clone();
             let dock = dock.clone();
-            Some(ContextMenu::build(window, cx, move |mut menu, window, cx| {
-                for &(label, action) in zenith_panel_menu_actions(panel.persistent_name()) {
-                    let Ok(action) = cx.build_action(action, None) else {
-                        continue;
-                    };
-                    let focus = panel.panel_focus_handle(cx);
-                    menu = menu.entry(label, None, move |window, cx| {
-                        window.focus(&focus, cx);
-                        window.dispatch_action(action.boxed_clone(), cx);
-                    });
+            Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                if panel.persistent_name() == "Project Panel" {
+                    menu = zenith_project_panel_menu(menu).separator();
                 }
-                menu = menu.separator();
-                let current = panel.position(window, cx);
-                for position in [DockPosition::Left, DockPosition::Right, DockPosition::Bottom] {
-                    if !panel.position_is_valid(position, cx) {
-                        continue;
+                let docking = panel.clone();
+                menu = menu.submenu("Move to", move |mut submenu, window, cx| {
+                    let current = docking.position(window, cx);
+                    for position in [
+                        DockPosition::Left,
+                        DockPosition::Right,
+                        DockPosition::Bottom,
+                    ] {
+                        if !docking.position_is_valid(position, cx) {
+                            continue;
+                        }
+                        let panel = docking.clone();
+                        submenu = submenu.toggleable_entry(
+                            position.label(),
+                            position == current,
+                            IconPosition::Start,
+                            None,
+                            move |window, cx| panel.set_position(position, window, cx),
+                        );
                     }
-                    let panel = panel.clone();
-                    menu = menu.toggleable_entry(
-                        format!("Dock {}", position.label()),
-                        position == current,
-                        IconPosition::Start,
-                        None,
-                        move |window, cx| panel.set_position(position, window, cx),
-                    );
-                }
+                    submenu
+                });
                 menu.separator().entry("Hide", None, move |window, cx| {
                     dock.update(cx, |dock, cx| dock.set_open(false, window, cx))
                         .ok();
@@ -1890,10 +1937,75 @@ fn zenith_panel_menu(panel: Arc<dyn PanelHandle>, dock: WeakEntity<Dock>) -> imp
         })
 }
 
+/// "Sort By" and "Appearance", which write the project panel's settings.
+fn zenith_project_panel_menu(menu: ContextMenu) -> ContextMenu {
+    use settings::{ProjectPanelSettingsContent as Content, ProjectPanelSortMode as Sort};
+    let project_panel = |cx: &App| {
+        cx.global::<SettingsStore>()
+            .merged_settings()
+            .project_panel
+            .clone()
+            .unwrap_or_default()
+    };
+    menu.submenu("Sort By", move |mut submenu, _, cx| {
+        let current = project_panel(cx).sort_mode.unwrap_or_default();
+        for (label, mode) in [
+            ("Directories First", Sort::DirectoriesFirst),
+            ("Mixed", Sort::Mixed),
+            ("Files First", Sort::FilesFirst),
+        ] {
+            submenu = submenu.toggleable_entry(
+                label,
+                current == mode,
+                IconPosition::Start,
+                None,
+                move |_, cx| {
+                    let fs = <dyn fs::Fs>::global(cx);
+                    settings::update_settings_file(fs, cx, move |content, _| {
+                        content.project_panel.get_or_insert_default().sort_mode = Some(mode);
+                    });
+                },
+            );
+        }
+        submenu
+    })
+    .submenu("Appearance", move |mut submenu, _, cx| {
+        type Field = fn(&mut Content) -> &mut Option<bool>;
+        // (label, setting, shown when the setting is off)
+        let toggles: [(&str, Field, bool); 4] = [
+            ("Show Hidden Files", |p| &mut p.hide_hidden, true),
+            ("Git Status", |p| &mut p.git_status, false),
+            ("File Icons", |p| &mut p.file_icons, false),
+            ("Diagnostic Badges", |p| &mut p.diagnostic_badges, false),
+        ];
+        for (label, field, inverted) in toggles {
+            let mut settings = project_panel(cx);
+            let value = field(&mut settings).unwrap_or(false);
+            submenu = submenu.toggleable_entry(
+                label,
+                value != inverted,
+                IconPosition::Start,
+                None,
+                move |_, cx| {
+                    let fs = <dyn fs::Fs>::global(cx);
+                    settings::update_settings_file(fs, cx, move |content, _| {
+                        *field(content.project_panel.get_or_insert_default()) = Some(!value);
+                    });
+                },
+            );
+        }
+        submenu
+    })
+}
+
 /// Panel actions for the "···" menu, by action name so this crate needs no panel dependency.
 pub fn zenith_panel_menu_actions(persistent_name: &str) -> &'static [(&'static str, &'static str)] {
     match persistent_name {
-        "Project Panel" => &[("Collapse All", "project_panel::CollapseAllEntries")],
+        "Project Panel" => &[
+            ("New File", "project_panel::NewFile"),
+            ("Expand All", "project_panel::ExpandAllEntries"),
+            ("Collapse All", "project_panel::CollapseAllEntries"),
+        ],
         "Outline Panel" => &[
             ("Expand All", "outline_panel::ExpandAllEntries"),
             ("Collapse All", "outline_panel::CollapseAllEntries"),
@@ -1916,8 +2028,21 @@ mod zenith_tests {
     #[test]
     fn test_panel_titles() {
         assert_eq!(super::zenith_panel_title("Project Panel"), Some("Project"));
-        assert_eq!(super::zenith_panel_title("Outline Panel"), Some("Structure"));
+        assert_eq!(
+            super::zenith_panel_title("Outline Panel"),
+            Some("Structure")
+        );
         assert_eq!(super::zenith_panel_title("Git Panel"), None);
+    }
+
+    #[test]
+    fn test_every_panel_action_has_a_header_icon() {
+        for name in ["Project Panel", "Outline Panel"] {
+            for (label, _) in super::zenith_panel_menu_actions(name) {
+                assert!(super::zenith_header_icon(label).is_some(), "{label}");
+            }
+        }
+        assert!(super::zenith_header_icon("Something Else").is_none());
     }
 
     #[test]
