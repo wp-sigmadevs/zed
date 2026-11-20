@@ -40,4 +40,6 @@ pub fn init(cx: &mut App) {
     zenith_templates::init(cx);
     #[cfg(feature = "scratches")]
     zenith_scratches::init(cx);
+    #[cfg(feature = "local_history")]
+    zenith_local_history::init(cx);
 }

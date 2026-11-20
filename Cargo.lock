@@ -22969,10 +22969,20 @@ name = "zenith_local_history"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "futures 0.3.34",
+ "gpui",
+ "language",
+ "log",
  "paths",
+ "project",
+ "rope",
+ "serde_json",
+ "settings",
  "sha2",
  "sqlez",
  "tempfile",
+ "util",
+ "worktree",
  "zed_env_vars",
  "zstd",
 ]

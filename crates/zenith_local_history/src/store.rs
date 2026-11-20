@@ -72,12 +72,11 @@ fn prepare_private_file(directory: &Path) -> Result<PathBuf> {
     Ok(file)
 }
 
-/// Files whose contents are likely secrets are never stored.
-fn is_secret_file(rel_path: &str) -> bool {
-    let Some(name) = Path::new(rel_path)
-        .file_name()
-        .and_then(|name| name.to_str())
-    else {
+/// Files whose contents are likely secrets are never stored. The name comes
+/// from the absolute path: a single-file worktree (`/dir/.env`) has an empty
+/// relative path.
+fn is_secret_file(abs_path: &Path) -> bool {
+    let Some(name) = abs_path.file_name().and_then(|name| name.to_str()) else {
         return false;
     };
     let name = name.to_ascii_lowercase();
@@ -111,10 +110,27 @@ impl Store {
         Self::open_in(&paths::data_dir().join("local_history"))
     }
 
+    /// Like [`Store::open`], but `None` when no database exists yet; never
+    /// creates one.
+    pub fn open_existing() -> Result<Option<Self>> {
+        if *ZED_STATELESS {
+            return Ok(None);
+        }
+        Self::open_existing_in(&paths::data_dir().join("local_history"))
+    }
+
+    pub(crate) fn open_existing_in(directory: &Path) -> Result<Option<Self>> {
+        if directory.join("history.db").exists() {
+            Self::open_in(directory).map(Some)
+        } else {
+            Ok(None)
+        }
+    }
+
     /// Opens `<directory>/history.db`, creating the directory (0o700) and the
     /// file (0o600) first. Fails rather than silently using an in-memory
     /// database when the file cannot be opened.
-    fn open_in(directory: &Path) -> Result<Self> {
+    pub(crate) fn open_in(directory: &Path) -> Result<Self> {
         let file = prepare_private_file(directory)?;
         let connection = Connection::open_file(&file.to_string_lossy());
         anyhow::ensure!(
@@ -146,7 +162,7 @@ impl Store {
         source: &str,
         ts: i64,
     ) -> Result<Option<i64>> {
-        if is_secret_file(rel_path) {
+        if is_secret_file(&Path::new(worktree_root).join(rel_path)) {
             return Ok(None);
         }
         let hash = format!("{:x}", Sha256::digest(bytes));
@@ -463,6 +479,10 @@ mod tests {
         ] {
             assert_eq!(store.record("/r", path, b"SECRET", None, "save", 1)?, None);
             assert!(store.revisions("/r", path)?.is_empty());
+        }
+        // Single-file worktrees: the secret name is in the root, rel_path is "".
+        for root in ["/dir/.env", "/dir/wp-config.php"] {
+            assert_eq!(store.record(root, "", b"SECRET", None, "save", 1)?, None);
         }
         assert_eq!(blob_count(&store)?, 0);
         assert!(

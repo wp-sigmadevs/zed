@@ -14,11 +14,25 @@ doctest = false
 
 [dependencies]
 anyhow.workspace = true
+futures.workspace = true
+gpui.workspace = true
+language.workspace = true
+log.workspace = true
 paths.workspace = true
+project.workspace = true
+rope.workspace = true
+settings.workspace = true
 sha2.workspace = true
 sqlez.workspace = true
+util.workspace = true
+worktree.workspace = true
 zed_env_vars.workspace = true
 zstd.workspace = true
 
 [dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }
+project = { workspace = true, features = ["test-support"] }
+serde_json.workspace = true
+settings = { workspace = true, features = ["test-support"] }
 tempfile.workspace = true
+worktree = { workspace = true, features = ["test-support"] }
