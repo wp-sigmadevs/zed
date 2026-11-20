@@ -519,7 +519,7 @@
   // The default number of context lines shown in multibuffer excerpts.
   "excerpt_context_lines": 2,
   // Globs to match against file paths to determine if a file is private.
-  "private_files": ["**/.env*", "**/*.pem", "**/*.key", "**/*.cert", "**/*.crt", "**/secrets.yml"],
+  "private_files": ["**/.env*", "**/*.pem", "**/*.key", "**/*.cert", "**/*.crt", "**/secrets.yml", "**/wp-config.php"],
   // Whether to use additional LSP queries to format (and amend) the code after
   // every "trigger" symbol input, defined by LSP server capabilities.
   "use_on_type_format": true,
@@ -3003,6 +3003,17 @@
       "scope": "project",
       // Where the panel docks: "left", "bottom" or "right".
       "dock": "bottom",
+    },
+    // Local History: automatic file revisions, independent of git.
+    "local_history": {
+      // Record a revision when a file is opened or saved.
+      "enabled": true,
+      // Days a revision is kept.
+      "retention_days": 14,
+      // Size cap of the history database in MB; oldest revisions go first.
+      "max_db_size_mb": 500,
+      // Files larger than this (in KB) are not recorded.
+      "max_file_size_kb": 2048,
     },
   },
   // The server to connect to. If the environment variable

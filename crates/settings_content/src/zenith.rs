@@ -11,6 +11,8 @@ pub struct ZenithSettingsContent {
     pub inspections: Option<ZenithInspectionsSettingsContent>,
     /// Settings for the TODO panel.
     pub todo: Option<ZenithTodoSettingsContent>,
+    /// Settings for Local History.
+    pub local_history: Option<ZenithLocalHistorySettingsContent>,
 }
 
 /// Settings for the Zenith welcome screen.
@@ -75,4 +77,25 @@ pub enum ZenithTodoScope {
     CurrentFile,
     /// Files git reports as changed.
     ChangedFiles,
+}
+
+/// Settings for Local History.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+pub struct ZenithLocalHistorySettingsContent {
+    /// Whether file revisions are recorded when a file is opened or saved.
+    ///
+    /// Default: true
+    pub enabled: Option<bool>,
+    /// How many days a revision is kept.
+    ///
+    /// Default: 14
+    pub retention_days: Option<u32>,
+    /// Size cap of the history database in megabytes; the oldest revisions go first.
+    ///
+    /// Default: 500
+    pub max_db_size_mb: Option<u64>,
+    /// Files larger than this many kilobytes are not recorded.
+    ///
+    /// Default: 2048
+    pub max_file_size_kb: Option<u64>,
 }
