@@ -1,0 +1,33 @@
+[package]
+name = "zenith_markdown"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/zenith_markdown.rs"
+doctest = false
+
+[dependencies]
+anyhow.workspace = true
+editor.workspace = true
+gpui.workspace = true
+language.workspace = true
+markdown_preview.workspace = true
+project.workspace = true
+ui.workspace = true
+workspace.workspace = true
+
+[dev-dependencies]
+db = { workspace = true, features = ["test-support"] }
+editor = { workspace = true, features = ["test-support"] }
+fs.workspace = true
+gpui = { workspace = true, features = ["test-support"] }
+project = { workspace = true, features = ["test-support"] }
+serde_json.workspace = true
+util.workspace = true
+workspace = { workspace = true, features = ["test-support"] }

@@ -1888,7 +1888,7 @@ const HEADER_YELLOW: u32 = 0xe5c05a;
 /// Icon and colour for a header button, by the panel action's label.
 fn zenith_header_icon(label: &str) -> Option<(IconName, u32)> {
     match label {
-        "New File" => Some((IconName::ZenithPlus, HEADER_TEAL)),
+        "New…" => Some((IconName::ZenithPlus, HEADER_TEAL)),
         "Expand All" => Some((IconName::ZenithExpandAll, HEADER_PINK)),
         "Collapse All" => Some((IconName::ZenithCollapseAll, HEADER_PINK)),
         _ => None,
@@ -2176,7 +2176,7 @@ fn project_panel_flag(
 pub fn zenith_panel_menu_actions(persistent_name: &str) -> &'static [(&'static str, &'static str)] {
     match persistent_name {
         "Project Panel" => &[
-            ("New File", "project_panel::NewFile"),
+            ("New…", "zenith_templates::NewFromTemplate"),
             ("Expand All", "project_panel::ExpandAllEntries"),
             ("Collapse All", "project_panel::CollapseAllEntries"),
         ],
@@ -2227,5 +2227,9 @@ mod zenith_tests {
             }
         }
         assert!(super::zenith_panel_menu_actions("Git Panel").is_empty());
+        assert_eq!(
+            super::zenith_panel_menu_actions("Project Panel")[0],
+            ("New…", "zenith_templates::NewFromTemplate")
+        );
     }
 }

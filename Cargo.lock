@@ -22905,14 +22905,35 @@ version = "0.1.0"
 dependencies = [
  "gpui",
  "onboarding",
+ "zenith_folds",
  "zenith_inspections",
  "zenith_look",
+ "zenith_markdown",
  "zenith_php_tools",
+ "zenith_problems",
  "zenith_rails",
+ "zenith_scratches",
  "zenith_search",
  "zenith_splash",
+ "zenith_templates",
  "zenith_todo",
  "zenith_welcome",
+]
+
+[[package]]
+name = "zenith_folds"
+version = "0.1.0"
+dependencies = [
+ "db",
+ "editor",
+ "fs",
+ "gpui",
+ "language",
+ "project",
+ "serde_json",
+ "tree-sitter-typescript",
+ "util",
+ "workspace",
 ]
 
 [[package]]
@@ -22962,6 +22983,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "zenith_markdown"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "db",
+ "editor",
+ "fs",
+ "gpui",
+ "language",
+ "markdown_preview",
+ "project",
+ "serde_json",
+ "ui",
+ "util",
+ "workspace",
+]
+
+[[package]]
 name = "zenith_php_tools"
 version = "0.1.0"
 dependencies = [
@@ -22981,6 +23020,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "zenith_problems"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "editor",
+ "file_icons",
+ "gpui",
+ "language",
+ "lsp",
+ "menu",
+ "project",
+ "serde_json",
+ "text",
+ "theme",
+ "theme_settings",
+ "ui",
+ "util",
+ "workspace",
+]
+
+[[package]]
 name = "zenith_rails"
 version = "0.1.0"
 dependencies = [
@@ -22990,6 +23050,28 @@ dependencies = [
  "theme",
  "theme_settings",
  "ui",
+ "workspace",
+]
+
+[[package]]
+name = "zenith_scratches"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "editor",
+ "file_icons",
+ "fs",
+ "futures 0.3.34",
+ "gpui",
+ "menu",
+ "paths",
+ "picker",
+ "project",
+ "settings",
+ "theme",
+ "theme_settings",
+ "ui",
+ "util",
  "workspace",
 ]
 
@@ -23012,6 +23094,7 @@ dependencies = [
  "open_path_prompt",
  "outline",
  "picker",
+ "picker_preview",
  "project",
  "project_symbols",
  "search",
@@ -23036,6 +23119,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "zenith_templates"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "command_palette_hooks",
+ "editor",
+ "file_icons",
+ "fs",
+ "fuzzy_nucleo",
+ "gpui",
+ "menu",
+ "picker",
+ "project",
+ "project_panel",
+ "remote_connection",
+ "serde_json",
+ "settings",
+ "theme",
+ "theme_settings",
+ "ui",
+ "util",
+ "workspace",
+]
+
+[[package]]
 name = "zenith_title_bar"
 version = "0.1.0"
 dependencies = [
@@ -23053,6 +23161,7 @@ name = "zenith_todo"
 version = "0.1.0"
 dependencies = [
  "editor",
+ "file_icons",
  "fs",
  "gpui",
  "language",

@@ -5,7 +5,7 @@
 
 use gpui::{AnyElement, App, Context, Entity, IntoElement, Render, Window};
 use theme::ActiveTheme as _;
-use ui::{Tooltip, prelude::*};
+use ui::prelude::*;
 use workspace::{
     IslandsActive, Workspace,
     dock::{DockPosition, DraggedPanelButton, PanelButtons, RailsActive},
@@ -80,7 +80,6 @@ impl Render for Rail {
                     v_flex()
                         .items_center()
                         .gap_1()
-                        .child(problems_button())
                         .children(self.foot.clone())
                         .into_any_element(),
                     cx,
@@ -111,26 +110,6 @@ fn drop_zone(
             }
         })
         .child(child)
-}
-
-/// PhpStorm's Problems tool window: Zed's project diagnostics, which also hold
-/// the inspections' findings. Built by name so this crate needs no `diagnostics` dependency.
-fn problems_button() -> impl IntoElement {
-    div()
-        .debug_selector(|| "zenith-rail-problems".into())
-        .child(
-            IconButton::new("zenith-rail-problems", IconName::ZenithAlert)
-                .icon_size(IconSize::Small)
-                .size(ButtonSize::Medium)
-                .width(px(28.))
-                .aria_label("Problems")
-                .tooltip(Tooltip::text("Problems"))
-                .on_click(|_, window, cx| {
-                    if let Ok(action) = cx.build_action("diagnostics::Deploy", None) {
-                        window.dispatch_action(action, cx);
-                    }
-                }),
-        )
 }
 
 #[cfg(test)]
@@ -170,10 +149,6 @@ mod tests {
         assert_eq!(right.size.width, workspace::RAIL_WIDTH);
         assert!(left.right() <= right.left());
         assert!(cx.debug_bounds("zenith-center-island").is_some());
-        let problems = cx
-            .debug_bounds("zenith-rail-problems")
-            .expect("problems button on a rail");
-        assert!(problems.right() <= left.right() && problems.top() >= left.top());
     }
 
     #[gpui::test]

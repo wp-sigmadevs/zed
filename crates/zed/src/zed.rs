@@ -1650,7 +1650,14 @@ fn open_about_window(cx: &mut App) {
                                     .color(Color::Muted)
                                     .size(LabelSize::XSmall),
                             )
-                            .child(Label::new(self.full_version.clone()).size(LabelSize::Small)),
+                            .child(Label::new(self.full_version.clone()).size(LabelSize::Small))
+                            .child(
+                                Label::new(
+                                    "A fork of Zed (zed.dev), GPL-3.0-or-later. Not affiliated with Zed Industries.",
+                                )
+                                .color(Color::Muted)
+                                .size(LabelSize::XSmall),
+                            ),
                     )
                     .child(
                         h_flex()
@@ -1725,7 +1732,7 @@ fn open_about_window(cx: &mut App) {
 
     let window_size = Size {
         width: px(440.),
-        height: px(300.),
+        height: px(340.),
     };
     let display_id = cx.active_display().map(|display| display.id());
 

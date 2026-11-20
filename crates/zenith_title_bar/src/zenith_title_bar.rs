@@ -5,12 +5,12 @@ use project::{Inventory, Project};
 use ui::{ButtonLike, IconButton, Tooltip, Vector, VectorName, prelude::*};
 
 /// Two-letter badge shown before the project name, e.g. "LG" for `lumen-gallery`.
-pub fn project_badge(project_name: &str, _cx: &App) -> Option<impl IntoElement + use<>> {
+pub fn project_badge(project_name: &str, cx: &App) -> Option<impl IntoElement + use<>> {
     let initials = initials(project_name)?;
     // Board: 22 px mark, then a 20 px #4a5b8c badge, radius 5, 9.5 px bold white.
-    let mark = Vector::square(VectorName::ZedLogo, rems_from_px(22_f32));
+    let mark = show_mark(cx).then(|| Vector::square(VectorName::ZedLogo, rems_from_px(22_f32)));
     Some(
-        h_flex().flex_none().gap(px(8.)).child(mark).child(
+        h_flex().flex_none().gap(px(8.)).children(mark).child(
             div()
                 .flex_none()
                 .size(px(20.))
@@ -25,6 +25,11 @@ pub fn project_badge(project_name: &str, _cx: &App) -> Option<impl IntoElement +
                 .child(initials),
         ),
     )
+}
+
+/// JetBrains' title bar has no logo: the mark is dropped under the islands/rails chrome.
+fn show_mark(cx: &App) -> bool {
+    !cx.has_global::<workspace::IslandsActive>() && !cx.has_global::<workspace::dock::RailsActive>()
 }
 
 /// Zenith's title bar middle: search, run controls, agent chip. One element, because
@@ -218,7 +223,7 @@ fn initials(name: &str) -> Option<SharedString> {
 
 #[cfg(test)]
 mod tests {
-    use super::{initials, run_label};
+    use super::{initials, run_label, show_mark};
     use gpui::TestAppContext;
     use project::{Inventory, TaskSourceKind};
     use task::{TaskContext, TaskTemplate};
@@ -241,6 +246,19 @@ mod tests {
             inventory.task_scheduled(TaskSourceKind::UserInput, task)
         });
         cx.update(|cx| assert_eq!(run_label(Some(&inventory), cx), "Build"));
+    }
+
+    #[gpui::test]
+    fn test_mark_hidden_under_islands_or_rails(cx: &mut TestAppContext) {
+        cx.update(|cx| assert!(show_mark(cx)));
+        cx.update(|cx| cx.set_global(workspace::IslandsActive));
+        cx.update(|cx| assert!(!show_mark(cx)));
+    }
+
+    #[gpui::test]
+    fn test_mark_hidden_under_rails(cx: &mut TestAppContext) {
+        cx.update(|cx| cx.set_global(workspace::dock::RailsActive));
+        cx.update(|cx| assert!(!show_mark(cx)));
     }
 
     #[test]

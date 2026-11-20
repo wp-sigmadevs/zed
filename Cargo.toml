@@ -252,12 +252,17 @@ members = [
     "crates/zed_credentials_provider",
     "crates/zed_env_vars",
     "crates/zenith",
+    "crates/zenith_folds",
     "crates/zenith_inspections",
+    "crates/zenith_markdown",
     "crates/zenith_php_tools",
+    "crates/zenith_problems",
     "crates/zenith_look",
     "crates/zenith_splash",
     "crates/zenith_rails",
+    "crates/zenith_scratches",
     "crates/zenith_search",
+    "crates/zenith_templates",
     "crates/zenith_title_bar",
     "crates/zenith_todo",
     "crates/zenith_welcome",
@@ -536,12 +541,17 @@ zed_actions = { path = "crates/zed_actions" }
 zed_credentials_provider = { path = "crates/zed_credentials_provider" }
 zed_env_vars = { path = "crates/zed_env_vars" }
 zenith = { path = "crates/zenith" }
+zenith_folds = { path = "crates/zenith_folds" }
 zenith_inspections = { path = "crates/zenith_inspections" }
+zenith_markdown = { path = "crates/zenith_markdown" }
 zenith_php_tools = { path = "crates/zenith_php_tools" }
+zenith_problems = { path = "crates/zenith_problems" }
 zenith_look = { path = "crates/zenith_look" }
 zenith_splash = { path = "crates/zenith_splash" }
 zenith_rails = { path = "crates/zenith_rails" }
+zenith_scratches = { path = "crates/zenith_scratches" }
 zenith_search = { path = "crates/zenith_search" }
+zenith_templates = { path = "crates/zenith_templates" }
 zenith_title_bar = { path = "crates/zenith_title_bar" }
 zenith_todo = { path = "crates/zenith_todo" }
 zenith_welcome = { path = "crates/zenith_welcome" }

@@ -176,7 +176,7 @@ use crate::{
 pub const SERIALIZATION_THROTTLE_TIME: Duration = Duration::from_millis(200);
 pub const MAX_RECENT_SELECTIONS: usize = 20;
 /// Zenith: width of the icon rails.
-pub const RAIL_WIDTH: Pixels = px(40.);
+pub const RAIL_WIDTH: Pixels = px(34.);
 
 /// Set when Zenith draws panels as rounded, separated islands.
 pub struct IslandsActive;

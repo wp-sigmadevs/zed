@@ -1,5 +1,11 @@
 > [!IMPORTANT]
 > Remove this line to confirm you've reviewed this PR before submitting.
+# Zenith
+
+Zenith is a fork of [Zed](https://github.com/zed-industries/zed), licensed GPL-3.0-or-later (some crates Apache-2.0; see `LICENSE-GPL`, `LICENSE-APACHE` and each crate's licence file). Zenith is not affiliated with or endorsed by Zed Industries; "Zed" is their trademark. Source for every Zenith build is in this repository at the release tag. Upstream README follows.
+
+---
+
 # Zed
 
 [![Zed](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/zed-industries/zed/main/assets/badge/v0.json)](https://zed.dev)

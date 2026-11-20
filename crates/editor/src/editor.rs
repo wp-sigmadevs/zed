@@ -2046,7 +2046,7 @@ impl Editor {
                 let editor = editor.clone();
                 FoldPlaceholder::fold_element(fold_id, cx)
                     .cursor_pointer()
-                    .child("⋯")
+                    .map(|chip| zenith_fold_chip(chip, cx))
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .on_click(move |_, _window, cx| {
                         editor
@@ -13440,4 +13440,16 @@ pub fn multibuffer_context_lines(cx: &App) -> u32 {
         .map(|settings| settings.excerpt_context_lines)
         .unwrap_or(2)
         .min(32)
+}
+
+/// Zenith: the folded-code chip (a visible rounded `...`) when the rails are on, else `⋯`.
+fn zenith_fold_chip(chip: Stateful<gpui::Div>, cx: &App) -> Stateful<gpui::Div> {
+    if !cx.has_global::<workspace::dock::RailsActive>() {
+        return chip.child("⋯");
+    }
+    let colors = cx.theme().colors();
+    chip.px_1()
+        .rounded_sm()
+        .bg(colors.element_hover)
+        .child("...")
 }

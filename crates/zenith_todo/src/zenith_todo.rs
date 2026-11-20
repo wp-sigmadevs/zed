@@ -2,16 +2,19 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     future::Future,
     ops::Range,
+    path::Path,
     sync::Arc,
     time::Duration,
 };
 
 use editor::{Editor, EditorEvent, HighlightKey, SelectionEffects, scroll::Autoscroll};
+use file_icons::FileIcons;
 use fs::Fs;
 use gpui::{
-    Action, App, AppContext as _, Context, Entity, EntityId, EventEmitter, FocusHandle, Focusable,
-    FontWeight, HighlightStyle, IntoElement, ParentElement, Pixels, Render, Styled, Task,
-    WeakEntity, Window, actions, px,
+    Action, App, AppContext as _, ClickEvent, Context, Entity, EntityId, EventEmitter, FocusHandle,
+    Focusable, FontWeight, HighlightStyle, IntoElement, ParentElement, Pixels, Render, Role,
+    ScrollStrategy, Styled, Task, UniformListScrollHandle, WeakEntity, Window, actions, px,
+    uniform_list,
 };
 use language::{Buffer, BufferEvent, BufferSnapshot};
 use project::{
@@ -22,7 +25,7 @@ use project::{
 use regex::{Regex, RegexBuilder};
 use settings::{RegisterSetting, Settings, SettingsContent, SettingsStore, ZenithTodoScope};
 use text::{Anchor, Point, ToOffset as _, ToPoint as _};
-use ui::{ListItem, ListItemSpacing, prelude::*};
+use ui::{ButtonLike, ListItem, ListItemSpacing, Tooltip, prelude::*};
 use util::{ResultExt as _, paths::PathMatcher};
 use workspace::{
     Workspace,
@@ -36,6 +39,14 @@ actions!(
         ToggleFocus,
         /// Scans the project again for TODO comments.
         Refresh,
+        /// Opens the next TODO item.
+        NextTodo,
+        /// Opens the previous TODO item.
+        PreviousTodo,
+        /// Expands every group in the TODO tool window.
+        ExpandAll,
+        /// Collapses every group in the TODO tool window.
+        CollapseAll,
     ]
 );
 
@@ -335,6 +346,71 @@ enum GroupBy {
     Pattern,
 }
 
+/// A node of the tree that can be collapsed.
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum Node {
+    Summary,
+    Project,
+    Group(SharedString),
+}
+
+/// One visible line of the tree; `Item` indexes `TodoPanel::items`.
+#[derive(Clone, PartialEq, Eq, Debug)]
+enum Row {
+    Summary,
+    Project,
+    Group(SharedString, usize),
+    Item(usize),
+}
+
+const HEADER_HEIGHT: f32 = 38.;
+const ROW_HEIGHT: f32 = 26.;
+const STRIP_WIDTH: f32 = 36.;
+const ITEM_INDENT: f32 = 20.;
+
+/// The top row: "Found 12 TODO items in 2 files", or what replaces it while scanning or
+/// when there is nothing to scan.
+fn summary_text(
+    items: usize,
+    files: usize,
+    limit_reached: bool,
+    scanning: bool,
+    message: Option<&str>,
+) -> String {
+    if scanning {
+        return "Scanning…".to_string();
+    }
+    if let Some(message) = message {
+        return message.to_string();
+    }
+    let plural = |count: usize, one: &str, many: &str| {
+        if count == 1 {
+            one.to_string()
+        } else {
+            many.to_string()
+        }
+    };
+    format!(
+        "Found {items} TODO {} in {files} {}{}",
+        plural(items, "item", "items"),
+        plural(files, "file", "files"),
+        if limit_reached {
+            " (limit reached)"
+        } else {
+            ""
+        }
+    )
+}
+
+/// "1 item" / "12 items".
+fn items_label(count: usize) -> String {
+    if count == 1 {
+        "1 item".to_string()
+    } else {
+        format!("{count} items")
+    }
+}
+
 struct TodoItem {
     buffer: Entity<Buffer>,
     path: SharedString,
@@ -352,6 +428,10 @@ pub struct TodoPanel {
     scope: Scope,
     group_by: GroupBy,
     items: Vec<TodoItem>,
+    rows: Vec<Row>,
+    collapsed: HashSet<Node>,
+    selected: Option<usize>,
+    scroll_handle: UniformListScrollHandle,
     scanned: bool,
     scanning: bool,
     limit_reached: bool,
@@ -409,6 +489,10 @@ impl TodoPanel {
             scope: settings.scope,
             group_by: GroupBy::File,
             items: Vec::new(),
+            rows: vec![Row::Summary],
+            collapsed: HashSet::new(),
+            selected: Some(0),
+            scroll_handle: UniformListScrollHandle::new(),
             scanned: false,
             scanning: false,
             limit_reached: false,
@@ -593,7 +677,133 @@ impl TodoPanel {
         self.limit_reached = limit_reached;
         self.message = message;
         self.scanning = false;
+        self.rebuild_rows(cx);
+    }
+
+    fn file_count(&self) -> usize {
+        self.items
+            .iter()
+            .map(|item| &item.path)
+            .collect::<HashSet<_>>()
+            .len()
+    }
+
+    fn summary(&self) -> String {
+        summary_text(
+            self.items.len(),
+            self.file_count(),
+            self.limit_reached,
+            self.scanning,
+            self.message.as_deref(),
+        )
+    }
+
+    fn rebuild_rows(&mut self, cx: &mut Context<Self>) {
+        let mut rows = vec![Row::Summary];
+        if !self.items.is_empty() && !self.collapsed.contains(&Node::Summary) {
+            rows.push(Row::Project);
+            if !self.collapsed.contains(&Node::Project) {
+                for (key, indices) in self.groups() {
+                    rows.push(Row::Group(key.clone(), indices.len()));
+                    if !self.collapsed.contains(&Node::Group(key)) {
+                        rows.extend(indices.into_iter().map(Row::Item));
+                    }
+                }
+            }
+        }
+        self.rows = rows;
+        let last = self.rows.len() - 1;
+        self.selected = self.selected.map(|ix| ix.min(last));
         cx.notify();
+    }
+
+    fn toggle_node(&mut self, node: Node, cx: &mut Context<Self>) {
+        if !self.collapsed.remove(&node) {
+            self.collapsed.insert(node);
+        }
+        self.rebuild_rows(cx);
+    }
+
+    fn expand_all(&mut self, _: &ExpandAll, _: &mut Window, cx: &mut Context<Self>) {
+        self.collapsed.clear();
+        self.rebuild_rows(cx);
+    }
+
+    fn collapse_all(&mut self, _: &CollapseAll, _: &mut Window, cx: &mut Context<Self>) {
+        self.collapsed = self.groups().into_keys().map(Node::Group).collect();
+        self.rebuild_rows(cx);
+    }
+
+    fn set_group_by(&mut self, group_by: GroupBy, cx: &mut Context<Self>) {
+        self.group_by = group_by;
+        self.collapsed.clear();
+        self.rebuild_rows(cx);
+    }
+
+    fn select(&mut self, ix: usize, cx: &mut Context<Self>) {
+        self.selected = Some(ix);
+        self.scroll_handle
+            .scroll_to_item(ix, ScrollStrategy::Nearest);
+        cx.notify();
+    }
+
+    /// Selects and opens the next or previous item row after the selection.
+    fn step_item(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let from = self.selected.unwrap_or(0);
+        let target = if forward {
+            (from + 1..self.rows.len()).find(|&ix| matches!(self.rows[ix], Row::Item(_)))
+        } else {
+            (0..from)
+                .rev()
+                .find(|&ix| matches!(self.rows[ix], Row::Item(_)))
+        };
+        if let Some(ix) = target {
+            self.activate(ix, window, cx);
+        }
+    }
+
+    /// Click: a node toggles, an item is selected and opened.
+    fn activate(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.select(ix, cx);
+        match self.rows.get(ix).cloned() {
+            Some(Row::Summary) => self.toggle_node(Node::Summary, cx),
+            Some(Row::Project) => self.toggle_node(Node::Project, cx),
+            Some(Row::Group(key, _)) => self.toggle_node(Node::Group(key), cx),
+            Some(Row::Item(item_ix)) => {
+                if let Some(item) = self.items.get(item_ix) {
+                    self.open(item.buffer.clone(), item.anchor, window, cx);
+                }
+            }
+            None => {}
+        }
+    }
+
+    fn project_name(&self, cx: &App) -> SharedString {
+        self.project
+            .read(cx)
+            .visible_worktrees(cx)
+            .next()
+            .map(|worktree| worktree.read(cx).root_name_str().to_string().into())
+            .unwrap_or_else(|| "Project".into())
+    }
+
+    /// Plain text of a row: also its accessible label.
+    fn row_text(&self, row: &Row, cx: &App) -> String {
+        match row {
+            Row::Summary => self.summary(),
+            Row::Project => format!(
+                "{} - {}",
+                self.project_name(cx),
+                items_label(self.items.len())
+            ),
+            Row::Group(key, count) => {
+                format!("{} {}", group_name(key, self.group_by), items_label(*count))
+            }
+            Row::Item(ix) => {
+                let item = &self.items[*ix];
+                format!("{} {}", item.row + 1, item.text)
+            }
+        }
     }
 
     fn open(&self, buffer: Entity<Buffer>, anchor: Anchor, window: &mut Window, cx: &mut App) {
@@ -618,16 +828,28 @@ impl TodoPanel {
         });
     }
 
-    fn groups(&self) -> BTreeMap<SharedString, Vec<&TodoItem>> {
-        let mut groups: BTreeMap<SharedString, Vec<&TodoItem>> = BTreeMap::new();
-        for item in &self.items {
+    /// Item indices per group, in item order (path, then line).
+    fn groups(&self) -> BTreeMap<SharedString, Vec<usize>> {
+        let mut groups: BTreeMap<SharedString, Vec<usize>> = BTreeMap::new();
+        for (ix, item) in self.items.iter().enumerate() {
             let key = match self.group_by {
                 GroupBy::File => item.path.clone(),
                 GroupBy::Pattern => item.pattern.clone(),
             };
-            groups.entry(key).or_default().push(item);
+            groups.entry(key).or_default().push(ix);
         }
         groups
+    }
+}
+
+/// A group's heading: the file name for files, the marker for patterns.
+fn group_name(key: &str, group_by: GroupBy) -> String {
+    match group_by {
+        GroupBy::File => Path::new(key).file_name().map_or_else(
+            || key.to_string(),
+            |name| name.to_string_lossy().into_owned(),
+        ),
+        GroupBy::Pattern => key.to_string(),
     }
 }
 
@@ -663,133 +885,234 @@ fn todo_items(buffer: Entity<Buffer>, ranges: Vec<Range<Anchor>>, cx: &App) -> V
         .collect()
 }
 
-impl Render for TodoPanel {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let groups = self.groups();
-        let file_count = self
-            .items
-            .iter()
-            .map(|item| &item.path)
-            .collect::<HashSet<_>>()
-            .len();
-        let status = if self.scanning {
-            "Scanning…".to_string()
-        } else if let Some(message) = &self.message {
-            message.to_string()
+impl TodoPanel {
+    /// A rounded chip for the scope tabs; the active one is outlined and tinted.
+    fn scope_chip(
+        &self,
+        id: &'static str,
+        label: &'static str,
+        scope: Scope,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let active = self.scope == scope;
+        let border = if active {
+            cx.theme().colors().border_focused
         } else {
-            let limit = if self.limit_reached {
-                " (limit reached)"
-            } else {
-                ""
-            };
-            format!(
-                "{} TODO items in {file_count} files{limit}",
-                self.items.len()
-            )
+            gpui::transparent_black()
         };
-        let scope_button = |id: &'static str, label: &'static str, scope: Scope| {
-            Button::new(id, label)
+        div().rounded(px(6.)).border_1().border_color(border).child(
+            ButtonLike::new(id)
                 .style(ButtonStyle::Subtle)
-                .toggle_state(self.scope == scope)
-                .on_click(cx.listener(move |this, _, _, cx| this.set_scope(scope, cx)))
-        };
-        let group_button = |id: &'static str, label: &'static str, group_by: GroupBy| {
-            Button::new(id, label)
-                .style(ButtonStyle::Subtle)
-                .toggle_state(self.group_by == group_by)
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.group_by = group_by;
-                    cx.notify();
-                }))
-        };
-        let toolbar = h_flex()
-            .px_2()
-            .py_1()
-            .gap_1()
-            .child(scope_button(
-                "zenith-todo-project",
-                "Project",
-                Scope::Project,
-            ))
-            .child(scope_button(
-                "zenith-todo-current",
-                "Current File",
-                Scope::CurrentFile,
-            ))
-            .child(scope_button(
-                "zenith-todo-changed",
-                "Changed Files",
-                Scope::ChangedFiles,
-            ))
-            .child(div().w_2())
-            .child(group_button(
-                "zenith-todo-by-file",
-                "By File",
-                GroupBy::File,
-            ))
-            .child(group_button(
-                "zenith-todo-by-pattern",
-                "By Pattern",
-                GroupBy::Pattern,
-            ))
-            .child(div().flex_1())
-            .child(Label::new(status).color(Color::Muted))
-            .child(
-                IconButton::new("zenith-todo-refresh", IconName::RotateCw)
-                    .tooltip(ui::Tooltip::text("Refresh"))
-                    .on_click(cx.listener(|this, _, _, cx| this.rescan(cx))),
-            );
+                .toggle_state(active)
+                .aria_role(Role::Tab)
+                .aria_label(label)
+                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.set_scope(scope, cx)))
+                .child(Label::new(label)),
+        )
+    }
 
-        let show_path = self.group_by == GroupBy::Pattern;
-        let mut list = v_flex()
-            .id("zenith-todo-items")
-            .flex_1()
-            .overflow_y_scroll();
-        let mut row_index = 0usize;
-        for (key, items) in &groups {
-            list = list.child(
-                ListItem::new(("todo-group", row_index))
-                    .spacing(ListItemSpacing::Dense)
+    fn strip_button(
+        &self,
+        id: &'static str,
+        icon: IconName,
+        tooltip: &'static str,
+        on_click: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        IconButton::new(id, icon)
+            .icon_size(IconSize::Small)
+            .tooltip(Tooltip::text(tooltip))
+            .on_click(cx.listener(move |this, _, window, cx| on_click(this, window, cx)))
+    }
+
+    /// The left icon strip: previous/next, expand/collapse, group by, refresh.
+    fn render_strip(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let (group_tooltip, next_group) = match self.group_by {
+            GroupBy::File => ("Group by Pattern", GroupBy::Pattern),
+            GroupBy::Pattern => ("Group by File", GroupBy::File),
+        };
+        v_flex()
+            .w(px(STRIP_WIDTH))
+            .flex_none()
+            .items_center()
+            .pt_2()
+            .gap_1()
+            .child(self.strip_button(
+                "zenith-todo-previous",
+                IconName::ArrowUp,
+                "Previous TODO",
+                |this, window, cx| this.step_item(false, window, cx),
+                cx,
+            ))
+            .child(self.strip_button(
+                "zenith-todo-next",
+                IconName::ArrowDown,
+                "Next TODO",
+                |this, window, cx| this.step_item(true, window, cx),
+                cx,
+            ))
+            .child(self.strip_button(
+                "zenith-todo-expand-all",
+                IconName::ZenithExpandAll,
+                "Expand All",
+                |this, window, cx| this.expand_all(&ExpandAll, window, cx),
+                cx,
+            ))
+            .child(self.strip_button(
+                "zenith-todo-collapse-all",
+                IconName::ZenithCollapseAll,
+                "Collapse All",
+                |this, window, cx| this.collapse_all(&CollapseAll, window, cx),
+                cx,
+            ))
+            .child(self.strip_button(
+                "zenith-todo-group-by",
+                IconName::ListTree,
+                group_tooltip,
+                move |this, _, cx| this.set_group_by(next_group, cx),
+                cx,
+            ))
+            .child(self.strip_button(
+                "zenith-todo-refresh",
+                IconName::RotateCw,
+                "Refresh",
+                |this, _, cx| this.rescan(cx),
+                cx,
+            ))
+    }
+
+    fn render_row(&self, ix: usize, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let row = self.rows[ix].clone();
+        let status = cx.theme().status();
+        let item = ListItem::new(("zenith-todo-row", ix))
+            .spacing(ListItemSpacing::Dense)
+            .height(px(ROW_HEIGHT))
+            .rounded()
+            .toggle_state(self.selected == Some(ix))
+            .aria_role(Role::TreeItem)
+            .aria_label(self.row_text(&row, cx))
+            .indent_step_size(px(ITEM_INDENT))
+            .on_click(cx.listener(move |this, _, window, cx| this.activate(ix, window, cx)));
+        let bold = |text: String| Label::new(text).weight(FontWeight::BOLD);
+        match row {
+            Row::Summary => item
+                .toggle(Some(!self.collapsed.contains(&Node::Summary)))
+                .child(Label::new(self.summary()))
+                .into_any_element(),
+            Row::Project => item
+                .indent_level(1)
+                .toggle(Some(!self.collapsed.contains(&Node::Project)))
+                .start_slot(Icon::new(IconName::Folder).size(IconSize::Small))
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .child(bold(self.project_name(cx).to_string()))
+                        .child(
+                            Label::new(format!("- {}", items_label(self.items.len())))
+                                .color(Color::Muted),
+                        ),
+                )
+                .into_any_element(),
+            Row::Group(key, count) => {
+                let icon = (self.group_by == GroupBy::File)
+                    .then(|| FileIcons::get_icon(Path::new(key.as_ref()), cx))
+                    .flatten()
+                    .map(|path| Icon::from_path(path).size(IconSize::Small));
+                item.indent_level(2)
+                    .toggle(Some(!self.collapsed.contains(&Node::Group(key.clone()))))
+                    .start_slot::<Icon>(icon)
                     .child(
                         h_flex()
                             .gap_2()
-                            .child(Label::new(key.clone()))
-                            .child(Label::new(items.len().to_string()).color(Color::Muted)),
-                    ),
-            );
-            row_index += 1;
-            for item in items {
-                let buffer = item.buffer.clone();
-                let anchor = item.anchor;
-                let location = if show_path {
-                    format!("{}:{}", item.path, item.row + 1)
-                } else {
-                    (item.row + 1).to_string()
+                            .child(Label::new(group_name(&key, self.group_by)))
+                            .child(Label::new(items_label(count)).color(Color::Muted)),
+                    )
+                    .into_any_element()
+            }
+            Row::Item(item_ix) => {
+                let todo = &self.items[item_ix];
+                // The marker's colour, with TODO in orange as PhpStorm draws it.
+                let colour = match colour_class(&todo.pattern) {
+                    0 => status.error,
+                    1 | 2 => status.warning,
+                    _ => status.hint,
                 };
-                list = list.child(
-                    ListItem::new(("todo-item", row_index))
-                        .spacing(ListItemSpacing::Dense)
-                        .indent_level(1)
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.open(buffer.clone(), anchor, window, cx)
-                        }))
-                        .child(
-                            h_flex()
-                                .gap_2()
-                                .child(Label::new(location).color(Color::Muted))
-                                .child(Label::new(item.text.clone()).truncate()),
-                        ),
-                );
-                row_index += 1;
+                let location = if self.group_by == GroupBy::Pattern {
+                    format!("{}:{}", todo.path, todo.row + 1)
+                } else {
+                    (todo.row + 1).to_string()
+                };
+                item.indent_level(3)
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .child(Label::new(location).color(Color::Muted))
+                            .child(
+                                Label::new(todo.text.clone())
+                                    .color(Color::Custom(colour))
+                                    .truncate(),
+                            ),
+                    )
+                    .into_any_element()
             }
         }
+    }
+}
+
+impl Render for TodoPanel {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let header = h_flex()
+            .h(px(HEADER_HEIGHT))
+            .flex_none()
+            .px_3()
+            .gap_3()
+            .items_center()
+            .border_b_1()
+            .border_color(cx.theme().colors().border_variant)
+            .child(Label::new("TODO").weight(FontWeight::BOLD))
+            .child(self.scope_chip("zenith-todo-project", "Project", Scope::Project, cx))
+            .child(self.scope_chip(
+                "zenith-todo-current",
+                "Current File",
+                Scope::CurrentFile,
+                cx,
+            ))
+            .child(self.scope_chip(
+                "zenith-todo-changed",
+                "Changed Files",
+                Scope::ChangedFiles,
+                cx,
+            ));
+        let list = uniform_list(
+            "zenith-todo-rows",
+            self.rows.len(),
+            cx.processor(|this, range: Range<usize>, _, cx| {
+                range.map(|ix| this.render_row(ix, cx)).collect::<Vec<_>>()
+            }),
+        )
+        .track_scroll(&self.scroll_handle)
+        .flex_1();
         v_flex()
             .key_context("TodoPanel")
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(|this, _: &Refresh, _, cx| this.rescan(cx)))
+            .on_action(
+                cx.listener(|this, _: &NextTodo, window, cx| this.step_item(true, window, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &PreviousTodo, window, cx| this.step_item(false, window, cx)),
+            )
+            .on_action(cx.listener(Self::expand_all))
+            .on_action(cx.listener(Self::collapse_all))
             .size_full()
-            .child(toolbar)
-            .child(list)
+            .child(header)
+            .child(
+                h_flex()
+                    .flex_1()
+                    .min_h_0()
+                    .child(self.render_strip(cx))
+                    .child(v_flex().flex_1().min_w_0().h_full().child(list)),
+            )
     }
 }
 
@@ -955,7 +1278,8 @@ mod tests {
                 serde_json::json!({ "a.txt": "// TODO: one\nplain todo\n" }),
             )
             .await;
-        let project = Project::test(app_state.fs.clone(), [std::path::Path::new("/project")], cx).await;
+        let project =
+            Project::test(app_state.fs.clone(), [std::path::Path::new("/project")], cx).await;
         let (multi_workspace, cx) = cx
             .add_window_view(|window, cx| workspace::MultiWorkspace::test_new(project, window, cx));
         let workspace = multi_workspace.read_with(cx, |multi, _| multi.workspace().clone());
@@ -997,5 +1321,156 @@ mod tests {
             .map(|(range, class)| (snapshot.text_for_range(range).collect(), class))
             .collect();
         assert_eq!(found, [("TODO".into(), 2), ("FIXME".into(), 0)]);
+    }
+
+    #[test]
+    fn summary_wording() {
+        assert_eq!(
+            summary_text(12, 2, false, false, None),
+            "Found 12 TODO items in 2 files"
+        );
+        assert_eq!(
+            summary_text(1, 1, false, false, None),
+            "Found 1 TODO item in 1 file"
+        );
+        assert_eq!(
+            summary_text(0, 0, true, false, None),
+            "Found 0 TODO items in 0 files (limit reached)"
+        );
+        assert_eq!(summary_text(3, 1, false, true, Some("x")), "Scanning…");
+        assert_eq!(
+            summary_text(0, 0, false, false, Some("No file is open.")),
+            "No file is open."
+        );
+    }
+
+    async fn panel_fixture(
+        cx: &mut gpui::TestAppContext,
+    ) -> (
+        Entity<workspace::Workspace>,
+        Entity<TodoPanel>,
+        &mut gpui::VisualTestContext,
+    ) {
+        let app_state = cx.update(|cx| {
+            let app_state = workspace::AppState::test(cx);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            editor::init(cx);
+            workspace::init(app_state.clone(), cx);
+            init(cx);
+            app_state
+        });
+        app_state
+            .fs
+            .as_fake()
+            .insert_tree(
+                "/project",
+                serde_json::json!({
+                    "a.txt": "// TODO: one\n// FIXME: two\n",
+                    "b.txt": "// TODO: three\n",
+                }),
+            )
+            .await;
+        let project =
+            Project::test(app_state.fs.clone(), [std::path::Path::new("/project")], cx).await;
+        let (multi_workspace, cx) = cx
+            .add_window_view(|window, cx| workspace::MultiWorkspace::test_new(project, window, cx));
+        let workspace = multi_workspace.read_with(cx, |multi, _| multi.workspace().clone());
+        let panel = workspace
+            .update_in(cx, |workspace, window, cx| {
+                workspace.focus_panel::<TodoPanel>(window, cx)
+            })
+            .expect("panel is registered");
+        cx.run_until_parked();
+        (workspace, panel, cx)
+    }
+
+    fn texts(panel: &Entity<TodoPanel>, cx: &mut gpui::VisualTestContext) -> Vec<String> {
+        panel.read_with(cx, |panel, cx| {
+            panel
+                .rows
+                .iter()
+                .map(|row| panel.row_text(row, cx))
+                .collect()
+        })
+    }
+
+    #[gpui::test]
+    async fn tree_has_summary_project_and_file_nodes(cx: &mut gpui::TestAppContext) {
+        let (_, panel, cx) = panel_fixture(cx).await;
+        assert_eq!(
+            texts(&panel, cx),
+            [
+                "Found 3 TODO items in 2 files",
+                "project - 3 items",
+                "a.txt 2 items",
+                "1 // TODO: one",
+                "2 // FIXME: two",
+                "b.txt 1 item",
+                "1 // TODO: three",
+            ]
+        );
+        panel.update_in(cx, |panel, window, cx| {
+            panel.collapse_all(&CollapseAll, window, cx)
+        });
+        assert_eq!(
+            texts(&panel, cx),
+            [
+                "Found 3 TODO items in 2 files",
+                "project - 3 items",
+                "a.txt 2 items",
+                "b.txt 1 item"
+            ]
+        );
+        panel.update_in(cx, |panel, window, cx| {
+            panel.expand_all(&ExpandAll, window, cx)
+        });
+        assert_eq!(texts(&panel, cx).len(), 7);
+    }
+
+    #[gpui::test]
+    async fn current_file_tab_scopes_to_the_active_editor(cx: &mut gpui::TestAppContext) {
+        let (workspace, panel, cx) = panel_fixture(cx).await;
+        workspace
+            .update_in(cx, |workspace, window, cx| {
+                workspace.open_abs_path(
+                    "/project/a.txt".into(),
+                    workspace::OpenOptions::default(),
+                    window,
+                    cx,
+                )
+            })
+            .await
+            .expect("file opens");
+        cx.run_until_parked();
+        panel.update(cx, |panel, cx| panel.set_scope(Scope::CurrentFile, cx));
+        cx.run_until_parked();
+        assert_eq!(
+            texts(&panel, cx),
+            [
+                "Found 2 TODO items in 1 file",
+                "project - 2 items",
+                "a.txt 2 items",
+                "1 // TODO: one",
+                "2 // FIXME: two",
+            ]
+        );
+    }
+
+    #[gpui::test]
+    async fn next_todo_walks_the_item_rows(cx: &mut gpui::TestAppContext) {
+        let (_, panel, cx) = panel_fixture(cx).await;
+        let selected = |panel: &Entity<TodoPanel>, cx: &mut gpui::VisualTestContext| {
+            panel.read_with(cx, |panel, _| panel.selected)
+        };
+        panel.update_in(cx, |panel, window, cx| panel.step_item(true, window, cx));
+        cx.run_until_parked();
+        assert_eq!(selected(&panel, cx), Some(3));
+        panel.update_in(cx, |panel, window, cx| panel.step_item(true, window, cx));
+        panel.update_in(cx, |panel, window, cx| panel.step_item(true, window, cx));
+        cx.run_until_parked();
+        assert_eq!(selected(&panel, cx), Some(6));
+        panel.update_in(cx, |panel, window, cx| panel.step_item(false, window, cx));
+        cx.run_until_parked();
+        assert_eq!(selected(&panel, cx), Some(4));
     }
 }

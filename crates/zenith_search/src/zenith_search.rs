@@ -1854,6 +1854,7 @@ fn symbol_badge_letter(kind: SymbolKind) -> (&'static str, BadgeColor) {
 mod tests {
     use super::*;
     use futures::StreamExt as _;
+    use std::{cell::RefCell, rc::Rc};
     use gpui::{TestAppContext, VisualTestContext};
     use serde_json::json;
     use settings::KeymapFile;
@@ -2750,20 +2751,79 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_find_in_files_lists_matching_lines(cx: &mut TestAppContext) {
+    async fn test_find_in_files_seeds_query_from_editor(cx: &mut TestAppContext) {
         let app_state = init_test(cx);
         app_state
             .fs
             .as_fake()
             .insert_tree(
                 "/root",
-                serde_json::json!({
-                    "a.php": "<?php\nadd_action('init', 'x');\n",
-                    "b.js": "add_action('nope');\n",
-                    "c.php": "nothing here\n",
-                }),
+                serde_json::json!({ "a.php": "<?php\nadd_action('init', 'x');\n" }),
             )
             .await;
+        let project = Project::test(app_state.fs.clone(), ["/root".as_ref()], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        let worktree_id = workspace.read_with(cx, |workspace, cx| {
+            workspace.project().read(cx).worktrees(cx).next().unwrap().read(cx).id()
+        });
+        workspace
+            .update_in(cx, |workspace, window, cx| {
+                let path = ProjectPath {
+                    worktree_id,
+                    path: RelPath::from_unix_str("a.php").unwrap().into(),
+                };
+                workspace.open_path(path, None, true, window, cx)
+            })
+            .await
+            .unwrap();
+        let editor = workspace.read_with(cx, |workspace, cx| {
+            workspace.active_item_as::<Editor>(cx).unwrap()
+        });
+        let open_query = |cx: &mut VisualTestContext| {
+            workspace.update_in(cx, |workspace, window, cx| {
+                find_in_files::FindInFilesModal::open(workspace, false, window, cx)
+            });
+            cx.run_until_parked();
+            let modal = workspace.update(cx, |workspace, cx| {
+                workspace
+                    .active_modal::<find_in_files::FindInFilesModal>(cx)
+                    .expect("open")
+            });
+            let query = modal.read_with(cx, |modal, cx| modal.query_text(cx));
+            workspace.update_in(cx, |workspace, window, cx| {
+                workspace.hide_modal(window, cx);
+            });
+            query
+        };
+        // A selection is searched as is.
+        editor.update_in(cx, |editor, window, cx| {
+            editor.change_selections(SelectionEffects::default(), window, cx, |selections| {
+                selections.select_ranges([Point::new(1, 0)..Point::new(1, 10)])
+            });
+        });
+        assert_eq!(open_query(cx), "add_action");
+        // With only a caret, the word under it.
+        editor.update_in(cx, |editor, window, cx| {
+            editor.change_selections(SelectionEffects::default(), window, cx, |selections| {
+                selections.select_ranges([Point::new(1, 3)..Point::new(1, 3)])
+            });
+        });
+        assert_eq!(open_query(cx), "add_action");
+    }
+
+    /// Opens Find in Files over a project of `files` and returns the modal.
+    async fn open_find_in_files(
+        files: serde_json::Value,
+        cx: &mut TestAppContext,
+    ) -> (
+        Entity<Workspace>,
+        Entity<find_in_files::FindInFilesModal>,
+        &mut VisualTestContext,
+    ) {
+        let app_state = init_test(cx);
+        app_state.fs.as_fake().insert_tree("/root", files).await;
         let project = Project::test(app_state.fs.clone(), ["/root".as_ref()], cx).await;
         let (multi_workspace, cx) =
             cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
@@ -2777,18 +2837,208 @@ mod tests {
                 .active_modal::<find_in_files::FindInFilesModal>(cx)
                 .expect("open")
         });
-        let picker = modal.read_with(cx, |modal, _| modal.picker().clone());
-        // Nothing typed: nothing listed.
-        assert_eq!(picker.read_with(cx, |p, _| p.delegate.match_count()), 0);
-        picker.update_in(cx, |picker, window, cx| {
-            picker.set_query("add_action", window, cx)
-        });
+        (workspace, modal, cx)
+    }
+
+    #[gpui::test]
+    async fn test_find_in_files_lists_matching_lines(cx: &mut TestAppContext) {
+        let (_, modal, cx) = open_find_in_files(
+            serde_json::json!({
+                "a.php": "<?php\nadd_action('init', 'x');\n",
+                "b.js": "add_action('nope');\n",
+                "c.php": "nothing here\n",
+            }),
+            cx,
+        )
+        .await;
+        // Nothing typed: nothing listed, nothing counted.
+        assert_eq!(modal.read_with(cx, |m, _| m.match_count()), 0);
+        assert_eq!(modal.read_with(cx, |m, cx| m.summary_text(cx)), "");
+        modal.update_in(cx, |m, window, cx| m.set_query("add_action", window, cx));
         cx.run_until_parked();
-        assert_eq!(picker.read_with(cx, |p, _| p.delegate.match_count()), 2);
+        assert_eq!(modal.read_with(cx, |m, _| m.match_count()), 2);
+        // Listed by path.
+        assert_eq!(
+            modal.read_with(cx, |m, _| m.hit_labels()),
+            ["a.php:2", "b.js:1"]
+        );
         // The mask narrows it to PHP.
         modal.update_in(cx, |modal, window, cx| modal.set_mask("*.php", window, cx));
         cx.run_until_parked();
-        assert_eq!(picker.read_with(cx, |p, _| p.delegate.match_count()), 1);
+        assert_eq!(modal.read_with(cx, |m, _| m.match_count()), 1);
+    }
+
+    #[gpui::test]
+    async fn test_find_in_files_counts_matches_and_files_live(cx: &mut TestAppContext) {
+        let (_, modal, cx) = open_find_in_files(
+            serde_json::json!({
+                "a.php": "$services = [];\nfn($services);\n$services;\n",
+                "b.php": "echo $services;\n",
+                "c.php": "nothing\n",
+            }),
+            cx,
+        )
+        .await;
+        let summary = |cx: &mut VisualTestContext| modal.read_with(cx, |m, cx| m.summary_text(cx));
+        modal.update_in(cx, |m, window, cx| m.set_query("$services", window, cx));
+        cx.run_until_parked();
+        assert_eq!(summary(cx), "4 matches in 2 files");
+        // Narrowing the query updates the header without any other action.
+        modal.update_in(cx, |m, window, cx| m.set_query("echo $services", window, cx));
+        cx.run_until_parked();
+        assert_eq!(summary(cx), "1 match in 1 file");
+        modal.update_in(cx, |m, window, cx| m.set_query("zzz", window, cx));
+        cx.run_until_parked();
+        assert_eq!(summary(cx), "0 matches in 0 files");
+    }
+
+    #[gpui::test]
+    async fn test_find_in_files_preview_follows_selection(cx: &mut TestAppContext) {
+        let (_, modal, cx) = open_find_in_files(
+            serde_json::json!({
+                "a.php": "<?php\nadd_action('a');\n\nadd_action('b');\n",
+                "b.php": "add_action('c');\n",
+            }),
+            cx,
+        )
+        .await;
+        modal.update_in(cx, |m, window, cx| m.set_query("add_action", window, cx));
+        cx.run_until_parked();
+        let previewed = |cx: &mut VisualTestContext| {
+            modal.read_with(cx, |m, _| {
+                m.previewed()
+                    .map(|(path, row)| (path.path.as_unix_str().to_string(), row))
+            })
+        };
+        // The first hit is previewed as soon as the results arrive.
+        assert_eq!(previewed(cx), Some(("a.php".to_string(), 1)));
+        cx.dispatch_action(menu::SelectNext);
+        assert_eq!(previewed(cx), Some(("a.php".to_string(), 3)));
+        cx.dispatch_action(menu::SelectNext);
+        assert_eq!(previewed(cx), Some(("b.php".to_string(), 0)));
+        assert_eq!(modal.read_with(cx, |m, _| m.selected_index()), 2);
+        // Past the end wraps; up goes back.
+        cx.dispatch_action(menu::SelectNext);
+        assert_eq!(previewed(cx), Some(("a.php".to_string(), 1)));
+        cx.dispatch_action(menu::SelectPrevious);
+        assert_eq!(previewed(cx), Some(("b.php".to_string(), 0)));
+        // No results, no preview.
+        modal.update_in(cx, |m, window, cx| m.set_query("zzz", window, cx));
+        cx.run_until_parked();
+        assert_eq!(previewed(cx), None);
+        // The rows and the preview are on screen.
+        modal.update_in(cx, |m, window, cx| m.set_query("add_action", window, cx));
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("zenith-find-hit-0").is_some());
+        assert!(cx.debug_bounds("zenith-find-preview").is_some());
+    }
+
+    #[gpui::test]
+    async fn test_open_results_in_new_tab_decides_what_enter_does(cx: &mut TestAppContext) {
+        let (workspace, modal, cx) = open_find_in_files(
+            serde_json::json!({ "a.php": "<?php\n\nadd_action('init');\n" }),
+            cx,
+        )
+        .await;
+        let deployed = Rc::new(RefCell::new(Vec::new()));
+        cx.update(|_, cx| {
+            let deployed = deployed.clone();
+            cx.on_action(move |action: &workspace::DeploySearch, _| {
+                deployed.borrow_mut().push(action.clone())
+            });
+        });
+        let reopen = |cx: &mut VisualTestContext| {
+            workspace.update_in(cx, |workspace, window, cx| {
+                find_in_files::FindInFilesModal::open(workspace, false, window, cx)
+            });
+            cx.run_until_parked();
+            let modal = workspace.update(cx, |workspace, cx| {
+                workspace
+                    .active_modal::<find_in_files::FindInFilesModal>(cx)
+                    .expect("open")
+            });
+            modal.update_in(cx, |m, window, cx| m.set_query("add_action", window, cx));
+            cx.run_until_parked();
+            modal
+        };
+        // Unticked: Enter goes to the line, in the editor.
+        modal.update_in(cx, |m, window, cx| m.set_query("add_action", window, cx));
+        cx.run_until_parked();
+        cx.dispatch_action(menu::Confirm);
+        cx.run_until_parked();
+        assert!(deployed.borrow().is_empty());
+        let (path, row) = workspace.update(cx, |workspace, cx| {
+            let editor = workspace.active_item_as::<Editor>(cx).expect("opened");
+            let row = editor.update(cx, |editor, cx| {
+                editor
+                    .selections
+                    .newest::<Point>(&editor.display_snapshot(cx))
+                    .head()
+                    .row
+            });
+            (
+                workspace.active_item(cx).unwrap().project_path(cx).unwrap(),
+                row,
+            )
+        });
+        assert_eq!((path.path.as_unix_str(), row), ("a.php", 2));
+        assert!(workspace.read_with(cx, |w, cx| w.active_modal::<find_in_files::FindInFilesModal>(cx).is_none()));
+        // Ticked: Enter sends the results to a search tab, with the query.
+        let modal = reopen(cx);
+        modal.update(cx, |m, _| m.set_open_in_tab(true));
+        cx.dispatch_action(menu::Confirm);
+        cx.run_until_parked();
+        let deployed = deployed.borrow();
+        assert_eq!(deployed.len(), 1);
+        assert_eq!(deployed[0].query.as_deref(), Some("add_action"));
+    }
+
+    #[gpui::test]
+    async fn test_find_in_files_directory_scope_narrows_results(cx: &mut TestAppContext) {
+        let (_, modal, cx) = open_find_in_files(
+            serde_json::json!({
+                "inc": { "a.php": "add_action();\n", "c.js": "add_action();\n" },
+                "src": { "b.php": "add_action();\n" },
+            }),
+            cx,
+        )
+        .await;
+        modal.update_in(cx, |m, window, cx| m.set_query("add_action", window, cx));
+        cx.run_until_parked();
+        assert_eq!(modal.read_with(cx, |m, _| m.match_count()), 3);
+        // Only the directory.
+        modal.update_in(cx, |m, window, cx| m.set_directory("inc", window, cx));
+        cx.run_until_parked();
+        assert_eq!(
+            modal.read_with(cx, |m, _| m.hit_labels()),
+            ["a.php:1", "c.js:1"]
+        );
+        // PhpStorm's absolute path means the same.
+        modal.update_in(cx, |m, window, cx| m.set_directory(path!("/root/src"), window, cx));
+        cx.run_until_parked();
+        assert_eq!(modal.read_with(cx, |m, _| m.hit_labels()), ["b.php:1"]);
+        // The mask applies inside the directory.
+        modal.update_in(cx, |m, window, cx| m.set_directory("inc", window, cx));
+        modal.update_in(cx, |m, window, cx| m.set_mask("*.php", window, cx));
+        cx.run_until_parked();
+        assert_eq!(modal.read_with(cx, |m, _| m.hit_labels()), ["a.php:1"]);
+    }
+
+    #[gpui::test]
+    async fn test_find_in_files_popup_moves_when_its_header_is_dragged(cx: &mut TestAppContext) {
+        let (_, modal, cx) = open_find_in_files(serde_json::json!({}), cx).await;
+        let start = cx
+            .debug_bounds("zenith-popup-drag")
+            .expect("the header is a drag handle")
+            .center();
+        let none = gpui::Modifiers::none();
+        cx.simulate_mouse_down(start, gpui::MouseButton::Left, none);
+        for step in 1..=4 {
+            let delta = gpui::point(px(30. * step as f32), px(20. * step as f32));
+            cx.simulate_mouse_move(start + delta, gpui::MouseButton::Left, none);
+        }
+        cx.simulate_mouse_up(start, gpui::MouseButton::Left, none);
+        assert!(modal.read_with(cx, |m, _| m.dragged()));
     }
 
     #[gpui::test]
@@ -2845,6 +3095,12 @@ mod tests {
     // zenith.json binds actions from sibling crates this test binary doesn't link.
     mod zenith_todo {
         gpui::actions!(zenith_todo, [ToggleFocus]);
+    }
+    mod zenith_problems {
+        gpui::actions!(zenith_problems, [ToggleFocus]);
+    }
+    mod zenith_scratches {
+        gpui::actions!(zenith_scratches, [NewScratchFile]);
     }
 
     #[gpui::test]
@@ -3004,6 +3260,7 @@ mod tests {
                     ("alt-o", "zenith_search::GoToSymbol"),
                     ("e", "zenith_search::RecentFiles"),
                     ("shift-e", "zenith_search::RecentLocations"),
+                    ("shift-n", "zenith_scratches::NewScratchFile"),
                 ] {
                     assert_eq!(
                         resolve(&all, keys, contexts).as_deref(),

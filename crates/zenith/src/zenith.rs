@@ -30,4 +30,14 @@ pub fn init(cx: &mut App) {
     zenith_look::init(cx);
     #[cfg(feature = "todo")]
     zenith_todo::init(cx);
+    #[cfg(feature = "markdown")]
+    zenith_markdown::init(cx);
+    #[cfg(feature = "problems")]
+    zenith_problems::init(cx);
+    #[cfg(feature = "folds")]
+    zenith_folds::init(cx);
+    #[cfg(feature = "templates")]
+    zenith_templates::init(cx);
+    #[cfg(feature = "scratches")]
+    zenith_scratches::init(cx);
 }

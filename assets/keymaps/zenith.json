@@ -18,8 +18,20 @@
       "ctrl-tab": "zenith_search::Switcher",
       // TODO tool window. PhpStorm has no default key for it and gives ⌘6 to Problems, so ⇧ is added.
       "secondary-shift-6": "zenith_todo::ToggleFocus",
+      // Problems tool window, as in PhpStorm (⌘6).
+      "secondary-6": "zenith_problems::ToggleFocus",
+      // New Scratch File, as in PhpStorm (⌘⇧N); overrides Go to File and New Window.
+      "secondary-shift-n": "zenith_scratches::NewScratchFile",
       "secondary-shift-f": "zenith_search::FindInFiles",
       "secondary-shift-r": "zenith_search::ReplaceInFiles",
+    },
+  },
+  {
+    // Collapse / expand a file in the Problems tool window.
+    "context": "ProblemsPanel",
+    "bindings": {
+      "left": "menu::SelectParent",
+      "right": "menu::SelectChild",
     },
   },
   {
@@ -42,6 +54,8 @@
     "bindings": {
       "secondary-shift-o": "zenith_search::GoToFile",
       "secondary-e": "zenith_search::RecentFiles",
+      // The JetBrains keymap binds ⌘⇧N (Go to File) in this context too.
+      "secondary-shift-n": "zenith_scratches::NewScratchFile",
     },
   },
   {
