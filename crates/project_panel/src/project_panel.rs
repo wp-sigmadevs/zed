@@ -8593,6 +8593,13 @@ mod zenith_tests {
     use std::path::Path;
     use workspace::MultiWorkspace;
 
+    // zenith_templates depends on project_panel, so it cannot be a dev-dependency (cycle, two
+    // project_panel copies, duplicate actions). Declare its action here so the menu names resolve.
+    // The real name is pinned by zenith_templates' `test_new_from_template_action_name`.
+    mod zenith_templates {
+        gpui::actions!(zenith_templates, [NewFromTemplate]);
+    }
+
     async fn open_panel(cx: &mut TestAppContext, zenith_chrome: bool) -> VisualTestContext {
         crate::project_panel_tests::init_test(cx);
         if zenith_chrome {

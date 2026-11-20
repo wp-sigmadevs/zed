@@ -143,7 +143,8 @@ fn agent_session_action(cx: &App) -> Option<Box<dyn Action>> {
 
 /// `None` when the scratches crate is not built in: the row is then hidden.
 fn scratch_action(cx: &App) -> Option<Box<dyn Action>> {
-    cx.build_action("zenith_scratches::NewScratchFile", None).ok()
+    cx.build_action("zenith_scratches::NewScratchFile", None)
+        .ok()
 }
 
 /// Entries whose action exists in this build.
@@ -585,6 +586,22 @@ mod tests {
     use std::{cell::Cell, rc::Rc};
     use util::path;
     use workspace::{AppState, MultiWorkspace};
+
+    /// The project panel's chrome test declares a stand-in action by this exact name
+    /// (project_panel.rs, `zenith_tests`); the header menu builds it by name too.
+    #[gpui::test]
+    fn test_new_from_template_action_name(cx: &mut TestAppContext) {
+        assert_eq!(
+            NewFromTemplate::name_for_type(),
+            "zenith_templates::NewFromTemplate"
+        );
+        cx.update(|cx| {
+            let built = cx
+                .build_action("zenith_templates::NewFromTemplate", None)
+                .expect("registered under its namespaced name");
+            assert!(built.as_any().is::<NewFromTemplate>());
+        });
+    }
 
     fn init_test(cx: &mut TestAppContext) -> Arc<AppState> {
         cx.update(|cx| {
