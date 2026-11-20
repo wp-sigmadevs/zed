@@ -3014,6 +3014,9 @@
       "max_db_size_mb": 500,
       // Files larger than this (in KB) are not recorded.
       "max_file_size_kb": 2048,
+      // Record a revision when something else (git checkout, a formatter, another
+      // tool) changes a file on disk.
+      "snapshot_external_changes": true,
     },
   },
   // The server to connect to. If the environment variable

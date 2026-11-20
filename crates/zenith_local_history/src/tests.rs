@@ -366,12 +366,11 @@ fn test_default_settings_file_matches_the_built_in_defaults() {
         LocalHistorySettings::from_settings(&defaults),
         LocalHistorySettings::from_settings(&SettingsContent::default())
     );
-    assert!(
-        defaults
-            .zenith
-            .and_then(|zenith| zenith.local_history)
-            .is_some()
-    );
+    let history = defaults
+        .zenith
+        .and_then(|zenith| zenith.local_history)
+        .expect("default.json has a local_history block");
+    assert_eq!(history.snapshot_external_changes, Some(true));
 }
 
 #[gpui::test]
@@ -458,7 +457,7 @@ async fn test_max_file_size_is_capped_at_what_can_be_read_back(cx: &mut TestAppC
 
 // External changes: something other than the editor rewrites a file on disk.
 
-async fn write_on_disk(
+pub(crate) async fn write_on_disk(
     project: &gpui::Entity<Project>,
     path: &str,
     text: &str,
@@ -472,7 +471,7 @@ async fn write_on_disk(
 }
 
 /// Lets queued work finish, including the wait for a file with unsaved edits.
-fn settle(cx: &mut TestAppContext) {
+pub(crate) fn settle(cx: &mut TestAppContext) {
     cx.run_until_parked();
     cx.executor()
         .advance_clock(std::time::Duration::from_secs(3));
@@ -480,7 +479,11 @@ fn settle(cx: &mut TestAppContext) {
 }
 
 /// Opens a file, which records its "open" baseline, then closes it again.
-async fn open_and_close(project: &gpui::Entity<Project>, path: &str, cx: &mut TestAppContext) {
+pub(crate) async fn open_and_close(
+    project: &gpui::Entity<Project>,
+    path: &str,
+    cx: &mut TestAppContext,
+) {
     let buffer = project
         .update(cx, |project, cx| project.open_local_buffer(path, cx))
         .await
@@ -564,8 +567,8 @@ async fn test_external_rewrite_with_the_same_text_is_not_a_revision(cx: &mut Tes
     start(cx, dir.path());
     let project = project_with(json!({ "a.txt": "one\ntwo" }), cx).await;
     open_and_close(&project, "/dir/a.txt", cx).await;
-    // A touch, then CRLF line endings and a BOM: none changes the text.
-    for same in ["one\ntwo", "one\r\ntwo", "\u{feff}one\ntwo"] {
+    // A touch, then CRLF or lone CR line endings and a BOM: none changes the text.
+    for same in ["one\ntwo", "one\r\ntwo", "one\rtwo", "\u{feff}one\ntwo"] {
         write_on_disk(&project, "/dir/a.txt", same, cx).await;
     }
     assert_eq!(sources(&revisions(cx, dir.path(), "a.txt")), ["open"]);
@@ -639,4 +642,152 @@ async fn test_initial_scan_is_not_an_external_change(cx: &mut TestAppContext) {
     settle(cx);
     drop(project);
     assert_eq!(sources(&revisions(cx, dir.path(), "a.txt")), ["save"]);
+}
+
+/// The file on disk is written without letting the clock run, so a file with
+/// unsaved edits is still waiting.
+async fn write_without_waiting(
+    project: &gpui::Entity<Project>,
+    path: &str,
+    text: &str,
+    cx: &mut TestAppContext,
+) {
+    let fs = project.read_with(cx, |project, _| project.fs().clone());
+    fs.write(Path::new(path), text.as_bytes())
+        .await
+        .expect("write file");
+    cx.run_until_parked();
+}
+
+#[gpui::test]
+async fn test_external_change_is_checked_again_after_the_wait(cx: &mut TestAppContext) {
+    let dir = history_dir();
+    start(cx, dir.path());
+    let project = project_with(json!({ "a.txt": "base" }), cx).await;
+    let buffer = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer("/dir/a.txt", cx)
+        })
+        .await
+        .expect("open buffer");
+    buffer.update(cx, |buffer, cx| buffer.edit([(0..0, "typed ")], None, cx));
+    write_without_waiting(&project, "/dir/a.txt", "from git", cx).await;
+    // While the change waits, the file becomes private.
+    cx.update(|cx| {
+        cx.update_global::<SettingsStore, _>(|store, cx| {
+            store.update_user_settings(cx, |content| {
+                content.project.worktree.private_files = Some(vec!["**/a.txt".to_string()].into());
+            });
+        });
+    });
+    settle(cx);
+    assert_eq!(sources(&revisions(cx, dir.path(), "a.txt")), ["open"]);
+    drop(buffer);
+}
+
+#[gpui::test]
+async fn test_external_change_that_became_a_symlink_is_not_recorded(cx: &mut TestAppContext) {
+    let dir = history_dir();
+    start(cx, dir.path());
+    let project = project_with(json!({ "a.txt": "base", "b.txt": "closed" }), cx).await;
+    let fs = project.read_with(cx, |project, _| project.fs().clone());
+    fs.create_dir(Path::new("/outside")).await.expect("dir");
+    fs.write(Path::new("/outside/secret"), b"SECRET")
+        .await
+        .expect("write");
+    let buffer = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer("/dir/a.txt", cx)
+        })
+        .await
+        .expect("open buffer");
+    open_and_close(&project, "/dir/b.txt", cx).await;
+    buffer.update(cx, |buffer, cx| buffer.edit([(0..0, "typed ")], None, cx));
+    write_without_waiting(&project, "/dir/a.txt", "from git", cx).await;
+    // Both files are swapped for links to a file outside the folder.
+    for name in ["a.txt", "b.txt"] {
+        let path = PathBuf::from("/dir").join(name);
+        fs.remove_file(&path, Default::default())
+            .await
+            .expect("remove");
+        fs.create_symlink(&path, PathBuf::from("/outside/secret"))
+            .await
+            .expect("symlink");
+    }
+    settle(cx);
+    for name in ["a.txt", "b.txt"] {
+        assert_eq!(
+            sources(&revisions(cx, dir.path(), name)),
+            ["open"],
+            "{name}"
+        );
+    }
+    drop(buffer);
+}
+
+#[gpui::test]
+async fn test_reload_under_typing_records_the_disk_text_not_the_buffer(cx: &mut TestAppContext) {
+    let dir = history_dir();
+    start(cx, dir.path());
+    let project = project_with(json!({ "a.txt": "base" }), cx).await;
+    let buffer = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer("/dir/a.txt", cx)
+        })
+        .await
+        .expect("open buffer");
+    let before = buffer.read_with(cx, |buffer, _| buffer.version());
+    buffer.update(cx, |buffer, cx| buffer.edit([(0..0, "typed ")], None, cx));
+    write_without_waiting(&project, "/dir/a.txt", "from git", cx).await;
+    // A reload that finishes after the user typed: the buffer holds both.
+    buffer.update(cx, |buffer, cx| {
+        let line_ending = buffer.line_ending();
+        buffer.did_reload(before, line_ending, None, cx);
+    });
+    cx.run_until_parked();
+    let revisions = revisions(cx, dir.path(), "a.txt");
+    let store = Store::open_in(dir.path()).expect("store");
+    let texts: Vec<_> = revisions
+        .iter()
+        .map(|revision| store.content(&revision.blob_hash).expect("content"))
+        .collect();
+    assert_eq!(sources(&revisions), ["external", "open"]);
+    assert_eq!(texts[0].as_deref(), Some(b"from git".as_slice()));
+}
+
+#[gpui::test]
+async fn test_external_changes_can_be_switched_off(cx: &mut TestAppContext) {
+    let dir = history_dir();
+    start(cx, dir.path());
+    configure(cx, |history| {
+        history.snapshot_external_changes = Some(false)
+    });
+    let project = project_with(
+        json!({ "open.txt": "a", "closed.txt": "a", "own.txt": "a" }),
+        cx,
+    )
+    .await;
+    let buffer = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer("/dir/open.txt", cx)
+        })
+        .await
+        .expect("open buffer");
+    open_and_close(&project, "/dir/closed.txt", cx).await;
+    write_on_disk(&project, "/dir/open.txt", "b", cx).await;
+    write_on_disk(&project, "/dir/closed.txt", "b", cx).await;
+    // Saving in the editor is not affected by the switch.
+    open_edit_save(&project, "/dir/own.txt", "x", cx).await;
+    for name in ["open.txt", "closed.txt"] {
+        assert_eq!(
+            sources(&revisions(cx, dir.path(), name)),
+            ["open"],
+            "{name}"
+        );
+    }
+    assert_eq!(
+        sources(&revisions(cx, dir.path(), "own.txt")),
+        ["save", "open"]
+    );
+    drop(buffer);
 }

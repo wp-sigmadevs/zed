@@ -15,12 +15,13 @@ use futures::{
     channel::{mpsc, oneshot},
 };
 use gpui::{App, AppContext as _, Context, Global, Task};
-use language::{Buffer, BufferEvent};
+use language::{Buffer, BufferEvent, LineEnding};
 use project::{Project, ProjectPath, buffer_store::BufferStoreEvent};
 use rope::Rope;
 use settings::{Settings, SettingsLocation};
 use std::{
     collections::HashMap,
+    io::Read as _,
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -31,14 +32,19 @@ use worktree::{PathChange, WorktreeSettings};
 const PRUNE_EVERY: Duration = Duration::from_secs(24 * 60 * 60);
 const BYTES_PER_KB: u64 = 1024;
 const BYTES_PER_MB: u64 = 1024 * 1024;
-/// Files looked at per worktree update: a checkout that rewrites thousands of
-/// files must not stall the main thread. The rest of such a burst is skipped.
+/// Changed files looked at per worktree update, after the cheap filter (a file
+/// whose change kind counts): a checkout that rewrites thousands of files must not
+/// stall the main thread. The rest of such a burst is skipped.
 const MAX_EXTERNAL_PER_UPDATE: usize = 512;
 /// How long a changed file with unsaved edits waits before it counts as an
 /// external change.
 const DIRTY_SETTLE: Duration = Duration::from_secs(2);
-/// Most files "Recover Deleted Files" reads from the database.
-pub(crate) const MAX_DELETED_LISTED: i64 = 5000;
+/// Most files "Recover Deleted Files" reads from the database, newest first. The
+/// list is filtered afterwards (the files that still exist are dropped), so this is a
+/// ceiling on distinct files with history in one folder, not on what is shown.
+// ponytail: older files than the newest 20 000 are not offered; page the query if
+// a retention window ever holds more.
+const MAX_DELETED_LISTED: i64 = 20_000;
 
 enum Job {
     Record {
@@ -54,7 +60,6 @@ enum Job {
     External {
         worktree_root: String,
         rel_path: String,
-        abs_path: PathBuf,
         fs: Arc<dyn Fs>,
         max_bytes: u64,
         ts: i64,
@@ -124,10 +129,10 @@ pub(crate) fn start(cx: &mut App, open: impl Fn(bool) -> Result<Option<Store>> +
         cx.subscribe(&buffer_store, |_, _, event, cx| {
             if let BufferStoreEvent::BufferAdded(buffer) = event {
                 capture(buffer, "open", cx);
-                cx.subscribe(buffer, |_, buffer, event, cx| match event {
+                cx.subscribe(buffer, |project, buffer, event, cx| match event {
                     BufferEvent::Saved => capture(&buffer, "save", cx),
                     // The buffer took a change made on disk by something else.
-                    BufferEvent::Reloaded => capture(&buffer, "external", cx),
+                    BufferEvent::Reloaded => capture_reloaded(project, &buffer, cx),
                     _ => {}
                 })
                 .detach();
@@ -177,7 +182,6 @@ async fn own_store(
             Job::External {
                 worktree_root,
                 rel_path,
-                abs_path,
                 fs,
                 max_bytes,
                 ts,
@@ -190,7 +194,9 @@ async fn own_store(
                 }
                 // ponytail: the read blocks this queue; fine for files under the size
                 // cap, give reads their own task if a slow disk makes history lists lag.
-                let Some(bytes) = read_text(fs.as_ref(), &abs_path, max_bytes).await else {
+                let root = PathBuf::from(&worktree_root);
+                let path = root.join(&rel_path);
+                let Some(bytes) = read_text(fs.as_ref(), &root, &path, max_bytes).await else {
                     continue;
                 };
                 // Not the borrow from before the await: `Store` is not `Sync`.
@@ -231,20 +237,56 @@ async fn own_store(
 }
 
 /// The text of a file as a buffer would hold it: UTF-8 without BOM, `\n` line
-/// endings, so a rewrite that only changes line endings or a BOM is no new
-/// revision. `None` for a file that is too large, binary or not UTF-8.
-async fn read_text(fs: &dyn Fs, path: &Path, max_bytes: u64) -> Option<Vec<u8>> {
+/// endings (a lone `\r` too), so a rewrite that only changes line endings or a BOM is
+/// no new revision. `None` for anything that is not a plain file inside the
+/// folder: a symbolic link, a folder, a pipe or device, a path that resolves
+/// outside `root`; and for a file that is too large, binary or not UTF-8. The
+/// read is bounded by `max_bytes` whatever the file turns out to be.
+///
+/// The main thread checked the entry before queueing this; a file can be swapped
+/// in between, so everything that matters is checked again on the disk, here.
+async fn read_text(fs: &dyn Fs, root: &Path, path: &Path, max_bytes: u64) -> Option<Vec<u8>> {
     let metadata = fs.metadata(path).await.ok().flatten()?;
-    if metadata.is_dir || metadata.is_fifo || metadata.len > max_bytes {
+    if metadata.is_symlink || metadata.is_dir || metadata.is_fifo || metadata.len > max_bytes {
         return None;
     }
-    let bytes = fs.load_bytes(path).await.ok()?;
-    if bytes.len() as u64 > max_bytes || bytes.contains(&0) {
+    // Follows links, so only a regular file passes: no device, socket or pipe.
+    if !fs.is_file(path).await {
         return None;
     }
-    let text = String::from_utf8(bytes).ok()?;
-    let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
-    Some(text.replace("\r\n", "\n").into_bytes())
+    // Backstop for a link in a parent folder.
+    let canonical_root = fs.canonicalize(root).await.ok()?;
+    if !fs
+        .canonicalize(path)
+        .await
+        .ok()?
+        .starts_with(canonical_root)
+    {
+        return None;
+    }
+    // ponytail: a blocking read on this background thread, like the store calls.
+    let reader = fs.open_sync(path).await.ok()?;
+    let bytes = read_bounded(reader, max_bytes)?;
+    if bytes.contains(&0) {
+        return None;
+    }
+    let mut text = String::from_utf8(bytes).ok()?;
+    if text.starts_with('\u{feff}') {
+        text.remove(0);
+    }
+    LineEnding::normalize(&mut text);
+    Some(text.into_bytes())
+}
+
+/// Everything `reader` holds, or `None` when it holds more than `max_bytes`
+/// (or cannot be read). Never reads past `max_bytes + 1`.
+fn read_bounded(reader: impl std::io::Read, max_bytes: u64) -> Option<Vec<u8>> {
+    let mut bytes = Vec::new();
+    reader
+        .take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .ok()?;
+    (bytes.len() as u64 <= max_bytes).then_some(bytes)
 }
 
 /// Revisions newest first, each with its content size.
@@ -405,13 +447,81 @@ pub(crate) fn is_viewable(file: &worktree::File, cx: &App) -> bool {
         })
 }
 
+/// A buffer that still differs from the disk: unsaved edits or a conflict.
+fn is_unsettled(buffer: &Buffer) -> bool {
+    buffer.is_dirty() || buffer.has_conflict()
+}
+
+/// The job that records `path` as an external change, if every check still
+/// holds now: the setting, the entry (a file), no clean open buffer (its reload
+/// records it) and the same gate as every other capture. The flag says whether an
+/// open buffer is involved.
+fn external_job(
+    project: &Project,
+    worktree_id: worktree::WorktreeId,
+    path: &Arc<RelPath>,
+    cx: &App,
+) -> Option<(Job, bool)> {
+    let settings = *LocalHistorySettings::get_global(cx);
+    if !settings.snapshot_external_changes {
+        return None;
+    }
+    let worktree = project.worktree_for_id(worktree_id, cx)?;
+    let worktree_root = root_key(&worktree.read(cx).abs_path())?;
+    let entry = worktree.read(cx).entry_for_path(path)?;
+    if !entry.is_file() || path.is_empty() {
+        return None;
+    }
+    let buffer = project.buffer_store().read(cx).get_by_path(&ProjectPath {
+        worktree_id,
+        path: path.clone(),
+    });
+    if buffer
+        .as_ref()
+        .is_some_and(|buffer| !is_unsettled(buffer.read(cx)))
+    {
+        return None;
+    }
+    let file = worktree::File::for_entry(entry.clone(), worktree.clone());
+    if !should_record(&file, usize::try_from(entry.size).ok()?, cx) {
+        return None;
+    }
+    let job = Job::External {
+        worktree_root,
+        rel_path: path.as_unix_str().to_owned(),
+        fs: project.fs().clone(),
+        max_bytes: settings.max_file_size_kb.saturating_mul(BYTES_PER_KB),
+        ts: now(),
+    };
+    Some((job, buffer.is_some()))
+}
+
+/// A buffer took a change from disk. Its text is the disk text unless the user typed
+/// since: then the file is read instead.
+fn capture_reloaded(project: &Project, buffer: &gpui::Entity<Buffer>, cx: &mut App) {
+    if !LocalHistorySettings::get_global(cx).snapshot_external_changes {
+        return;
+    }
+    if !is_unsettled(buffer.read(cx)) {
+        return capture(buffer, "external", cx);
+    }
+    let Some(file) = worktree::File::from_dyn(buffer.read(cx).file()) else {
+        return;
+    };
+    let (worktree_id, path) = (file.worktree_id(cx), file.path.clone());
+    if let Some((job, _)) = external_job(project, worktree_id, &path, cx) {
+        send_all(cx, [job]);
+    }
+}
+
 /// Files changed on disk: queue the ones no clean open buffer already covers
 /// (its reload records them), through the same gate as every other capture.
 ///
 /// A file whose buffer has unsaved edits waits [`DIRTY_SETTLE`] first: the editor's
 /// own save reaches the worktree before it marks the buffer clean, and that must
 /// stay a "save", not an "external" change. If the buffer is still dirty then,
-/// the disk text is a real conflict and is recorded before a later save overwrites it.
+/// the disk text is a real conflict and is recorded before a later save overwrites
+/// it. Every check runs again after the wait, right before the job is queued.
 fn capture_external(
     project: &Project,
     worktree_id: worktree::WorktreeId,
@@ -424,77 +534,43 @@ fn capture_external(
     let Some(worktree) = project.worktree_for_id(worktree_id, cx) else {
         return;
     };
-    let abs_root = worktree.read(cx).abs_path();
-    let Some(worktree_root) = root_key(&abs_root) else {
-        return;
-    };
-    let max_bytes = LocalHistorySettings::get_global(cx)
-        .max_file_size_kb
-        .saturating_mul(BYTES_PER_KB);
-    let mut now_jobs = Vec::new();
-    let mut later_jobs = Vec::new();
-    for (path, _, change) in changes.iter().take(MAX_EXTERNAL_PER_UPDATE) {
+    let paths: Vec<_> = changes
+        .iter()
         // Never `Loaded`: that is the initial scan, not a change.
-        if !matches!(
-            change,
-            PathChange::Added | PathChange::Updated | PathChange::AddedOrUpdated
-        ) {
-            continue;
-        }
-        let Some(entry) = worktree.read(cx).entry_for_path(path) else {
-            continue;
-        };
-        if !entry.is_file() || path.is_empty() {
-            continue;
-        }
-        let project_path = ProjectPath {
-            worktree_id,
-            path: path.clone(),
-        };
-        let buffer = project.buffer_store().read(cx).get_by_path(&project_path);
-        if buffer
-            .as_ref()
-            .is_some_and(|buffer| !buffer.read(cx).is_dirty())
-        {
-            continue;
-        }
-        let file = worktree::File::for_entry(entry.clone(), worktree.clone());
-        let Ok(len) = usize::try_from(entry.size) else {
-            continue;
-        };
-        if !should_record(&file, len, cx) {
-            continue;
-        }
-        let job = Job::External {
-            worktree_root: worktree_root.clone(),
-            rel_path: path.as_unix_str().to_owned(),
-            abs_path: abs_root.join(path.as_std_path()),
-            fs: project.fs().clone(),
-            max_bytes,
-            ts: now(),
-        };
-        if buffer.is_some() {
-            later_jobs.push((job, project_path));
-        } else {
-            now_jobs.push(job);
+        .filter(|(path, _, change)| {
+            matches!(
+                change,
+                PathChange::Added | PathChange::Updated | PathChange::AddedOrUpdated
+            ) && worktree
+                .read(cx)
+                .entry_for_path(path)
+                .is_some_and(|entry| entry.is_file())
+        })
+        .take(MAX_EXTERNAL_PER_UPDATE)
+        .map(|(path, _, _)| path.clone())
+        .collect();
+    let mut now_jobs = Vec::new();
+    let mut later = Vec::new();
+    for path in paths {
+        match external_job(project, worktree_id, &path, cx) {
+            Some((job, false)) => now_jobs.push(job),
+            Some((_, true)) => later.push(path),
+            None => {}
         }
     }
     send_all(cx, now_jobs);
-    if later_jobs.is_empty() {
+    if later.is_empty() {
         return;
     }
     cx.spawn(async move |project, cx| {
         cx.background_executor().timer(DIRTY_SETTLE).await;
         project
             .update(cx, |project, cx| {
-                let still_dirty = later_jobs.into_iter().filter(|(_, path)| {
-                    project
-                        .buffer_store()
-                        .read(cx)
-                        .get_by_path(path)
-                        .is_none_or(|buffer| buffer.read(cx).is_dirty())
-                });
-                send_all(cx, still_dirty.map(|(job, _)| job));
+                let jobs = later
+                    .iter()
+                    .filter_map(|path| external_job(project, worktree_id, path, cx))
+                    .map(|(job, _)| job);
+                send_all(cx, jobs.collect::<Vec<_>>());
             })
             .ok();
     })
@@ -544,3 +620,7 @@ pub(crate) fn capture(buffer: &gpui::Entity<Buffer>, source: &'static str, cx: &
         })
         .log_err();
 }
+
+#[cfg(test)]
+#[path = "capture_tests.rs"]
+mod tests;

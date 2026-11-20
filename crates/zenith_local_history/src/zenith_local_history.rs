@@ -17,6 +17,7 @@ pub struct LocalHistorySettings {
     pub retention_days: u32,
     pub max_db_size_mb: u64,
     pub max_file_size_kb: u64,
+    pub snapshot_external_changes: bool,
 }
 
 impl Settings for LocalHistorySettings {
@@ -43,6 +44,9 @@ impl Settings for LocalHistorySettings {
                 .unwrap_or(2048)
                 // A larger file could be recorded but never read back.
                 .min(store::MAX_CONTENT_BYTES / 1024),
+            snapshot_external_changes: history
+                .and_then(|settings| settings.snapshot_external_changes)
+                .unwrap_or(true),
         }
     }
 }

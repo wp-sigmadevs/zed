@@ -39,7 +39,7 @@ pub(crate) fn init(cx: &mut App) {
 
 /// Why a file is not restored. Shown to the user as the status text.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum Refusal {
+enum Refusal {
     NotLocal,
     Untrusted,
     FolderGone,
@@ -74,9 +74,11 @@ impl fmt::Display for Refusal {
 
 /// A file with history that is gone from its folder.
 #[derive(Clone, Debug)]
-pub(crate) struct Deleted {
-    pub worktree_id: WorktreeId,
-    pub revision: Revision,
+struct Deleted {
+    worktree_id: WorktreeId,
+    /// The folder's name, shown when more than one folder is open.
+    folder: SharedString,
+    revision: Revision,
 }
 
 /// Running a project's files is trusting it: only in a worktree the user trusts.
@@ -94,7 +96,7 @@ fn worktree_trusted(project: &Entity<Project>, worktree_id: WorktreeId, cx: &mut
 /// A recorded path as a [`RelPath`], or `BadPath`. Strict: empty, absolute, `.`,
 /// `..`, repeated, leading or trailing separators, backslashes, NUL and anything
 /// inside `.git` are all refused.
-pub(crate) fn validate_rel(rel_path: &str) -> Result<&RelPath, Refusal> {
+fn validate_rel(rel_path: &str) -> Result<&RelPath, Refusal> {
     if rel_path.is_empty() || rel_path.contains(['\0', '\\']) {
         return Err(Refusal::BadPath);
     }
@@ -170,6 +172,7 @@ fn listed(
         return Vec::new();
     };
     let worktree = worktree.read(cx);
+    let folder: SharedString = worktree.root_name_str().to_owned().into();
     revisions
         .into_iter()
         .filter(|revision| {
@@ -179,6 +182,7 @@ fn listed(
         })
         .map(|revision| Deleted {
             worktree_id,
+            folder: folder.clone(),
             revision,
         })
         .collect()
@@ -221,9 +225,6 @@ fn prepare(
     revision: &Revision,
     cx: &mut App,
 ) -> Result<Prepared, Refusal> {
-    if !project.read(cx).is_local() {
-        return Err(Refusal::NotLocal);
-    }
     let worktree = project
         .read(cx)
         .worktree_for_id(worktree_id, cx)
@@ -232,10 +233,16 @@ fn prepare(
             worktree.is_visible() && worktree.root_entry().is_some_and(|entry| entry.is_dir())
         })
         .ok_or(Refusal::FolderGone)?;
+    // Not a flag that could be wrong: only a local worktree has a path on this
+    // machine, and the folder to write into is taken from it.
+    let root = worktree
+        .read(cx)
+        .as_local()
+        .map(|local| local.abs_path().clone())
+        .ok_or(Refusal::NotLocal)?;
     if !worktree_trusted(project, worktree_id, cx) {
         return Err(Refusal::Untrusted);
     }
-    let root = worktree.read(cx).abs_path();
     // The folder is looked up by the caller's id, never by the recorded root.
     if capture::root_key(&root).as_deref() != Some(revision.worktree_root.as_str()) {
         return Err(Refusal::BadPath);
@@ -261,6 +268,14 @@ fn prepare(
     })
 }
 
+/// The muted second line of a row; names the folder when several are open.
+fn row_detail(when: &str, folder: Option<&str>) -> String {
+    match folder {
+        Some(folder) => format!("Last revision {when} · {folder}"),
+        None => format!("Last revision {when}"),
+    }
+}
+
 fn io(error: impl fmt::Display) -> Refusal {
     Refusal::Io(error.to_string())
 }
@@ -269,8 +284,10 @@ fn io(error: impl fmt::Display) -> Refusal {
 /// component may be a symbolic link, nothing may exist at the target, and the
 /// deepest existing folder must resolve to a place inside the root. Only plain
 /// names remain to be created, so the parents stay inside the folder.
-// ponytail: a path component swapped for a symlink between these checks and the
-// write is not detected; that needs a local attacker racing the user.
+// ponytail: a folder component swapped for a symlink between the walk and the write
+// is not detected (the file itself is safe, see the write step); that needs a local
+// attacker racing the user. The canonical check above is a backstop for it and for a
+// root that is not what it seems, not the main defence: the walk is.
 async fn write_new(
     fs: &dyn Fs,
     root: PathBuf,
@@ -315,7 +332,14 @@ async fn write_new(
     {
         fs.create_dir(parent).await.map_err(io)?;
     }
-    // `overwrite: false` and not ignoring an existing file: fails if anything is there.
+    // Recorded text is always UTF-8; anything else is not a revision of ours.
+    let text = String::from_utf8(bytes).map_err(io)?;
+    // `Fs` cannot write through the handle that creates the file, so two steps. The
+    // first is exclusive (`O_EXCL`): it fails if anything is there, a dangling symlink
+    // included, and never follows a link. The second is a temporary file renamed over
+    // the name, which replaces whatever is at the name now, a link swapped in since,
+    // and never writes through it (a plain `write` reopens by path and would).
+    // Side effect: the file gets the temporary file's private mode (0600).
     fs.create_file(
         &target,
         CreateOptions {
@@ -325,7 +349,7 @@ async fn write_new(
     )
     .await
     .map_err(io)?;
-    if let Err(error) = fs.write(&target, &bytes).await {
+    if let Err(error) = fs.atomic_write(target.clone(), text).await {
         fs.remove_file(&target, RemoveOptions::default()).await.ok();
         return Err(io(error));
     }
@@ -333,7 +357,7 @@ async fn write_new(
 }
 
 /// Writes `revision` back as a new file in the folder. Never overwrites.
-pub(crate) fn restore(
+fn restore(
     project: &Entity<Project>,
     worktree_id: WorktreeId,
     revision: &Revision,
@@ -371,6 +395,7 @@ fn open(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspa
         });
         let load = match eligible {
             Ok(folders) => {
+                let several = folders.len() > 1;
                 let found = load(project, folders, cx);
                 let picker = picker.downgrade();
                 cx.spawn_in(window, async move |_, cx| {
@@ -378,6 +403,7 @@ fn open(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspa
                     picker
                         .update_in(cx, |picker, window, cx| {
                             picker.delegate.loading = false;
+                            picker.delegate.several_folders = several;
                             picker.delegate.entries = deleted;
                             picker.refresh(window, cx);
                         })
@@ -393,7 +419,7 @@ fn open(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspa
     });
 }
 
-pub(crate) struct RecoverModal {
+struct RecoverModal {
     picker: Entity<Picker<RecoverDelegate>>,
     _load: Task<()>,
 }
@@ -410,18 +436,22 @@ impl Focusable for RecoverModal {
 impl Render for RecoverModal {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         v_flex()
-            .key_context("LocalHistoryRecover")
+            .id("zenith-recover-modal")
+            .role(Role::Dialog)
+            .aria_label("Recover deleted files")
             .child(self.picker.clone())
     }
 }
 
-pub(crate) struct RecoverDelegate {
+struct RecoverDelegate {
     modal: WeakEntity<RecoverModal>,
     project: Entity<Project>,
     entries: Vec<Deleted>,
     matches: Vec<StringMatch>,
     selected: usize,
     loading: bool,
+    /// More than one folder is open, so a row names its folder.
+    several_folders: bool,
     blocked: Option<Refusal>,
     /// What the last restore did or why it did not; read out by screen readers.
     status: Option<SharedString>,
@@ -441,6 +471,7 @@ impl RecoverDelegate {
             matches: Vec::new(),
             selected: 0,
             loading: blocked.is_none(),
+            several_folders: false,
             blocked,
             status: None,
             busy: false,
@@ -458,6 +489,8 @@ impl RecoverDelegate {
         }
         match &self.blocked {
             Some(refusal) => refusal.to_string().into(),
+            None if self.loading => "Looking for deleted files…".into(),
+            None if self.entries.is_empty() => "No deleted files to restore.".into(),
             None => "Enter restores the selected file. Escape closes.".into(),
         }
     }
@@ -517,7 +550,8 @@ impl PickerDelegate for RecoverDelegate {
 
     fn confirm(&mut self, _: bool, window: &mut Window, cx: &mut Context<Picker<Self>>) {
         if self.busy {
-            return;
+            self.status = Some("Still restoring. Wait for it to finish.".into());
+            return cx.notify();
         }
         if let Some(refusal) = &self.blocked {
             self.status = Some(refusal.to_string().into());
@@ -581,20 +615,22 @@ impl PickerDelegate for RecoverDelegate {
         let file = self.entries.get(found.candidate_id)?;
         let when = format_time(file.revision.ts);
         let path = file.revision.rel_path.clone();
+        let detail = row_detail(&when, self.several_folders.then_some(&*file.folder));
         Some(
             ListItem::new(("zenith-recover-row", ix))
                 .inset(true)
                 .spacing(ListItemSpacing::Sparse)
                 .toggle_state(selected)
                 .aria_role(Role::ListItem)
-                .aria_label(format!("{path}, last revision {when}"))
+                .aria_label(format!("{path}, {detail}"))
+                .when(selected, |item| item.aria_active_descendant())
                 .child(
                     v_flex()
                         .w_full()
                         .min_w_0()
                         .child(HighlightedLabel::new(path, found.positions.clone()).truncate())
                         .child(
-                            Label::new(format!("Last revision {when}"))
+                            Label::new(detail)
                                 .color(Color::Muted)
                                 .size(LabelSize::Small),
                         ),

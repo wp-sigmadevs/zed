@@ -1,10 +1,10 @@
-use super::{RecoverDelegate, RecoverModal, Refusal, restore, validate_rel, write_new};
+use super::{RecoverDelegate, RecoverModal, Refusal, restore, row_detail, validate_rel, write_new};
 use crate::{
     Revision, Store, capture,
     tests::{configure, history_dir},
 };
 use fs::{FakeFs, Fs as _};
-use gpui::{BorrowAppContext as _, Entity, TestAppContext, VisualTestContext};
+use gpui::{BorrowAppContext as _, Entity, Focusable as _, TestAppContext, VisualTestContext};
 use project::Project;
 use serde_json::json;
 use settings::{KeymapFile, KeymapFileLoadResult, SettingsStore};
@@ -39,12 +39,16 @@ impl Fixture {
 
     /// A revision of `rel_path` (text `text`, time `ts`) in the history database.
     fn seed(&self, rel_path: &str, text: &str, ts: i64) -> Revision {
+        self.seed_in("/dir", rel_path, text, ts)
+    }
+
+    fn seed_in(&self, root: &str, rel_path: &str, text: &str, ts: i64) -> Revision {
         let store = self.store();
         store
-            .record("/dir", rel_path, text.as_bytes(), None, "save", ts)
+            .record(root, rel_path, text.as_bytes(), None, "save", ts)
             .expect("record");
         store
-            .revisions("/dir", rel_path)
+            .revisions(root, rel_path)
             .expect("revisions")
             .remove(0)
     }
@@ -62,6 +66,16 @@ impl Fixture {
 /// `trust == false` the folder is untrusted.
 async fn fixture(
     files: serde_json::Value,
+    trust: bool,
+    cx: &mut TestAppContext,
+) -> (Fixture, &mut VisualTestContext) {
+    fixture_with_folders(files, None, trust, cx).await
+}
+
+/// Like [`fixture`], with a second folder `/dir2` holding `second` when it is given.
+async fn fixture_with_folders(
+    files: serde_json::Value,
+    second: Option<serde_json::Value>,
     trust: bool,
     cx: &mut TestAppContext,
 ) -> (Fixture, &mut VisualTestContext) {
@@ -92,7 +106,12 @@ async fn fixture(
     });
     let fs = app_state.fs.as_fake();
     fs.insert_tree("/dir", files).await;
-    let project = Project::test(app_state.fs.clone(), [Path::new("/dir")], cx).await;
+    let mut roots = vec![Path::new("/dir")];
+    if let Some(second) = second {
+        fs.insert_tree("/dir2", second).await;
+        roots.push(Path::new("/dir2"));
+    }
+    let project = Project::test(app_state.fs.clone(), roots, cx).await;
     let (multi_workspace, cx) =
         cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
     let workspace = multi_workspace.read_with(cx, |multi, _| multi.workspace().clone());
@@ -504,4 +523,144 @@ async fn test_restore_refuses_a_revision_of_another_folder(cx: &mut TestAppConte
         Err(Refusal::BadPath)
     );
     assert!(!fixture.exists("/dir/a.txt"));
+}
+
+fn picker_has_focus(modal: &Entity<RecoverModal>, cx: &mut VisualTestContext) -> bool {
+    let handle = modal.read_with(cx, |modal, cx| modal.focus_handle(cx));
+    cx.update(|window, cx| handle.contains_focused(window, cx))
+}
+
+#[gpui::test]
+async fn test_recover_moves_with_the_arrow_keys_and_restores_the_second_file(
+    cx: &mut TestAppContext,
+) {
+    let (fixture, cx) = fixture(json!({}), true, cx).await;
+    fixture.seed("first.txt", "one", 2);
+    fixture.seed("second.txt", "two", 1);
+    let modal = open_modal(&fixture, cx);
+    assert_eq!(listed_paths(&modal, cx), ["first.txt", "second.txt"]);
+    cx.simulate_keystrokes("down");
+    cx.run_until_parked();
+    assert_eq!(with_delegate(&modal, cx, |delegate| delegate.selected), 1);
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert_eq!(fixture.text("/dir/second.txt").await, "two");
+    assert!(!fixture.exists("/dir/first.txt"));
+    // Up and Enter again restores the other one.
+    cx.simulate_keystrokes("up enter");
+    cx.run_until_parked();
+    assert_eq!(fixture.text("/dir/first.txt").await, "one");
+}
+
+#[gpui::test]
+async fn test_recover_takes_focus_and_gives_it_back(cx: &mut TestAppContext) {
+    let (fixture, cx) = fixture(json!({}), true, cx).await;
+    fixture.seed("a.txt", "a", 1);
+    let before = cx.update(|window, cx| {
+        fixture
+            .workspace
+            .read(cx)
+            .focus_handle(cx)
+            .contains_focused(window, cx)
+    });
+    let modal = open_modal(&fixture, cx);
+    assert!(
+        picker_has_focus(&modal, cx),
+        "the picker has focus when it opens"
+    );
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(!picker_has_focus(&modal, cx));
+    let after = cx.update(|window, cx| {
+        fixture
+            .workspace
+            .read(cx)
+            .focus_handle(cx)
+            .contains_focused(window, cx)
+    });
+    assert_eq!(before, after, "focus returns to where it was");
+}
+
+#[gpui::test]
+async fn test_confirm_while_restoring_says_to_wait(cx: &mut TestAppContext) {
+    let (fixture, cx) = fixture(json!({}), true, cx).await;
+    fixture.seed("a.txt", "a", 1);
+    let modal = open_modal(&fixture, cx);
+    modal.update(cx, |modal, cx| {
+        modal
+            .picker
+            .update(cx, |picker, _| picker.delegate.busy = true)
+    });
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert_eq!(
+        status(&modal, cx),
+        "Still restoring. Wait for it to finish."
+    );
+    assert!(
+        !fixture.exists("/dir/a.txt"),
+        "nothing was written while busy"
+    );
+}
+
+#[gpui::test]
+async fn test_the_footer_says_what_the_list_is_doing(cx: &mut TestAppContext) {
+    let (fixture, cx) = fixture(json!({}), true, cx).await;
+    let modal = open_modal(&fixture, cx);
+    assert_eq!(status(&modal, cx), "No deleted files to restore.");
+    // While the list is still being read.
+    modal.update(cx, |modal, cx| {
+        modal
+            .picker
+            .update(cx, |picker, _| picker.delegate.loading = true)
+    });
+    assert_eq!(status(&modal, cx), "Looking for deleted files…");
+    cx.simulate_keystrokes("escape");
+    fixture.seed("a.txt", "a", 1);
+    let modal = open_modal(&fixture, cx);
+    assert_eq!(
+        status(&modal, cx),
+        "Enter restores the selected file. Escape closes."
+    );
+}
+
+#[test]
+fn test_row_detail_names_the_folder_only_when_asked() {
+    assert_eq!(row_detail("today", None), "Last revision today");
+    assert_eq!(
+        row_detail("today", Some("theme")),
+        "Last revision today · theme"
+    );
+}
+
+#[gpui::test]
+async fn test_rows_name_their_folder_when_several_are_open(cx: &mut TestAppContext) {
+    let (fixture, cx) = fixture_with_folders(json!({}), Some(json!({})), true, cx).await;
+    fixture.seed_in("/dir", "a.txt", "a", 2);
+    fixture.seed_in("/dir2", "a.txt", "b", 1);
+    let modal = open_modal(&fixture, cx);
+    let rows = with_delegate(&modal, cx, |delegate| {
+        (
+            delegate.several_folders,
+            delegate
+                .entries
+                .iter()
+                .map(|entry| entry.folder.to_string())
+                .collect::<Vec<_>>(),
+        )
+    });
+    assert_eq!(rows, (true, vec!["dir".to_string(), "dir2".to_string()]));
+    // The second folder's file is restored into the second folder.
+    cx.simulate_keystrokes("down enter");
+    cx.run_until_parked();
+    assert_eq!(fixture.text("/dir2/a.txt").await, "b");
+    assert!(!fixture.exists("/dir/a.txt"));
+}
+
+#[gpui::test]
+async fn test_rows_do_not_name_the_folder_when_one_is_open(cx: &mut TestAppContext) {
+    let (fixture, cx) = fixture(json!({}), true, cx).await;
+    fixture.seed("a.txt", "a", 1);
+    let modal = open_modal(&fixture, cx);
+    assert!(!with_delegate(&modal, cx, |delegate| delegate.several_folders));
 }

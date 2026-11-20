@@ -98,4 +98,9 @@ pub struct ZenithLocalHistorySettingsContent {
     ///
     /// Default: 2048
     pub max_file_size_kb: Option<u64>,
+    /// Whether a change made to a file on disk by something else (a git
+    /// checkout, a formatter, another tool) is recorded as a revision.
+    ///
+    /// Default: true
+    pub snapshot_external_changes: Option<bool>,
 }
