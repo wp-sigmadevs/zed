@@ -303,7 +303,7 @@ pub(crate) fn is_viewable(file: &worktree::File, cx: &App) -> bool {
         })
 }
 
-fn capture(buffer: &gpui::Entity<Buffer>, source: &'static str, cx: &mut App) {
+pub(crate) fn capture(buffer: &gpui::Entity<Buffer>, source: &'static str, cx: &mut App) {
     let Some(history) = cx.try_global::<LocalHistory>() else {
         return;
     };

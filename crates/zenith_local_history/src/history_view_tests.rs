@@ -490,3 +490,172 @@ async fn test_history_view_shows_why_the_diff_could_not_be_built(cx: &mut TestAp
         Some("Could not compare: boom")
     );
 }
+
+/// Opens the history of a.txt (three saved revisions, newest "21base") and selects
+/// the oldest, "base", waiting until its text is loaded.
+async fn history_on_the_oldest_revision(
+    fixture: &Fixture,
+    cx: &mut VisualTestContext,
+) -> (Entity<LocalHistoryView>, Entity<Buffer>) {
+    let buffer = open_and_save(fixture, "a.txt", &["1", "2"], cx).await;
+    // Tests group nothing by default; real editing groups edits typed close together.
+    buffer.update(cx, |buffer, _| {
+        buffer.set_group_interval(Duration::from_secs(300))
+    });
+    cx.simulate_keystrokes("alt-shift-h");
+    cx.run_until_parked();
+    let view = history_view(fixture, cx);
+    cx.simulate_keystrokes("down down");
+    cx.run_until_parked();
+    assert_eq!(view.read_with(cx, |view, _| view.selected), 2);
+    assert_eq!(
+        view.read_with(cx, |view, _| view.revision_text.clone())
+            .as_deref(),
+        Some("base")
+    );
+    (view, buffer)
+}
+
+fn clipboard_text(cx: &mut VisualTestContext) -> Option<String> {
+    cx.read_from_clipboard().and_then(|item| item.text())
+}
+
+#[gpui::test]
+async fn test_history_view_revert_replaces_the_text_in_one_undoable_edit(cx: &mut TestAppContext) {
+    let (fixture, cx) = fixture(true, cx).await;
+    let (view, buffer) = history_on_the_oldest_revision(&fixture, cx).await;
+    // An unsaved edit: reverting must not lose it.
+    buffer.update(cx, |buffer, cx| buffer.edit([(0..0, "Z")], None, cx));
+    assert_eq!(buffer.read_with(cx, |b, _| b.text()), "Z21base");
+
+    cx.dispatch_action(zed_actions::zenith_local_history::RevertToRevision);
+    cx.run_until_parked();
+
+    assert_eq!(buffer.read_with(cx, |b, _| b.text()), "base");
+    assert!(
+        buffer.read_with(cx, |b, _| b.is_dirty()),
+        "saved by the user, not by revert"
+    );
+    let on_disk = project::Fs::load(
+        fixture
+            .project
+            .read_with(cx, |p, _| p.fs().clone())
+            .as_ref(),
+        Path::new("/dir/a.txt"),
+    )
+    .await
+    .expect("load");
+    assert_eq!(on_disk, "21base", "revert must not write the file");
+
+    // The unsaved text is kept as a labelled revision.
+    let entries = cx
+        .update(|_, cx| capture::list(cx, "/dir".into(), "a.txt".into()))
+        .await
+        .expect("list");
+    let newest = &entries[0].revision;
+    assert_eq!(newest.source, "before-revert");
+    assert_eq!(super::source_name(&newest.source), "Before revert");
+    drop(view);
+
+    // One undo brings the unsaved text back.
+    buffer.update(cx, |buffer, cx| buffer.undo(cx));
+    assert_eq!(buffer.read_with(cx, |b, _| b.text()), "Z21base");
+}
+
+#[gpui::test]
+async fn test_history_view_revert_works_from_the_diff_pane_and_keeps_later_typing_separate(
+    cx: &mut TestAppContext,
+) {
+    let (fixture, cx) = fixture(true, cx).await;
+    let (_view, buffer) = history_on_the_oldest_revision(&fixture, cx).await;
+    cx.simulate_keystrokes("enter"); // focus moves into the diff pane
+
+    cx.dispatch_action(zed_actions::zenith_local_history::RevertToRevision);
+    cx.run_until_parked();
+    assert_eq!(buffer.read_with(cx, |b, _| b.text()), "base");
+
+    // Typing afterwards is its own undo step: undo removes it, not the revert.
+    buffer.update(cx, |buffer, cx| buffer.edit([(0..0, "Q")], None, cx));
+    buffer.update(cx, |buffer, cx| buffer.undo(cx));
+    assert_eq!(buffer.read_with(cx, |b, _| b.text()), "base");
+    buffer.update(cx, |buffer, cx| buffer.undo(cx));
+    assert_eq!(buffer.read_with(cx, |b, _| b.text()), "21base");
+}
+
+#[gpui::test]
+async fn test_history_view_copy_puts_the_revision_text_on_the_clipboard(cx: &mut TestAppContext) {
+    let (fixture, cx) = fixture(true, cx).await;
+    let (_view, buffer) = history_on_the_oldest_revision(&fixture, cx).await;
+    cx.write_to_clipboard(gpui::ClipboardItem::new_string("sentinel".into()));
+
+    cx.dispatch_action(zed_actions::zenith_local_history::CopyRevisionText);
+    cx.run_until_parked();
+
+    assert_eq!(clipboard_text(cx).as_deref(), Some("base"));
+    assert_eq!(buffer.read_with(cx, |b, _| b.text()), "21base");
+}
+
+#[gpui::test]
+async fn test_history_view_revert_and_copy_do_nothing_when_the_file_is_no_longer_viewable(
+    cx: &mut TestAppContext,
+) {
+    let (fixture, cx) = fixture(true, cx).await;
+    let (view, buffer) = history_on_the_oldest_revision(&fixture, cx).await;
+    assert!(view.read_with(cx, |view, cx| view.revision_to_use(cx).is_some()));
+    cx.write_to_clipboard(gpui::ClipboardItem::new_string("sentinel".into()));
+    cx.update(|_, cx| {
+        cx.update_global::<SettingsStore, _>(|store, cx| {
+            store.update_user_settings(cx, |content| {
+                content.project.worktree.private_files = Some(vec!["**/a.txt".to_string()].into());
+            });
+        });
+    });
+
+    // The text is loaded, the gate alone refuses.
+    assert!(view.read_with(cx, |view, _| view.revision_text.is_some()));
+    assert!(view.read_with(cx, |view, cx| view.revision_to_use(cx).is_none()));
+    cx.dispatch_action(zed_actions::zenith_local_history::RevertToRevision);
+    cx.dispatch_action(zed_actions::zenith_local_history::CopyRevisionText);
+    cx.run_until_parked();
+
+    assert_eq!(buffer.read_with(cx, |b, _| b.text()), "21base");
+    assert!(!buffer.read_with(cx, |b, _| b.is_dirty()));
+    assert_eq!(clipboard_text(cx).as_deref(), Some("sentinel"));
+}
+
+#[gpui::test]
+async fn test_history_view_revert_and_copy_do_nothing_without_a_selected_loaded_revision(
+    cx: &mut TestAppContext,
+) {
+    // No history at all: nothing is selected.
+    let (fixture, cx) = fixture(false, cx).await;
+    let buffer = open_and_save(&fixture, "a.txt", &["1"], cx).await;
+    cx.simulate_keystrokes("alt-shift-h");
+    cx.run_until_parked();
+    let view = history_view(&fixture, cx);
+    cx.write_to_clipboard(gpui::ClipboardItem::new_string("sentinel".into()));
+    cx.dispatch_action(zed_actions::zenith_local_history::RevertToRevision);
+    cx.dispatch_action(zed_actions::zenith_local_history::CopyRevisionText);
+    cx.run_until_parked();
+    assert!(view.read_with(cx, |view, cx| view.revision_to_use(cx).is_none()));
+    assert_eq!(buffer.read_with(cx, |b, _| b.text()), "1base");
+    assert!(!buffer.read_with(cx, |b, _| b.is_dirty()));
+    assert_eq!(clipboard_text(cx).as_deref(), Some("sentinel"));
+}
+
+#[gpui::test]
+async fn test_history_view_revert_and_copy_do_nothing_until_the_revision_is_loaded(
+    cx: &mut TestAppContext,
+) {
+    let (fixture, cx) = fixture(true, cx).await;
+    let (view, buffer) = history_on_the_oldest_revision(&fixture, cx).await;
+    view.update(cx, |view, _| view.revision_text = None); // as while a selection loads
+    cx.write_to_clipboard(gpui::ClipboardItem::new_string("sentinel".into()));
+
+    cx.dispatch_action(zed_actions::zenith_local_history::RevertToRevision);
+    cx.dispatch_action(zed_actions::zenith_local_history::CopyRevisionText);
+    cx.run_until_parked();
+
+    assert_eq!(buffer.read_with(cx, |b, _| b.text()), "21base");
+    assert_eq!(clipboard_text(cx).as_deref(), Some("sentinel"));
+}
