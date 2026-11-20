@@ -1,0 +1,1 @@
+{"totals":{"errors":0,"file_errors":1},"files":{"/project/src/a.php":{"errors":1,"messages":[{"message":"Undefined variable: $undefined_new","line":6,"ignorable":true,"identifier":"variable.undefined"}]}},"errors":[]}

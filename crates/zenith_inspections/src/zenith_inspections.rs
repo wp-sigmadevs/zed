@@ -18,6 +18,7 @@ use util::ResultExt as _;
 use workspace::Workspace;
 use zenith_php_tools::{ProjectKind, Tool};
 
+pub mod since_branch;
 mod suppress;
 pub use suppress::{SuppressProvider, suppression_edit};
 
@@ -281,6 +282,9 @@ pub fn parse_phpstan(output: &str) -> Result<Vec<Problem>> {
     Ok(problems)
 }
 
+/// PHPStan's identifier for "Ignored error pattern ... was not matched".
+const IGNORE_UNMATCHED: &str = "ignore.unmatched";
+
 fn phpstan_files(report: PhpstanReport) -> Vec<Problem> {
     report
         .files
@@ -288,7 +292,13 @@ fn phpstan_files(report: PhpstanReport) -> Vec<Problem> {
         .flat_map(|(path, file)| {
             // Trait errors arrive as "/x/T.php (in context of class C)".
             let path = PathBuf::from(path.split(" (in context of").next().unwrap_or(&path));
-            file.messages.into_iter().map(move |message| Problem {
+            // A stale baseline entry is housekeeping, not a problem in the code
+            // (whole-project runs report it as a line-less file message).
+            let messages = file
+                .messages
+                .into_iter()
+                .filter(|message| message.identifier.as_deref() != Some(IGNORE_UNMATCHED));
+            messages.map(move |message| Problem {
                 path: path.clone(),
                 line: message.line.unwrap_or(1),
                 column: 1,
@@ -562,6 +572,7 @@ async fn git_changes(root: &Path) -> Result<(PathBuf, String), String> {
         let root = root.to_path_buf();
         async move {
             util::command::new_command("git")
+                .args(since_branch::GIT_HARDENING)
                 .args(args)
                 .current_dir(&root)
                 .output()

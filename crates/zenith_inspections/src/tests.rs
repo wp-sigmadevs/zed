@@ -5,6 +5,12 @@ use std::{fs, os::unix::fs::PermissionsExt as _};
 const PHPCS: &str = include_str!("../fixtures/phpcs-wordpress.json");
 const PHPSTAN: &str = include_str!("../fixtures/phpstan.json");
 
+// Real PHPStan 2.1.40 runs over src/a.php (two undefined variables, one in
+// phpstan-baseline.neon) with paths rewritten to /project.
+const PHPSTAN_BASELINE_SINGLE: &str = include_str!("../fixtures/phpstan-baseline-single-file.json");
+const PHPSTAN_BASELINE_WHOLE: &str =
+    include_str!("../fixtures/phpstan-baseline-whole-project.json");
+
 #[test]
 fn test_phpcs_report_after_php_deprecation_notices() {
     let problems = parse_phpcs(PHPCS).unwrap();
@@ -52,6 +58,29 @@ fn test_phpstan_report_with_trait_context_and_tip() {
         ]
     );
     assert!(problems[2].message.ends_with("discovering-symbols"));
+}
+
+#[test]
+fn test_phpstan_baseline_hides_ignored_findings() {
+    // The baseline entry for `$undefined_old` is gone from the report; only the
+    // finding outside the baseline reaches the editor.
+    let problems = parse_phpstan(PHPSTAN_BASELINE_SINGLE).unwrap();
+    assert_eq!(problems.len(), 1);
+    assert_eq!(problems[0].message, "Undefined variable: $undefined_new");
+    assert_eq!(problems[0].line, 6);
+    // A fully baselined file is an empty report.
+    let clean = r#"{"totals":{"errors":0,"file_errors":0},"files":{},"errors":[]}"#;
+    assert_eq!(parse_phpstan(clean).unwrap(), Vec::new());
+}
+
+#[test]
+fn test_phpstan_baseline_unmatched_patterns() {
+    // Whole-project runs put a path-scoped stale entry in the file's messages
+    // (`ignore.unmatched`, no line) and a global one in top-level `errors`.
+    // Neither becomes a problem; single-file runs report neither.
+    let problems = parse_phpstan(PHPSTAN_BASELINE_WHOLE).unwrap();
+    assert_eq!(problems.len(), 1);
+    assert_eq!(problems[0].rule.as_deref(), Some("variable.undefined"));
 }
 
 #[test]
