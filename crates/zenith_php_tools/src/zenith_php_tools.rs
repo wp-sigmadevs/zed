@@ -43,19 +43,24 @@ fn top_level_php_files(root: &Path) -> impl Iterator<Item = PathBuf> {
 
 /// Up to `max` bytes of a regular file, symlinks followed. `None` for a device,
 /// pipe, folder or unreadable path: a project can plant `x.php -> /dev/zero`,
-/// and an unbounded read of it never ends. A FIFO is refused before it is opened,
-/// since opening one blocks.
+/// and an unbounded read of it never ends. The check is on the opened handle, so
+/// a path swapped for a pipe cannot slip through; the open is non-blocking (a
+/// plain open of a pipe with no writer blocks) and a regular file ignores that.
 pub fn read_regular(path: &Path, max: u64) -> Option<Vec<u8>> {
     use std::io::Read as _;
-    if !fs::metadata(path).ok()?.is_file() {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options.open(path).ok()?;
+    if !file.metadata().ok()?.is_file() {
         return None;
     }
     let mut bytes = Vec::new();
-    fs::File::open(path)
-        .ok()?
-        .take(max)
-        .read_to_end(&mut bytes)
-        .ok()?;
+    file.take(max).read_to_end(&mut bytes).ok()?;
     Some(bytes)
 }
 
@@ -1005,7 +1010,7 @@ mod tests {
         symlink("/dev/zero", dir.path().join("endless.php")).unwrap();
         assert_eq!(read_regular(&dir.path().join("endless.php"), 8192), None);
         assert_eq!(read_regular(dir.path(), 8192), None);
-        // A pipe would block the open; it is refused before that.
+        // A pipe with no writer would block a plain open; it is refused on the handle.
         #[allow(clippy::disallowed_methods, reason = "mkfifo has no std API")]
         let made = std::process::Command::new("mkfifo")
             .arg(dir.path().join("pipe.php"))
