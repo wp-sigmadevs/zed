@@ -284,10 +284,10 @@ fn io(error: impl fmt::Display) -> Refusal {
 /// component may be a symbolic link, nothing may exist at the target, and the
 /// deepest existing folder must resolve to a place inside the root. Only plain
 /// names remain to be created, so the parents stay inside the folder.
-// ponytail: a folder component swapped for a symlink between the walk and the write
-// is not detected (the file itself is safe, see the write step); that needs a local
-// attacker racing the user. The canonical check above is a backstop for it and for a
-// root that is not what it seems, not the main defence: the walk is.
+// ponytail: every check here is by path and the writes reopen by path, so the races
+// are narrowed, not closed. A folder component swapped for a symlink after the walk
+// is not detected (the file itself is safe, see the write step). That needs a local
+// attacker racing the user. The canonical check is a backstop, not the main defence.
 async fn write_new(
     fs: &dyn Fs,
     root: PathBuf,

@@ -129,3 +129,40 @@ async fn test_the_cap_counts_changed_files_not_every_entry(cx: &mut TestAppConte
     );
     fs.as_fake().unpause_events_and_flush();
 }
+
+#[cfg(unix)]
+mod unix {
+    use super::super::open_unix;
+    use std::{io::Read as _, os::unix::fs::MetadataExt as _, path::Path};
+
+    fn inode(path: &Path) -> u64 {
+        std::fs::symlink_metadata(path).expect("stat").ino()
+    }
+
+    #[test]
+    fn test_open_unix_opens_only_the_plain_file_that_was_checked() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let file = dir.path().join("a.txt");
+        let other = dir.path().join("b.txt");
+        let link = dir.path().join("link.txt");
+        std::fs::write(&file, "hello").expect("write");
+        std::fs::write(&other, "other").expect("write");
+        std::os::unix::fs::symlink(&other, &link).expect("symlink");
+
+        let mut text = String::new();
+        open_unix(&file, inode(&file), 100)
+            .expect("the control opens")
+            .read_to_string(&mut text)
+            .expect("read");
+        assert_eq!(text, "hello");
+        // A link at the name, even one the caller thought was the file (same inode as
+        // its target): `O_NOFOLLOW`.
+        assert!(open_unix(&link, inode(&other), 100).is_none());
+        // Not the file the earlier check saw.
+        assert!(open_unix(&file, inode(&other), 100).is_none());
+        // Over the cap, by the handle's own size.
+        assert!(open_unix(&file, inode(&file), 3).is_none());
+        // A folder is not a plain file.
+        assert!(open_unix(dir.path(), inode(dir.path()), u64::MAX).is_none());
+    }
+}

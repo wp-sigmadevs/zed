@@ -664,3 +664,63 @@ async fn test_rows_do_not_name_the_folder_when_one_is_open(cx: &mut TestAppConte
     let modal = open_modal(&fixture, cx);
     assert!(!with_delegate(&modal, cx, |delegate| delegate.several_folders));
 }
+
+/// Real disk, because the exclusive create is what the real `Fs` does, not FakeFs.
+#[cfg(unix)]
+#[gpui::test]
+async fn test_write_new_on_the_real_disk_never_replaces_and_writes_the_text(
+    cx: &mut TestAppContext,
+) {
+    cx.executor().allow_parking();
+    let fs = fs::RealFs::new(None, cx.executor());
+    let dir = tempfile::tempdir().expect("temp dir");
+    let root = dir.path().canonicalize().expect("canonical");
+    std::fs::write(root.join("exists.txt"), "mine").expect("write");
+    std::os::unix::fs::symlink(root.join("nowhere"), root.join("dangling.txt")).expect("symlink");
+    let rel = |name: &str| -> Arc<RelPath> { RelPath::from_unix_str(name).expect("rel").into() };
+    let text = || b"from history".to_vec();
+
+    assert_eq!(
+        write_new(fs.as_ref(), root.clone(), rel("exists.txt"), text()).await,
+        Err(Refusal::Exists)
+    );
+    assert_eq!(
+        write_new(fs.as_ref(), root.clone(), rel("dangling.txt"), text()).await,
+        Err(Refusal::Symlink)
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("exists.txt")).expect("read"),
+        "mine"
+    );
+    assert!(
+        !root.join("nowhere").exists(),
+        "nothing written through the link"
+    );
+
+    // The exclusive create itself, without the walk in front of it: this is the
+    // second layer, and it must refuse both too.
+    let exclusive = fs::CreateOptions {
+        overwrite: false,
+        ignore_if_exists: false,
+    };
+    assert!(
+        fs.create_file(&root.join("exists.txt"), exclusive)
+            .await
+            .is_err()
+    );
+    assert!(
+        fs.create_file(&root.join("dangling.txt"), exclusive)
+            .await
+            .is_err()
+    );
+    assert!(!root.join("nowhere").exists());
+
+    // The control: a new file in a new folder is written with the text.
+    write_new(fs.as_ref(), root.clone(), rel("new/dir/c.txt"), text())
+        .await
+        .expect("restored");
+    assert_eq!(
+        std::fs::read_to_string(root.join("new/dir/c.txt")).expect("read"),
+        "from history"
+    );
+}

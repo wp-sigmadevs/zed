@@ -243,8 +243,11 @@ async fn own_store(
 /// outside `root`; and for a file that is too large, binary or not UTF-8. The
 /// read is bounded by `max_bytes` whatever the file turns out to be.
 ///
-/// The main thread checked the entry before queueing this; a file can be swapped
-/// in between, so everything that matters is checked again on the disk, here.
+/// The main thread checked the entry before queueing this, and the checks here run
+/// again on the disk. That narrows the window for a file swapped in between; it does
+/// not close it: the checks are by path, and the read opens by path afterwards. On
+/// unix the open itself refuses a link and the handle is compared with the path
+/// (`open_unix`), which leaves only a swap between those last two steps.
 async fn read_text(fs: &dyn Fs, root: &Path, path: &Path, max_bytes: u64) -> Option<Vec<u8>> {
     let metadata = fs.metadata(path).await.ok().flatten()?;
     if metadata.is_symlink || metadata.is_dir || metadata.is_fifo || metadata.len > max_bytes {
@@ -265,8 +268,10 @@ async fn read_text(fs: &dyn Fs, root: &Path, path: &Path, max_bytes: u64) -> Opt
         return None;
     }
     // ponytail: a blocking read on this background thread, like the store calls.
-    let reader = fs.open_sync(path).await.ok()?;
-    let bytes = read_bounded(reader, max_bytes)?;
+    let bytes = match open_plain_file(fs, path, metadata.inode, max_bytes).await {
+        Some(reader) => read_bounded(reader, max_bytes)?,
+        None => return None,
+    };
     if bytes.contains(&0) {
         return None;
     }
@@ -276,6 +281,38 @@ async fn read_text(fs: &dyn Fs, root: &Path, path: &Path, max_bytes: u64) -> Opt
     }
     LineEnding::normalize(&mut text);
     Some(text.into_bytes())
+}
+
+async fn open_plain_file(
+    fs: &dyn Fs,
+    path: &Path,
+    inode: u64,
+    max_bytes: u64,
+) -> Option<Box<dyn std::io::Read + Send>> {
+    #[cfg(unix)]
+    if !fs.is_fake() {
+        return Some(Box::new(open_unix(path, inode, max_bytes)?));
+    }
+    let _ = (inode, max_bytes);
+    Some(Box::new(fs.open_sync(path).await.ok()?))
+}
+
+/// Opens `path` the way a file that may be swapped under us must be: no link
+/// followed at the last component (`O_NOFOLLOW`) and no wait on a pipe (`O_NONBLOCK`).
+/// The open handle must be a regular file within the size cap, the file the earlier
+/// check saw (`inode`), and still the file the path names now.
+#[cfg(unix)]
+fn open_unix(path: &Path, inode: u64, max_bytes: u64) -> Option<std::fs::File> {
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .ok()?;
+    let held = file.metadata().ok()?;
+    let named = std::fs::symlink_metadata(path).ok()?;
+    let same_file = (held.dev(), held.ino()) == (named.dev(), named.ino());
+    (held.is_file() && held.len() <= max_bytes && held.ino() == inode && same_file).then_some(file)
 }
 
 /// Everything `reader` holds, or `None` when it holds more than `max_bytes`
