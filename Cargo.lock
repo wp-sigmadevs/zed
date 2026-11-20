@@ -22941,6 +22941,7 @@ name = "zenith_inspections"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "db",
  "editor",
  "futures 0.3.34",
  "gpui",

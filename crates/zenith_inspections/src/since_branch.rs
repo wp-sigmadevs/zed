@@ -6,7 +6,9 @@
 //! (`core.fsmonitor`, hooks, `protocol.ext`), so the B2 caller (the "new since
 //! branch" filter) MUST gate on `zenith_php_tools::worktree_trusted` first, as
 //! `changed_php_files`/`collect_*` in `zenith_inspections.rs` do. The flags in
-//! `GIT_HARDENING` are defence in depth, not a substitute for that check.
+//! `GIT_HARDENING` are defence in depth only: they do NOT disable
+//! `filter.<name>.clean` / `filter.<name>.process` (run when git reads a changed
+//! file), so the trust gate is the only guard against those.
 
 use std::ops::Range;
 use std::path::{Path, PathBuf};

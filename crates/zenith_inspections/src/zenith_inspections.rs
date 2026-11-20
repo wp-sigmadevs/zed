@@ -3,6 +3,7 @@
 //! diagnostics and the project diagnostics view show them with no language server.
 
 use anyhow::{Context as _, Result};
+use futures::FutureExt as _;
 use gpui::{App, AppContext as _, Entity};
 use language::{Buffer, BufferEvent, DiagnosticSourceKind};
 use lsp::{DiagnosticSeverity, LanguageServerId, NumberOrString};
@@ -18,6 +19,7 @@ use util::ResultExt as _;
 use workspace::Workspace;
 use zenith_php_tools::{ProjectKind, Tool};
 
+mod new_since_branch;
 pub mod since_branch;
 mod suppress;
 pub use suppress::{SuppressProvider, suppression_edit};
@@ -529,7 +531,10 @@ gpui::actions!(
         /// Inspect Code on a file), whatever `run_on_save` says.
         InspectCurrentFile,
         /// Runs PHPCS and PHPStan on every PHP file in the project's trusted folders.
-        InspectProject
+        InspectProject,
+        /// Switches this project between all PHPCS/PHPStan findings and only those
+        /// on lines changed since the default branch.
+        ToggleNewSinceBranch
     ]
 );
 
@@ -653,6 +658,14 @@ fn inspect_changed_files(
         .filter(|(id, _)| zenith_php_tools::worktree_trusted(&project, *id, cx))
         .cloned()
         .collect();
+    // Trusted folders only; `base_branch` checks trust again before any git.
+    let trusted: Vec<_> = trusted
+        .into_iter()
+        .map(|(id, root)| {
+            let base = since_base_for(&project, id, cx);
+            (id, root, base)
+        })
+        .collect();
     if trusted.is_empty() {
         let message = if worktrees.is_empty() {
             "Open a folder first."
@@ -665,7 +678,30 @@ fn inspect_changed_files(
     cx.spawn_in(window, async move |workspace, cx| {
         let mut files = Vec::new();
         let mut problems = Vec::new();
-        for (worktree_id, root) in trusted {
+        let mut branch_note = None;
+        let mut bases = std::collections::HashMap::new();
+        for (worktree_id, root, base) in trusted {
+            if let Some(base) = base {
+                bases.insert(worktree_id, base.clone());
+                let branch_files = match base.await {
+                    Ok(base) => {
+                        cx.background_spawn({
+                            let root = root.clone();
+                            async move { since_branch::branch_php_files(&root, &base).await }
+                        })
+                        .await
+                    }
+                    Err(message) => Err(message),
+                };
+                match branch_files {
+                    Ok(branch_files) => {
+                        files.extend(branch_files.into_iter().map(|file| (worktree_id, file)))
+                    }
+                    Err(message) => {
+                        branch_note = Some(new_since_branch::listing_fallback_message(&message))
+                    }
+                }
+            }
             let changes = cx
                 .background_spawn({
                     let root = root.clone();
@@ -681,15 +717,31 @@ fn inspect_changed_files(
                 Err(message) => problems.push(message),
             }
         }
-        let message = match (files.len(), problems.first()) {
-            (0, Some(problem)) => problem.clone(),
-            (0, None) => "No changed PHP files.".to_string(),
-            (1, _) => "Inspecting 1 changed PHP file.".to_string(),
-            (count, _) => format!("Inspecting {count} changed PHP files."),
-        };
-        inspect_files(project, files, message, max_parallel, workspace, cx).await;
+        let mut seen = std::collections::HashSet::new();
+        files.retain(|file| seen.insert(file.clone()));
+        let message = changed_files_message(files.len(), problems.first(), branch_note);
+        inspect_files(project, files, message, max_parallel, bases, workspace, cx).await;
     })
     .detach();
+}
+
+/// The notice that starts "inspect changed files". A failed branch listing is
+/// added only when there is nothing to inspect: otherwise each run reports it.
+fn changed_files_message(
+    count: usize,
+    problem: Option<&String>,
+    branch_note: Option<String>,
+) -> String {
+    let message = match (count, problem) {
+        (0, Some(problem)) => problem.clone(),
+        (0, None) => "No changed PHP files.".to_string(),
+        (1, _) => "Inspecting 1 changed PHP file.".to_string(),
+        (count, _) => format!("Inspecting {count} changed PHP files."),
+    };
+    match (count, branch_note) {
+        (0, Some(note)) => format!("{message} {note}"),
+        _ => message,
+    }
 }
 
 /// Announces the run, inspects `files` at most `max_parallel` at a time, then shows
@@ -699,21 +751,36 @@ async fn inspect_files(
     files: Vec<(WorktreeId, PathBuf)>,
     message: String,
     max_parallel: usize,
+    mut bases: std::collections::HashMap<WorktreeId, new_since_branch::SharedBase>,
     workspace: gpui::WeakEntity<Workspace>,
     cx: &mut gpui::AsyncWindowContext,
 ) {
     workspace
         .update(cx, |workspace, cx| notify(workspace, message, cx))
         .log_err();
-    let errors: Vec<String> = run_limited(
+    // One base lookup per folder for the whole batch, not one per file.
+    let folders: std::collections::HashSet<WorktreeId> = files.iter().map(|(id, _)| *id).collect();
+    for worktree_id in folders {
+        if bases.contains_key(&worktree_id) {
+            continue;
+        }
+        if let Ok(Some(base)) = cx.update(|_, cx| since_base_for(&project, worktree_id, cx)) {
+            bases.insert(worktree_id, base);
+        }
+    }
+    let mut report = Report::default();
+    for each in run_limited(
         files
             .into_iter()
             .map(|(worktree_id, file)| {
                 let (project, mut cx) = (project.clone(), cx.clone());
+                let base = bases.get(&worktree_id).cloned();
                 move || async move {
-                    match cx.update(|_, cx| inspect_path(&project, worktree_id, file, cx)) {
+                    match cx
+                        .update(|_, cx| inspect_path_with(&project, worktree_id, file, base, cx))
+                    {
                         Ok(task) => task.await,
-                        Err(_) => Vec::new(),
+                        Err(_) => Report::default(),
                     }
                 }
             })
@@ -721,11 +788,12 @@ async fn inspect_files(
         max_parallel,
     )
     .await
-    .into_iter()
-    .flatten()
-    .collect();
+    {
+        report.errors.extend(each.errors);
+        report.notes.extend(each.notes);
+    }
     workspace
-        .update(cx, |workspace, cx| report_errors(workspace, errors, cx))
+        .update(cx, |workspace, cx| report_run(workspace, report, cx))
         .log_err();
 }
 
@@ -781,7 +849,16 @@ fn inspect_folder(
     };
     let max_parallel = InspectionSettings::get_global(cx).max_parallel;
     cx.spawn_in(window, async move |workspace, cx| {
-        inspect_files(project, files, message, max_parallel, workspace, cx).await;
+        inspect_files(
+            project,
+            files,
+            message,
+            max_parallel,
+            Default::default(),
+            workspace,
+            cx,
+        )
+        .await;
     })
     .detach();
 }
@@ -832,8 +909,16 @@ fn inspect_current_file(
     let files = vec![(project_path.worktree_id, abs_path)];
     let max_parallel = InspectionSettings::get_global(cx).max_parallel;
     cx.spawn_in(window, async move |workspace, cx| {
-        inspect_files(project, files, format!("Inspecting {name}."), max_parallel, workspace, cx)
-            .await;
+        inspect_files(
+            project,
+            files,
+            format!("Inspecting {name}."),
+            max_parallel,
+            Default::default(),
+            workspace,
+            cx,
+        )
+        .await;
     })
     .detach();
 }
@@ -892,19 +977,35 @@ fn inspect_project(
     };
     let max_parallel = InspectionSettings::get_global(cx).max_parallel;
     cx.spawn_in(window, async move |workspace, cx| {
-        inspect_files(project, files, message, max_parallel, workspace, cx).await;
+        inspect_files(
+            project,
+            files,
+            message,
+            max_parallel,
+            Default::default(),
+            workspace,
+            cx,
+        )
+        .await;
     })
     .detach();
 }
 
-/// Shows each distinct tool failure once per session, so a broken ruleset does not
-/// raise a notification on every save.
-fn report_errors(
-    workspace: &mut Workspace,
-    errors: Vec<String>,
-    cx: &mut gpui::Context<Workspace>,
-) {
-    let new = unseen_errors(&mut cx.default_global::<ShownErrors>().0, errors);
+/// What a run tells the user: tool failures, and notices that are not failures.
+#[derive(Default)]
+pub struct Report {
+    pub errors: Vec<String>,
+    pub notes: Vec<String>,
+}
+
+/// Shows each distinct tool failure and notice once per session, so a broken
+/// ruleset does not raise a notification on every save.
+fn report_run(workspace: &mut Workspace, report: Report, cx: &mut gpui::Context<Workspace>) {
+    let notes = unseen_errors(&mut cx.default_global::<ShownErrors>().0, report.notes);
+    if !notes.is_empty() {
+        notify_once::<ShownNotes>(workspace, notes.join("\n"), cx);
+    }
+    let new = unseen_errors(&mut cx.default_global::<ShownErrors>().0, report.errors);
     if !new.is_empty() {
         workspace.show_notification(
             workspace::notifications::NotificationId::unique::<ShownErrors>(),
@@ -923,6 +1024,27 @@ fn report_errors(
 
 #[derive(Default)]
 struct ShownErrors(std::collections::HashSet<String>);
+
+/// Id of the notice notification, apart from the failures one.
+struct ShownNotes;
+
+fn notify_once<Id: 'static>(
+    workspace: &mut Workspace,
+    message: String,
+    cx: &mut gpui::Context<Workspace>,
+) {
+    workspace.show_notification(
+        workspace::notifications::NotificationId::unique::<Id>(),
+        cx,
+        |cx| {
+            cx.new(|cx| {
+                workspace::notifications::simple_message_notification::MessageNotification::new(
+                    message, cx,
+                )
+            })
+        },
+    );
+}
 
 const PHP_NOT_FOUND: &str = "PHP was not found.";
 
@@ -1070,9 +1192,9 @@ fn fix_current_file(
                 if matches!(result, Ok(FixOutcome::Fixed | FixOutcome::FixedSome)) {
                     let run = inspect_path(&project, worktree_id, abs_path, cx);
                     cx.spawn(async move |workspace, cx| {
-                        let errors = run.await;
+                        let report = run.await;
                         workspace
-                            .update(cx, |workspace, cx| report_errors(workspace, errors, cx))
+                            .update(cx, |workspace, cx| report_run(workspace, report, cx))
                             .ok();
                     })
                     .detach();
@@ -1103,6 +1225,9 @@ pub fn init(cx: &mut App) {
         });
         workspace.register_action(|workspace, _: &InspectProject, window, cx| {
             inspect_project(workspace, window, cx)
+        });
+        workspace.register_action(|workspace, _: &ToggleNewSinceBranch, window, cx| {
+            new_since_branch::toggle(workspace, window, cx)
         });
         workspace.register_action(
             |workspace, _: &zed_actions::zenith_inspections::InspectFolder, window, cx| {
@@ -1203,9 +1328,9 @@ pub fn inspect(
     let task = cx.spawn({
         let key = key.clone();
         async move |cx| {
-            let errors = run.await;
+            let report = run.await;
             workspace
-                .update(cx, |workspace, cx| report_errors(workspace, errors, cx))
+                .update(cx, |workspace, cx| report_run(workspace, report, cx))
                 .ok();
             cx.update(|cx| {
                 let tasks = &mut cx.default_global::<Running>().tasks;
@@ -1228,20 +1353,45 @@ struct Running {
 
 impl gpui::Global for Running {}
 
+/// The default-branch lookup for a folder, when "new since branch" is on there.
+fn since_base_for(
+    project: &Entity<Project>,
+    worktree_id: WorktreeId,
+    cx: &mut App,
+) -> Option<new_since_branch::SharedBase> {
+    let worktree = project.read(cx).worktree_for_id(worktree_id, cx)?;
+    let root = worktree_folder(&worktree, cx);
+    new_since_branch::is_on(&root, cx)
+        .then(|| new_since_branch::base_branch(project, worktree_id, cx).shared())
+}
+
 /// Runs the analyzers on one file under a worktree root, open or not.
 pub fn inspect_path(
     project: &Entity<Project>,
     worktree_id: WorktreeId,
     abs_path: PathBuf,
     cx: &mut App,
-) -> gpui::Task<Vec<String>> {
+) -> gpui::Task<Report> {
+    let since_base = since_base_for(project, worktree_id, cx);
+    inspect_path_with(project, worktree_id, abs_path, since_base, cx)
+}
+
+/// `inspect_path` with the base already looked up (`Some` when "new since branch"
+/// is on), so a batch looks it up once.
+fn inspect_path_with(
+    project: &Entity<Project>,
+    worktree_id: WorktreeId,
+    abs_path: PathBuf,
+    since_base: Option<new_since_branch::SharedBase>,
+    cx: &mut App,
+) -> gpui::Task<Report> {
     let Some(worktree) = project.read(cx).worktree_for_id(worktree_id, cx) else {
-        return gpui::Task::ready(Vec::new());
+        return gpui::Task::ready(Report::default());
     };
     // Remote paths are not local files, and local tools must not run on them.
     if !project.read(cx).is_local() || !zenith_php_tools::worktree_trusted(project, worktree_id, cx)
     {
-        return gpui::Task::ready(Vec::new());
+        return gpui::Task::ready(Report::default());
     }
     let root = worktree_folder(&worktree, cx);
     let environment = tool_environment(cx);
@@ -1290,18 +1440,46 @@ pub fn inspect_path(
                         results.push((analyzer, result));
                     }
                 }
-                Ok((abs_path, results))
+                // The base lookup has been running beside the tools. Git only runs
+                // with a base, which `base_branch` gives trusted folders alone.
+                let mut base_note = None;
+                let new_lines = match since_base {
+                    Some(base) if !results.is_empty() => match base.await {
+                        Ok(base) => Some(since_branch::new_lines(&root, &base, &abs_path).await),
+                        Err(message) => {
+                            base_note = Some(new_since_branch::fallback_message(&message));
+                            None
+                        }
+                    },
+                    _ => None,
+                };
+                Ok((abs_path, results, new_lines, base_note))
             })
             .await;
-        let (abs_path, results) = match results {
+        let (abs_path, results, new_lines, base_note) = match results {
             Ok(found) => found,
             Err(abs_path) => {
                 cx.update(|cx| finish_generation(&abs_path, generation, cx));
                 log::warn!("inspections: PHP was not found");
-                return vec![PHP_NOT_FOUND.to_string()];
+                return Report {
+                    errors: vec![PHP_NOT_FOUND.to_string()],
+                    notes: Vec::new(),
+                };
             }
         };
-        let mut errors = Vec::new();
+        let mut report = Report {
+            errors: Vec::new(),
+            notes: base_note.into_iter().collect(),
+        };
+        let new_lines = match new_lines {
+            Some((new_lines, message)) => {
+                report
+                    .notes
+                    .extend(message.map(|message| new_since_branch::fallback_message(&message)));
+                new_lines
+            }
+            None => since_branch::NewLines::All,
+        };
         lsp_store.update(cx, |lsp_store, cx| {
             // A newer save of this file is running; its results win.
             if current_generation(&abs_path, cx) != generation {
@@ -1309,6 +1487,7 @@ pub fn inspect_path(
             }
             finish_generation(&abs_path, generation, cx);
             forget_errors(PHP_NOT_FOUND, cx);
+            let mut hidden = false;
             for analyzer in [Analyzer::Phpcs, Analyzer::Phpstan] {
                 // An analyzer that did not run (switched off, no tool, no config)
                 // clears its old findings; a failed run keeps them.
@@ -1316,18 +1495,23 @@ pub fn inspect_path(
                     None => Vec::new(),
                     Some((_, Ok(problems))) => {
                         forget_errors(analyzer.name(), cx);
-                        problems.clone()
+                        let shown = new_since_branch::keep_new(problems.clone(), &new_lines);
+                        hidden |= shown.len() < problems.len();
+                        shown
                     }
                     Some((_, Err(error))) => {
                         log::warn!("{}: {error:#}", analyzer.name());
-                        errors.push(format!("{}: {error:#}", analyzer.name()));
+                        report
+                            .errors
+                            .push(format!("{}: {error:#}", analyzer.name()));
                         continue;
                     }
                 };
                 push_diagnostics(lsp_store, analyzer, &abs_path, &mine, cx).log_err();
             }
+            new_since_branch::mark_hidden(&abs_path, hidden, cx);
         });
-        errors
+        report
     })
 }
 
