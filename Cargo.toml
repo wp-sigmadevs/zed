@@ -255,6 +255,7 @@ members = [
     "crates/zenith_external_libraries",
     "crates/zenith_laravel",
     "crates/zenith_nextjs",
+    "crates/zenith_postfix",
     "crates/zenith_refactor",
     "crates/zenith_welcome",
     "crates/zenith_wordpress",
@@ -536,6 +537,7 @@ zenith = { path = "crates/zenith" }
 zenith_external_libraries = { path = "crates/zenith_external_libraries" }
 zenith_laravel = { path = "crates/zenith_laravel" }
 zenith_nextjs = { path = "crates/zenith_nextjs" }
+zenith_postfix = { path = "crates/zenith_postfix" }
 zenith_refactor = { path = "crates/zenith_refactor" }
 zenith_welcome = { path = "crates/zenith_welcome" }
 zenith_wordpress = { path = "crates/zenith_wordpress" }

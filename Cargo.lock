@@ -22964,6 +22964,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "zenith_postfix"
+version = "0.1.0"
+dependencies = [
+ "collections",
+ "gpui",
+ "icons",
+ "log",
+ "pretty_assertions",
+ "schemars 1.0.4",
+ "serde",
+ "serde_json",
+ "settings",
+ "ui",
+ "util",
+ "workspace",
+]
+
+[[package]]
 name = "zenith_refactor"
 version = "0.1.0"
 dependencies = [
