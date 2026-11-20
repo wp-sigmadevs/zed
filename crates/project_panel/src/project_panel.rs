@@ -1151,7 +1151,7 @@ impl ProjectPanel {
             let is_dir = entry.is_dir();
             let is_foldable = auto_fold_dirs && self.is_foldable(entry, worktree);
             let is_unfoldable = auto_fold_dirs && self.is_unfoldable(entry, worktree);
-            let is_read_only = project.is_read_only(cx);
+            let is_read_only = project.is_read_only(cx) || zenith_external_libraries::is_external_library_entry(entry.id, &entry.path);
             let is_remote = project.is_remote();
             let is_collab = project.is_via_collab();
             let is_local = project.is_local() || project.is_via_wsl_with_host_interop(cx);
@@ -1768,6 +1768,7 @@ impl ProjectPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if zenith_external_libraries::toggle_expanded(entry_id) { self.update_visible_entries(None, false, false, window, cx); return; }
         if let Some(worktree_id) = self.project.read(cx).worktree_id_for_entry(entry_id, cx)
             && let Some(expanded_dir_ids) = self.state.expanded_dir_ids.get_mut(&worktree_id)
         {
@@ -4730,6 +4731,7 @@ impl ProjectPanel {
                             auto_folded_ancestors.clear();
                             if (!hide_gitignore || !entry.is_ignored)
                                 && (!hide_hidden || !entry.is_hidden)
+                                && !zenith_external_libraries::is_library_path(&entry.path)
                             {
                                 visible_worktree_entries.push(entry.to_owned());
                             }
@@ -4838,7 +4840,8 @@ impl ProjectPanel {
                                     }
                                 };
 
-                            if expanded_dir_ids.binary_search(&entry.id).is_err()
+                            if (expanded_dir_ids.binary_search(&entry.id).is_err()
+                                || zenith_external_libraries::is_library_path(&entry.path))
                                 && entry_iter.advance_to_sibling()
                             {
                                 continue;
@@ -4851,6 +4854,8 @@ impl ProjectPanel {
                             sort_mode,
                             sort_order,
                         );
+                        let expanded_dir_ids = new_state.expanded_dir_ids.get(&worktree_id).map(Vec::as_slice).unwrap_or(&[]);
+                        zenith_external_libraries::append_external_libraries_to_worktree(&worktree_snapshot, expanded_dir_ids, &mut visible_worktree_entries);
                         new_state.visible_entries.push(VisibleEntriesForWorktree {
                             worktree_id,
                             entries: visible_worktree_entries,
@@ -7137,13 +7142,13 @@ impl ProjectPanel {
             .unwrap_or(&[]);
         let is_expanded = expanded_entry_ids.binary_search(&entry.id).is_ok();
 
-        let (chevron, icon) = Self::entry_icons(entry, is_expanded, cx);
+        let (mut chevron, mut icon) = Self::entry_icons(entry, is_expanded, cx);
 
         let path_style = self.project.read(cx).path_style(cx);
         let (depth, difference) =
             ProjectPanel::calculate_depth_and_difference(entry, entries_paths);
 
-        let filename = if difference > 1 {
+        let mut filename = if difference > 1 {
             entry
                 .path
                 .last_n_components(difference)
@@ -7153,6 +7158,7 @@ impl ProjectPanel {
         } else {
             entry_file_name(entry, root_name).to_string()
         };
+        zenith_external_libraries::customize_entry(entry.id, &entry.path, &mut filename, &mut icon, &mut chevron);
 
         let selection = SelectedEntry {
             worktree_id,
