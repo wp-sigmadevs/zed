@@ -4,6 +4,8 @@
 //! The main thread only decides (cheap metadata checks) and clones the rope;
 //! one background task owns the store, so revisions land in event order and no
 //! database call touches the main thread.
+//!
+//! Symlinked and external files (outside the worktree) are intentionally not recorded.
 
 use crate::{LocalHistorySettings, Revision, Store};
 use anyhow::Result;
@@ -261,11 +263,15 @@ pub(crate) fn should_record(file: &worktree::File, len: usize, cx: &App) -> bool
     is_trackable(file, cx) && u64::try_from(len).is_ok_and(|len| len <= max_bytes)
 }
 
-/// Everything the gate checks except size. Also applied when history is shown,
-/// so a file that has since become private, ignored or a symlink does not
-/// expose its old revisions.
+/// Everything the gate checks except size.
 pub(crate) fn is_trackable(file: &worktree::File, cx: &App) -> bool {
-    let settings = LocalHistorySettings::get_global(cx);
+    LocalHistorySettings::get_global(cx).enabled && is_viewable(file, cx)
+}
+
+/// What decides whether old revisions may be shown: the gate minus `enabled`
+/// and size. A file that has since become private, ignored or a symlink does
+/// not expose its old revisions, but turning recording off hides nothing.
+pub(crate) fn is_viewable(file: &worktree::File, cx: &App) -> bool {
     let worktree = file.worktree.read(cx);
     // A single-file worktree (`/dir/.env`) has an empty relative path; the
     // private and exclusion globs must see the real file name instead.
@@ -287,8 +293,7 @@ pub(crate) fn is_trackable(file: &worktree::File, cx: &App) -> bool {
     );
     // A symlink may point anywhere (`~/.aws/credentials`); never follow one.
     let entry = file.entry_id.and_then(|id| worktree.entry_for_id(id));
-    settings.enabled
-        && root_key(&abs_path).is_some()
+    root_key(&abs_path).is_some()
         && file.is_local
         && !file.is_private
         && !exclusions.is_path_private(path)

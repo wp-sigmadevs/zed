@@ -179,11 +179,11 @@ impl LocalHistoryView {
                 let buffer = open.await.context("opening the file")?;
                 // Checked when shown, not only when recorded: a file that is private,
                 // ignored or a symlink by now must not expose its old revisions.
-                let trackable = this.update(cx, |_, cx| {
+                let viewable = this.update(cx, |_, cx| {
                     worktree::File::from_dyn(buffer.read(cx).file())
-                        .is_some_and(|file| capture::is_trackable(file, cx))
+                        .is_some_and(|file| capture::is_viewable(file, cx))
                 })?;
-                if !trackable {
+                if !viewable {
                     return Ok((buffer, Vec::new()));
                 }
                 let list = this.update(cx, |_, cx| capture::list(cx, root, rel_path))?;
@@ -264,11 +264,8 @@ impl LocalHistoryView {
             let diff = match build_buffer_diff(&old_buffer, &current, cx).await {
                 Ok(diff) => diff,
                 Err(error) => {
-                    this.update(cx, |this, cx| {
-                        this.note = Some(format!("Could not compare: {error:#}").into());
-                        cx.notify();
-                    })
-                    .ok();
+                    this.update(cx, |this, cx| this.diff_failed(&error, cx))
+                        .ok();
                     return;
                 }
             };
@@ -277,6 +274,11 @@ impl LocalHistoryView {
             })
             .ok();
         });
+        cx.notify();
+    }
+
+    fn diff_failed(&mut self, error: &anyhow::Error, cx: &mut Context<Self>) {
+        self.note = Some(format!("Could not compare: {error:#}").into());
         cx.notify();
     }
 

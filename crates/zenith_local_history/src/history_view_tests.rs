@@ -343,3 +343,150 @@ async fn test_history_view_hides_old_revisions_of_a_file_that_is_now_private(
         assert!(view.diff.is_none());
     });
 }
+
+#[gpui::test]
+async fn test_history_view_still_lists_revisions_after_recording_is_turned_off(
+    cx: &mut TestAppContext,
+) {
+    let (fixture, cx) = fixture(true, cx).await;
+    open_and_save(&fixture, "a.txt", &["1", "2"], cx).await;
+    cx.update(|_, cx| {
+        cx.update_global::<SettingsStore, _>(|store, cx| {
+            store.update_user_settings(cx, |content| {
+                content.zenith = Some(settings::ZenithSettingsContent {
+                    local_history: Some(settings::ZenithLocalHistorySettingsContent {
+                        enabled: Some(false),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                });
+            });
+        });
+    });
+
+    cx.simulate_keystrokes("alt-shift-h");
+    cx.run_until_parked();
+
+    let view = history_view(&fixture, cx);
+    assert_eq!(view.read_with(cx, |view, _| view.entries.len()), 3);
+}
+
+/// Opens a.txt in an editor and its history, then types in the history's right pane.
+async fn edit_in_the_history_pane(
+    fixture: &Fixture,
+    cx: &mut VisualTestContext,
+) -> (Entity<LocalHistoryView>, Entity<Buffer>) {
+    let buffer = open_and_save(fixture, "a.txt", &["1"], cx).await;
+    cx.simulate_keystrokes("alt-shift-h");
+    cx.run_until_parked();
+    let view = history_view(fixture, cx);
+    cx.simulate_keystrokes("enter");
+    cx.simulate_input("Z");
+    cx.run_until_parked();
+    assert!(buffer.read_with(cx, |buffer, _| buffer.is_dirty()));
+    (view, buffer)
+}
+
+fn close_active_tab(
+    fixture: &Fixture,
+    cx: &mut VisualTestContext,
+) -> gpui::Task<anyhow::Result<()>> {
+    fixture.workspace.update_in(cx, |workspace, window, cx| {
+        workspace.active_pane().update(cx, |pane, cx| {
+            pane.close_active_item(&workspace::CloseActiveItem::default(), window, cx)
+        })
+    })
+}
+
+// Closing prompts only when no other tab holds the dirty buffer, so with an
+// editor tab open the history tab closes silently and nothing is lost.
+#[gpui::test]
+async fn test_history_view_closes_without_a_prompt_while_an_editor_tab_holds_the_buffer(
+    cx: &mut TestAppContext,
+) {
+    use workspace::Item as _;
+    let (fixture, cx) = fixture(true, cx).await;
+    let (view, buffer) = edit_in_the_history_pane(&fixture, cx).await;
+    assert!(view.read_with(cx, |view, cx| view.is_dirty(cx)));
+
+    let closing = close_active_tab(&fixture, cx);
+    cx.run_until_parked();
+
+    assert!(!cx.has_pending_prompt());
+    closing.await.expect("close");
+    assert_eq!(view_count(&fixture, cx), 0);
+    assert!(buffer.read_with(cx, |buffer, _| buffer.text().contains('Z')));
+    assert!(buffer.read_with(cx, |buffer, _| buffer.is_dirty()));
+    let editors = fixture.workspace.read_with(cx, |workspace, cx| {
+        workspace.items_of_type::<editor::Editor>(cx).count()
+    });
+    assert_eq!(editors, 1);
+}
+
+// With no other tab on the file, closing the history tab prompts exactly once.
+#[gpui::test]
+async fn test_history_view_prompts_once_when_it_is_the_only_tab_holding_the_edit(
+    cx: &mut TestAppContext,
+) {
+    let (fixture, cx) = fixture(true, cx).await;
+    let buffer = open_and_save(&fixture, "a.txt", &["1"], cx).await;
+    cx.simulate_keystrokes("alt-shift-h");
+    cx.run_until_parked();
+    let view = history_view(&fixture, cx);
+    // Close the editor tab (clean, so silent), leaving only the history tab.
+    let editor_id = fixture.workspace.read_with(cx, |workspace, cx| {
+        workspace
+            .items_of_type::<editor::Editor>(cx)
+            .next()
+            .expect("editor tab")
+            .entity_id()
+    });
+    let closing_editor = fixture.workspace.update_in(cx, |workspace, window, cx| {
+        workspace.active_pane().update(cx, |pane, cx| {
+            pane.close_item_by_id(editor_id, workspace::SaveIntent::Close, window, cx)
+        })
+    });
+    cx.run_until_parked();
+    closing_editor.await.expect("close editor");
+    assert!(!cx.has_pending_prompt());
+    assert!(list_is_focused(&view, cx));
+    cx.simulate_keystrokes("enter");
+    cx.simulate_input("Z");
+    cx.run_until_parked();
+    assert!(buffer.read_with(cx, |buffer, _| buffer.is_dirty()));
+
+    let closing = close_active_tab(&fixture, cx);
+    cx.run_until_parked();
+    let (message, detail) = cx.pending_prompt().expect("one prompt");
+    assert!(
+        message.contains("a.txt") || detail.contains("a.txt"),
+        "{message:?} {detail:?}"
+    );
+    cx.simulate_prompt_answer("Cancel");
+    cx.run_until_parked();
+    // Cancelled: the tab stays, the edit is kept, and there is no second prompt.
+    closing.await.ok();
+    assert!(!cx.has_pending_prompt());
+    assert_eq!(view_count(&fixture, cx), 1);
+    assert!(buffer.read_with(cx, |buffer, _| buffer.text().contains('Z')));
+}
+
+#[gpui::test]
+async fn test_history_view_shows_why_the_diff_could_not_be_built(cx: &mut TestAppContext) {
+    let (fixture, cx) = fixture(true, cx).await;
+    open_and_save(&fixture, "a.txt", &["1"], cx).await;
+    cx.simulate_keystrokes("alt-shift-h");
+    cx.run_until_parked();
+    let view = history_view(&fixture, cx);
+
+    view.update(cx, |view, cx| {
+        view.diff = None;
+        view.diff_failed(&anyhow::anyhow!("boom"), cx);
+    });
+    cx.run_until_parked();
+
+    assert_eq!(
+        view.read_with(cx, |view, _| view.note.clone()).as_deref(),
+        Some("Could not compare: boom")
+    );
+}
