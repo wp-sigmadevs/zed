@@ -1314,6 +1314,12 @@ impl ProjectPanel {
                                 }
                             })
                         })
+                        .when(!is_dir && is_local, |menu| {
+                            menu.action(
+                                "Local History…",
+                                Box::new(zed_actions::zenith_local_history::ShowFileHistory),
+                            )
+                        })
                         .when(should_show_compare, |menu| {
                             menu.separator()
                                 .action("Compare With…", Box::new(CompareMarkedFiles))
