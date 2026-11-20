@@ -1,10 +1,9 @@
-use std::sync::{Arc, RwLock};
 use gpui::prelude::*;
 use gpui::{
-    Action, App, Context, EventEmitter, FocusHandle, Focusable,
-    IntoElement, ParentElement, Pixels, Render, SharedString, Styled, WeakEntity,
-    Window, px,
+    Action, App, Context, EventEmitter, FocusHandle, Focusable, IntoElement, ParentElement, Pixels,
+    Render, SharedString, Styled, WeakEntity, Window, px,
 };
+use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard};
 use ui::prelude::*;
 use ui::{ButtonStyle, Color, Icon, IconName, Label, LabelCommon};
 use workspace::dock::{DockPosition, Panel, PanelEvent};
@@ -70,10 +69,19 @@ impl Panel for NextJsPanel {
     }
 
     fn position_is_valid(&self, position: DockPosition) -> bool {
-        matches!(position, DockPosition::Left | DockPosition::Right | DockPosition::Bottom)
+        matches!(
+            position,
+            DockPosition::Left | DockPosition::Right | DockPosition::Bottom
+        )
     }
 
-    fn set_position(&mut self, _position: DockPosition, _window: &mut Window, _cx: &mut Context<Self>) {}
+    fn set_position(
+        &mut self,
+        _position: DockPosition,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+    }
 
     fn default_size(&self, _window: &Window, _cx: &App) -> Pixels {
         px(360.)
@@ -98,7 +106,7 @@ impl Panel for NextJsPanel {
 
 impl Render for NextJsPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let index_guard = self.index.read().unwrap();
+        let index_guard = read_index(&self.index);
         let query = self.search_query.to_lowercase();
         let filter_kind = self.filter_kind;
 
@@ -138,13 +146,15 @@ impl Render for NextJsPanel {
                             .gap_2()
                             .items_center()
                             .child(Icon::new(IconName::Code).color(Color::Accent))
-                            .child(Label::new("Next.js App Router").weight(gpui::FontWeight::SEMIBOLD))
+                            .child(
+                                Label::new("Next.js App Router").weight(gpui::FontWeight::SEMIBOLD),
+                            ),
                     )
                     .child(
                         Label::new(format!("{route_count} routes"))
                             .size(LabelSize::Small)
-                            .color(Color::Muted)
-                    )
+                            .color(Color::Muted),
+                    ),
             )
             .child(
                 h_flex()
@@ -154,19 +164,35 @@ impl Render for NextJsPanel {
                     .border_color(cx.theme().colors().border_variant)
                     .child(
                         Button::new("filter-all", "All")
-                            .style(if self.filter_kind.is_none() { ButtonStyle::Filled } else { ButtonStyle::Subtle })
-                            .on_click(cx.listener(|this, _, _, cx| this.set_filter_kind(None, cx)))
+                            .style(if self.filter_kind.is_none() {
+                                ButtonStyle::Filled
+                            } else {
+                                ButtonStyle::Subtle
+                            })
+                            .on_click(cx.listener(|this, _, _, cx| this.set_filter_kind(None, cx))),
                     )
                     .child(
                         Button::new("filter-pages", "Pages")
-                            .style(if self.filter_kind == Some(AppRouterKind::Page) { ButtonStyle::Filled } else { ButtonStyle::Subtle })
-                            .on_click(cx.listener(|this, _, _, cx| this.set_filter_kind(Some(AppRouterKind::Page), cx)))
+                            .style(if self.filter_kind == Some(AppRouterKind::Page) {
+                                ButtonStyle::Filled
+                            } else {
+                                ButtonStyle::Subtle
+                            })
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.set_filter_kind(Some(AppRouterKind::Page), cx)
+                            })),
                     )
                     .child(
                         Button::new("filter-routes", "APIs")
-                            .style(if self.filter_kind == Some(AppRouterKind::RouteHandler) { ButtonStyle::Filled } else { ButtonStyle::Subtle })
-                            .on_click(cx.listener(|this, _, _, cx| this.set_filter_kind(Some(AppRouterKind::RouteHandler), cx)))
-                    )
+                            .style(if self.filter_kind == Some(AppRouterKind::RouteHandler) {
+                                ButtonStyle::Filled
+                            } else {
+                                ButtonStyle::Subtle
+                            })
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.set_filter_kind(Some(AppRouterKind::RouteHandler), cx)
+                            })),
+                    ),
             )
             .child(
                 v_flex()
@@ -195,7 +221,10 @@ impl Render for NextJsPanel {
                         };
 
                         h_flex()
-                            .id(SharedString::from(format!("route-{}-{:?}", route.url_path, route.kind)))
+                            .id(SharedString::from(format!(
+                                "route-{}-{:?}",
+                                route.url_path, route.kind
+                            )))
                             .p_1()
                             .gap_2()
                             .rounded_sm()
@@ -205,7 +234,9 @@ impl Render for NextJsPanel {
                                 if let Some(workspace) = workspace.upgrade() {
                                     let path = path.clone();
                                     workspace.update(cx, |workspace, cx| {
-                                        workspace.open_abs_path(path, OpenOptions::default(), window, cx).detach_and_log_err(cx);
+                                        workspace
+                                            .open_abs_path(path, OpenOptions::default(), window, cx)
+                                            .detach_and_log_err(cx);
                                     });
                                 }
                             })
@@ -213,26 +244,35 @@ impl Render for NextJsPanel {
                                 Label::new(badge_text)
                                     .size(LabelSize::XSmall)
                                     .weight(gpui::FontWeight::BOLD)
-                                    .color(badge_color)
+                                    .color(badge_color),
                             )
                             .child(
                                 Label::new(format!("{}{http_methods_str}", route.url_path))
                                     .size(LabelSize::Small)
-                                    .weight(gpui::FontWeight::MEDIUM)
+                                    .weight(gpui::FontWeight::MEDIUM),
                             )
                             .child(
-                                h_flex()
-                                    .flex_1()
-                                    .justify_end()
-                                    .child(
-                                        Label::new(route.file_path.file_name().map(|f| f.to_string_lossy()).unwrap_or_default())
-                                            .size(LabelSize::XSmall)
-                                            .color(Color::Muted)
+                                h_flex().flex_1().justify_end().child(
+                                    Label::new(
+                                        route
+                                            .file_path
+                                            .file_name()
+                                            .map(|f| f.to_string_lossy())
+                                            .unwrap_or_default(),
                                     )
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted),
+                                ),
                             )
-                    }))
+                    })),
             )
     }
+}
+
+/// Reads the shared index; a lock poisoned by a panicked indexer still yields the last index
+/// instead of panicking the render.
+pub(crate) fn read_index<T>(index: &RwLock<T>) -> RwLockReadGuard<'_, T> {
+    index.read().unwrap_or_else(PoisonError::into_inner)
 }
 
 #[cfg(test)]
@@ -242,9 +282,7 @@ mod tests {
     #[gpui::test]
     fn test_nextjs_panel_state(cx: &mut App) {
         let index = Arc::new(RwLock::new(NextJsIndex::new()));
-        let panel = cx.new(|cx| {
-            NextJsPanel::new(WeakEntity::new_invalid(), index, cx)
-        });
+        let panel = cx.new(|cx| NextJsPanel::new(WeakEntity::new_invalid(), index, cx));
 
         panel.update(cx, |this, cx| {
             assert_eq!(this.filter_kind, None);
@@ -255,5 +293,19 @@ mod tests {
             this.set_search_query("about".to_string(), cx);
             assert_eq!(this.search_query, "about");
         });
+    }
+
+    #[test]
+    fn test_read_index_survives_a_poisoned_lock() {
+        let index = Arc::new(RwLock::new(7));
+        let writer = index.clone();
+        std::thread::spawn(move || {
+            let _guard = writer.write().unwrap();
+            panic!("indexer died");
+        })
+        .join()
+        .unwrap_err();
+        assert!(index.is_poisoned());
+        assert_eq!(*read_index(&index), 7);
     }
 }

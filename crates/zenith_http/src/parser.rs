@@ -1,5 +1,5 @@
-use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HttpRequest {
@@ -23,23 +23,35 @@ impl HttpRequest {
         }
     }
 
+    /// A shell command that sends this request. Every piece that comes from the file (method,
+    /// headers, body, URL) is single-quoted, so `$(...)`, backticks, quotes, `;` and newlines
+    /// in them stay data.
     pub fn to_curl(&self) -> String {
-        let mut parts = vec!["curl".to_string(), "-X".to_string(), self.method.clone()];
+        let mut parts = vec![
+            "curl".to_string(),
+            "-X".to_string(),
+            shell_quote(&self.method),
+        ];
 
         for (k, v) in &self.headers {
             parts.push("-H".to_string());
-            parts.push(format!("\"{k}: {v}\""));
+            parts.push(shell_quote(&format!("{k}: {v}")));
         }
 
         if let Some(ref b) = self.body {
             parts.push("--data".to_string());
-            let escaped = b.replace('\'', "'\\''");
-            parts.push(format!("'{escaped}'"));
+            parts.push(shell_quote(b));
         }
 
-        parts.push(format!("\"{}\"", self.url));
+        parts.push(shell_quote(&self.url));
         parts.join(" ")
     }
+}
+
+/// Quotes `text` for a POSIX shell: inside single quotes nothing is special, so only the
+/// quote itself needs the `'\\''` dance.
+pub fn shell_quote(text: &str) -> String {
+    format!("'{}'", text.replace('\'', "'\\''"))
 }
 
 pub fn parse_http_file(content: &str) -> Vec<HttpRequest> {
@@ -187,16 +199,33 @@ fn parse_single_chunk(chunk: &str, base_line: usize) -> Option<HttpRequest> {
 }
 
 pub fn substitute_variables(text: &str, env: &HashMap<String, String>) -> String {
+    substitute_variables_with(text, env, &mut || uuid::Uuid::new_v4().as_u64_pair().0)
+}
+
+/// Like [`substitute_variables`] with the random source injected: `random` yields uniformly
+/// random `u64`s. Each `{{$uuid}}` and `{{$randomInt}}` gets its own value.
+pub fn substitute_variables_with(
+    text: &str,
+    env: &HashMap<String, String>,
+    random: &mut dyn FnMut() -> u64,
+) -> String {
     let mut result = text.to_string();
 
     let now_ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs().to_string())
-        .unwrap_or_else(|_| "1700000000".to_string());
+        .unwrap_or_default();
 
     result = result.replace("{{$timestamp}}", &now_ts);
-    result = result.replace("{{$randomInt}}", "42");
-    result = result.replace("{{$uuid}}", "c8d8c2e6-7a1b-4f3d-9e5c-0b8f4e2a1d3c");
+    result = replace_each(&result, "{{$randomInt}}", || (random() % 1000).to_string());
+    result = replace_each(&result, "{{$uuid}}", || {
+        let mut bytes = [0u8; 16];
+        bytes[..8].copy_from_slice(&random().to_be_bytes());
+        bytes[8..].copy_from_slice(&random().to_be_bytes());
+        uuid::Builder::from_random_bytes(bytes)
+            .into_uuid()
+            .to_string()
+    });
 
     for (k, v) in env {
         let placeholder = format!("{{{{{k}}}}}");
@@ -204,6 +233,19 @@ pub fn substitute_variables(text: &str, env: &HashMap<String, String>) -> String
     }
 
     result
+}
+
+/// Replaces every occurrence of `placeholder`, calling `value` once per occurrence.
+fn replace_each(text: &str, placeholder: &str, mut value: impl FnMut() -> String) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find(placeholder) {
+        out.push_str(&rest[..at]);
+        out.push_str(&value());
+        rest = &rest[at + placeholder.len()..];
+    }
+    out.push_str(rest);
+    out
 }
 
 pub fn parse_curl(curl_cmd: &str) -> Result<HttpRequest, String> {
@@ -231,7 +273,8 @@ pub fn parse_curl(curl_cmd: &str) -> Result<HttpRequest, String> {
                 headers.push((h[..pos].trim().to_string(), h[pos + 1..].trim().to_string()));
             }
             i += 2;
-        } else if (part == "-d" || part == "--data" || part == "--data-raw") && i + 1 < parts.len() {
+        } else if (part == "-d" || part == "--data" || part == "--data-raw") && i + 1 < parts.len()
+        {
             body = Some(parts[i + 1].clone());
             if method == "GET" {
                 method = "POST".to_string();
@@ -256,28 +299,59 @@ pub fn parse_curl(curl_cmd: &str) -> Result<HttpRequest, String> {
     Ok(req)
 }
 
+/// Splits like a POSIX shell: single quotes are literal, double quotes allow `\\` escapes of
+/// `"`, `\\`, `$` and backtick, and outside quotes a backslash escapes the next character.
 fn shell_split(input: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut current = String::new();
+    let mut started = false;
     let mut in_single = false;
     let mut in_double = false;
+    let mut chars = input.chars();
 
-    for c in input.chars() {
-        if c == '\'' && !in_double {
-            in_single = !in_single;
-        } else if c == '"' && !in_single {
-            in_double = !in_double;
-        } else if c.is_whitespace() && !in_single && !in_double {
-            if !current.is_empty() {
-                tokens.push(current.clone());
-                current.clear();
+    while let Some(c) = chars.next() {
+        if in_single {
+            if c == '\'' {
+                in_single = false;
+            } else {
+                current.push(c);
+            }
+        } else if in_double {
+            match c {
+                '"' => in_double = false,
+                '\\' => match chars.next() {
+                    Some(next @ ('"' | '\\' | '$' | '`')) => current.push(next),
+                    Some(next) => {
+                        current.push('\\');
+                        current.push(next);
+                    }
+                    None => current.push('\\'),
+                },
+                _ => current.push(c),
+            }
+        } else if c == '\'' {
+            in_single = true;
+            started = true;
+        } else if c == '"' {
+            in_double = true;
+            started = true;
+        } else if c == '\\' {
+            started = true;
+            if let Some(next) = chars.next() {
+                current.push(next);
+            }
+        } else if c.is_whitespace() {
+            if started {
+                tokens.push(std::mem::take(&mut current));
+                started = false;
             }
         } else {
             current.push(c);
+            started = true;
         }
     }
 
-    if !current.is_empty() {
+    if started {
         tokens.push(current);
     }
 
@@ -321,7 +395,13 @@ DELETE https://api.example.com/v1/users/42
         assert_eq!(requests[1].method, "POST");
         assert_eq!(requests[1].name, Some("Create User".to_string()));
         assert_eq!(requests[1].headers.len(), 1);
-        assert!(requests[1].body.as_ref().unwrap().contains("alice@example.com"));
+        assert!(
+            requests[1]
+                .body
+                .as_ref()
+                .unwrap()
+                .contains("alice@example.com")
+        );
 
         assert_eq!(requests[2].method, "DELETE");
         assert_eq!(requests[2].url, "https://api.example.com/v1/users/42");
@@ -333,23 +413,26 @@ DELETE https://api.example.com/v1/users/42
         env.insert("host".to_string(), "https://staging.api.com".to_string());
         env.insert("token".to_string(), "secret-123".to_string());
 
-        let template = "POST {{host}}/v1/login\nAuthorization: Bearer {{token}}\nX-Req-Id: {{$uuid}}";
+        let template =
+            "POST {{host}}/v1/login\nAuthorization: Bearer {{token}}\nX-Req-Id: {{$uuid}}";
         let resolved = substitute_variables(template, &env);
 
         assert!(resolved.contains("POST https://staging.api.com/v1/login"));
         assert!(resolved.contains("Authorization: Bearer secret-123"));
-        assert!(resolved.contains("X-Req-Id: c8d8c2e6-7a1b-4f3d-9e5c-0b8f4e2a1d3c"));
+        let id = resolved.rsplit("X-Req-Id: ").next().unwrap();
+        assert!(uuid::Uuid::parse_str(id).is_ok(), "{id}");
     }
 
     #[test]
     fn test_curl_export_and_import() {
         let mut req = HttpRequest::new("POST", "https://api.example.com/v1/items", 1);
-        req.headers.push(("Content-Type".to_string(), "application/json".to_string()));
+        req.headers
+            .push(("Content-Type".to_string(), "application/json".to_string()));
         req.body = Some("{\"title\":\"Zenith\"}".to_string());
 
         let curl = req.to_curl();
-        assert!(curl.contains("-X POST"));
-        assert!(curl.contains("-H \"Content-Type: application/json\""));
+        assert!(curl.contains("-X 'POST'"));
+        assert!(curl.contains("-H 'Content-Type: application/json'"));
         assert!(curl.contains("--data '{\"title\":\"Zenith\"}'"));
 
         let imported = parse_curl(&curl).expect("parse curl");
@@ -358,5 +441,117 @@ DELETE https://api.example.com/v1/users/42
         assert_eq!(imported.headers.len(), 1);
         assert_eq!(imported.headers[0].0, "Content-Type");
         assert_eq!(imported.body, Some("{\"title\":\"Zenith\"}".to_string()));
+    }
+
+    #[test]
+    fn test_shell_quote() {
+        assert_eq!(shell_quote("plain"), "'plain'");
+        assert_eq!(shell_quote("it's"), "'it'\\''s'");
+    }
+
+    /// The nastiest values must come back out of the shell as the same single words.
+    // The point of this test is a real `sh`; a blocking spawn is fine in a unit test.
+    #[test]
+    #[allow(clippy::disallowed_methods)]
+    fn test_curl_export_quotes_hostile_values() {
+        // Hostile values only ever `touch` a marker in a scratch directory, never anything real.
+        let scratch = tempfile::tempdir().unwrap();
+        let marker = scratch.path().join("pwned");
+        let marker = marker.display();
+        let nasty = [
+            format!("$(touch {marker})"),
+            format!("`touch {marker}`"),
+            format!("a\"b; touch {marker}; echo \""),
+            format!("a'b; touch {marker}; echo 'c"),
+            format!("line1\ntouch {marker}\nline3"),
+            "it's a 'quote'".to_string(),
+            "back\\slash $HOME ${IFS}".to_string(),
+        ];
+        for value in nasty.iter().map(String::as_str) {
+            let mut req = HttpRequest::new("GET", &format!("https://x.test/?q={value}"), 1);
+            req.headers.push(("X-Test".to_string(), value.to_string()));
+            req.body = Some(value.to_string());
+            let curl = req.to_curl();
+
+            // Real shell: print each argument on its own line, NUL separated.
+            let out = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(format!(
+                    "set -- {}; for a in \"$@\"; do printf '%s\\0' \"$a\"; done",
+                    &curl["curl".len()..]
+                ))
+                .output()
+                .unwrap();
+            let args: Vec<String> = out
+                .stdout
+                .split(|b| *b == 0)
+                .filter(|a| !a.is_empty())
+                .map(|a| String::from_utf8_lossy(a).to_string())
+                .collect();
+            assert_eq!(
+                args,
+                vec![
+                    "-X".to_string(),
+                    "GET".to_string(),
+                    "-H".to_string(),
+                    format!("X-Test: {value}"),
+                    "--data".to_string(),
+                    value.to_string(),
+                    format!("https://x.test/?q={value}"),
+                ],
+                "{curl}"
+            );
+
+            // And our own importer agrees.
+            let back = parse_curl(&curl).unwrap();
+            assert_eq!(back.url, format!("https://x.test/?q={value}"));
+            assert_eq!(back.body.as_deref(), Some(value));
+            assert_eq!(back.headers[0].1, value);
+        }
+        assert!(
+            !scratch.path().join("pwned").exists(),
+            "a value was executed by the shell"
+        );
+    }
+
+    #[test]
+    fn test_method_is_quoted() {
+        let req = HttpRequest {
+            method: "GET; echo hi".to_string(),
+            ..HttpRequest::new("GET", "https://x.test", 1)
+        };
+        assert!(req.to_curl().starts_with("curl -X 'GET; echo hi' "));
+    }
+
+    #[test]
+    fn test_uuid_and_random_int_are_real_and_injectable() {
+        let mut state = 0x1234_5678_9abc_def0u64;
+        let mut rng = move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            state
+        };
+        let out = substitute_variables_with(
+            "{{$uuid}} {{$uuid}} {{$randomInt}} {{$randomInt}}",
+            &HashMap::new(),
+            &mut rng,
+        );
+        let parts: Vec<&str> = out.split(' ').collect();
+        let (a, b) = (
+            uuid::Uuid::parse_str(parts[0]).unwrap(),
+            uuid::Uuid::parse_str(parts[1]).unwrap(),
+        );
+        assert_eq!(a.get_version_num(), 4);
+        assert_eq!(a.get_variant(), uuid::Variant::RFC4122);
+        assert_ne!(a, b, "every occurrence is its own uuid");
+        assert_ne!(parts[0], "c8d8c2e6-7a1b-4f3d-9e5c-0b8f4e2a1d3c");
+        let (x, y): (u32, u32) = (parts[2].parse().unwrap(), parts[3].parse().unwrap());
+        assert!(x < 1000 && y < 1000);
+        assert_ne!(x, 42);
+        // The default source differs between calls.
+        let one = substitute_variables("{{$uuid}}", &HashMap::new());
+        let two = substitute_variables("{{$uuid}}", &HashMap::new());
+        assert_ne!(one, two);
     }
 }

@@ -1,13 +1,13 @@
-use gpui::{
-    App, Context, FocusHandle, Focusable, InteractiveElement, IntoElement,
-    ParentElement, Render, Styled, Window,
-};
-use ui::{
-    Button, ButtonCommon, ButtonStyle, Color, Label, LabelCommon,
-    LabelSize, v_flex, h_flex, prelude::*,
-};
 use crate::parser::HttpRequest;
 use crate::response::HttpResponse;
+use gpui::{
+    App, Context, FocusHandle, Focusable, InteractiveElement, IntoElement, ParentElement, Render,
+    Styled, Window,
+};
+use ui::{
+    Button, ButtonCommon, ButtonStyle, Color, Label, LabelCommon, LabelSize, h_flex, prelude::*,
+    v_flex,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResponseTab {
@@ -109,21 +109,16 @@ impl Render for HttpResponseView {
                                             .color(method_color),
                                     ),
                             )
+                            .child(Label::new(self.request.url.clone()).size(LabelSize::Small))
                             .child(
-                                Label::new(self.request.url.clone())
-                                    .size(LabelSize::Small),
-                            )
-                            .child(
-                                h_flex()
-                                    .px_2()
-                                    .py_0p5()
-                                    .bg(status_bg)
-                                    .rounded_sm()
-                                    .child(
-                                        Label::new(format!("{} {}", self.response.status, self.response.status_text))
-                                            .size(LabelSize::Small)
-                                            .color(status_color),
-                                    ),
+                                h_flex().px_2().py_0p5().bg(status_bg).rounded_sm().child(
+                                    Label::new(format!(
+                                        "{} {}",
+                                        self.response.status, self.response.status_text
+                                    ))
+                                    .size(LabelSize::Small)
+                                    .color(status_color),
+                                ),
                             )
                             .child(
                                 Label::new(format!("{}ms", self.response.duration_ms))
@@ -145,7 +140,9 @@ impl Render for HttpResponseView {
                                     .on_click({
                                         let curl = self.request.to_curl();
                                         move |_, _window, cx| {
-                                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(curl.clone()));
+                                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                                curl.clone(),
+                                            ));
                                         }
                                     }),
                             )
@@ -155,7 +152,9 @@ impl Render for HttpResponseView {
                                     .on_click({
                                         let body = self.response.body.clone();
                                         move |_, _window, cx| {
-                                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(body.clone()));
+                                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                                body.clone(),
+                                            ));
                                         }
                                     }),
                             ),
@@ -228,45 +227,35 @@ impl Render for HttpResponseView {
                             vec![
                                 v_flex()
                                     .id("body-content")
-                                    .child(
-                                        Label::new(formatted)
-                                            .size(LabelSize::Small),
-                                    )
+                                    .child(Label::new(formatted).size(LabelSize::Small))
                                     .into_any_element(),
                             ]
                         }
-                        ResponseTab::Headers => {
-                            self.response
-                                .headers
-                                .iter()
-                                .enumerate()
-                                .map(|(ix, (k, v))| {
-                                    h_flex()
-                                        .id(format!("header-row-{ix}"))
-                                        .py_1()
-                                        .gap_2()
-                                        .child(
-                                            Label::new(format!("{k}:"))
-                                                .size(LabelSize::Small)
-                                                .color(Color::Accent),
-                                        )
-                                        .child(
-                                            Label::new(v.clone())
-                                                .size(LabelSize::Small),
-                                        )
-                                        .into_any_element()
-                                })
-                                .collect()
-                        }
+                        ResponseTab::Headers => self
+                            .response
+                            .headers
+                            .iter()
+                            .enumerate()
+                            .map(|(ix, (k, v))| {
+                                h_flex()
+                                    .id(format!("header-row-{ix}"))
+                                    .py_1()
+                                    .gap_2()
+                                    .child(
+                                        Label::new(format!("{k}:"))
+                                            .size(LabelSize::Small)
+                                            .color(Color::Accent),
+                                    )
+                                    .child(Label::new(v.clone()).size(LabelSize::Small))
+                                    .into_any_element()
+                            })
+                            .collect(),
                         ResponseTab::Raw => {
                             let raw = self.response.to_raw_http();
                             vec![
                                 v_flex()
                                     .id("raw-content")
-                                    .child(
-                                        Label::new(raw)
-                                            .size(LabelSize::Small),
-                                    )
+                                    .child(Label::new(raw).size(LabelSize::Small))
                                     .into_any_element(),
                             ]
                         }
@@ -302,7 +291,13 @@ mod tests {
     #[gpui::test]
     fn test_http_response_view_tab_switch(cx: &mut App) {
         let req = HttpRequest::new("POST", "https://api.example.com/v1/users", 1);
-        let res = HttpResponse::new(200, "OK", vec![("Content-Type".into(), "application/json".into())], "{\"id\":1}", 45);
+        let res = HttpResponse::new(
+            200,
+            "OK",
+            vec![("Content-Type".into(), "application/json".into())],
+            "{\"id\":1}",
+            45,
+        );
 
         let view = cx.new(|cx| HttpResponseView::new(res, req, cx));
 

@@ -22980,6 +22980,7 @@ dependencies = [
  "tempfile",
  "ui",
  "util",
+ "uuid",
  "workspace",
 ]
 

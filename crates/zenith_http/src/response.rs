@@ -9,10 +9,19 @@ pub struct HttpResponse {
     pub duration_ms: u64,
     pub size_bytes: usize,
     pub timestamp: String,
+    /// The body was cut at the size limit; `body` ends with a note saying so.
+    #[serde(default)]
+    pub truncated: bool,
 }
 
 impl HttpResponse {
-    pub fn new(status: u16, status_text: &str, headers: Vec<(String, String)>, body: &str, duration_ms: u64) -> Self {
+    pub fn new(
+        status: u16,
+        status_text: &str,
+        headers: Vec<(String, String)>,
+        body: &str,
+        duration_ms: u64,
+    ) -> Self {
         let size_bytes = body.len();
         let timestamp = chrono_or_fallback_ts();
 
@@ -24,7 +33,18 @@ impl HttpResponse {
             duration_ms,
             size_bytes,
             timestamp,
+            truncated: false,
         }
+    }
+
+    /// Marks the body as cut at `limit` bytes and says so at its end.
+    pub fn mark_truncated(mut self, limit: usize) -> Self {
+        self.truncated = true;
+        self.body.push_str(&format!(
+            "\n\n[Response truncated: only the first {} MiB are shown]",
+            limit / (1024 * 1024)
+        ));
+        self
     }
 
     pub fn is_success(&self) -> bool {
@@ -60,7 +80,9 @@ impl HttpResponse {
 
 fn chrono_or_fallback_ts() -> String {
     let now = std::time::SystemTime::now();
-    let since = now.duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+    let since = now
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
     format!("{}s", since.as_secs())
 }
 
@@ -71,7 +93,13 @@ mod tests {
     #[test]
     fn test_format_json_body() {
         let raw_json = "{\"status\":\"ok\",\"count\":2}";
-        let res = HttpResponse::new(200, "OK", vec![("Content-Type".into(), "application/json".into())], raw_json, 120);
+        let res = HttpResponse::new(
+            200,
+            "OK",
+            vec![("Content-Type".into(), "application/json".into())],
+            raw_json,
+            120,
+        );
 
         assert!(res.is_success());
         let formatted = res.format_body();

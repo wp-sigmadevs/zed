@@ -1,5 +1,5 @@
-use std::collections::HashMap;
 use serde_json::Value;
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EnvironmentStore {
@@ -12,7 +12,11 @@ impl EnvironmentStore {
         Self::default()
     }
 
-    pub fn load_from_json(&mut self, public_json: &str, private_json: Option<&str>) -> Result<(), String> {
+    pub fn load_from_json(
+        &mut self,
+        public_json: &str,
+        private_json: Option<&str>,
+    ) -> Result<(), String> {
         let mut parsed: HashMap<String, HashMap<String, String>> = HashMap::new();
 
         if !public_json.trim().is_empty() {
@@ -57,13 +61,24 @@ impl EnvironmentStore {
         }
 
         self.environments = parsed;
-        if self.active_environment.is_none() && !self.environments.is_empty() {
-            let mut keys: Vec<String> = self.environments.keys().cloned().collect();
-            keys.sort();
-            self.active_environment = Some(keys[0].clone());
+        // No environment is picked for the user: an implicit choice could be `prod`. A
+        // selection that no longer exists is dropped.
+        if self
+            .active_environment
+            .as_ref()
+            .is_some_and(|name| !self.environments.contains_key(name))
+        {
+            self.active_environment = None;
         }
 
         Ok(())
+    }
+
+    /// Environment names, sorted, for a picker.
+    pub fn names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.environments.keys().cloned().collect();
+        names.sort();
+        names
     }
 
     pub fn get_active_variables(&self) -> HashMap<String, String> {
@@ -103,7 +118,9 @@ mod tests {
         }"#;
 
         let mut store = EnvironmentStore::new();
-        store.load_from_json(public_json, Some(private_json)).expect("load env");
+        store
+            .load_from_json(public_json, Some(private_json))
+            .expect("load env");
 
         store.set_active_environment(Some("dev".to_string()));
         let dev_vars = store.get_active_variables();
@@ -113,5 +130,37 @@ mod tests {
         store.set_active_environment(Some("prod".to_string()));
         let prod_vars = store.get_active_variables();
         assert_eq!(prod_vars.get("api_key").unwrap(), "public-prod-key");
+    }
+
+    #[test]
+    fn test_no_environment_is_chosen_implicitly() {
+        let mut store = EnvironmentStore::new();
+        store
+            .load_from_json(
+                r#"{"dev": {"h": "d"}, "production": {"h": "p"}, "a-prod": {"h": "x"}}"#,
+                None,
+            )
+            .unwrap();
+        assert_eq!(store.active_environment, None);
+        assert!(store.get_active_variables().is_empty());
+        assert_eq!(store.names(), vec!["a-prod", "dev", "production"]);
+
+        store.set_active_environment(Some("dev".to_string()));
+        store
+            .load_from_json(r#"{"dev": {"h": "d2"}}"#, None)
+            .unwrap();
+        assert_eq!(
+            store.get_active_variables()["h"],
+            "d2",
+            "a kept selection survives a reload"
+        );
+
+        store
+            .load_from_json(r#"{"staging": {"h": "s"}}"#, None)
+            .unwrap();
+        assert_eq!(
+            store.active_environment, None,
+            "a removed environment is deselected, not replaced"
+        );
     }
 }

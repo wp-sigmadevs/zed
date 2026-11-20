@@ -1,11 +1,10 @@
-use std::collections::HashSet;
-use std::sync::{Arc, RwLock};
 use gpui::prelude::*;
 use gpui::{
-    Action, App, Context, EventEmitter, FocusHandle, Focusable,
-    IntoElement, ParentElement, Pixels, Render, SharedString, Styled, WeakEntity,
-    Window, px,
+    Action, App, Context, EventEmitter, FocusHandle, Focusable, IntoElement, ParentElement, Pixels,
+    Render, SharedString, Styled, WeakEntity, Window, px,
 };
+use std::collections::HashSet;
+use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard};
 use ui::prelude::*;
 use ui::{ButtonStyle, Color, Icon, IconName, Label, LabelCommon};
 use workspace::dock::{DockPosition, Panel, PanelEvent};
@@ -82,10 +81,19 @@ impl Panel for WpHooksPanel {
     }
 
     fn position_is_valid(&self, position: DockPosition) -> bool {
-        matches!(position, DockPosition::Left | DockPosition::Right | DockPosition::Bottom)
+        matches!(
+            position,
+            DockPosition::Left | DockPosition::Right | DockPosition::Bottom
+        )
     }
 
-    fn set_position(&mut self, _position: DockPosition, _window: &mut Window, _cx: &mut Context<Self>) {}
+    fn set_position(
+        &mut self,
+        _position: DockPosition,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+    }
 
     fn default_size(&self, _window: &Window, _cx: &App) -> Pixels {
         px(340.)
@@ -110,7 +118,7 @@ impl Panel for WpHooksPanel {
 
 impl Render for WpHooksPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let index_guard = self.index.read().unwrap();
+        let index_guard = read_index(&self.index);
         let query = self.search_query.to_lowercase();
         let filter_kind = self.filter_kind;
 
@@ -151,13 +159,15 @@ impl Render for WpHooksPanel {
                             .gap_2()
                             .items_center()
                             .child(Icon::new(IconName::BookCopy).color(Color::Accent))
-                            .child(Label::new("WordPress Hooks").weight(gpui::FontWeight::SEMIBOLD))
+                            .child(
+                                Label::new("WordPress Hooks").weight(gpui::FontWeight::SEMIBOLD),
+                            ),
                     )
                     .child(
                         Label::new(format!("{total_count} hooks"))
                             .size(LabelSize::Small)
-                            .color(Color::Muted)
-                    )
+                            .color(Color::Muted),
+                    ),
             )
             .child(
                 h_flex()
@@ -167,19 +177,35 @@ impl Render for WpHooksPanel {
                     .border_color(cx.theme().colors().border_variant)
                     .child(
                         Button::new("filter-all", "All")
-                            .style(if self.filter_kind.is_none() { ButtonStyle::Filled } else { ButtonStyle::Subtle })
-                            .on_click(cx.listener(|this, _, _, cx| this.set_filter_kind(None, cx)))
+                            .style(if self.filter_kind.is_none() {
+                                ButtonStyle::Filled
+                            } else {
+                                ButtonStyle::Subtle
+                            })
+                            .on_click(cx.listener(|this, _, _, cx| this.set_filter_kind(None, cx))),
                     )
                     .child(
                         Button::new("filter-actions", "Actions")
-                            .style(if self.filter_kind == Some(HookKind::Action) { ButtonStyle::Filled } else { ButtonStyle::Subtle })
-                            .on_click(cx.listener(|this, _, _, cx| this.set_filter_kind(Some(HookKind::Action), cx)))
+                            .style(if self.filter_kind == Some(HookKind::Action) {
+                                ButtonStyle::Filled
+                            } else {
+                                ButtonStyle::Subtle
+                            })
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.set_filter_kind(Some(HookKind::Action), cx)
+                            })),
                     )
                     .child(
                         Button::new("filter-filters", "Filters")
-                            .style(if self.filter_kind == Some(HookKind::Filter) { ButtonStyle::Filled } else { ButtonStyle::Subtle })
-                            .on_click(cx.listener(|this, _, _, cx| this.set_filter_kind(Some(HookKind::Filter), cx)))
-                    )
+                            .style(if self.filter_kind == Some(HookKind::Filter) {
+                                ButtonStyle::Filled
+                            } else {
+                                ButtonStyle::Subtle
+                            })
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.set_filter_kind(Some(HookKind::Filter), cx)
+                            })),
+                    ),
             )
             .child(
                 v_flex()
@@ -214,19 +240,22 @@ impl Render for WpHooksPanel {
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.toggle_expand(&hook_name_clone, cx);
                                     }))
-                                    .child(Icon::new(chevron_icon).size(IconSize::Small).color(Color::Muted))
-                                    .child(Label::new(hook_name.clone()).weight(gpui::FontWeight::MEDIUM))
                                     .child(
-                                        h_flex()
-                                            .flex_1()
-                                            .justify_end()
-                                            .gap_1()
-                                            .child(
-                                                Label::new(format!("{listener_count}L / {def_count}D"))
-                                                    .size(LabelSize::XSmall)
-                                                    .color(Color::Muted)
-                                            )
+                                        Icon::new(chevron_icon)
+                                            .size(IconSize::Small)
+                                            .color(Color::Muted),
                                     )
+                                    .child(
+                                        Label::new(hook_name.clone())
+                                            .weight(gpui::FontWeight::MEDIUM),
+                                    )
+                                    .child(
+                                        h_flex().flex_1().justify_end().gap_1().child(
+                                            Label::new(format!("{listener_count}L / {def_count}D"))
+                                                .size(LabelSize::XSmall)
+                                                .color(Color::Muted),
+                                        ),
+                                    ),
                             );
 
                         if is_expanded {
@@ -249,25 +278,50 @@ impl Render for WpHooksPanel {
                                             if let Some(workspace) = workspace.upgrade() {
                                                 let path = path.clone();
                                                 workspace.update(cx, |workspace, cx| {
-                                                    workspace.open_abs_path(path, OpenOptions::default(), window, cx).detach_and_log_err(cx);
+                                                    workspace
+                                                        .open_abs_path(
+                                                            path,
+                                                            OpenOptions::default(),
+                                                            window,
+                                                            cx,
+                                                        )
+                                                        .detach_and_log_err(cx);
                                                 });
                                             }
                                         })
-                                        .child(Label::new("[def]").size(LabelSize::XSmall).color(Color::Accent))
                                         .child(
-                                            Label::new(format!("{}:{}", def.file_path.file_name().map(|f| f.to_string_lossy()).unwrap_or_default(), line))
-                                                .size(LabelSize::Small)
-                                                .color(Color::Default)
+                                            Label::new("[def]")
+                                                .size(LabelSize::XSmall)
+                                                .color(Color::Accent),
                                         )
+                                        .child(
+                                            Label::new(format!(
+                                                "{}:{}",
+                                                def.file_path
+                                                    .file_name()
+                                                    .map(|f| f.to_string_lossy())
+                                                    .unwrap_or_default(),
+                                                line
+                                            ))
+                                            .size(LabelSize::Small)
+                                            .color(Color::Default),
+                                        ),
                                 );
                             }
 
                             for listener in listeners {
                                 let callback_str = match &listener.callback {
                                     CallbackTarget::Function(f) => format!("{f}()"),
-                                    CallbackTarget::Method { class_name, method_name, is_static } => {
+                                    CallbackTarget::Method {
+                                        class_name,
+                                        method_name,
+                                        is_static,
+                                    } => {
                                         let sep = if *is_static { "::" } else { "->" };
-                                        format!("{}{sep}{method_name}()", class_name.as_deref().unwrap_or("$this"))
+                                        format!(
+                                            "{}{sep}{method_name}()",
+                                            class_name.as_deref().unwrap_or("$this")
+                                        )
                                     }
                                     CallbackTarget::Closure => "Closure".to_string(),
                                     CallbackTarget::Unknown(u) => u.clone(),
@@ -279,7 +333,10 @@ impl Render for WpHooksPanel {
 
                                 details = details.child(
                                     h_flex()
-                                        .id(SharedString::from(format!("listener-{}-{line}", listener.hook_name)))
+                                        .id(SharedString::from(format!(
+                                            "listener-{}-{line}",
+                                            listener.hook_name
+                                        )))
                                         .p_1()
                                         .gap_1()
                                         .rounded_sm()
@@ -289,22 +346,42 @@ impl Render for WpHooksPanel {
                                             if let Some(workspace) = workspace.upgrade() {
                                                 let path = path.clone();
                                                 workspace.update(cx, |workspace, cx| {
-                                                    workspace.open_abs_path(path, OpenOptions::default(), window, cx).detach_and_log_err(cx);
+                                                    workspace
+                                                        .open_abs_path(
+                                                            path,
+                                                            OpenOptions::default(),
+                                                            window,
+                                                            cx,
+                                                        )
+                                                        .detach_and_log_err(cx);
                                                 });
                                             }
                                         })
-                                        .child(Label::new(format!("[{}]", listener.priority)).size(LabelSize::XSmall).color(Color::Muted))
-                                        .child(Label::new(callback_str).size(LabelSize::Small).color(Color::Default))
                                         .child(
-                                            h_flex()
-                                                .flex_1()
-                                                .justify_end()
-                                                .child(
-                                                    Label::new(format!("{}:{}", listener.file_path.file_name().map(|f| f.to_string_lossy()).unwrap_or_default(), line))
-                                                        .size(LabelSize::XSmall)
-                                                        .color(Color::Muted)
-                                                )
+                                            Label::new(format!("[{}]", listener.priority))
+                                                .size(LabelSize::XSmall)
+                                                .color(Color::Muted),
                                         )
+                                        .child(
+                                            Label::new(callback_str)
+                                                .size(LabelSize::Small)
+                                                .color(Color::Default),
+                                        )
+                                        .child(
+                                            h_flex().flex_1().justify_end().child(
+                                                Label::new(format!(
+                                                    "{}:{}",
+                                                    listener
+                                                        .file_path
+                                                        .file_name()
+                                                        .map(|f| f.to_string_lossy())
+                                                        .unwrap_or_default(),
+                                                    line
+                                                ))
+                                                .size(LabelSize::XSmall)
+                                                .color(Color::Muted),
+                                            ),
+                                        ),
                                 );
                             }
 
@@ -312,9 +389,15 @@ impl Render for WpHooksPanel {
                         }
 
                         hook_item
-                    }))
+                    })),
             )
     }
+}
+
+/// Reads the shared index; a lock poisoned by a panicked indexer still yields the last index
+/// instead of panicking the render.
+pub(crate) fn read_index<T>(index: &RwLock<T>) -> RwLockReadGuard<'_, T> {
+    index.read().unwrap_or_else(PoisonError::into_inner)
 }
 
 #[cfg(test)]
@@ -324,15 +407,13 @@ mod tests {
     #[gpui::test]
     fn test_wp_hooks_panel_state(cx: &mut App) {
         let index = Arc::new(RwLock::new(WordPressIndex::new()));
-        let panel = cx.new(|cx| {
-            WpHooksPanel {
-                focus_handle: cx.focus_handle(),
-                index,
-                search_query: String::new(),
-                filter_kind: None,
-                expanded_hooks: HashSet::new(),
-                workspace: WeakEntity::new_invalid(),
-            }
+        let panel = cx.new(|cx| WpHooksPanel {
+            focus_handle: cx.focus_handle(),
+            index,
+            search_query: String::new(),
+            filter_kind: None,
+            expanded_hooks: HashSet::new(),
+            workspace: WeakEntity::new_invalid(),
         });
 
         panel.update(cx, |this, cx| {
@@ -350,5 +431,19 @@ mod tests {
             this.toggle_expand("init", cx);
             assert!(!this.expanded_hooks.contains("init"));
         });
+    }
+
+    #[test]
+    fn test_read_index_survives_a_poisoned_lock() {
+        let index = Arc::new(RwLock::new(7));
+        let writer = index.clone();
+        std::thread::spawn(move || {
+            let _guard = writer.write().unwrap();
+            panic!("indexer died");
+        })
+        .join()
+        .unwrap_err();
+        assert!(index.is_poisoned());
+        assert_eq!(*read_index(&index), 7);
     }
 }

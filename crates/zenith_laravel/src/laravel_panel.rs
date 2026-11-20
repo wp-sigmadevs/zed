@@ -1,10 +1,9 @@
-use std::sync::{Arc, RwLock};
 use gpui::prelude::*;
 use gpui::{
-    Action, App, Context, EventEmitter, FocusHandle, Focusable,
-    IntoElement, ParentElement, Pixels, Render, SharedString, Styled, WeakEntity,
-    Window, px,
+    Action, App, Context, EventEmitter, FocusHandle, Focusable, IntoElement, ParentElement, Pixels,
+    Render, SharedString, Styled, WeakEntity, Window, px,
 };
+use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard};
 use ui::prelude::*;
 use ui::{ButtonStyle, Color, Icon, IconName, Label, LabelCommon};
 use workspace::dock::{DockPosition, Panel, PanelEvent};
@@ -76,10 +75,19 @@ impl Panel for LaravelPanel {
     }
 
     fn position_is_valid(&self, position: DockPosition) -> bool {
-        matches!(position, DockPosition::Left | DockPosition::Right | DockPosition::Bottom)
+        matches!(
+            position,
+            DockPosition::Left | DockPosition::Right | DockPosition::Bottom
+        )
     }
 
-    fn set_position(&mut self, _position: DockPosition, _window: &mut Window, _cx: &mut Context<Self>) {}
+    fn set_position(
+        &mut self,
+        _position: DockPosition,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+    }
 
     fn default_size(&self, _window: &Window, _cx: &App) -> Pixels {
         px(360.)
@@ -104,7 +112,7 @@ impl Panel for LaravelPanel {
 
 impl Render for LaravelPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let index_guard = self.index.read().unwrap();
+        let index_guard = read_index(&self.index);
         let query = self.search_query.to_lowercase();
         let active_tab = self.active_tab;
 
@@ -120,7 +128,11 @@ impl Render for LaravelPanel {
                         }
                         r.name.to_lowercase().contains(&query)
                             || r.uri.to_lowercase().contains(&query)
-                            || r.action.as_deref().unwrap_or("").to_lowercase().contains(&query)
+                            || r.action
+                                .as_deref()
+                                .unwrap_or("")
+                                .to_lowercase()
+                                .contains(&query)
                     })
                     .cloned()
                     .collect();
@@ -153,7 +165,9 @@ impl Render for LaravelPanel {
                                 if let Some(workspace) = workspace.upgrade() {
                                     let path = path.clone();
                                     workspace.update(cx, |workspace, cx| {
-                                        workspace.open_abs_path(path, OpenOptions::default(), window, cx).detach_and_log_err(cx);
+                                        workspace
+                                            .open_abs_path(path, OpenOptions::default(), window, cx)
+                                            .detach_and_log_err(cx);
                                     });
                                 }
                             })
@@ -161,7 +175,7 @@ impl Render for LaravelPanel {
                                 Label::new(route.method)
                                     .size(LabelSize::XSmall)
                                     .weight(gpui::FontWeight::BOLD)
-                                    .color(method_color)
+                                    .color(method_color),
                             )
                             .child(
                                 v_flex()
@@ -169,23 +183,32 @@ impl Render for LaravelPanel {
                                     .child(
                                         Label::new(route.uri)
                                             .size(LabelSize::Small)
-                                            .weight(gpui::FontWeight::MEDIUM)
+                                            .weight(gpui::FontWeight::MEDIUM),
                                     )
                                     .child(
-                                        Label::new(format!("name: {} | {}", route.name, route.action.as_deref().unwrap_or("closure")))
-                                            .size(LabelSize::XSmall)
-                                            .color(Color::Muted)
-                                    )
+                                        Label::new(format!(
+                                            "name: {} | {}",
+                                            route.name,
+                                            route.action.as_deref().unwrap_or("closure")
+                                        ))
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Muted),
+                                    ),
                             )
                             .child(
-                                h_flex()
-                                    .flex_1()
-                                    .justify_end()
-                                    .child(
-                                        Label::new(format!("{}:{}", route.file_path.file_name().map(|f| f.to_string_lossy()).unwrap_or_default(), line))
-                                            .size(LabelSize::XSmall)
-                                            .color(Color::Muted)
-                                    )
+                                h_flex().flex_1().justify_end().child(
+                                    Label::new(format!(
+                                        "{}:{}",
+                                        route
+                                            .file_path
+                                            .file_name()
+                                            .map(|f| f.to_string_lossy())
+                                            .unwrap_or_default(),
+                                        line
+                                    ))
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted),
+                                ),
                             )
                     }))
                     .into_any_element()
@@ -224,21 +247,24 @@ impl Render for LaravelPanel {
                                 if let Some(workspace) = workspace.upgrade() {
                                     let path = path.clone();
                                     workspace.update(cx, |workspace, cx| {
-                                        workspace.open_abs_path(path, OpenOptions::default(), window, cx).detach_and_log_err(cx);
+                                        workspace
+                                            .open_abs_path(path, OpenOptions::default(), window, cx)
+                                            .detach_and_log_err(cx);
                                     });
                                 }
                             })
-                            .child(Icon::new(IconName::FileCode).size(IconSize::Small).color(Color::Muted))
+                            .child(
+                                Icon::new(IconName::FileCode)
+                                    .size(IconSize::Small)
+                                    .color(Color::Muted),
+                            )
                             .child(Label::new(view.dot_name).size(LabelSize::Small))
                             .child(
-                                h_flex()
-                                    .flex_1()
-                                    .justify_end()
-                                    .child(
-                                        Label::new(if view.is_blade { ".blade.php" } else { ".php" })
-                                            .size(LabelSize::XSmall)
-                                            .color(Color::Muted)
-                                    )
+                                h_flex().flex_1().justify_end().child(
+                                    Label::new(if view.is_blade { ".blade.php" } else { ".php" })
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Muted),
+                                ),
                             )
                     }))
                     .into_any_element()
@@ -262,8 +288,8 @@ impl Render for LaravelPanel {
                             .gap_2()
                             .items_center()
                             .child(Icon::new(IconName::Server).color(Color::Accent))
-                            .child(Label::new("Laravel").weight(gpui::FontWeight::SEMIBOLD))
-                    )
+                            .child(Label::new("Laravel").weight(gpui::FontWeight::SEMIBOLD)),
+                    ),
             )
             .child(
                 h_flex()
@@ -273,17 +299,35 @@ impl Render for LaravelPanel {
                     .border_color(cx.theme().colors().border_variant)
                     .child(
                         Button::new("tab-routes", "Routes")
-                            .style(if self.active_tab == LaravelPanelTab::Routes { ButtonStyle::Filled } else { ButtonStyle::Subtle })
-                            .on_click(cx.listener(|this, _, _, cx| this.set_tab(LaravelPanelTab::Routes, cx)))
+                            .style(if self.active_tab == LaravelPanelTab::Routes {
+                                ButtonStyle::Filled
+                            } else {
+                                ButtonStyle::Subtle
+                            })
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.set_tab(LaravelPanelTab::Routes, cx)
+                            })),
                     )
                     .child(
                         Button::new("tab-views", "Views")
-                            .style(if self.active_tab == LaravelPanelTab::Views { ButtonStyle::Filled } else { ButtonStyle::Subtle })
-                            .on_click(cx.listener(|this, _, _, cx| this.set_tab(LaravelPanelTab::Views, cx)))
-                    )
+                            .style(if self.active_tab == LaravelPanelTab::Views {
+                                ButtonStyle::Filled
+                            } else {
+                                ButtonStyle::Subtle
+                            })
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.set_tab(LaravelPanelTab::Views, cx)
+                            })),
+                    ),
             )
             .child(content_view)
     }
+}
+
+/// Reads the shared index; a lock poisoned by a panicked indexer still yields the last index
+/// instead of panicking the render.
+pub(crate) fn read_index<T>(index: &RwLock<T>) -> RwLockReadGuard<'_, T> {
+    index.read().unwrap_or_else(PoisonError::into_inner)
 }
 
 #[cfg(test)]
@@ -293,9 +337,7 @@ mod tests {
     #[gpui::test]
     fn test_laravel_panel_state(cx: &mut App) {
         let index = Arc::new(RwLock::new(LaravelIndex::new()));
-        let panel = cx.new(|cx| {
-            LaravelPanel::new(WeakEntity::new_invalid(), index, cx)
-        });
+        let panel = cx.new(|cx| LaravelPanel::new(WeakEntity::new_invalid(), index, cx));
 
         panel.update(cx, |this, cx| {
             assert_eq!(this.active_tab, LaravelPanelTab::Routes);
@@ -306,5 +348,19 @@ mod tests {
             this.set_search_query("users".to_string(), cx);
             assert_eq!(this.search_query, "users");
         });
+    }
+
+    #[test]
+    fn test_read_index_survives_a_poisoned_lock() {
+        let index = Arc::new(RwLock::new(7));
+        let writer = index.clone();
+        std::thread::spawn(move || {
+            let _guard = writer.write().unwrap();
+            panic!("indexer died");
+        })
+        .join()
+        .unwrap_err();
+        assert!(index.is_poisoned());
+        assert_eq!(*read_index(&index), 7);
     }
 }
