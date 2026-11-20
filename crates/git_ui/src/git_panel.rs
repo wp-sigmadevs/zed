@@ -10223,7 +10223,7 @@ impl Panel for GitPanel {
     fn icon(&self, _: &Window, cx: &App) -> Option<ui::IconName> {
         GitPanelSettings::get_global(cx)
             .button
-            .then_some(ui::IconName::GitBranch)
+            .then_some(ui::IconName::ZenithGitBranch)
     }
 
     fn icon_tooltip(&self, _window: &Window, _cx: &App) -> Option<&'static str> {
@@ -15692,6 +15692,15 @@ mod tests {
     #[gpui::test]
     async fn test_history_tab_pane_navigation_focuses_rendered_panel(cx: &mut TestAppContext) {
         init_test(cx);
+        // Navigating right reaches the panel only when it is in the right dock.
+        cx.update(|cx| {
+            cx.update_global::<SettingsStore, _>(|store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.git_panel.get_or_insert_default().dock =
+                        Some(settings::DockPosition::Right);
+                });
+            });
+        });
 
         let (_, _project, workspace, panel, mut cx) =
             setup_git_panel_with_changes(cx, json!({ ".git": {} }), &[]).await;

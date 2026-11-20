@@ -114,8 +114,10 @@ impl<D: PickerDelegate> Picker<D> {
                     .px_2p5()
                     .flex_none()
                     .overflow_hidden()
+                    .children(zenith_search_icon(cx))
                     .child(div().flex_1().child(editor.render(window, cx)))
                     .children(self.delegate.searchbar_trailer(window, cx))
+                    .children(zenith_esc_hint(cx))
                     .when(self.delegate.supports_multi_select(), |this| {
                         this.child(self.render_multi_select_toggle(cx))
                     }),
@@ -450,4 +452,31 @@ impl<D: PickerDelegate> Picker<D> {
             }
         }
     }
+}
+
+// Zenith: every picker's search field gets PhpStorm's magnifier and `esc` hint
+// while Zenith's chrome is on.
+fn zenith_search_icon(cx: &App) -> Option<impl IntoElement + use<>> {
+    cx.has_global::<workspace::IslandsActive>().then(|| {
+        div()
+            .debug_selector(|| "zenith-search-field".into())
+            .mr_2()
+            .child(
+                Icon::new(IconName::MagnifyingGlass)
+                    .size(IconSize::Small)
+                    .color(Color::Muted),
+            )
+    })
+}
+
+fn zenith_esc_hint(cx: &App) -> Option<impl IntoElement + use<>> {
+    cx.has_global::<workspace::IslandsActive>().then(|| {
+        div()
+            .ml_2()
+            .px_1()
+            .rounded_sm()
+            .border_1()
+            .border_color(cx.theme().colors().border_variant)
+            .child(Label::new("esc").size(LabelSize::XSmall).color(Color::Muted))
+    })
 }

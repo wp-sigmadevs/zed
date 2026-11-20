@@ -1,0 +1,34 @@
+[package]
+name = "zenith_php_tools"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/zenith_php_tools.rs"
+doctest = false
+
+[dependencies]
+futures.workspace = true
+gpui.workspace = true
+http_client.workspace = true
+project.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+ui.workspace = true
+util.workspace = true
+workspace.workspace = true
+
+[dev-dependencies]
+http_client = { workspace = true, features = ["test-support"] }
+gpui = { workspace = true, features = ["test-support"] }
+project = { workspace = true, features = ["test-support"] }
+settings.workspace = true
+tempfile.workspace = true
+theme.workspace = true
+theme_settings.workspace = true
+workspace = { workspace = true, features = ["test-support"] }

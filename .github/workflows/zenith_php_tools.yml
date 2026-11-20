@@ -1,0 +1,53 @@
+# Zenith: installs each PHP tool profile from its checked-in lock file, so a stale
+# lock or a new PHP version breaks here and not on a user's machine.
+name: zenith_php_tools
+
+on:
+  pull_request:
+    paths:
+      - "crates/zenith_php_tools/profiles/**"
+      - ".github/workflows/zenith_php_tools.yml"
+  push:
+    branches: [feat/look]
+    paths:
+      - "crates/zenith_php_tools/profiles/**"
+      - ".github/workflows/zenith_php_tools.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  install:
+    name: ${{ matrix.profile }} on PHP ${{ matrix.php }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: [wordpress, php]
+        php: ["8.1", "8.3", "8.5"]
+        include:
+          # Larastan needs PHP 8.2 or newer.
+          - { profile: laravel, php: "8.3" }
+          - { profile: laravel, php: "8.5" }
+    defaults:
+      run:
+        working-directory: crates/zenith_php_tools/profiles/${{ matrix.profile }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php }}
+          tools: composer:v2
+      - name: Lock matches manifest
+        run: composer validate --strict --no-check-publish
+      - name: Install from the lock
+        run: composer install --no-interaction --no-progress
+      - name: Tools are present
+        run: |
+          case "${{ matrix.profile }}" in
+            wordpress) vendor/bin/phpcs -i | grep -q WordPress-Extra && vendor/bin/phpstan --version ;;
+            laravel) vendor/bin/pint --version && vendor/bin/phpstan --version ;;
+            php) vendor/bin/php-cs-fixer --version && vendor/bin/phpstan --version ;;
+          esac

@@ -137,6 +137,74 @@ mod tests {
         });
     }
 
+    // Plan 34 step 1: Driftwood is bundled and is the default dark theme.
+    #[gpui::test]
+    fn test_driftwood_is_bundled_default_dark(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update(|cx| {
+            let theme = theme::ThemeRegistry::global(cx)
+                .get("Driftwood")
+                .expect("Driftwood bundled");
+            assert_eq!(theme.appearance, theme::Appearance::Dark);
+        });
+        let defaults = settings::default_settings();
+        assert!(defaults.contains(r#""dark": "Driftwood""#));
+        // Icons ship inside the app (zenith_look), not from the extension registry.
+        assert!(defaults.contains(r#""icon_theme": "Archipelago Icons""#));
+        assert!(!defaults.contains(r#""archipelago-icons": true"#));
+    }
+
+    // Plan 34 step 6: PhpStorm layout — project tools left, agent right.
+    #[test]
+    fn test_panels_dock_like_phpstorm() {
+        let defaults: serde_json::Value =
+            settings::parse_json_with_comments(&settings::default_settings())
+                .expect("default settings parse");
+        for (panel, side) in [
+            ("project_panel", "left"),
+            ("outline_panel", "left"),
+            ("git_panel", "left"),
+            ("agent", "right"),
+            ("debugger", "bottom"),
+            ("terminal", "bottom"),
+        ] {
+            assert_eq!(defaults[panel]["dock"], side, "{panel}");
+        }
+    }
+
+    // Plan 34 step 3: errors and types show in the editor, as in PhpStorm.
+    #[gpui::test]
+    fn test_inline_diagnostics_and_inlay_hints_on_by_default(cx: &mut TestAppContext) {
+        use settings::Settings as _;
+        init_test(cx);
+        cx.update(|cx| {
+            let project_settings = project::project_settings::ProjectSettings::get_global(cx);
+            assert!(project_settings.diagnostics.inline.enabled);
+            let language_settings = language::language_settings::all_language_settings(None, cx);
+            assert!(language_settings.defaults.inlay_hints.enabled);
+        });
+    }
+
+    #[gpui::test]
+    fn test_driftwood_warning_is_not_agent_orange(cx: &mut TestAppContext) {
+        use theme::ActiveTheme as _;
+        init_test(cx);
+        cx.update(|cx| {
+            cx.update_global::<SettingsStore, _>(|store, cx| {
+                store
+                    .set_user_settings(r#"{"theme": "Driftwood"}"#, cx)
+                    .result()
+                    .expect("valid settings");
+            });
+        });
+        // Theme reload runs in the settings observer, after the update above.
+        cx.update(|cx| {
+            assert_eq!(cx.theme().name, "Driftwood");
+            let amber: gpui::Hsla = gpui::rgb(0xe2b13c).into();
+            assert_eq!(cx.theme().status().warning, amber);
+        });
+    }
+
     fn set_enabled(enabled: bool, cx: &mut App) {
         cx.update_global::<SettingsStore, _>(|store, cx| {
             store

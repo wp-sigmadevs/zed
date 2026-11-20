@@ -7,11 +7,19 @@
   // - "light": Use the theme indicated by the "light" field
   // - "dark": Use the theme indicated by the "dark" field
   "theme": {
-    "mode": "system",
+    "mode": "dark",
     "light": "One Light",
-    "dark": "One Dark",
+    "dark": "Driftwood",
   },
-  "icon_theme": "Zed (Default)",
+  "icon_theme": "Archipelago Icons",
+  // Zenith: orange means "an agent did this", so Driftwood warnings use amber.
+  "theme_overrides": {
+    "Driftwood": {
+      "warning": "#e2b13c",
+      "warning.background": "#3d3420",
+      "warning.border": "#6b5a28",
+    },
+  },
   // The name of a base set of key bindings to use.
   // This setting can take the following values:
   //
@@ -24,11 +32,13 @@
   // 7. "Emacs"
   // 8. "Cursor"
   // 9. "None"
-  "base_keymap": "Zed",
+  // Zenith: JetBrains keys, as in PhpStorm.
+  "base_keymap": "JetBrains",
   // The name of a font to use for rendering text in the editor
   // ".ZedMono" currently aliases to Lilex
   // but this may change in the future.
-  "buffer_font_family": ".ZedMono",
+  // Zenith: JetBrains Mono, bundled in assets/fonts/jetbrains-mono.
+  "buffer_font_family": "JetBrains Mono",
   // Set the buffer text's font fallbacks, this will be merged with
   // the platform's default fallbacks.
   "buffer_font_fallbacks": null,
@@ -36,9 +46,10 @@
   "buffer_font_features": {
     // Disable ligatures:
     // "calt": false
+    "liga": true,
   },
   // The default font size for text in the editor
-  "buffer_font_size": 15,
+  "buffer_font_size": 17,
   // The weight of the editor font in standard CSS units from 100 to 900.
   "buffer_font_weight": 400,
   // Set the buffer's line height.
@@ -51,7 +62,9 @@
   //         "buffer_line_height": {
   //           "custom": 2
   //         },
-  "buffer_line_height": "comfortable",
+  "buffer_line_height": {
+    "custom": 1.8,
+  },
   // The name of a font to use for rendering text in the UI
   // You can set this to ".SystemUIFont" to use the system font
   // ".ZedSans" currently aliases to "IBM Plex Sans", but this may
@@ -92,9 +105,10 @@
     // Values are clamped to the [0.0, 1.0] range.
     "inactive_opacity": 1.0,
   },
-  // Layout mode of the bottom dock. Defaults to "contained"
+  // Layout mode of the bottom dock. Defaults to "full"
   //   choices: contained, full, left_aligned, right_aligned
-  "bottom_dock_layout": "contained",
+  // Zenith: full, as in PhpStorm (the tool window spans the whole window under the sidebars).
+  "bottom_dock_layout": "full",
   // The direction that you want to split panes horizontally. Defaults to "down"
   "pane_split_direction_horizontal": "down",
   // The direction that you want to split panes vertically. Defaults to "right"
@@ -389,7 +403,7 @@
   //
   // The colors that are used for different indentation levels are defined in the theme (theme key: `accents`).
   // They can be customized by using theme overrides.
-  "colorize_brackets": false,
+  "colorize_brackets": true,
   // When to show the scrollbar in the completion menu.
   // This setting can take four values:
   //
@@ -505,7 +519,7 @@
   // The default number of context lines shown in multibuffer excerpts.
   "excerpt_context_lines": 2,
   // Globs to match against file paths to determine if a file is private.
-  "private_files": ["**/.env*", "**/*.pem", "**/*.key", "**/*.cert", "**/*.crt", "**/secrets.yml"],
+  "private_files": ["**/.env*", "**/*.pem", "**/*.key", "**/*.cert", "**/*.crt", "**/secrets.yml", "**/wp-config.php"],
   // Whether to use additional LSP queries to format (and amend) the code after
   // every "trigger" symbol input, defined by LSP server capabilities.
   "use_on_type_format": true,
@@ -703,7 +717,7 @@
     //    "always"
     // 3. Never show the minimap:
     //    "never" (default)
-    "show": "never",
+    "show": "always",
     // Where to show the minimap in the editor.
     // This setting can take two values:
     // 1. Show the minimap on the focused editor only:
@@ -782,13 +796,13 @@
     // 1. "disabled"
     // 2. "fixed"
     // 3. "indent_aware"
-    "coloring": "fixed",
+    "coloring": "indent_aware",
     // Determines how indent guide backgrounds are colored.
     // This setting can take the following two values:
     //
     // 1. "disabled"
     // 2. "indent_aware"
-    "background_coloring": "disabled",
+    "background_coloring": "indent_aware",
   },
   // Whether the editor will scroll beyond the last line.
   "scroll_beyond_last_line": "one_page",
@@ -848,8 +862,9 @@
   "use_smartcase_search": false,
   // Inlay hint related settings
   "inlay_hints": {
-    // Global switch to toggle hints on and off, switched off by default.
-    "enabled": false,
+    // Global switch to toggle hints on and off.
+    // Zenith: on by default, as in PhpStorm.
+    "enabled": true,
     // Toggle certain types of hints on and off, all switched on by default.
     "show_type_hints": true,
     "show_parameter_hints": true,
@@ -859,7 +874,7 @@
     // Whether to show a background for inlay hints.
     //
     // If set to `true`, the background will use the `hint.background` color from the current theme.
-    "show_background": false,
+    "show_background": true,
     // Time to wait after editing the buffer, before requesting the hints,
     // set to 0 to disable debouncing.
     "edit_debounce_ms": 700,
@@ -889,7 +904,8 @@
     // Default width of the project panel.
     "default_width": 240,
     // Where to dock the project panel. Can be 'left' or 'right'.
-    "dock": "right",
+    // Zenith: left, as in PhpStorm.
+    "dock": "left",
     // Spacing between worktree entries in the project panel. Can be 'comfortable' or 'standard'.
     "entry_spacing": "comfortable",
     // Whether to show file icons in the project panel.
@@ -902,7 +918,8 @@
     //   "chevron"
     // 3. A disclosure chevron followed by a folder icon:
     //   "both"
-    "folder_indicator": "icon",
+    // Zenith: "both", as in PhpStorm.
+    "folder_indicator": "both",
     // Whether to show the git status in the project panel.
     "git_status": true,
     // Amount of indentation for nested items.
@@ -1017,7 +1034,8 @@
     // Default width of the outline panel.
     "default_width": 300,
     // Where to dock the outline panel. Can be 'left' or 'right'.
-    "dock": "right",
+    // Zenith: left, as in PhpStorm.
+    "dock": "left",
     // Whether to show file icons in the outline panel.
     "file_icons": true,
     // What to show for directories in the outline panel.
@@ -1079,7 +1097,8 @@
   },
   "collaboration_panel": {
     // Whether to show the collaboration panel button in the status bar.
-    "button": true,
+    // Zenith: off; not part of the PhpStorm layout.
+    "button": false,
     // Where to dock the collaboration panel. Can be 'left' or 'right'.
     "dock": "right",
     // Default width of the collaboration panel.
@@ -1095,7 +1114,8 @@
     // Whether to show the git panel button in the status bar.
     "button": true,
     // Where to dock the git panel. Can be 'left' or 'right'.
-    "dock": "right",
+    // Zenith: left, as in PhpStorm.
+    "dock": "left",
     // Default width of the git panel.
     "default_width": 360,
     // Style of the git status indicator in the panel.
@@ -1184,7 +1204,8 @@
     // Whether to show the agent panel button in the status bar.
     "button": true,
     // Where to dock the agent panel. Can be 'left', 'right' or 'bottom'.
-    "dock": "left",
+    // Zenith: right, as in PhpStorm.
+    "dock": "right",
     // Whether the agent panel should use flexible (proportional) sizing when docked
     // to the left or right. When enabled, `default_width` does not control the panel
     // width, and resetting the panel restores the default proportion.
@@ -1497,8 +1518,9 @@
     "show_tab_bar_buttons": true,
     // Whether or not to show pinned tabs in a separate row.
     // When enabled, pinned tabs appear in a top row and unpinned tabs in a bottom row.
-    // When disabled, all tabs appear in a single row (default behavior).
-    "show_pinned_tabs_in_separate_row": false,
+    // When disabled, all tabs appear in a single row.
+    // Zenith: on, so pinned tabs sit in a top row as in PhpStorm.
+    "show_pinned_tabs_in_separate_row": true,
   },
   // Settings related to the tab switcher (Ctrl-Tab).
   "tab_switcher": {
@@ -1510,12 +1532,12 @@
   // Settings related to the editor's tabs
   "tabs": {
     // Show git status colors in the editor tabs.
-    "git_status": false,
+    "git_status": true,
     // Position of the close button on the editor tabs.
     // One of: ["right", "left"]
     "close_position": "right",
     // Whether to show the file icon for a tab.
-    "file_icons": false,
+    "file_icons": true,
     // Controls the appearance behavior of the tab's close button.
     //
     // 1. Show it just upon hovering the tab. (default)
@@ -1747,7 +1769,7 @@
   "disable_ai": false,
   // Automatically update Zed. This setting may be ignored on Linux if
   // installed through a package manager.
-  "auto_update": true,
+  "auto_update": false,
   // How to render LSP `textDocument/documentColor` colors in the editor.
   //
   // Possible values:
@@ -1784,7 +1806,8 @@
     // Settings for inline diagnostics
     "inline": {
       // Whether to show diagnostics inline or not
-      "enabled": false,
+      // Zenith: on by default, as in PhpStorm.
+      "enabled": true,
       // The delay in milliseconds to show inline diagnostics after the
       // last diagnostic update.
       "update_debounce_ms": 150,
@@ -2077,9 +2100,9 @@
     // Whether to show the cursor position button in the status bar.
     "cursor_position_button": true,
     // Whether to show active line endings button in the status bar.
-    "line_endings_button": false,
+    "line_endings_button": true,
     // Control when to show the active encoding in the status bar.
-    "active_encoding_button": "non_utf8",
+    "active_encoding_button": "enabled",
     // Whether to show an indicator while multi-stroke input is pending.
     // If the input has a timeout, a countdown is shown and hovering pauses it.
     // Its binding preview popover is disabled when "which_key.enabled" is true.
@@ -2103,7 +2126,8 @@
     //     }
     "shell": "system",
     // Where to dock terminals panel. Can be `left`, `right`, `bottom`.
-    "dock": "bottom",
+    // Zenith: right, so its rail button sits on the right bar; drag the button to move it.
+    "dock": "right",
     // Whether the terminal panel should open on startup.
     //
     // Default: false
@@ -2252,6 +2276,7 @@
     // Set the terminal's font size. If this option is not included,
     // the terminal will default to matching the buffer's font size.
     // "font_size": 15,
+    "font_size": 16,
     // Set the terminal's font family. If this option is not included,
     // the terminal will default to matching the buffer's font family.
     // "font_family": ".ZedMono",
@@ -2404,6 +2429,9 @@
   // and change the value to `false`.
   "auto_install_extensions": {
     "html": true,
+    "php": true,
+    "blade": true,
+    "scss": true,
   },
   // Whether to suggest installing extensions based on the files you open.
   "suggest_extensions": true,
@@ -2564,6 +2592,7 @@
     },
     "JavaScript": {
       "language_servers": ["!typescript-language-server", "vtsls", "..."],
+      "semantic_tokens": "combined",
       "prettier": {
         "allowed": true,
       },
@@ -2606,7 +2635,7 @@
       },
     },
     "PHP": {
-      "language_servers": ["phpactor", "!intelephense", "!phptools", "!phpantom", "..."],
+      "language_servers": ["intelephense", "phpactor", "!phptools", "!phpantom", "..."],
       "prettier": {
         "allowed": true,
         "plugins": ["@prettier/plugin-php"],
@@ -2669,6 +2698,7 @@
     },
     "TSX": {
       "language_servers": ["!typescript-language-server", "vtsls", "..."],
+      "semantic_tokens": "combined",
       "prettier": {
         "allowed": true,
       },
@@ -2680,6 +2710,7 @@
     },
     "TypeScript": {
       "language_servers": ["!typescript-language-server", "vtsls", "..."],
+      "semantic_tokens": "combined",
       "prettier": {
         "allowed": true,
       },
@@ -2871,7 +2902,21 @@
     // ]
     //
     // Default rules are viewable via the "zed: show default semantic token rules" action.
-    "semantic_token_rules": [],
+    // Zenith: JS/TS colours from the theme's ts.* styles (WebStorm look).
+    "semantic_token_rules": [
+      { "token_type": "variable", "token_modifiers": ["local"], "style": ["ts.variable.local"] },
+      { "token_type": "variable", "style": ["ts.variable"] },
+      { "token_type": "parameter", "style": ["ts.parameter"] },
+      { "token_type": "property", "style": ["ts.property"], "font_style": "normal" },
+      { "token_type": "function", "style": ["ts.function"] },
+      { "token_type": "member", "style": ["ts.function"] },
+      { "token_type": "class", "style": ["ts.type"] },
+      { "token_type": "interface", "style": ["ts.type"] },
+      { "token_type": "type", "style": ["ts.type"] },
+      { "token_type": "typeParameter", "style": ["ts.type"] },
+      { "token_type": "enum", "style": ["ts.type"] },
+      { "token_type": "enumMember", "style": ["ts.enum_member"] },
+    ],
   },
   // Jupyter settings
   "jupyter": {
@@ -2936,6 +2981,42 @@
       // Whether to show the Zenith welcome screen instead of the
       // upstream onboarding and welcome pages.
       "enabled": true,
+    },
+    // PHP inspections: PHPCS and PHPStan findings shown as diagnostics.
+    "inspections": {
+      // Run PHPCS.
+      "phpcs": true,
+      // Run PHPStan (only in projects that have a PHPStan config).
+      "phpstan": true,
+      // Analyze a PHP file when it is saved.
+      "run_on_save": true,
+      // Files "Inspect changed files" analyzes at once.
+      "max_parallel": 2,
+    },
+    // TODO panel (⌘⇧6) and editor colouring of TODO markers.
+    "todo": {
+      // Regexes matched case-insensitively inside comments.
+      "patterns": ["\\bTODO\\b", "\\bFIXME\\b", "\\bHACK\\b", "\\bXXX\\b", "@todo", "shortcut:"],
+      // Colour TODO markers in the editor.
+      "highlight": true,
+      // Files listed when the panel opens: "project", "current_file" or "changed_files".
+      "scope": "project",
+      // Where the panel docks: "left", "bottom" or "right".
+      "dock": "bottom",
+    },
+    // Local History: automatic file revisions, independent of git.
+    "local_history": {
+      // Record a revision when a file is opened or saved.
+      "enabled": true,
+      // Days a revision is kept.
+      "retention_days": 14,
+      // Size cap of the history database in MB; oldest revisions go first.
+      "max_db_size_mb": 500,
+      // Files larger than this (in KB) are not recorded.
+      "max_file_size_kb": 2048,
+      // Record a revision when something else (git checkout, a formatter, another
+      // tool) changes a file on disk.
+      "snapshot_external_changes": true,
     },
   },
   // The server to connect to. If the environment variable

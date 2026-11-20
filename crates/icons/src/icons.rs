@@ -308,6 +308,22 @@ pub enum IconName {
     ZedSrcCustom,
     ZedSrcExtension,
     Zenith,
+    ZenithAlert,
+    ZenithBot,
+    ZenithDatabase,
+    ZenithFolder,
+    ZenithGitBranch,
+    ZenithGlobe,
+    ZenithHistory,
+    ZenithHook,
+    ZenithListChecks,
+    ZenithTerminal,
+    ZenithPlus,
+    ZenithMinus,
+    ZenithExpandAll,
+    ZenithCollapseAll,
+    ZenithMoreVertical,
+    ZenithColumns,
 }
 
 impl IconName {

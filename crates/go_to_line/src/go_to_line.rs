@@ -330,6 +330,7 @@ impl Render for GoToLine {
             .key_context("GoToLine")
             .on_action(cx.listener(Self::cancel))
             .on_action(cx.listener(Self::confirm))
+            .children(zenith_title(cx))
             .child(
                 div()
                     .border_b_1()
@@ -345,7 +346,50 @@ impl Render for GoToLine {
                     .gap_1()
                     .child(Label::new(help_text).color(Color::Muted)),
             )
+            .children(zenith_buttons(cx))
     }
+}
+
+
+// Zenith: PhpStorm's "Go to Line:Column" dialog — title and Cancel / OK —
+// while Zenith's chrome is on.
+fn zenith_title(cx: &App) -> Option<impl IntoElement + use<>> {
+    cx.has_global::<workspace::IslandsActive>().then(|| {
+        div()
+            .debug_selector(|| "zenith-go-to-line-title".into())
+            .px_2()
+            .pt_2()
+            .pb_1()
+            .child(
+                Label::new("Go to Line:Column")
+                    .size(LabelSize::Small)
+                    .weight(gpui::FontWeight::SEMIBOLD),
+            )
+    })
+}
+
+fn zenith_buttons(cx: &App) -> Option<impl IntoElement + use<>> {
+    cx.has_global::<workspace::IslandsActive>().then(|| {
+        h_flex()
+            .debug_selector(|| "zenith-go-to-line-buttons".into())
+            .px_2()
+            .py_1p5()
+            .gap_1()
+            .justify_end()
+            .border_t_1()
+            .border_color(cx.theme().colors().border_variant)
+            .child(
+                Button::new("zenith-go-to-line-cancel", "Cancel")
+                    .label_size(LabelSize::Small)
+                    .on_click(|_, window, cx| window.dispatch_action(Box::new(menu::Cancel), cx)),
+            )
+            .child(
+                Button::new("zenith-go-to-line-ok", "OK")
+                    .label_size(LabelSize::Small)
+                    .style(ButtonStyle::Filled)
+                    .on_click(|_, window, cx| window.dispatch_action(Box::new(menu::Confirm), cx)),
+            )
+    })
 }
 
 #[cfg(test)]
@@ -1122,5 +1166,78 @@ mod tests {
             scroll_position_after_confirm, scroll_position_after_input,
             "Confirm should maintain new scroll position"
         );
+    }
+}
+
+#[cfg(test)]
+mod zenith_tests {
+    use super::*;
+    use gpui::{TestAppContext, VisualTestContext};
+    use project::{FakeFs, Project};
+    use serde_json::json;
+    use util::{path, rel_path::rel_path};
+    use workspace::{AppState, MultiWorkspace};
+
+    async fn open_dialog(
+        cx: &mut TestAppContext,
+        islands: bool,
+    ) -> (Entity<Editor>, VisualTestContext) {
+        cx.update(|cx| {
+            let _state = AppState::test(cx);
+            crate::init(cx);
+            editor::init(cx);
+            if islands {
+                cx.set_global(workspace::IslandsActive);
+            }
+        });
+        let fs = FakeFs::new(cx.executor());
+        let text = (0..20).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        fs.insert_tree(path!("/dir"), json!({ "a.rs": text })).await;
+        let project = Project::test(fs, [path!("/dir").as_ref()], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        let worktree_id = workspace.update(cx, |workspace, cx| {
+            workspace.project().read(cx).worktrees(cx).next().unwrap().read(cx).id()
+        });
+        let editor = workspace
+            .update_in(cx, |workspace, window, cx| {
+                workspace.open_path((worktree_id, rel_path("a.rs")), None, true, window, cx)
+            })
+            .await
+            .unwrap()
+            .downcast::<Editor>()
+            .unwrap();
+        cx.dispatch_action(editor::actions::ToggleGoToLine);
+        cx.run_until_parked();
+        (editor, cx.clone())
+    }
+
+    #[gpui::test]
+    async fn test_phpstorm_dialog_and_ok_button(cx: &mut TestAppContext) {
+        let (editor, mut cx) = open_dialog(cx, true).await;
+        let cx = &mut cx;
+        assert!(cx.debug_bounds("zenith-go-to-line-title").is_some());
+        assert!(cx.debug_bounds("zenith-go-to-line-buttons").is_some());
+        cx.simulate_input("12");
+        let ok = cx.debug_bounds("zenith-go-to-line-buttons").unwrap();
+        // OK is the right-most button.
+        cx.simulate_click(gpui::point(ok.right() - gpui::px(8.), ok.center().y), gpui::Modifiers::none());
+        cx.run_until_parked();
+        let row = editor.update(cx, |editor, cx| {
+            editor
+                .selections
+                .newest::<text::Point>(&editor.display_snapshot(cx))
+                .head()
+                .row
+        });
+        assert_eq!(row, 11);
+    }
+
+    #[gpui::test]
+    async fn test_no_dialog_chrome_without_islands(cx: &mut TestAppContext) {
+        let (_editor, mut cx) = open_dialog(cx, false).await;
+        assert!(cx.debug_bounds("zenith-go-to-line-title").is_none());
+        assert!(cx.debug_bounds("zenith-go-to-line-buttons").is_none());
     }
 }

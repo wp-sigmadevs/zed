@@ -1,0 +1,27 @@
+[package]
+name = "zenith_title_bar"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/zenith_title_bar.rs"
+doctest = false
+
+[dependencies]
+gpui.workspace = true
+ui.workspace = true
+project.workspace = true
+zed_actions.workspace = true
+workspace.workspace = true
+zenith_search.workspace = true
+
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }
+project = { workspace = true, features = ["test-support"] }
+task.workspace = true
+workspace = { workspace = true, features = ["test-support"] }

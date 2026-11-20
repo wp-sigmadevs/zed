@@ -1000,3 +1000,29 @@ pub mod git_panel {
         ]
     );
 }
+
+pub mod zenith_inspections {
+    use gpui::actions;
+
+    actions!(
+        zenith_inspections,
+        [
+            /// Runs the PHP inspections on every PHP file in the selected folder.
+            InspectFolder,
+        ]
+    );
+}
+
+pub mod zenith_local_history {
+    use gpui::actions;
+
+    actions!(
+        zenith_local_history,
+        [
+            /// Shows the local history of the current file.
+            ShowFileHistory,
+            /// Lists deleted files that have local history and restores them.
+            RecoverDeletedFiles,
+        ]
+    );
+}

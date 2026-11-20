@@ -344,6 +344,9 @@ impl Render for TitleBar {
                                 .when(title_bar_settings.show_project_items, |title_bar| {
                                     title_bar
                                         .children(self.render_project_host(cx))
+                                        .children(project_name.as_deref().and_then(|name| {
+                                            zenith_title_bar::project_badge(name, cx)
+                                        }))
                                         .child(self.render_project_name(project_name, window, cx))
                                 })
                                 .when_some(
@@ -363,6 +366,7 @@ impl Render for TitleBar {
         );
 
         children.push(self.render_collaborator_list(window, cx).into_any_element());
+        children.push(zenith_title_bar::middle(&self.project, cx).into_any_element());
 
         if title_bar_settings.show_onboarding_banner {
             if let Some(banner) = &self.banner {
@@ -1176,7 +1180,9 @@ impl TitleBar {
             client::Status::UpgradeRequired => {
                 let auto_updater = auto_update::AutoUpdater::get(cx);
                 let label = match auto_updater.map(|auto_update| auto_update.read(cx).status()) {
-                    Some(AutoUpdateStatus::Updated { .. }) => "Please restart Zenith to Collaborate",
+                    Some(AutoUpdateStatus::Updated { .. }) => {
+                        "Please restart Zenith to Collaborate"
+                    }
                     Some(AutoUpdateStatus::Installing { .. })
                     | Some(AutoUpdateStatus::Downloading { .. })
                     | Some(AutoUpdateStatus::Checking) => "Updating...",
@@ -1326,7 +1332,9 @@ impl TitleBar {
                                     .w_full()
                                     .gap_1()
                                     .justify_between()
-                                    .child(Label::new("Restart to update Zenith").color(Color::Accent))
+                                    .child(
+                                        Label::new("Restart to update Zenith").color(Color::Accent),
+                                    )
                                     .child(
                                         Icon::new(IconName::Download)
                                             .size(IconSize::Small)

@@ -14,10 +14,36 @@ test = false
 doctest = false
 
 [features]
-default = ["welcome"]
+default = ["welcome", "search", "rails", "php", "inspections", "look", "todo", "splash", "markdown", "problems", "folds", "templates", "scratches", "local_history"]
 welcome = ["dep:zenith_welcome"]
+search = ["dep:zenith_search"]
+rails = ["dep:zenith_rails"]
+php = ["dep:zenith_php_tools"]
+inspections = ["dep:zenith_inspections"]
+look = ["dep:zenith_look"]
+todo = ["dep:zenith_todo"]
+splash = ["dep:zenith_splash"]
+markdown = ["dep:zenith_markdown"]
+problems = ["dep:zenith_problems"]
+folds = ["dep:zenith_folds"]
+templates = ["dep:zenith_templates"]
+scratches = ["dep:zenith_scratches"]
+local_history = ["dep:zenith_local_history"]
 
 [dependencies]
 gpui.workspace = true
 onboarding.workspace = true
+zenith_folds = { workspace = true, optional = true }
+zenith_inspections = { workspace = true, optional = true }
+zenith_markdown = { workspace = true, optional = true }
+zenith_local_history = { workspace = true, optional = true }
+zenith_look = { workspace = true, optional = true }
+zenith_php_tools = { workspace = true, optional = true }
+zenith_problems = { workspace = true, optional = true }
+zenith_rails = { workspace = true, optional = true }
+zenith_scratches = { workspace = true, optional = true }
+zenith_search = { workspace = true, optional = true }
+zenith_splash = { workspace = true, optional = true }
+zenith_templates = { workspace = true, optional = true }
+zenith_todo = { workspace = true, optional = true }
 zenith_welcome = { workspace = true, optional = true }

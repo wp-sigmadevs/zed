@@ -1,0 +1,59 @@
+[package]
+name = "zenith_local_history"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/zenith_local_history.rs"
+doctest = false
+
+[dependencies]
+anyhow.workspace = true
+buffer_diff.workspace = true
+fs.workspace = true
+futures.workspace = true
+fuzzy_nucleo.workspace = true
+git_ui_core.workspace = true
+gpui.workspace = true
+language.workspace = true
+log.workspace = true
+menu.workspace = true
+paths.workspace = true
+picker.workspace = true
+project.workspace = true
+project_panel.workspace = true
+rope.workspace = true
+settings.workspace = true
+sha2.workspace = true
+sqlez.workspace = true
+time.workspace = true
+time_format.workspace = true
+ui.workspace = true
+util.workspace = true
+workspace.workspace = true
+worktree.workspace = true
+zed_actions.workspace = true
+zed_env_vars.workspace = true
+zstd.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[dev-dependencies]
+editor = { workspace = true, features = ["test-support"] }
+fs = { workspace = true, features = ["test-support"] }
+gpui = { workspace = true, features = ["test-support"] }
+project = { workspace = true, features = ["test-support"] }
+remote_connection = { workspace = true, features = ["test-support"] }
+serde_json.workspace = true
+settings = { workspace = true, features = ["test-support"] }
+tempfile.workspace = true
+theme.workspace = true
+theme_settings.workspace = true
+workspace = { workspace = true, features = ["test-support"] }
+worktree = { workspace = true, features = ["test-support"] }

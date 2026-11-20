@@ -1,0 +1,106 @@
+// Zenith bindings, loaded after the base keymap so they apply in every keymap.
+[
+  {
+    "context": "Workspace",
+    "bindings": {
+      // ⇧⇧ opens Search Everywhere, as in PhpStorm.
+      "shift shift": "zenith_search::Toggle",
+      // Find Action (⌘⇧A / Ctrl+Shift+A), as in PhpStorm.
+      "secondary-shift-a": "zenith_search::FindAction",
+      // Go to Class / File / Symbol and Recent Files, as in PhpStorm.
+      "secondary-o": "zenith_search::GoToClass",
+      "secondary-shift-o": "zenith_search::GoToFile",
+      "secondary-alt-o": "zenith_search::GoToSymbol",
+      "secondary-e": "zenith_search::RecentFiles",
+      // Recent Locations, as in PhpStorm; the project panel keeps ⌘1.
+      "secondary-shift-e": "zenith_search::RecentLocations",
+      // PhpStorm's Switcher: hold ⌃, Tab to step, let go to open.
+      "ctrl-tab": "zenith_search::Switcher",
+      // TODO tool window. PhpStorm has no default key for it and gives ⌘6 to Problems, so ⇧ is added.
+      "secondary-shift-6": "zenith_todo::ToggleFocus",
+      // Problems tool window, as in PhpStorm (⌘6).
+      "secondary-6": "zenith_problems::ToggleFocus",
+      // New Scratch File, as in PhpStorm (⌘⇧N); overrides Go to File and New Window.
+      "secondary-shift-n": "zenith_scratches::NewScratchFile",
+      "secondary-shift-f": "zenith_search::FindInFiles",
+      "secondary-shift-r": "zenith_search::ReplaceInFiles",
+      // Show History (local history of the file), PhpStorm has no default key for it.
+      "alt-shift-h": "zenith_local_history::ShowFileHistory",
+    },
+  },
+  {
+    // The history tab. Tab and Shift-Tab move between the revision list and the Revert and Copy
+    // buttons. The base keymap has a context-less "tab" (menu::SelectNext) that would step the
+    // list selection; a context-less binding ranks as the deepest context, so only a binding whose
+    // context is the focused element's own (the list, or the tab's own area for the buttons) ties
+    // with it, and being loaded later wins the tie.
+    "context": "LocalHistoryList || LocalHistoryView",
+    "bindings": {
+      "tab": "zenith_local_history::FocusNextControl",
+      "shift-tab": "zenith_local_history::FocusPreviousControl",
+      "alt-shift-r": "zenith_local_history::RevertToRevision",
+      "alt-shift-c": "zenith_local_history::CopyRevisionText",
+    },
+  },
+  {
+    // Collapse / expand a file in the Problems tool window.
+    "context": "ProblemsPanel",
+    "bindings": {
+      "left": "menu::SelectParent",
+      "right": "menu::SelectChild",
+    },
+  },
+  {
+    // PhpStorm's Back / Forward through the navigation history (go to definition, search
+    // results, recent places). Zed binds these keys to previous/next tab in "Pane", the
+    // same depth, so they are repeated here where the later-loaded keymap wins.
+    "context": "Pane",
+    "bindings": {
+      "secondary-alt-left": "pane::GoBack",
+      "secondary-alt-right": "pane::GoForward",
+      // PhpStorm's Find in Files and Replace in Files are popups, not a search tab.
+      "secondary-shift-f": "zenith_search::FindInFiles",
+      "secondary-shift-r": "zenith_search::ReplaceInFiles",
+    },
+  },
+  {
+    // The editor binds ⌘E (use selection for find) and ⌘⇧O (outline) itself, so
+    // the same keys are repeated here, where they win.
+    "context": "Editor && mode == full",
+    "bindings": {
+      "secondary-shift-o": "zenith_search::GoToFile",
+      "secondary-e": "zenith_search::RecentFiles",
+      // The JetBrains keymap binds ⌘⇧N (Go to File) in this context too.
+      "secondary-shift-n": "zenith_scratches::NewScratchFile",
+    },
+  },
+  {
+    // Same key, same context string as the editor's "reveal in project panel",
+    // which is two levels deep and would win over the rules above.
+    "context": "!AcpThread > Editor && mode == full",
+    "bindings": {
+      "secondary-shift-e": "zenith_search::RecentLocations",
+    },
+  },
+  {
+    // Tab / Shift-Tab switch Search Everywhere tabs, as in PhpStorm; arrows move
+    // through results. Loaded last, so this beats the picker's own Tab.
+    "context": "SearchEverywhere > Editor",
+    "bindings": {
+      "tab": "zenith_search::NextTab",
+      "shift-tab": "zenith_search::PreviousTab",
+      // Switcher: more ⌃Tab steps down the list, ⌃⇧Tab back up.
+      "ctrl-tab": "zenith_search::Switcher",
+      "ctrl-shift-tab": "menu::SelectPrevious",
+    },
+  },
+  {
+    // Owner's WebStorm customs (zed-config keymap.json), built in.
+    "context": "Editor",
+    "bindings": {
+      "secondary-g": "go_to_line::Toggle",
+      "alt-d": ["editor::SelectNext", { "replace_newest": false }],
+      "secondary-shift-i": "assistant::InlineAssist",
+    },
+  },
+]

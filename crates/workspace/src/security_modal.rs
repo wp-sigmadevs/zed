@@ -193,9 +193,7 @@ impl Render for SecurityModal {
                                 .color(Color::Muted),
                             )
                             .child(
-                                Label::new(
-                                    "Review .zenith/settings.json (or .zed/settings.json) for any extensions or commands configured by this project.",
-                                )
+                                Label::new(settings_review_text(self.has_legacy_settings(cx)))
                                 .color(Color::Muted),
                             ),
                     )
@@ -740,5 +738,83 @@ mod tests {
                 ssh_options.connection_string(),
             );
         }
+    }
+}
+
+// Zenith: name the legacy `.zed/` folder only when a project has one.
+impl SecurityModal {
+    fn has_legacy_settings(&self, cx: &App) -> bool {
+        self.worktree_store.upgrade().is_some_and(|worktree_store| {
+            has_legacy_settings(&worktree_store, self.restricted_paths.keys(), cx)
+        })
+    }
+}
+
+fn has_legacy_settings<'a>(
+    worktree_store: &Entity<WorktreeStore>,
+    mut worktree_ids: impl Iterator<Item = &'a WorktreeId>,
+    cx: &App,
+) -> bool {
+    let legacy = paths::legacy_local_settings_file_relative_path();
+    worktree_ids.any(|worktree_id| {
+        worktree_store
+            .read(cx)
+            .worktree_for_id(*worktree_id, cx)
+            .is_some_and(|worktree| worktree.read(cx).entry_for_path(legacy).is_some())
+    })
+}
+
+fn settings_review_text(has_legacy_settings: bool) -> &'static str {
+    if has_legacy_settings {
+        "Review .zenith/settings.json and .zed/settings.json for any extensions or commands configured by this project."
+    } else {
+        "Review .zenith/settings.json for any extensions or commands configured by this project."
+    }
+}
+
+#[cfg(test)]
+mod zenith_tests {
+    use super::*;
+    use project::Project;
+    use serde_json::json;
+
+    async fn review_text(tree: serde_json::Value, cx: &mut gpui::TestAppContext) -> &'static str {
+        cx.update(|cx| {
+            let settings = settings::SettingsStore::test(cx);
+            cx.set_global(settings);
+        });
+        let fs = project::FakeFs::new(cx.executor());
+        fs.insert_tree("/project", tree).await;
+        let project = Project::test(fs, [Path::new("/project")], cx).await;
+        cx.run_until_parked();
+        let worktree_store = project.read_with(cx, |project, _| project.worktree_store());
+        cx.update(|cx| {
+            let ids: Vec<_> = worktree_store
+                .read(cx)
+                .worktrees()
+                .map(|worktree| worktree.read(cx).id())
+                .collect();
+            settings_review_text(has_legacy_settings(&worktree_store, ids.iter(), cx))
+        })
+    }
+
+    #[gpui::test]
+    async fn test_legacy_folder_not_named_when_absent(cx: &mut gpui::TestAppContext) {
+        let text = review_text(
+            json!({ ".zenith": { "settings.json": "{}" }, "a.php": "" }),
+            cx,
+        )
+        .await;
+        assert!(!text.contains(".zed/"), "{text}");
+    }
+
+    #[gpui::test]
+    async fn test_legacy_folder_named_when_present(cx: &mut gpui::TestAppContext) {
+        let text = review_text(
+            json!({ ".zed": { "settings.json": "{}" }, "a.php": "" }),
+            cx,
+        )
+        .await;
+        assert!(text.contains(".zed/settings.json"), "{text}");
     }
 }

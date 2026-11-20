@@ -33629,7 +33629,14 @@ async fn setup_indent_guides_editor(
     text: &str,
     cx: &mut TestAppContext,
 ) -> (BufferId, EditorTestContext) {
-    init_test(cx, |_| {});
+    // Zenith: defaults use indent-aware colours; these tests expect the upstream ones.
+    init_test(cx, |settings| {
+        settings.defaults.indent_guides = Some(settings::IndentGuideSettingsContent {
+            coloring: Some(settings::IndentGuideColoring::Fixed),
+            background_coloring: Some(settings::IndentGuideBackgroundColoring::Disabled),
+            ..Default::default()
+        });
+    });
 
     let mut cx = EditorTestContext::new(cx).await;
 

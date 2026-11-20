@@ -12817,6 +12817,9 @@ async fn test_focus_follows_mouse_into_blank_area(cx: &mut gpui::TestAppContext)
                     enabled: Some(true),
                     debounce_ms: Some(100),
                 });
+                // The mouse position below assumes the panel is in the right dock.
+                settings.project_panel.get_or_insert_default().dock =
+                    Some(settings::DockSide::Right);
             });
         });
     });

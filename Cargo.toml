@@ -253,11 +253,25 @@ members = [
     "crates/zed_env_vars",
     "crates/zenith",
     "crates/zenith_external_libraries",
+    "crates/zenith_folds",
     "crates/zenith_http",
+    "crates/zenith_inspections",
     "crates/zenith_laravel",
+    "crates/zenith_local_history",
+    "crates/zenith_look",
+    "crates/zenith_markdown",
     "crates/zenith_nextjs",
+    "crates/zenith_php_tools",
     "crates/zenith_postfix",
+    "crates/zenith_problems",
+    "crates/zenith_rails",
     "crates/zenith_refactor",
+    "crates/zenith_scratches",
+    "crates/zenith_search",
+    "crates/zenith_splash",
+    "crates/zenith_templates",
+    "crates/zenith_title_bar",
+    "crates/zenith_todo",
     "crates/zenith_welcome",
     "crates/zenith_wordpress",
     "crates/zeta_prompt",
@@ -536,11 +550,25 @@ zed_credentials_provider = { path = "crates/zed_credentials_provider" }
 zed_env_vars = { path = "crates/zed_env_vars" }
 zenith = { path = "crates/zenith" }
 zenith_external_libraries = { path = "crates/zenith_external_libraries" }
+zenith_folds = { path = "crates/zenith_folds" }
 zenith_http = { path = "crates/zenith_http" }
+zenith_inspections = { path = "crates/zenith_inspections" }
 zenith_laravel = { path = "crates/zenith_laravel" }
+zenith_local_history = { path = "crates/zenith_local_history" }
+zenith_look = { path = "crates/zenith_look" }
+zenith_markdown = { path = "crates/zenith_markdown" }
 zenith_nextjs = { path = "crates/zenith_nextjs" }
+zenith_php_tools = { path = "crates/zenith_php_tools" }
 zenith_postfix = { path = "crates/zenith_postfix" }
+zenith_problems = { path = "crates/zenith_problems" }
+zenith_rails = { path = "crates/zenith_rails" }
 zenith_refactor = { path = "crates/zenith_refactor" }
+zenith_scratches = { path = "crates/zenith_scratches" }
+zenith_search = { path = "crates/zenith_search" }
+zenith_splash = { path = "crates/zenith_splash" }
+zenith_templates = { path = "crates/zenith_templates" }
+zenith_title_bar = { path = "crates/zenith_title_bar" }
+zenith_todo = { path = "crates/zenith_todo" }
 zenith_welcome = { path = "crates/zenith_welcome" }
 zenith_wordpress = { path = "crates/zenith_wordpress" }
 zeta_prompt = { path = "crates/zeta_prompt" }

@@ -175,6 +175,13 @@ use crate::{
 
 pub const SERIALIZATION_THROTTLE_TIME: Duration = Duration::from_millis(200);
 pub const MAX_RECENT_SELECTIONS: usize = 20;
+/// Zenith: width of the icon rails.
+pub const RAIL_WIDTH: Pixels = px(34.);
+
+/// Set when Zenith draws panels as rounded, separated islands.
+pub struct IslandsActive;
+
+impl Global for IslandsActive {}
 
 /// Which optional window-title variables are actually referenced by the active
 /// template. Used to skip expensive lookups when the template doesn't need them.
@@ -1673,6 +1680,8 @@ pub struct Workspace {
     toast_layer: Entity<ToastLayer>,
     titlebar_item: Option<AnyView>,
     window_tabs_item: Option<AnyView>,
+    /// Zenith: icon rails down each side of the window.
+    rails: Option<(AnyView, AnyView)>,
     titlebar_focus_handle: FocusHandle,
     region_focus_handles: RegionFocusHandles,
     notifications: Notifications,
@@ -2173,6 +2182,7 @@ impl Workspace {
             toast_layer,
             titlebar_item: None,
             window_tabs_item: None,
+            rails: None,
             titlebar_focus_handle: cx.focus_handle(),
             region_focus_handles: RegionFocusHandles::new(cx),
             notifications: Notifications::default(),
@@ -3513,6 +3523,12 @@ impl Workspace {
 
     pub fn client(&self) -> &Arc<Client> {
         &self.app_state.client
+    }
+
+    /// Zenith: puts icon rails left and right of the docks and editor.
+    pub fn set_rails(&mut self, left: AnyView, right: AnyView, cx: &mut Context<Self>) {
+        self.rails = Some((left, right));
+        cx.notify();
     }
 
     pub fn set_titlebar_item(&mut self, item: AnyView, _: &mut Window, cx: &mut Context<Self>) {
@@ -9135,6 +9151,7 @@ impl Workspace {
             .flex()
             .overflow_hidden()
             .flex_none()
+            .when(cx.has_global::<IslandsActive>(), |this| this.p(px(2.5)))
             .child(dock.clone())
             .children(leader_border);
 
@@ -9342,13 +9359,31 @@ impl Workspace {
                 this.track_focus(&self.region_focus_handles.editor)
             })
             .size_full()
-            .child(self.center.render(
-                self.zoomed.as_ref(),
-                self.maximized_pane.as_ref(),
-                render_cx,
-                window,
-                cx,
-            ))
+            .when(cx.has_global::<IslandsActive>(), |this| this.p(px(2.5)))
+            .child({
+                let islands = cx.has_global::<IslandsActive>();
+                let island_border = cx.theme().colors().border;
+                let center = self.center.render(
+                    self.zoomed.as_ref(),
+                    self.maximized_pane.as_ref(),
+                    render_cx,
+                    window,
+                    cx,
+                );
+                if islands {
+                    div()
+                        .debug_selector(|| "zenith-center-island".into())
+                        .size_full()
+                        .rounded(px(10.))
+                        .overflow_hidden()
+                        .border_1()
+                        .border_color(island_border)
+                        .child(center)
+                        .into_any_element()
+                } else {
+                    center.into_any_element()
+                }
+            })
     }
 
     pub fn for_window(window: &Window, cx: &App) -> Option<Entity<Workspace>> {
@@ -10264,7 +10299,11 @@ impl Render for Workspace {
                     .child(
                         div()
                             .id("workspace")
-                            .bg(colors.background)
+                            .bg(if cx.has_global::<IslandsActive>() {
+                                colors.title_bar_background
+                            } else {
+                                colors.background
+                            })
                             .relative()
                             .flex_1()
                             .w_full()
@@ -10274,6 +10313,7 @@ impl Render for Workspace {
                             .border_t_1()
                             .border_b_1()
                             .border_color(colors.border)
+                            .when(self.rails.is_some(), |this| this.px(RAIL_WIDTH))
                             .child({
                                 let this = cx.entity();
                                 canvas(
@@ -10645,6 +10685,13 @@ impl Render for Workspace {
                                     }
                                 })
                             }))
+                            // After the zoomed overlay, so the rails stay on top of it.
+                            .when_some(self.rails.clone(), |this, (left, right)| {
+                                this.child(div().absolute().top_0().bottom_0().left_0().child(left))
+                                    .child(
+                                        div().absolute().top_0().bottom_0().right_0().child(right),
+                                    )
+                            })
                             .children(self.render_notifications(window, cx)),
                     )
                     .when(self.status_bar_visible(cx), |parent| {

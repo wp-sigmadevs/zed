@@ -23,6 +23,7 @@ impl QuickActionBar {
 
         let preview_target = if let Some(editor) = &editor
             && MarkdownPreviewView::is_markdown_file(editor, cx)
+            && !cx.has_global::<workspace::dock::RailsActive>()
         {
             PreviewTarget::Markdown(editor.clone())
         } else if let Some(buffer) = active_item.act_as::<MultiBuffer>(cx)

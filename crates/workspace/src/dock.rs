@@ -386,8 +386,27 @@ struct PanelEntry {
     _subscriptions: [Subscription; 4],
 }
 
+/// A rail button being dragged; dropping it on another rail docks its panel there.
+#[derive(Clone)]
+pub struct DraggedPanelButton {
+    pub panel: Arc<dyn PanelHandle>,
+    icon: IconName,
+}
+
+impl Render for DraggedPanelButton {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .p_1()
+            .rounded_md()
+            .bg(cx.theme().colors().elevated_surface_background)
+            .child(Icon::new(self.icon).size(IconSize::Small))
+    }
+}
+
 pub struct PanelButtons {
     dock: Entity<Dock>,
+    /// Zenith rails: the buttons stack vertically.
+    vertical: bool,
     _settings_subscription: Subscription,
 }
 
@@ -1277,6 +1296,7 @@ impl Render for Dock {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let dispatch_context = Self::dispatch_context(cx);
         if let Some(entry) = self.visible_entry() {
+            let panel_body = self.zenith_panel_body(&entry.panel.clone(), cx);
             let position = self.position;
             let create_resize_handle = || {
                 let handle = div()
@@ -1357,18 +1377,16 @@ impl Render for Dock {
                     DockPosition::Right => this.border_l_1(),
                     DockPosition::Bottom => this.border_t_1(),
                 })
+                .when(cx.has_global::<crate::IslandsActive>(), |this| {
+                    this.border_1().rounded(px(10.))
+                })
                 .child(
                     div()
                         .map(|this| match self.position().axis() {
                             Axis::Horizontal => this.w_full().h_full(),
                             Axis::Vertical => this.h_full().w_full(),
                         })
-                        .child(
-                            entry
-                                .panel
-                                .to_any()
-                                .cached(StyleRefinement::default().v_flex().size_full()),
-                        ),
+                        .child(panel_body),
                 )
                 .when(self.resizable(cx), |this| {
                     this.child(create_resize_handle())
@@ -1388,10 +1406,22 @@ impl PanelButtons {
         let settings_subscription = cx.observe_global::<SettingsStore>(|_, cx| cx.notify());
         Self {
             dock,
+            vertical: false,
             _settings_subscription: settings_subscription,
         }
     }
+
+    /// Stacks the buttons top to bottom, for a Zenith rail.
+    pub fn vertical(mut self) -> Self {
+        self.vertical = true;
+        self
+    }
 }
+
+/// Set when Zenith's rails show the dock buttons: the status bar's copies draw nothing.
+pub struct RailsActive;
+
+impl gpui::Global for RailsActive {}
 
 impl Render for PanelButtons {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1405,6 +1435,7 @@ impl Render for PanelButtons {
             DockPosition::Bottom | DockPosition::Right => (Anchor::BottomRight, Anchor::TopRight),
         };
 
+        let vertical = self.vertical;
         let dock_entity = self.dock.clone();
         let workspace = dock.workspace.clone();
         let mut buttons: Vec<_> = dock
@@ -1443,6 +1474,10 @@ impl Render for PanelButtons {
 
                 let focus_handle = dock.panel_button_focus_handle(window, cx);
                 let icon_label = entry.panel.icon_label(window, cx);
+                let dragged = DraggedPanelButton {
+                    panel: entry.panel.clone(),
+                    icon,
+                };
 
                 Some(
                     right_click_menu(name)
@@ -1543,6 +1578,9 @@ impl Render for PanelButtons {
                                 .icon_size(IconSize::Small)
                                 .toggle_state(is_active_button)
                                 .tab_index(0isize)
+                                .when(vertical, |this| {
+                                    this.size(ButtonSize::Medium).width(px(28.))
+                                })
                                 .aria_label(icon_tooltip)
                                 .on_click({
                                     let action = action.boxed_clone();
@@ -1557,36 +1595,50 @@ impl Render for PanelButtons {
                                     })
                                 });
 
-                            div().relative().child(button).when_some(
-                                icon_label
-                                    .clone()
-                                    .filter(|_| !is_active_button)
-                                    .and_then(|label| label.parse::<usize>().ok()),
-                                |this, count| this.child(CountBadge::new(count)),
-                            )
+                            div()
+                                .id(SharedString::from(format!("zenith-drag-{name}")))
+                                .relative()
+                                .when(vertical, |this| {
+                                    this.on_drag(dragged.clone(), |dragged, _, _, cx| {
+                                        cx.new(|_| dragged.clone())
+                                    })
+                                })
+                                .child(button)
+                                .when_some(
+                                    icon_label
+                                        .clone()
+                                        .filter(|_| !is_active_button)
+                                        .and_then(|label| label.parse::<usize>().ok()),
+                                    |this, count| this.child(CountBadge::new(count)),
+                                )
                         }),
                 )
             })
             .collect();
 
-        if dock_position == DockPosition::Right {
+        if dock_position == DockPosition::Right && !self.vertical {
             buttons.reverse();
         }
 
         let has_buttons = !buttons.is_empty();
+        if !self.vertical && cx.has_global::<RailsActive>() {
+            return div();
+        }
 
-        h_flex()
+        (if self.vertical { v_flex() } else { h_flex() })
             .gap_1()
             .when(
-                has_buttons
+                !self.vertical
+                    && has_buttons
                     && (dock.position == DockPosition::Bottom
                         || dock.position == DockPosition::Right),
                 |this| this.child(Divider::vertical().color(DividerColor::Border)),
             )
             .children(buttons)
-            .when(has_buttons && dock.position == DockPosition::Left, |this| {
-                this.child(Divider::vertical().color(DividerColor::Border))
-            })
+            .when(
+                !self.vertical && has_buttons && dock.position == DockPosition::Left,
+                |this| this.child(Divider::vertical().color(DividerColor::Border)),
+            )
     }
 }
 
@@ -1768,5 +1820,416 @@ pub mod test {
         fn focus_handle(&self, _cx: &App) -> FocusHandle {
             self.focus_handle.clone()
         }
+    }
+}
+
+// Zenith: PhpStorm-style tool window header ("Project  ×") on panels that draw none.
+impl Dock {
+    /// Every panel in this dock, for Zenith's Recent Files tool window list.
+    pub fn zenith_panels(&self) -> impl Iterator<Item = &Arc<dyn PanelHandle>> {
+        self.panel_entries.iter().map(|entry| &entry.panel)
+    }
+
+    fn zenith_panel_body(
+        &self,
+        panel: &Arc<dyn PanelHandle>,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let body = panel
+            .to_any()
+            .cached(StyleRefinement::default().v_flex().size_full());
+        let title = cx
+            .has_global::<RailsActive>()
+            .then(|| zenith_panel_title(panel.persistent_name()))
+            .flatten();
+        let Some(title) = title else {
+            return body.into_any_element();
+        };
+        v_flex()
+            .size_full()
+            .child(
+                h_flex()
+                    .debug_selector(|| "zenith-panel-header".into())
+                    .h_8()
+                    .flex_none()
+                    .px_2()
+                    .justify_between()
+                    .child(
+                        Label::new(title)
+                            .size(LabelSize::Small)
+                            .weight(gpui::FontWeight::SEMIBOLD),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_0p5()
+                            .children(zenith_header_buttons(panel, cx))
+                            .child(zenith_panel_menu(panel.clone(), cx.entity().downgrade()))
+                            .child(
+                                IconButton::new("zenith-panel-hide", IconName::ZenithMinus)
+                                    .icon_size(IconSize::Small)
+                                    .icon_color(Color::Custom(gpui::rgb(HEADER_YELLOW).into()))
+                                    .tooltip(Tooltip::text("Hide"))
+                                    .on_click(cx.listener(|dock, _, window, cx| {
+                                        dock.set_open(false, window, cx)
+                                    })),
+                            ),
+                    ),
+            )
+            .child(div().flex_1().min_h_0().child(body))
+            .into_any_element()
+    }
+}
+
+/// PhpStorm's coloured tool-window toolbar: teal ＋, pink expand/collapse, yellow ⋮ and –.
+const HEADER_TEAL: u32 = 0x4fc3c7;
+const HEADER_PINK: u32 = 0xf0a6c8;
+const HEADER_YELLOW: u32 = 0xe5c05a;
+
+/// Icon and colour for a header button, by the panel action's label.
+fn zenith_header_icon(label: &str) -> Option<(IconName, u32)> {
+    match label {
+        "New…" => Some((IconName::ZenithPlus, HEADER_TEAL)),
+        "Expand All" => Some((IconName::ZenithExpandAll, HEADER_PINK)),
+        "Collapse All" => Some((IconName::ZenithCollapseAll, HEADER_PINK)),
+        _ => None,
+    }
+}
+
+/// One icon button per panel action, before the ⋮ menu.
+fn zenith_header_buttons(
+    panel: &Arc<dyn PanelHandle>,
+    cx: &mut Context<Dock>,
+) -> Vec<gpui::AnyElement> {
+    zenith_panel_menu_actions(panel.persistent_name())
+        .iter()
+        .filter_map(|&(label, action)| {
+            let (icon, color) = zenith_header_icon(label)?;
+            let action = cx.build_action(action, None).ok()?;
+            let focus = panel.panel_focus_handle(cx);
+            Some(
+                IconButton::new(SharedString::from(format!("zenith-header-{label}")), icon)
+                    .icon_size(IconSize::Small)
+                    .icon_color(Color::Custom(gpui::rgb(color).into()))
+                    .tooltip(Tooltip::text(label))
+                    .on_click(move |_, window, cx| {
+                        window.focus(&focus, cx);
+                        window.dispatch_action(action.boxed_clone(), cx);
+                    })
+                    .into_any_element(),
+            )
+        })
+        .collect()
+}
+
+/// The header's ⋮ menu, in PhpStorm's order. Entries whose feature Zenith lacks (scopes, tab
+/// groups, view modes, the "Help" link) are left out rather than shown dead.
+fn zenith_panel_menu(panel: Arc<dyn PanelHandle>, dock: WeakEntity<Dock>) -> impl IntoElement {
+    ui::PopoverMenu::new("zenith-panel-menu")
+        .trigger(
+            IconButton::new("zenith-panel-menu-button", IconName::ZenithMoreVertical)
+                .icon_size(IconSize::Small)
+                .icon_color(Color::Custom(gpui::rgb(HEADER_YELLOW).into())),
+        )
+        .menu(move |window, cx| {
+            let panel = panel.clone();
+            let dock = dock.clone();
+            let position = panel.position(window, cx);
+            Some(ContextMenu::build(window, cx, move |mut menu, _, cx| {
+                if panel.persistent_name() == "Project Panel" {
+                    menu = zenith_project_panel_menu(menu).separator();
+                }
+                let docking = panel.clone();
+                menu = menu.submenu("Move to", move |mut submenu, window, cx| {
+                    let current = docking.position(window, cx);
+                    // PhpStorm's names: the left rail's top, its bottom half, the right rail.
+                    for (label, target) in [
+                        ("Left Top", DockPosition::Left),
+                        ("Left Bottom", DockPosition::Bottom),
+                        ("Right Top", DockPosition::Right),
+                    ] {
+                        if !docking.position_is_valid(target, cx) {
+                            continue;
+                        }
+                        let panel = docking.clone();
+                        submenu = submenu.toggleable_entry(
+                            label,
+                            target == current,
+                            IconPosition::Start,
+                            None,
+                            move |window, cx| panel.set_position(target, window, cx),
+                        );
+                    }
+                    submenu
+                });
+                let resizing = panel.clone();
+                menu = menu.submenu("Resize", move |mut submenu, _, _| {
+                    let (grow, shrink) = match position {
+                        DockPosition::Left => ("Stretch to Right", "Stretch to Left"),
+                        DockPosition::Right => ("Stretch to Left", "Stretch to Right"),
+                        DockPosition::Bottom => ("Stretch to Top", "Stretch to Bottom"),
+                    };
+                    for (label, grows) in [(grow, true), (shrink, false)] {
+                        let panel = resizing.clone();
+                        submenu = submenu.entry(label, None, move |window, cx| {
+                            let focus = panel.panel_focus_handle(cx);
+                            window.focus(&focus, cx);
+                            let action: Box<dyn Action> = if grows {
+                                Box::new(crate::IncreaseActiveDockSize { px: 40 })
+                            } else {
+                                Box::new(crate::DecreaseActiveDockSize { px: 40 })
+                            };
+                            window.dispatch_action(action, cx);
+                        });
+                    }
+                    let panel = resizing.clone();
+                    submenu
+                        .separator()
+                        .entry("Maximize Tool Window", None, move |window, cx| {
+                            let focus = panel.panel_focus_handle(cx);
+                            window.focus(&focus, cx);
+                            window.dispatch_action(Box::new(crate::ToggleZoom), cx);
+                        })
+                });
+                menu = menu.separator();
+                if let Some(hide) = panel.hide_button_setting(cx) {
+                    menu = menu.entry("Remove from Sidebar", None, move |_, cx| hide.apply(cx));
+                }
+                menu.entry("Hide", None, move |window, cx| {
+                    dock.update(cx, |dock, cx| dock.set_open(false, window, cx))
+                        .ok();
+                })
+            }))
+        })
+}
+
+type SettingGet = fn(&settings::SettingsContent) -> bool;
+type SettingSet = fn(&mut settings::SettingsContent, bool);
+
+/// A checked menu item for a boolean setting; choosing it writes the opposite.
+fn setting_entry(
+    menu: ContextMenu,
+    label: &'static str,
+    get: SettingGet,
+    set: SettingSet,
+    cx: &App,
+) -> ContextMenu {
+    let checked = get(cx.global::<SettingsStore>().merged_settings());
+    menu.toggleable_entry(label, checked, IconPosition::Start, None, move |_, cx| {
+        let fs = <dyn fs::Fs>::global(cx);
+        settings::update_settings_file(fs, cx, move |content, _| set(content, !checked));
+    })
+}
+
+/// Behavior, Appearance and Sort By: each writes a project-panel or tab setting.
+fn zenith_project_panel_menu(menu: ContextMenu) -> ContextMenu {
+    use settings::{ProjectPanelSortMode as Sort, ProjectPanelSortOrder as Order};
+    menu.submenu("Behavior", |submenu, _, cx| {
+        let submenu = setting_entry(
+            submenu,
+            "Enable Preview Tab",
+            |s| {
+                s.preview_tabs
+                    .as_ref()
+                    .and_then(|p| p.enabled)
+                    .unwrap_or(false)
+            },
+            |s, on| s.preview_tabs.get_or_insert_default().enabled = Some(on),
+            cx,
+        );
+        let submenu = setting_entry(
+            submenu,
+            "Open Files with Single Click",
+            |s| {
+                s.preview_tabs
+                    .as_ref()
+                    .and_then(|p| p.enable_preview_from_project_panel)
+                    .unwrap_or(false)
+            },
+            |s, on| {
+                s.preview_tabs
+                    .get_or_insert_default()
+                    .enable_preview_from_project_panel = Some(on)
+            },
+            cx,
+        );
+        setting_entry(
+            submenu,
+            "Always Select Opened File",
+            |s| {
+                s.project_panel
+                    .as_ref()
+                    .and_then(|p| p.auto_reveal_entries)
+                    .unwrap_or(false)
+            },
+            |s, on| s.project_panel.get_or_insert_default().auto_reveal_entries = Some(on),
+            cx,
+        )
+    })
+    .submenu("Appearance", |submenu, _, cx| {
+        let mut submenu = submenu.header("Show");
+        let toggles: [(&'static str, SettingGet, SettingSet); 6] = [
+            (
+                "Hidden Files",
+                |s| !project_panel_flag(s, |p| p.hide_hidden),
+                |s, on| s.project_panel.get_or_insert_default().hide_hidden = Some(!on),
+            ),
+            (
+                "Ignored Files",
+                |s| !project_panel_flag(s, |p| p.hide_gitignore),
+                |s, on| s.project_panel.get_or_insert_default().hide_gitignore = Some(!on),
+            ),
+            (
+                "File Icons",
+                |s| project_panel_flag(s, |p| p.file_icons),
+                |s, on| s.project_panel.get_or_insert_default().file_icons = Some(on),
+            ),
+            (
+                "Git Status",
+                |s| project_panel_flag(s, |p| p.git_status),
+                |s, on| s.project_panel.get_or_insert_default().git_status = Some(on),
+            ),
+            (
+                "Diagnostic Badges",
+                |s| project_panel_flag(s, |p| p.diagnostic_badges),
+                |s, on| s.project_panel.get_or_insert_default().diagnostic_badges = Some(on),
+            ),
+            (
+                "Compact Folders",
+                |s| project_panel_flag(s, |p| p.auto_fold_dirs),
+                |s, on| s.project_panel.get_or_insert_default().auto_fold_dirs = Some(on),
+            ),
+        ];
+        for (label, get, set) in toggles {
+            submenu = setting_entry(submenu, label, get, set, cx);
+        }
+        submenu
+    })
+    .submenu("Sort By", move |mut submenu, _, cx| {
+        let content = cx
+            .global::<SettingsStore>()
+            .merged_settings()
+            .project_panel
+            .clone()
+            .unwrap_or_default();
+        let order = content.sort_order.unwrap_or_default();
+        let mode = content.sort_mode.unwrap_or_default();
+        for (label, value) in [
+            ("Name", Order::Default),
+            ("Name (Uppercase First)", Order::Upper),
+            ("Name (Lowercase First)", Order::Lower),
+            ("Name (Unicode)", Order::Unicode),
+        ] {
+            submenu = submenu.toggleable_entry(
+                label,
+                order == value,
+                IconPosition::Start,
+                None,
+                move |_, cx| {
+                    let fs = <dyn fs::Fs>::global(cx);
+                    settings::update_settings_file(fs, cx, move |content, _| {
+                        content.project_panel.get_or_insert_default().sort_order = Some(value);
+                    });
+                },
+            );
+        }
+        submenu = submenu.separator();
+        for (label, on, off, target) in [
+            (
+                "Folders Always on Top",
+                mode == Sort::DirectoriesFirst,
+                Sort::Mixed,
+                Sort::DirectoriesFirst,
+            ),
+            (
+                "Files First",
+                mode == Sort::FilesFirst,
+                Sort::DirectoriesFirst,
+                Sort::FilesFirst,
+            ),
+        ] {
+            submenu =
+                submenu.toggleable_entry(label, on, IconPosition::Start, None, move |_, cx| {
+                    let fs = <dyn fs::Fs>::global(cx);
+                    settings::update_settings_file(fs, cx, move |content, _| {
+                        content.project_panel.get_or_insert_default().sort_mode =
+                            Some(if on { off } else { target });
+                    });
+                });
+        }
+        submenu
+    })
+}
+
+/// A project-panel boolean from the merged settings, false when unset.
+fn project_panel_flag(
+    settings: &settings::SettingsContent,
+    field: fn(&settings::ProjectPanelSettingsContent) -> Option<bool>,
+) -> bool {
+    settings
+        .project_panel
+        .as_ref()
+        .and_then(field)
+        .unwrap_or(false)
+}
+
+/// Panel actions for the "···" menu, by action name so this crate needs no panel dependency.
+pub fn zenith_panel_menu_actions(persistent_name: &str) -> &'static [(&'static str, &'static str)] {
+    match persistent_name {
+        "Project Panel" => &[
+            ("New…", "zenith_templates::NewFromTemplate"),
+            ("Expand All", "project_panel::ExpandAllEntries"),
+            ("Collapse All", "project_panel::CollapseAllEntries"),
+        ],
+        "Outline Panel" => &[
+            ("Expand All", "outline_panel::ExpandAllEntries"),
+            ("Collapse All", "outline_panel::CollapseAllEntries"),
+        ],
+        _ => &[],
+    }
+}
+
+/// PhpStorm's names for the panels that get a header; others keep their own chrome.
+pub fn zenith_panel_title(persistent_name: &str) -> Option<&'static str> {
+    match persistent_name {
+        "Project Panel" => Some("Project"),
+        "Outline Panel" => Some("Structure"),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod zenith_tests {
+    #[test]
+    fn test_panel_titles() {
+        assert_eq!(super::zenith_panel_title("Project Panel"), Some("Project"));
+        assert_eq!(
+            super::zenith_panel_title("Outline Panel"),
+            Some("Structure")
+        );
+        assert_eq!(super::zenith_panel_title("Git Panel"), None);
+    }
+
+    #[test]
+    fn test_every_panel_action_has_a_header_icon() {
+        for name in ["Project Panel", "Outline Panel"] {
+            for (label, _) in super::zenith_panel_menu_actions(name) {
+                assert!(super::zenith_header_icon(label).is_some(), "{label}");
+            }
+        }
+        assert!(super::zenith_header_icon("Something Else").is_none());
+    }
+
+    #[test]
+    fn test_panel_menu_action_names_are_namespaced() {
+        for name in ["Project Panel", "Outline Panel"] {
+            for (_, action) in super::zenith_panel_menu_actions(name) {
+                assert!(action.contains("::"), "{action}");
+            }
+        }
+        assert!(super::zenith_panel_menu_actions("Git Panel").is_empty());
+        assert_eq!(
+            super::zenith_panel_menu_actions("Project Panel")[0],
+            ("New…", "zenith_templates::NewFromTemplate")
+        );
     }
 }

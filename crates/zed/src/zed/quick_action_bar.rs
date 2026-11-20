@@ -11,9 +11,9 @@ use editor::actions::{
 use editor::code_context_menus::{CodeContextMenu, ContextMenuOrigin};
 use editor::{Editor, EditorSettings};
 use gpui::{
-    Action, Anchor, AnchoredPositionMode, ClickEvent, Context, ElementId, Entity, EventEmitter,
-    FocusHandle, Focusable, InteractiveElement, ParentElement, Render, Styled, Subscription,
-    WeakEntity, Window, anchored, deferred, point,
+    Action, Anchor, AnchoredPositionMode, App, ClickEvent, Context, ElementId, Entity,
+    EventEmitter, FocusHandle, Focusable, InteractiveElement, ParentElement, Render, Styled,
+    Subscription, WeakEntity, Window, anchored, deferred, point,
 };
 use project::{
     DisableAiSettings,
@@ -38,6 +38,8 @@ pub struct QuickActionBar {
     _inlay_hints_enabled_subscription: Option<Subscription>,
     _ai_settings_subscription: Subscription,
     active_item: Option<Box<dyn ItemHandle>>,
+    // Zenith: `act_as`, so a composite tab (markdown split view) still yields its editor.
+    editor: Option<Entity<Editor>>,
     buffer_search_bar: Entity<BufferSearchBar>,
     show: bool,
     toggle_selections_handle: PopoverMenuHandle<ContextMenu>,
@@ -69,6 +71,7 @@ impl QuickActionBar {
             _inlay_hints_enabled_subscription: None,
             _ai_settings_subscription: ai_settings_subscription,
             active_item: None,
+            editor: None,
             buffer_search_bar,
             show: true,
             toggle_selections_handle: Default::default(),
@@ -82,9 +85,7 @@ impl QuickActionBar {
     }
 
     fn active_editor(&self) -> Option<Entity<Editor>> {
-        self.active_item
-            .as_ref()
-            .and_then(|item| item.downcast::<Editor>())
+        self.editor.clone()
     }
 
     fn apply_settings(&mut self, cx: &mut Context<Self>) {
@@ -116,6 +117,13 @@ impl Render for QuickActionBar {
         let supports_semantic_tokens =
             editor.update(cx, |editor, cx| editor.supports_semantic_tokens(cx));
         let supports_code_lens = editor.update(cx, |editor, cx| editor.supports_code_lens(cx));
+        // Zenith: with the rails the individual buttons fold into one ⋮ menu (JetBrains' toolbar).
+        let rails = cx.has_global::<workspace::dock::RailsActive>();
+        let settings_icon = if rails {
+            IconName::ZenithMoreVertical
+        } else {
+            IconName::Filter
+        };
         let editor_value = editor.read(cx);
         let selection_menu_enabled = editor_value.selection_menu_enabled(cx);
         let inlay_hints_enabled = editor_value.inlay_hints_enabled();
@@ -172,7 +180,7 @@ impl Render for QuickActionBar {
             },
         );
 
-        let code_actions_dropdown = code_action_enabled.then(|| {
+        let code_actions_dropdown = (code_action_enabled && !rails).then(|| {
             let is_deployed = {
                 let menu_ref = editor.read(cx).context_menu().borrow();
                 let code_action_menu = menu_ref
@@ -240,7 +248,7 @@ impl Render for QuickActionBar {
                 }))
         });
 
-        let editor_selections_dropdown = selection_menu_enabled.then(|| {
+        let editor_selections_dropdown = (selection_menu_enabled && !rails).then(|| {
             let has_diff_hunks = editor
                 .read(cx)
                 .buffer()
@@ -336,7 +344,7 @@ impl Render for QuickActionBar {
 
             PopoverMenu::new("editor-settings")
                 .trigger_with_tooltip(
-                    IconButton::new("toggle_editor_settings_icon", IconName::Filter)
+                    IconButton::new("toggle_editor_settings_icon", settings_icon)
                         .icon_size(IconSize::Small)
                         .toggle_state(self.toggle_settings_handle.is_deployed()),
                     Tooltip::text("Editor Controls"),
@@ -346,8 +354,11 @@ impl Render for QuickActionBar {
                 .menu(move |window, cx| {
                     let menu = ContextMenu::build(window, cx, {
                         let focus_handle = editor_focus_handle.clone();
-                        |mut menu, _, _| {
+                        |mut menu, _, cx| {
                             menu = menu.context(focus_handle);
+                            if rails {
+                                menu = zenith_more_menu_head(menu, &editor, cx);
+                            }
 
                             if supports_inlay_hints {
                                 menu = menu.toggleable_entry(
@@ -708,9 +719,11 @@ impl Render for QuickActionBar {
             .gap(DynamicSpacing::Base01.rems(cx))
             .children(self.render_repl_menu(cx))
             .children(self.render_preview_button(cx))
-            .children(search_button)
+            .children(search_button.filter(|_| !rails))
             .when(
-                AgentSettings::get_global(cx).enabled(cx) && AgentSettings::get_global(cx).button,
+                AgentSettings::get_global(cx).enabled(cx)
+                    && AgentSettings::get_global(cx).button
+                    && !rails,
                 |bar| bar.child(assistant_button),
             )
             .children(code_actions_dropdown)
@@ -778,10 +791,11 @@ impl ToolbarItemView for QuickActionBar {
         cx: &mut Context<Self>,
     ) -> ToolbarItemLocation {
         self.active_item = active_pane_item.map(ItemHandle::boxed_clone);
-        if let Some(active_item) = active_pane_item {
+        self.editor = active_pane_item.and_then(|item| item.act_as::<Editor>(cx));
+        if active_pane_item.is_some() {
             self._inlay_hints_enabled_subscription.take();
 
-            if let Some(editor) = active_item.downcast::<Editor>() {
+            if let Some(editor) = self.editor.clone() {
                 let (
                     mut inlay_hints_enabled,
                     mut supports_inlay_hints,
@@ -820,4 +834,99 @@ impl ToolbarItemView for QuickActionBar {
         }
         self.get_toolbar_item_location()
     }
+}
+
+// Zenith: the buttons the rails hide (search, inline assist, code actions, selection controls)
+// as the head of the ⋮ menu. The selection list repeats `editor_selections_dropdown` so that
+// code stays untouched upstream.
+fn zenith_more_menu_head(
+    mut menu: ContextMenu,
+    editor: &WeakEntity<Editor>,
+    cx: &mut App,
+) -> ContextMenu {
+    let Some(editor) = editor.upgrade() else {
+        return menu;
+    };
+    let focus = editor.focus_handle(cx);
+    let (has_code_actions, code_actions_enabled) = {
+        let editor = editor.read(cx);
+        (
+            editor.has_available_code_actions_for_selection(),
+            editor.code_actions_enabled_for_toolbar(cx),
+        )
+    };
+    let has_diff_hunks = editor
+        .read(cx)
+        .buffer()
+        .read(cx)
+        .snapshot(cx)
+        .has_diff_hunks();
+    let has_selection = editor.update(cx, |editor, cx| {
+        editor.has_non_empty_selection(&editor.display_snapshot(cx))
+    });
+    if editor.buffer_kind(cx) == ItemBufferKind::Singleton {
+        menu = menu.action("Find in File", Box::new(buffer_search::Deploy::find()));
+    }
+    if AgentSettings::get_global(cx).enabled(cx) && AgentSettings::get_global(cx).button {
+        menu = menu.action("Inline Assist", Box::new(InlineAssist::default()));
+    }
+    if code_actions_enabled {
+        menu = menu.action_disabled_when(
+            !has_code_actions,
+            "Code Actions",
+            Box::new(ToggleCodeActions::default()),
+        );
+    }
+    if editor.read(cx).selection_menu_enabled(cx) {
+        menu = menu.submenu("Selection", move |submenu, _, cx| {
+            let disable_ai = DisableAiSettings::get_global(cx).disable_ai;
+            submenu
+                .context(focus.clone())
+                .action("Select All", Box::new(SelectAll))
+                .action(
+                    "Select Next Occurrence",
+                    Box::new(SelectNext {
+                        replace_newest: false,
+                    }),
+                )
+                .action("Expand Selection", Box::new(SelectLargerSyntaxNode))
+                .action("Shrink Selection", Box::new(SelectSmallerSyntaxNode))
+                .action(
+                    "Add Cursor Above",
+                    Box::new(AddSelectionAbove {
+                        skip_soft_wrap: true,
+                    }),
+                )
+                .action(
+                    "Add Cursor Below",
+                    Box::new(AddSelectionBelow {
+                        skip_soft_wrap: true,
+                    }),
+                )
+                .when(!disable_ai, |this| {
+                    this.separator().action_disabled_when(
+                        !has_selection,
+                        "Add to Agent Thread",
+                        Box::new(AddSelectionToThread),
+                    )
+                })
+                .separator()
+                .action("Go to Symbol", Box::new(ToggleOutline))
+                .action("Go to Line/Column", Box::new(ToggleGoToLine))
+                .separator()
+                .action("Next Problem", Box::new(GoToDiagnostic::default()))
+                .action(
+                    "Previous Problem",
+                    Box::new(GoToPreviousDiagnostic::default()),
+                )
+                .separator()
+                .action_disabled_when(!has_diff_hunks, "Next Hunk", Box::new(GoToHunk))
+                .action_disabled_when(!has_diff_hunks, "Previous Hunk", Box::new(GoToPreviousHunk))
+                .separator()
+                .action("Move Line Up", Box::new(MoveLineUp))
+                .action("Move Line Down", Box::new(MoveLineDown))
+                .action("Duplicate Selection", Box::new(DuplicateLineDown))
+        });
+    }
+    menu.separator()
 }

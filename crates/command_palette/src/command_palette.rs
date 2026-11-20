@@ -1850,3 +1850,31 @@ mod tests {
         });
     }
 }
+
+// Zenith: Search Everywhere shares the palette's action history. Kept as an
+// appended block so upstream syncs don't conflict with it.
+
+/// When each action was last run from the palette or Search Everywhere, as a Unix timestamp.
+pub fn action_last_invoked(cx: &App) -> HashMap<SharedString, i64> {
+    if !CommandPaletteSettings::get_global(cx).use_command_history {
+        return HashMap::new();
+    }
+    CommandPaletteDB::global(cx)
+        .list_commands_used()
+        .log_err()
+        .into_iter()
+        .flatten()
+        .map(|command| {
+            (
+                SharedString::from(command.command_name),
+                command.last_invoked.unix_timestamp(),
+            )
+        })
+        .collect()
+}
+
+pub fn record_command_invocation(command_name: SharedString, query: String, cx: &App) {
+    let db = CommandPaletteDB::global(cx);
+    cx.background_spawn(async move { db.write_command_invocation(command_name, query).await })
+        .detach_and_log_err(cx);
+}

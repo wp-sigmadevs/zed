@@ -1712,6 +1712,14 @@ mod tests {
     #[gpui::test]
     async fn test_code_lens_resolve_only_visible(cx: &mut TestAppContext) {
         init_test(cx, |_| {});
+        // Zenith: the default 1.8 line height shows fewer lines than this test expects.
+        cx.update(|cx| {
+            <settings::SettingsStore as gpui::UpdateGlobal>::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.theme.buffer_line_height = Some(settings::BufferLineHeight::Comfortable);
+                });
+            });
+        });
         update_test_editor_settings(cx, &|settings| {
             settings.code_lens = Some(CodeLens::On);
         });

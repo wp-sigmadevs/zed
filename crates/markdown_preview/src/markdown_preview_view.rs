@@ -76,7 +76,7 @@ pub struct MarkdownPreviewView {
     markdown: Entity<Markdown>,
     _markdown_subscription: Subscription,
     active_source_index: Option<usize>,
-    scroll_handle: ScrollHandle,
+    pub scroll_handle: ScrollHandle,
     image_cache: Entity<RetainAllImageCache>,
     base_directory: Option<PathBuf>,
     pending_update_task: Option<Task<Result<()>>>,
@@ -1015,7 +1015,7 @@ impl MarkdownPreviewView {
         cx.notify();
     }
 
-    fn close_and_return_to_editor(
+    pub fn close_and_return_to_editor(
         &mut self,
         _: &CloseAndReturnToEditor,
         window: &mut Window,

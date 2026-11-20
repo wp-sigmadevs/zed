@@ -1,0 +1,20 @@
+{
+    "name": "zenith/php-tools-laravel",
+    "description": "Tools Zenith manages for PHP projects. Not your project's dependencies.",
+    "type": "project",
+    "license": "proprietary",
+    "require": {
+        "laravel/pint": "^1.0",
+        "phpstan/phpstan": "^2.0",
+        "larastan/larastan": "^3.0"
+    },
+    "config": {
+        "sort-packages": true,
+        "platform": {
+            "php": "8.2.99"
+        },
+        "allow-plugins": {
+            "dealerdirect/phpcodesniffer-composer-installer": true
+        }
+    }
+}

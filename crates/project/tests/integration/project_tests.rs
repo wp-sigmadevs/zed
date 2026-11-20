@@ -1194,18 +1194,28 @@ async fn test_zenith_and_legacy_zed_project_settings(cx: &mut gpui::TestAppConte
     cx.update(|cx| {
         let a = LanguageSettings::for_buffer(&buffer_a.read(cx), cx);
         assert_eq!(a.tab_size.get(), 4, ".zenith wins over .zed");
-        assert_eq!(a.preferred_line_length, 64, ".zed keys not in .zenith still apply");
+        assert_eq!(
+            a.preferred_line_length, 64,
+            ".zed keys not in .zenith still apply"
+        );
         let b = LanguageSettings::for_buffer(&buffer_b.read(cx), cx);
         assert_eq!(b.tab_size.get(), 2, ".zenith alone is read");
     });
 
-    fs.remove_file(path!("/dir/.zenith/settings.json").as_ref(), Default::default())
-        .await
-        .unwrap();
+    fs.remove_file(
+        path!("/dir/.zenith/settings.json").as_ref(),
+        Default::default(),
+    )
+    .await
+    .unwrap();
     cx.executor().run_until_parked();
     cx.update(|cx| {
         let a = LanguageSettings::for_buffer(&buffer_a.read(cx), cx);
-        assert_eq!(a.tab_size.get(), 8, "falls back to .zed when .zenith is removed");
+        assert_eq!(
+            a.tab_size.get(),
+            8,
+            "falls back to .zed when .zenith is removed"
+        );
     });
 }
 

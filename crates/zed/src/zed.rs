@@ -1650,7 +1650,14 @@ fn open_about_window(cx: &mut App) {
                                     .color(Color::Muted)
                                     .size(LabelSize::XSmall),
                             )
-                            .child(Label::new(self.full_version.clone()).size(LabelSize::Small)),
+                            .child(Label::new(self.full_version.clone()).size(LabelSize::Small))
+                            .child(
+                                Label::new(
+                                    "A fork of Zed (zed.dev), GPL-3.0-or-later. Not affiliated with Zed Industries.",
+                                )
+                                .color(Color::Muted)
+                                .size(LabelSize::XSmall),
+                            ),
                     )
                     .child(
                         h_flex()
@@ -1725,7 +1732,7 @@ fn open_about_window(cx: &mut App) {
 
     let window_size = Size {
         width: px(440.),
-        height: px(300.),
+        height: px(340.),
     };
     let display_id = cx.active_display().map(|display| display.id());
 
@@ -2377,6 +2384,17 @@ pub fn load_default_keymap(cx: &mut App) {
             cx,
         ));
     }
+
+    // Zenith: after the base keymap so its bindings win in every keymap.
+    cx.bind_keys(filter_disabled_ai_bindings(
+        KeymapFile::load_asset(
+            settings::ZENITH_KEYMAP_PATH,
+            Some(KeybindSource::Default),
+            cx,
+        )
+        .unwrap(),
+        cx,
+    ));
 
     if VimModeSetting::get_global(cx).0 || vim_mode_setting::HelixModeSetting::get_global(cx).0 {
         cx.bind_keys(filter_disabled_ai_bindings(
@@ -3284,7 +3302,8 @@ mod tests {
             .update(cx, |multi_workspace, window, cx| {
                 multi_workspace.workspace().update(cx, |workspace, cx| {
                     assert_eq!(workspace.worktrees(cx).count(), 2);
-                    assert!(workspace.right_dock().read(cx).is_open());
+                    // Zenith: the project panel docks left, as in PhpStorm.
+                    assert!(workspace.left_dock().read(cx).is_open());
                     assert!(
                         workspace
                             .active_pane()
@@ -6349,6 +6368,9 @@ mod tests {
                 "zed",
                 "zed_actions",
                 "zed_predict_onboarding",
+                "zenith_inspections",
+                "zenith_php_tools",
+                "zenith_search",
                 "zeta",
             ];
             assert_eq!(
