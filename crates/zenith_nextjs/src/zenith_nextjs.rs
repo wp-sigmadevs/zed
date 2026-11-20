@@ -1,9 +1,9 @@
 pub mod nextjs_panel;
 pub use nextjs_panel::{NextJsPanel, ToggleNextJsPanel};
 
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum AppRouterKind {
@@ -55,10 +55,7 @@ impl NextJsIndex {
         root_path.join("next.config.js").is_file()
             || root_path.join("next.config.mjs").is_file()
             || root_path.join("next.config.ts").is_file()
-            || root_path.join("package.json").is_file()
-                && std::fs::read_to_string(root_path.join("package.json"))
-                    .map(|c| c.contains("\"next\""))
-                    .unwrap_or(false)
+            || manifest_contains(&root_path.join("package.json"), "\"next\"")
     }
 
     pub fn index_app_file(&mut self, app_root: &Path, file_path: &Path, content: &str) {
@@ -275,7 +272,9 @@ pub fn analyze_component_safety(file_path: &Path, content: &str) -> Vec<RscDiagn
             if let Some(pos) = line.find(hook) {
                 let is_word_boundary_before = if pos > 0 {
                     let prev_char = line[..pos].chars().last();
-                    prev_char.map(|c| !c.is_alphanumeric() && c != '_').unwrap_or(true)
+                    prev_char
+                        .map(|c| !c.is_alphanumeric() && c != '_')
+                        .unwrap_or(true)
                 } else {
                     true
                 };
@@ -302,6 +301,36 @@ pub fn analyze_component_safety(file_path: &Path, content: &str) -> Vec<RscDiagn
     }
 
     diagnostics
+}
+
+/// A manifest is small; only this much of one is read.
+const MANIFEST_MAX_BYTES: u64 = 1024 * 1024;
+
+/// Up to `max` bytes of a regular file, symlinks followed. `None` for a device, pipe, folder or
+/// unreadable path: a project can plant `composer.json -> /dev/zero`, and an unbounded read of
+/// it never ends. The check is on the opened handle, and the open is non-blocking (a plain open
+/// of a pipe with no writer blocks). Same logic as `zenith_php_tools::read_regular`.
+fn read_regular(path: &Path, max: u64) -> Option<Vec<u8>> {
+    use std::io::Read as _;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options.open(path).ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    file.take(max).read_to_end(&mut bytes).ok()?;
+    Some(bytes)
+}
+
+fn manifest_contains(path: &Path, needle: &str) -> bool {
+    read_regular(path, MANIFEST_MAX_BYTES)
+        .is_some_and(|bytes| String::from_utf8_lossy(&bytes).contains(needle))
 }
 
 #[cfg(test)]
@@ -374,7 +403,11 @@ export default function UserProfile({ id }: { id: string }) {
 "#;
         let diagnostics = analyze_component_safety(Path::new("UserProfile.tsx"), server_component);
         assert_eq!(diagnostics.len(), 1);
-        assert!(diagnostics[0].message.contains("React hook 'useState' cannot be called in a Server Component"));
+        assert!(
+            diagnostics[0]
+                .message
+                .contains("React hook 'useState' cannot be called in a Server Component")
+        );
         assert_eq!(diagnostics[0].line, 5);
 
         let client_component = r#""use client";
@@ -385,7 +418,35 @@ export default function UserProfile() {
     return <div>User</div>;
 }
 "#;
-        let client_diagnostics = analyze_component_safety(Path::new("UserProfile.tsx"), client_component);
+        let client_diagnostics =
+            analyze_component_safety(Path::new("UserProfile.tsx"), client_component);
         assert!(client_diagnostics.is_empty());
+    }
+
+    #[test]
+    fn test_project_detection_reads_manifests_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = dir.path().join("package.json");
+        assert!(!NextJsIndex::is_nextjs_project(dir.path()));
+
+        std::fs::write(&manifest, r#"{"dependencies": {"next": "14"}}"#).unwrap();
+        assert!(NextJsIndex::is_nextjs_project(dir.path()));
+
+        // The marker sits past the read limit, so it is not seen.
+        let mut big = " ".repeat(MANIFEST_MAX_BYTES as usize + 16);
+        big.push_str("\"next\"");
+        std::fs::write(&manifest, big).unwrap();
+        assert!(!NextJsIndex::is_nextjs_project(dir.path()));
+    }
+
+    /// A pipe in place of the manifest must not block detection.
+    #[cfg(unix)]
+    #[test]
+    fn test_project_detection_ignores_a_pipe_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let path =
+            std::ffi::CString::new(dir.path().join("package.json").to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        assert!(!NextJsIndex::is_nextjs_project(dir.path()));
     }
 }

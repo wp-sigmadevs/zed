@@ -1,9 +1,9 @@
 pub mod laravel_panel;
 pub use laravel_panel::{LaravelPanel, LaravelPanelTab, ToggleLaravelPanel};
 
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ViewDefinition {
@@ -57,10 +57,7 @@ impl LaravelIndex {
     pub fn is_laravel_project(root_path: &Path) -> bool {
         root_path.join("artisan").is_file()
             || root_path.join("bootstrap/app.php").is_file()
-            || root_path.join("composer.json").is_file()
-                && std::fs::read_to_string(root_path.join("composer.json"))
-                    .map(|c| c.contains("laravel/framework"))
-                    .unwrap_or(false)
+            || manifest_contains(&root_path.join("composer.json"), "laravel/framework")
     }
 
     pub fn index_view_path(&mut self, base_views_path: &Path, file_path: &Path) {
@@ -284,13 +281,21 @@ pub fn parse_route_file(file_path: &Path, content: &str) -> Vec<RouteDefinition>
     routes
 }
 
-pub fn parse_config_keys(config_name: &str, file_path: &Path, content: &str) -> Vec<ConfigDefinition> {
+pub fn parse_config_keys(
+    config_name: &str,
+    file_path: &Path,
+    content: &str,
+) -> Vec<ConfigDefinition> {
     let mut configs = Vec::new();
     let mut key_stack: Vec<(String, usize)> = Vec::new();
 
     for (line_index, line) in content.lines().enumerate() {
         let trimmed = line.trim();
-        if trimmed.starts_with("//") || trimmed.starts_with('#') || trimmed.starts_with("/*") || trimmed.starts_with('*') {
+        if trimmed.starts_with("//")
+            || trimmed.starts_with('#')
+            || trimmed.starts_with("/*")
+            || trimmed.starts_with('*')
+        {
             continue;
         }
 
@@ -311,7 +316,8 @@ pub fn parse_config_keys(config_name: &str, file_path: &Path, content: &str) -> 
                 let full_key = if key_stack.is_empty() {
                     format!("{config_name}.{key_name}")
                 } else {
-                    let parent_keys: Vec<&str> = key_stack.iter().map(|(k, _)| k.as_str()).collect();
+                    let parent_keys: Vec<&str> =
+                        key_stack.iter().map(|(k, _)| k.as_str()).collect();
                     format!("{}.{}.{}", config_name, parent_keys.join("."), key_name)
                 };
 
@@ -390,6 +396,36 @@ fn extract_string_literal(input: &str) -> Option<(String, &str)> {
     Some((literal.to_string(), remainder))
 }
 
+/// A manifest is small; only this much of one is read.
+const MANIFEST_MAX_BYTES: u64 = 1024 * 1024;
+
+/// Up to `max` bytes of a regular file, symlinks followed. `None` for a device, pipe, folder or
+/// unreadable path: a project can plant `composer.json -> /dev/zero`, and an unbounded read of
+/// it never ends. The check is on the opened handle, and the open is non-blocking (a plain open
+/// of a pipe with no writer blocks). Same logic as `zenith_php_tools::read_regular`.
+fn read_regular(path: &Path, max: u64) -> Option<Vec<u8>> {
+    use std::io::Read as _;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options.open(path).ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    file.take(max).read_to_end(&mut bytes).ok()?;
+    Some(bytes)
+}
+
+fn manifest_contains(path: &Path, needle: &str) -> bool {
+    read_regular(path, MANIFEST_MAX_BYTES)
+        .is_some_and(|bytes| String::from_utf8_lossy(&bytes).contains(needle))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -400,9 +436,15 @@ mod tests {
         let base = Path::new("/app/resources/views");
 
         index.index_view_path(base, Path::new("/app/resources/views/auth/login.blade.php"));
-        index.index_view_path(base, Path::new("/app/resources/views/auth/register.blade.php"));
+        index.index_view_path(
+            base,
+            Path::new("/app/resources/views/auth/register.blade.php"),
+        );
         index.index_view_path(base, Path::new("/app/resources/views/dashboard.blade.php"));
-        index.index_view_path(base, Path::new("/app/resources/views/components/alert.blade.php"));
+        index.index_view_path(
+            base,
+            Path::new("/app/resources/views/components/alert.blade.php"),
+        );
 
         let view = index.find_view("auth.login").expect("view should exist");
         assert_eq!(view.dot_name, "auth.login");
@@ -412,7 +454,9 @@ mod tests {
         let completions = index.view_completions("auth.");
         assert_eq!(completions, vec!["auth.login", "auth.register"]);
 
-        let component = index.find_component("x-alert").expect("component should exist");
+        let component = index
+            .find_component("x-alert")
+            .expect("component should exist");
         assert_eq!(component.dot_name, "components.alert");
         assert!(component.is_component);
     }
@@ -431,11 +475,17 @@ Route::delete('/users/{id}', 'UserController@destroy')->name('users.destroy');
         assert_eq!(route.name, "users.index");
         assert_eq!(route.method, "GET");
         assert_eq!(route.uri, "/users");
-        assert_eq!(route.action.as_deref(), Some("[UserController::class, 'index']"));
+        assert_eq!(
+            route.action.as_deref(),
+            Some("[UserController::class, 'index']")
+        );
         assert_eq!(route.line, 2);
 
         let completions = index.route_completions("users.");
-        assert_eq!(completions, vec!["users.destroy", "users.index", "users.store"]);
+        assert_eq!(
+            completions,
+            vec!["users.destroy", "users.index", "users.store"]
+        );
     }
 
     #[test]
@@ -456,7 +506,9 @@ return [
         assert_eq!(config.key, "app.name");
         assert_eq!(config.line, 3);
 
-        let nested = index.find_config("app.database.default").expect("nested config should exist");
+        let nested = index
+            .find_config("app.database.default")
+            .expect("nested config should exist");
         assert_eq!(nested.key, "app.database.default");
         assert_eq!(nested.line, 6);
     }
@@ -479,5 +531,32 @@ DB_HOST=127.0.0.1
 
         let completions = index.env_completions("APP_");
         assert_eq!(completions, vec!["APP_ENV", "APP_KEY", "APP_NAME"]);
+    }
+
+    #[test]
+    fn test_project_detection_reads_manifests_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = dir.path().join("composer.json");
+        assert!(!LaravelIndex::is_laravel_project(dir.path()));
+
+        std::fs::write(&manifest, r#"{"require": {"laravel/framework": "^1"}}"#).unwrap();
+        assert!(LaravelIndex::is_laravel_project(dir.path()));
+
+        // The marker sits past the read limit, so it is not seen.
+        let mut big = " ".repeat(MANIFEST_MAX_BYTES as usize + 16);
+        big.push_str("laravel/framework");
+        std::fs::write(&manifest, big).unwrap();
+        assert!(!LaravelIndex::is_laravel_project(dir.path()));
+    }
+
+    /// A pipe in place of the manifest must not block detection.
+    #[cfg(unix)]
+    #[test]
+    fn test_project_detection_ignores_a_pipe_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let path =
+            std::ffi::CString::new(dir.path().join("composer.json").to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        assert!(!LaravelIndex::is_laravel_project(dir.path()));
     }
 }

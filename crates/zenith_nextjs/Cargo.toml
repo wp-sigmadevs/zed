@@ -24,7 +24,11 @@ ui.workspace = true
 util.workspace = true
 workspace.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }
 workspace = { workspace = true, features = ["test-support"] }
 pretty_assertions.workspace = true
+tempfile.workspace = true
