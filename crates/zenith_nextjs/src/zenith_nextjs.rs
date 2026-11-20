@@ -1,3 +1,6 @@
+pub mod nextjs_panel;
+pub use nextjs_panel::{NextJsPanel, ToggleNextJsPanel};
+
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
