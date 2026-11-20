@@ -13,6 +13,18 @@ pub struct ZenithSettingsContent {
     pub todo: Option<ZenithTodoSettingsContent>,
     /// Settings for Local History.
     pub local_history: Option<ZenithLocalHistorySettingsContent>,
+    /// Settings for the External Libraries project panel section.
+    pub external_libraries: Option<ZenithExternalLibrariesSettingsContent>,
+}
+
+/// Settings for the External Libraries project panel section.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+pub struct ZenithExternalLibrariesSettingsContent {
+    /// Whether vendor/, node_modules/ and WordPress core are moved under an
+    /// "External Libraries" node in the project panel.
+    ///
+    /// Default: true
+    pub enabled: Option<bool>,
 }
 
 /// Settings for the Zenith welcome screen.

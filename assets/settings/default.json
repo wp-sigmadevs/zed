@@ -3018,6 +3018,11 @@
       // tool) changes a file on disk.
       "snapshot_external_changes": true,
     },
+    // External Libraries: vendor/, node_modules/ and WordPress core in one project panel node.
+    "external_libraries": {
+      // Move detected library folders under an "External Libraries" node.
+      "enabled": true,
+    },
   },
   // The server to connect to. If the environment variable
   // ZED_SERVER_URL is set, it will override this setting.
