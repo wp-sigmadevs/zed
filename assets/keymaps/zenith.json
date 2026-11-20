@@ -29,6 +29,20 @@
     },
   },
   {
+    // The history tab. Tab and Shift-Tab move between the revision list and the Revert and Copy
+    // buttons. The base keymap has a context-less "tab" (menu::SelectNext) that would step the
+    // list selection; a context-less binding ranks as the deepest context, so only a binding whose
+    // context is the focused element's own (the list, or the tab's own area for the buttons) ties
+    // with it, and being loaded later wins the tie.
+    "context": "LocalHistoryList || LocalHistoryView",
+    "bindings": {
+      "tab": "zenith_local_history::FocusNextControl",
+      "shift-tab": "zenith_local_history::FocusPreviousControl",
+      "alt-shift-r": "zenith_local_history::RevertToRevision",
+      "alt-shift-c": "zenith_local_history::CopyRevisionText",
+    },
+  },
+  {
     // Collapse / expand a file in the Problems tool window.
     "context": "ProblemsPanel",
     "bindings": {

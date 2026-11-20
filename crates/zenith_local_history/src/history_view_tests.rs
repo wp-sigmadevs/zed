@@ -5,10 +5,31 @@ use language::Buffer;
 use project::{Project, ProjectPath};
 use project_panel::ProjectPanel;
 use serde_json::json;
-use settings::{KeymapFile, SettingsStore};
+use settings::{KeymapFile, KeymapFileLoadResult, SettingsStore};
 use std::{path::Path, time::Duration};
 use util::rel_path::RelPath;
 use workspace::{AppState, MultiWorkspace, Workspace};
+
+/// Binds a keymap file. Entries for actions of crates this test does not link are
+/// skipped, but none of this crate's own may be.
+fn bind_keymap(json: &str, cx: &mut gpui::App) {
+    let key_bindings = match KeymapFile::load(json, cx) {
+        KeymapFileLoadResult::Success { key_bindings } => key_bindings,
+        KeymapFileLoadResult::SomeFailedToLoad {
+            key_bindings,
+            error_message,
+        } => {
+            assert!(
+                !error_message.0.contains("zenith_local_history"),
+                "{}",
+                error_message.0
+            );
+            key_bindings
+        }
+        KeymapFileLoadResult::JsonParseFailure { error } => panic!("{error:#}"),
+    };
+    cx.bind_keys(key_bindings);
+}
 
 struct Fixture {
     workspace: Entity<Workspace>,
@@ -49,16 +70,12 @@ async fn fixture(enabled: bool, cx: &mut TestAppContext) -> (Fixture, &mut Visua
                 });
             });
         }
-        // Zenith's keymap, reduced to this view; the loader rejects unknown action names.
-        cx.bind_keys(KeymapFile::load_panic_on_failure(
-            r#"[
-                { "context": "Workspace", "bindings": { "alt-shift-h": "zenith_local_history::ShowFileHistory" } },
-                { "context": "LocalHistoryList", "bindings": {
-                    "down": "menu::SelectNext", "up": "menu::SelectPrevious",
-                    "enter": "menu::Confirm", "escape": "menu::Cancel" } }
-            ]"#,
+        // The shipped keymaps: Tab, Escape and the history keys are decided by both of them.
+        bind_keymap(
+            include_str!("../../../assets/keymaps/default-macos.json"),
             cx,
-        ));
+        );
+        bind_keymap(include_str!("../../../assets/keymaps/zenith.json"), cx);
         app_state
     });
     app_state
@@ -520,6 +537,18 @@ fn clipboard_text(cx: &mut VisualTestContext) -> Option<String> {
     cx.read_from_clipboard().and_then(|item| item.text())
 }
 
+fn status(view: &Entity<LocalHistoryView>, cx: &mut VisualTestContext) -> Option<String> {
+    view.read_with(cx, |view, _| view.status.as_ref().map(|s| s.to_string()))
+}
+
+fn revert_is_focused(view: &Entity<LocalHistoryView>, cx: &mut VisualTestContext) -> bool {
+    cx.update(|window, cx| view.read(cx).revert_focus.is_focused(window))
+}
+
+fn copy_is_focused(view: &Entity<LocalHistoryView>, cx: &mut VisualTestContext) -> bool {
+    cx.update(|window, cx| view.read(cx).copy_focus.is_focused(window))
+}
+
 #[gpui::test]
 async fn test_history_view_revert_replaces_the_text_in_one_undoable_edit(cx: &mut TestAppContext) {
     let (fixture, cx) = fixture(true, cx).await;
@@ -528,13 +557,18 @@ async fn test_history_view_revert_replaces_the_text_in_one_undoable_edit(cx: &mu
     buffer.update(cx, |buffer, cx| buffer.edit([(0..0, "Z")], None, cx));
     assert_eq!(buffer.read_with(cx, |b, _| b.text()), "Z21base");
 
-    cx.dispatch_action(zed_actions::zenith_local_history::RevertToRevision);
+    cx.dispatch_action(super::RevertToRevision);
     cx.run_until_parked();
 
     assert_eq!(buffer.read_with(cx, |b, _| b.text()), "base");
     assert!(
         buffer.read_with(cx, |b, _| b.is_dirty()),
         "saved by the user, not by revert"
+    );
+    assert!(
+        status(&view, cx).unwrap().starts_with("Reverted to the "),
+        "{:?}",
+        status(&view, cx)
     );
     let on_disk = project::Fs::load(
         fixture
@@ -547,7 +581,7 @@ async fn test_history_view_revert_replaces_the_text_in_one_undoable_edit(cx: &mu
     .expect("load");
     assert_eq!(on_disk, "21base", "revert must not write the file");
 
-    // The unsaved text is kept as a labelled revision.
+    // The unsaved text is kept as a labelled revision, with exactly that text.
     let entries = cx
         .update(|_, cx| capture::list(cx, "/dir".into(), "a.txt".into()))
         .await
@@ -555,7 +589,12 @@ async fn test_history_view_revert_replaces_the_text_in_one_undoable_edit(cx: &mu
     let newest = &entries[0].revision;
     assert_eq!(newest.source, "before-revert");
     assert_eq!(super::source_name(&newest.source), "Before revert");
-    drop(view);
+    let kept = cx
+        .update(|_, cx| capture::content(cx, newest.blob_hash.clone()))
+        .await
+        .expect("content")
+        .expect("blob");
+    assert_eq!(kept, b"Z21base");
 
     // One undo brings the unsaved text back.
     buffer.update(cx, |buffer, cx| buffer.undo(cx));
@@ -567,10 +606,11 @@ async fn test_history_view_revert_works_from_the_diff_pane_and_keeps_later_typin
     cx: &mut TestAppContext,
 ) {
     let (fixture, cx) = fixture(true, cx).await;
-    let (_view, buffer) = history_on_the_oldest_revision(&fixture, cx).await;
+    let (view, buffer) = history_on_the_oldest_revision(&fixture, cx).await;
     cx.simulate_keystrokes("enter"); // focus moves into the diff pane
+    assert!(diff_is_focused(&view, cx));
 
-    cx.dispatch_action(zed_actions::zenith_local_history::RevertToRevision);
+    cx.dispatch_action(super::RevertToRevision);
     cx.run_until_parked();
     assert_eq!(buffer.read_with(cx, |b, _| b.text()), "base");
 
@@ -583,16 +623,125 @@ async fn test_history_view_revert_works_from_the_diff_pane_and_keeps_later_typin
 }
 
 #[gpui::test]
+async fn test_history_view_revert_keeps_cursors_outside_the_changed_lines_and_the_line_endings(
+    cx: &mut TestAppContext,
+) {
+    use language::LineEnding;
+    let (fixture, cx) = fixture(true, cx).await;
+    // Saved as "x\nbase"; the oldest revision is "base". Only the first line changes.
+    let buffer = open_and_save(&fixture, "a.txt", &["x\n"], cx).await;
+    cx.simulate_keystrokes("alt-shift-h");
+    cx.run_until_parked();
+    let view = history_view(&fixture, cx);
+    cx.simulate_keystrokes("down");
+    cx.run_until_parked();
+    assert_eq!(buffer.read_with(cx, |b, _| b.text()), "x\nbase");
+    let anchor = buffer.update(cx, |buffer, cx| {
+        buffer.set_line_ending(LineEnding::Windows, cx);
+        buffer.anchor_before(4) // before the 's'
+    });
+
+    cx.dispatch_action(super::RevertToRevision);
+    cx.run_until_parked();
+
+    assert_eq!(buffer.read_with(cx, |b, _| b.text()), "base");
+    let offset = buffer.read_with(cx, |b, _| b.snapshot().summary_for_anchor::<usize>(&anchor));
+    assert_eq!(
+        offset, 2,
+        "a whole-text replacement would lose the position"
+    );
+    assert_eq!(
+        buffer.read_with(cx, |b, _| b.line_ending()),
+        LineEnding::Windows,
+        "the revision's line ending must not replace the file's"
+    );
+    drop(view);
+}
+
+#[gpui::test]
+async fn test_history_view_revert_still_matches_the_revision_when_typing_races_the_diff(
+    cx: &mut TestAppContext,
+) {
+    use gpui::Action as _;
+    let (fixture, cx) = fixture(true, cx).await;
+    let (view, buffer) = history_on_the_oldest_revision(&fixture, cx).await;
+
+    // The diff is computed in the background; a keystroke lands before it is applied
+    // and clashes with the hunk that deletes "21".
+    view.update_in(cx, |_, window, cx| {
+        window.dispatch_action(super::RevertToRevision.boxed_clone(), cx);
+    });
+    buffer.update(cx, |buffer, cx| buffer.edit([(0..0, "Q")], None, cx));
+    cx.run_until_parked();
+
+    assert_eq!(buffer.read_with(cx, |b, _| b.text()), "base");
+    buffer.update(cx, |buffer, cx| buffer.undo(cx));
+    assert_eq!(
+        buffer.read_with(cx, |b, _| b.text()),
+        "Q21base",
+        "the revert is one undo step"
+    );
+}
+
+#[gpui::test]
+async fn test_history_view_revert_of_the_current_text_changes_nothing_and_says_so(
+    cx: &mut TestAppContext,
+) {
+    let (fixture, cx) = fixture(true, cx).await;
+    let (view, buffer) = history_on_the_oldest_revision(&fixture, cx).await;
+    cx.simulate_keystrokes("up up"); // the newest revision is the current text
+    cx.run_until_parked();
+    assert_eq!(view.read_with(cx, |view, _| view.selected), 0);
+
+    cx.dispatch_action(super::RevertToRevision);
+    cx.run_until_parked();
+
+    assert_eq!(buffer.read_with(cx, |b, _| b.text()), "21base");
+    assert!(!buffer.read_with(cx, |b, _| b.is_dirty()));
+    assert_eq!(
+        status(&view, cx).as_deref(),
+        Some("The file already matches this revision.")
+    );
+}
+
+#[gpui::test]
+async fn test_history_view_revert_is_refused_for_a_read_only_buffer_but_copy_still_works(
+    cx: &mut TestAppContext,
+) {
+    let (fixture, cx) = fixture(true, cx).await;
+    let (view, buffer) = history_on_the_oldest_revision(&fixture, cx).await;
+    buffer.update(cx, |buffer, cx| {
+        buffer.set_capability(language::Capability::ReadOnly, cx)
+    });
+
+    assert_eq!(
+        view.read_with(cx, |view, cx| view.revert_blocker(cx)),
+        Some("The file is read-only.")
+    );
+    cx.dispatch_action(super::RevertToRevision);
+    cx.run_until_parked();
+    assert_eq!(buffer.read_with(cx, |b, _| b.text()), "21base");
+    assert_eq!(status(&view, cx).as_deref(), Some("The file is read-only."));
+    // The disabled Revert button is skipped by Tab.
+    cx.simulate_keystrokes("tab");
+    assert!(copy_is_focused(&view, cx));
+
+    cx.dispatch_action(super::CopyRevisionText);
+    assert_eq!(clipboard_text(cx).as_deref(), Some("base"));
+}
+
+#[gpui::test]
 async fn test_history_view_copy_puts_the_revision_text_on_the_clipboard(cx: &mut TestAppContext) {
     let (fixture, cx) = fixture(true, cx).await;
-    let (_view, buffer) = history_on_the_oldest_revision(&fixture, cx).await;
+    let (view, buffer) = history_on_the_oldest_revision(&fixture, cx).await;
     cx.write_to_clipboard(gpui::ClipboardItem::new_string("sentinel".into()));
 
-    cx.dispatch_action(zed_actions::zenith_local_history::CopyRevisionText);
+    cx.dispatch_action(super::CopyRevisionText);
     cx.run_until_parked();
 
     assert_eq!(clipboard_text(cx).as_deref(), Some("base"));
     assert_eq!(buffer.read_with(cx, |b, _| b.text()), "21base");
+    assert_eq!(status(&view, cx).as_deref(), Some("Copied revision text."));
 }
 
 #[gpui::test]
@@ -601,7 +750,7 @@ async fn test_history_view_revert_and_copy_do_nothing_when_the_file_is_no_longer
 ) {
     let (fixture, cx) = fixture(true, cx).await;
     let (view, buffer) = history_on_the_oldest_revision(&fixture, cx).await;
-    assert!(view.read_with(cx, |view, cx| view.revision_to_use(cx).is_some()));
+    assert!(view.read_with(cx, |view, cx| view.revision_to_use(cx).is_ok()));
     cx.write_to_clipboard(gpui::ClipboardItem::new_string("sentinel".into()));
     cx.update(|_, cx| {
         cx.update_global::<SettingsStore, _>(|store, cx| {
@@ -613,14 +762,28 @@ async fn test_history_view_revert_and_copy_do_nothing_when_the_file_is_no_longer
 
     // The text is loaded, the gate alone refuses.
     assert!(view.read_with(cx, |view, _| view.revision_text.is_some()));
-    assert!(view.read_with(cx, |view, cx| view.revision_to_use(cx).is_none()));
-    cx.dispatch_action(zed_actions::zenith_local_history::RevertToRevision);
-    cx.dispatch_action(zed_actions::zenith_local_history::CopyRevisionText);
+    assert!(view.read_with(cx, |view, cx| view.revision_to_use(cx).is_err()));
+    cx.dispatch_action(super::RevertToRevision);
+    assert_eq!(
+        status(&view, cx).as_deref(),
+        Some("This file's history can no longer be shown.")
+    );
+    status_cleared_then(&view, cx);
+    cx.dispatch_action(super::CopyRevisionText);
     cx.run_until_parked();
 
     assert_eq!(buffer.read_with(cx, |b, _| b.text()), "21base");
     assert!(!buffer.read_with(cx, |b, _| b.is_dirty()));
     assert_eq!(clipboard_text(cx).as_deref(), Some("sentinel"));
+    assert_eq!(
+        status(&view, cx).as_deref(),
+        Some("This file's history can no longer be shown.")
+    );
+}
+
+/// Forgets the status, so the next assertion proves the next action set it.
+fn status_cleared_then(view: &Entity<LocalHistoryView>, cx: &mut VisualTestContext) {
+    view.update(cx, |view, _| view.status = None);
 }
 
 #[gpui::test]
@@ -634,10 +797,19 @@ async fn test_history_view_revert_and_copy_do_nothing_without_a_selected_loaded_
     cx.run_until_parked();
     let view = history_view(&fixture, cx);
     cx.write_to_clipboard(gpui::ClipboardItem::new_string("sentinel".into()));
-    cx.dispatch_action(zed_actions::zenith_local_history::RevertToRevision);
-    cx.dispatch_action(zed_actions::zenith_local_history::CopyRevisionText);
+    cx.dispatch_action(super::RevertToRevision);
+    assert_eq!(
+        status(&view, cx).as_deref(),
+        Some("No revision is selected.")
+    );
+    status_cleared_then(&view, cx);
+    cx.dispatch_action(super::CopyRevisionText);
     cx.run_until_parked();
-    assert!(view.read_with(cx, |view, cx| view.revision_to_use(cx).is_none()));
+    assert_eq!(
+        status(&view, cx).as_deref(),
+        Some("No revision is selected.")
+    );
+    assert!(view.read_with(cx, |view, cx| view.revision_to_use(cx).is_err()));
     assert_eq!(buffer.read_with(cx, |b, _| b.text()), "1base");
     assert!(!buffer.read_with(cx, |b, _| b.is_dirty()));
     assert_eq!(clipboard_text(cx).as_deref(), Some("sentinel"));
@@ -647,15 +819,124 @@ async fn test_history_view_revert_and_copy_do_nothing_without_a_selected_loaded_
 async fn test_history_view_revert_and_copy_do_nothing_until_the_revision_is_loaded(
     cx: &mut TestAppContext,
 ) {
+    use gpui::Action as _;
     let (fixture, cx) = fixture(true, cx).await;
     let (view, buffer) = history_on_the_oldest_revision(&fixture, cx).await;
-    view.update(cx, |view, _| view.revision_text = None); // as while a selection loads
     cx.write_to_clipboard(gpui::ClipboardItem::new_string("sentinel".into()));
 
-    cx.dispatch_action(zed_actions::zenith_local_history::RevertToRevision);
-    cx.dispatch_action(zed_actions::zenith_local_history::CopyRevisionText);
-    cx.run_until_parked();
-
+    // Selecting another row while the old row's text is still in the view: both actions
+    // arrive before the new text has been read, so they must not use the old one.
+    view.update_in(cx, |view, window, cx| {
+        view.select(1, window, cx);
+        window.dispatch_action(super::RevertToRevision.boxed_clone(), cx);
+        window.dispatch_action(super::CopyRevisionText.boxed_clone(), cx);
+    });
+    assert_eq!(
+        status(&view, cx).as_deref(),
+        Some("This revision's text is not loaded yet.")
+    );
     assert_eq!(buffer.read_with(cx, |b, _| b.text()), "21base");
     assert_eq!(clipboard_text(cx).as_deref(), Some("sentinel"));
+
+    // Once it has been read the actions work on the new row.
+    cx.run_until_parked();
+    assert_eq!(
+        view.read_with(cx, |view, _| view.revision_text.clone())
+            .as_deref(),
+        Some("1base")
+    );
+    cx.dispatch_action(super::CopyRevisionText);
+    assert_eq!(clipboard_text(cx).as_deref(), Some("1base"));
+}
+
+#[gpui::test]
+async fn test_history_view_loading_again_makes_the_old_text_unusable_until_it_is_checked(
+    cx: &mut TestAppContext,
+) {
+    let (fixture, cx) = fixture(true, cx).await;
+    let (view, _buffer) = history_on_the_oldest_revision(&fixture, cx).await;
+    view.update(cx, |view, _| view.status = Some("old".into()));
+    view.update_in(cx, |view, window, cx| view.load(window, cx));
+    assert!(view.read_with(cx, |view, _| view.revision_text.is_none()));
+    assert_eq!(status(&view, cx), None);
+}
+
+#[gpui::test]
+async fn test_history_view_keys_revert_and_copy_and_report_what_they_did(cx: &mut TestAppContext) {
+    let (fixture, cx) = fixture(true, cx).await;
+    let (view, buffer) = history_on_the_oldest_revision(&fixture, cx).await;
+    cx.write_to_clipboard(gpui::ClipboardItem::new_string("sentinel".into()));
+
+    cx.simulate_keystrokes("alt-shift-c");
+    assert_eq!(clipboard_text(cx).as_deref(), Some("base"));
+    assert_eq!(status(&view, cx).as_deref(), Some("Copied revision text."));
+
+    cx.simulate_keystrokes("alt-shift-r");
+    cx.run_until_parked();
+    assert_eq!(buffer.read_with(cx, |b, _| b.text()), "base");
+    let status = status(&view, cx).expect("a status");
+    assert!(
+        status.starts_with("Reverted to the ") && status.ends_with("save to keep."),
+        "{status:?}"
+    );
+}
+
+#[gpui::test]
+async fn test_history_view_tab_moves_between_the_list_and_the_buttons(cx: &mut TestAppContext) {
+    let (fixture, cx) = fixture(true, cx).await;
+    let (view, buffer) = history_on_the_oldest_revision(&fixture, cx).await;
+    assert!(list_is_focused(&view, cx));
+
+    // Tab leaves the list for the buttons instead of stepping the selection.
+    cx.simulate_keystrokes("tab");
+    assert!(revert_is_focused(&view, cx));
+    assert_eq!(view.read_with(cx, |view, _| view.selected), 2);
+    cx.simulate_keystrokes("tab");
+    assert!(copy_is_focused(&view, cx));
+    cx.simulate_keystrokes("shift-tab");
+    assert!(revert_is_focused(&view, cx));
+    cx.simulate_keystrokes("shift-tab");
+    assert!(list_is_focused(&view, cx));
+
+    // A focused button works from the keyboard.
+    cx.simulate_keystrokes("tab alt-shift-r");
+    cx.run_until_parked();
+    assert_eq!(buffer.read_with(cx, |b, _| b.text()), "base");
+}
+
+#[gpui::test]
+async fn test_history_view_escape_steps_back_to_the_list_then_closes(cx: &mut TestAppContext) {
+    let (fixture, cx) = fixture(true, cx).await;
+    let (view, _buffer) = history_on_the_oldest_revision(&fixture, cx).await;
+
+    // From the diff pane.
+    cx.simulate_keystrokes("enter");
+    assert!(diff_is_focused(&view, cx));
+    cx.simulate_keystrokes("escape");
+    assert!(list_is_focused(&view, cx));
+    assert_eq!(view_count(&fixture, cx), 1);
+
+    // From a button.
+    cx.simulate_keystrokes("tab");
+    assert!(revert_is_focused(&view, cx));
+    cx.simulate_keystrokes("escape");
+    assert!(list_is_focused(&view, cx));
+    assert_eq!(view_count(&fixture, cx), 1);
+
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert_eq!(view_count(&fixture, cx), 0);
+}
+
+#[gpui::test]
+async fn test_history_view_status_is_forgotten_when_another_revision_is_selected(
+    cx: &mut TestAppContext,
+) {
+    let (fixture, cx) = fixture(true, cx).await;
+    let (view, _buffer) = history_on_the_oldest_revision(&fixture, cx).await;
+    cx.simulate_keystrokes("alt-shift-c");
+    assert_eq!(status(&view, cx).as_deref(), Some("Copied revision text."));
+
+    cx.simulate_keystrokes("up");
+    assert_eq!(status(&view, cx), None);
 }

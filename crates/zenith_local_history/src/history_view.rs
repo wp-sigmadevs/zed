@@ -12,7 +12,7 @@ use git_ui_core::file_diff_view::{FileDiffView, build_buffer_diff};
 use gpui::{
     Action as _, App, ClickEvent, ClipboardItem, Context, Entity, EventEmitter, FocusHandle,
     Focusable, IntoElement, ParentElement, Render, Role, SharedString, Styled, Task,
-    UniformListScrollHandle, WeakEntity, Window, px, uniform_list,
+    UniformListScrollHandle, WeakEntity, Window, actions, px, uniform_list,
 };
 use language::Buffer;
 use project::{Project, ProjectPath};
@@ -20,10 +20,24 @@ use project_panel::ProjectPanel;
 use std::ops::Range;
 use time::{OffsetDateTime, UtcOffset};
 use time_format::TimestampFormat;
-use ui::{ListItem, ListItemSpacing, Tooltip, prelude::*};
+use ui::{KeyBinding, ListItem, ListItemSpacing, Tooltip, prelude::*};
 use util::size::format_file_size;
 use workspace::{Item, Workspace, item::SaveOptions};
-use zed_actions::zenith_local_history::{CopyRevisionText, RevertToRevision, ShowFileHistory};
+use zed_actions::zenith_local_history::ShowFileHistory;
+
+actions!(
+    zenith_local_history,
+    [
+        /// Replaces the file's text with the selected local history revision, as one undoable edit. Save to keep it.
+        RevertToRevision,
+        /// Copies the text of the selected local history revision.
+        CopyRevisionText,
+        /// Moves focus to the next control of the history tab: the revision list, then its buttons.
+        FocusNextControl,
+        /// Moves focus to the previous control of the history tab.
+        FocusPreviousControl,
+    ]
+);
 
 const LIST_WIDTH: f32 = 320.;
 const ROW_HEIGHT: f32 = 44.;
@@ -112,10 +126,15 @@ pub struct LocalHistoryView {
     diff: Option<DiffPane>,
     /// Text of the selected revision, once read. `None` while it loads or when it is gone.
     revision_text: Option<SharedString>,
+    /// What the last Revert / Copy did or why it did nothing; read out by screen readers.
+    status: Option<SharedString>,
     /// Why the diff pane is empty, when it is not just loading.
     note: Option<SharedString>,
+    revert_focus: FocusHandle,
+    copy_focus: FocusHandle,
     load_task: Task<()>,
     content_task: Task<()>,
+    revert_task: Task<()>,
 }
 
 impl LocalHistoryView {
@@ -150,15 +169,22 @@ impl LocalHistoryView {
             current: None,
             diff: None,
             revision_text: None,
+            status: None,
             note: None,
+            revert_focus: cx.focus_handle(),
+            copy_focus: cx.focus_handle(),
             load_task: Task::ready(()),
             content_task: Task::ready(()),
+            revert_task: Task::ready(()),
         }
     }
 
     /// Opens the file's buffer, then reads its revisions. The buffer goes first:
     /// opening it records the "Opened" baseline, which the list must include.
     fn load(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // The old text stays unusable until the gate has been re-checked below.
+        self.revision_text = None;
+        self.status = None;
         let Some(worktree) = self
             .project
             .read(cx)
@@ -217,6 +243,7 @@ impl LocalHistoryView {
         };
         self.selected = ix;
         self.revision_text = None;
+        self.status = None;
         self.scroll_handle
             .scroll_to_item(ix, gpui::ScrollStrategy::Center);
         let content = capture::content(cx, entry.revision.blob_hash.clone());
@@ -283,38 +310,105 @@ impl LocalHistoryView {
         cx.notify();
     }
 
-    /// The selected revision's text, when the user may act on it: it is loaded and the
-    /// file is still viewable (not private, ignored or a symlink by now).
-    fn revision_to_use(&self, cx: &App) -> Option<SharedString> {
-        let buffer = self.current.as_ref()?.read(cx);
-        worktree::File::from_dyn(buffer.file())
-            .is_some_and(|file| capture::is_viewable(file, cx))
-            .then(|| self.revision_text.clone())?
+    /// The selected revision's text, or why it cannot be used: not loaded yet, or the
+    /// file is not viewable any more (private, ignored or a symlink by now).
+    fn revision_to_use(&self, cx: &App) -> Result<SharedString, &'static str> {
+        let Some(text) = &self.revision_text else {
+            return Err(if self.entries.get(self.selected).is_none() {
+                "No revision is selected."
+            } else {
+                "This revision's text is not loaded yet."
+            });
+        };
+        let viewable = self.current.as_ref().is_some_and(|buffer| {
+            worktree::File::from_dyn(buffer.read(cx).file())
+                .is_some_and(|file| capture::is_viewable(file, cx))
+        });
+        if viewable {
+            Ok(text.clone())
+        } else {
+            Err("This file's history can no longer be shown.")
+        }
+    }
+
+    /// Why Revert cannot run now, if it cannot.
+    fn revert_blocker(&self, cx: &App) -> Option<&'static str> {
+        match self.revision_to_use(cx) {
+            Err(reason) => Some(reason),
+            Ok(_) if self.current.as_ref().is_none_or(|b| b.read(cx).read_only()) => {
+                Some("The file is read-only.")
+            }
+            Ok(_) => None,
+        }
+    }
+
+    fn set_status(&mut self, status: impl Into<SharedString>, cx: &mut Context<Self>) {
+        self.status = Some(status.into());
+        cx.notify();
     }
 
     /// Replaces the project buffer's text with the revision: one undoable edit, never
     /// a file write, so the editor shows it and the user saves with the usual key.
+    /// A diff keeps cursors and folds outside the changed lines.
     fn revert(&mut self, _: &RevertToRevision, _: &mut Window, cx: &mut Context<Self>) {
-        let (Some(text), Some(buffer)) = (self.revision_to_use(cx), self.current.clone()) else {
+        if let Some(reason) = self.revert_blocker(cx) {
+            return self.set_status(reason, cx);
+        }
+        let (Some(text), Some(buffer)) = (self.revision_text.clone(), self.current.clone()) else {
             return;
         };
-        if buffer.read(cx).read_only() || *buffer.read(cx).text() == *text {
-            return;
+        if buffer.read(cx).text() == text.as_ref() {
+            return self.set_status("The file already matches this revision.", cx);
         }
-        // The text about to be replaced may never have been saved: keep it as a revision.
+        let when = self
+            .entries
+            .get(self.selected)
+            .map(|entry| format_time(entry.revision.ts))
+            .unwrap_or_default();
+        // The text about to be replaced may never have been saved: with recording on,
+        // keep it as a revision first.
         capture::capture(&buffer, "before-revert", cx);
-        buffer.update(cx, |buffer, cx| {
-            // Closed on both sides so the revert neither merges into earlier typing
-            // nor swallows later typing: one undo step brings the old text back.
-            buffer.finalize_last_transaction();
-            buffer.set_text(text.as_ref(), cx);
-            buffer.finalize_last_transaction();
+        let diff = buffer.read(cx).diff(text.to_string(), cx);
+        self.revert_task = cx.spawn(async move |this, cx| {
+            let diff = diff.await;
+            buffer.update(cx, |buffer, cx| {
+                let line_ending = buffer.line_ending();
+                // Closed on both sides so the revert neither merges into earlier typing
+                // nor swallows later typing: one undo step brings the old text back.
+                buffer.finalize_last_transaction();
+                buffer.start_transaction();
+                buffer.apply_diff(diff, cx);
+                // apply_diff drops hunks that clash with edits made while the diff was
+                // computed; whatever is left over is replaced as part of the same edit.
+                if buffer.text() != text.as_ref() {
+                    buffer.set_text(text.as_ref(), cx);
+                }
+                // The diff carries the revision's line ending; the file keeps its own.
+                if buffer.line_ending() != line_ending {
+                    buffer.set_line_ending(line_ending, cx);
+                }
+                buffer.end_transaction(cx);
+                buffer.finalize_last_transaction();
+            });
+            this.update(cx, |this, cx| {
+                this.set_status(
+                    format!(
+                        "Reverted to the {when} revision. Undo with the editor's undo; save to keep."
+                    ),
+                    cx,
+                )
+            })
+            .ok();
         });
     }
 
     fn copy_revision(&mut self, _: &CopyRevisionText, _: &mut Window, cx: &mut Context<Self>) {
-        if let Some(text) = self.revision_to_use(cx) {
-            cx.write_to_clipboard(ClipboardItem::new_string(text.to_string()));
+        match self.revision_to_use(cx) {
+            Ok(text) => {
+                cx.write_to_clipboard(ClipboardItem::new_string(text.to_string()));
+                self.set_status("Copied revision text.", cx);
+            }
+            Err(reason) => self.set_status(reason, cx),
         }
     }
 
@@ -384,8 +478,31 @@ impl LocalHistoryView {
         }
     }
 
+    /// Escape steps back: from the diff or a button to the list, from the list closes the tab.
     fn cancel(&mut self, _: &menu::Cancel, window: &mut Window, cx: &mut Context<Self>) {
-        window.dispatch_action(workspace::CloseActiveItem::default().boxed_clone(), cx);
+        if self.focus_handle.is_focused(window) {
+            window.dispatch_action(workspace::CloseActiveItem::default().boxed_clone(), cx);
+        } else {
+            window.focus(&self.focus_handle, cx);
+        }
+    }
+
+    fn focus_next_control(
+        &mut self,
+        _: &FocusNextControl,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        window.focus_next(cx);
+    }
+
+    fn focus_previous_control(
+        &mut self,
+        _: &FocusPreviousControl,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        window.focus_prev(cx);
     }
 
     fn render_row(&self, ix: usize, cx: &mut Context<Self>) -> impl IntoElement {
@@ -404,10 +521,8 @@ impl LocalHistoryView {
             .rounded()
             .toggle_state(selected)
             .aria_role(Role::ListItem)
-            .aria_label(format!(
-                "{title}, {detail}, {delta}{}",
-                if selected { ", selected" } else { "" }
-            ))
+            // Selection is reported by the role (`aria_selected`), not repeated in the label.
+            .aria_label(format!("{title}, {detail}, {delta}"))
             .when(selected, |item| item.aria_active_descendant())
             .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                 window.focus(&this.focus_handle, cx);
@@ -435,17 +550,16 @@ impl LocalHistoryView {
     }
 
     /// A centred message that still takes focus, so Escape closes the tab.
-    fn placeholder(
-        &self,
-        text: SharedString,
-        hint: Option<&'static str>,
-        cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
+    fn placeholder(&self, text: SharedString, hint: Option<&'static str>) -> gpui::AnyElement {
         v_flex()
             .id("zenith-history-placeholder")
+            .role(Role::Status)
+            .aria_label(match hint {
+                Some(hint) => format!("{text}. {hint}"),
+                None => text.to_string(),
+            })
             .key_context("LocalHistoryList")
             .track_focus(&self.focus_handle)
-            .on_action(cx.listener(Self::cancel))
             .size_full()
             .items_center()
             .justify_center()
@@ -471,29 +585,47 @@ impl LocalHistoryView {
         .track_scroll(&self.scroll_handle)
         .flex_1();
         let selected = self.entries.get(self.selected);
-        let can_use = self.revision_to_use(cx).is_some();
+        let revert_blocker = self.revert_blocker(cx);
+        let copy_blocker = self.revision_to_use(cx).err();
+        // A disabled button is not a tab stop. (The handle's own flag counts: a tracked handle
+        // ignores the element's `tab_index`.)
+        let revert_focus = self.revert_focus.clone().tab_stop(revert_blocker.is_none());
+        let copy_focus = self.copy_focus.clone().tab_stop(copy_blocker.is_none());
+        let description = |blocker: Option<&str>, available: &str| match blocker {
+            Some(reason) => format!("Unavailable: {reason}"),
+            None => available.to_string(),
+        };
         h_flex()
             .size_full()
             .child(
-                v_flex()
-                    .id("zenith-history-list")
-                    .role(Role::List)
-                    .aria_label(format!("Revisions of {}", self.name))
-                    .key_context("LocalHistoryList")
-                    .track_focus(&self.focus_handle)
-                    .on_action(cx.listener(Self::select_next))
-                    .on_action(cx.listener(Self::select_previous))
-                    .on_action(cx.listener(Self::select_first))
-                    .on_action(cx.listener(Self::select_last))
-                    .on_action(cx.listener(Self::confirm))
-                    .on_action(cx.listener(Self::cancel))
+                div()
                     .w(px(LIST_WIDTH))
                     .h_full()
                     .flex_none()
                     .border_r_1()
                     .border_color(colors.border)
-                    .p_1()
-                    .child(list),
+                    .p_0p5()
+                    .child(
+                        v_flex()
+                            .id("zenith-history-list")
+                            .role(Role::List)
+                            .aria_label(format!("Revisions of {}", self.name))
+                            .key_context("LocalHistoryList")
+                            .track_focus(&self.focus_handle)
+                            .on_action(cx.listener(Self::select_next))
+                            .on_action(cx.listener(Self::select_previous))
+                            .on_action(cx.listener(Self::select_first))
+                            .on_action(cx.listener(Self::select_last))
+                            .on_action(cx.listener(Self::confirm))
+                            .size_full()
+                            .p_0p5()
+                            // A visible focus ring for keyboard users.
+                            .border_1()
+                            .border_color(colors.border_transparent)
+                            .rounded_sm()
+                            .focus_visible(|style| style.border_color(colors.border_focused))
+                            .child(list),
+                    ),
             )
             .child(
                 v_flex()
@@ -530,10 +662,19 @@ impl LocalHistoryView {
                                                 "Revert to this revision",
                                             )
                                             .label_size(LabelSize::Small)
-                                            .tab_index(0i16)
-                                            .disabled(!can_use)
+                                            .track_focus(&revert_focus)
+                                            .disabled(revert_blocker.is_some())
+                                            .aria_description(description(
+                                                revert_blocker,
+                                                "Replaces the file's text with this revision. Undo to go back; save to keep.",
+                                            ))
+                                            .key_binding(KeyBinding::for_action_in(
+                                                &RevertToRevision,
+                                                &self.focus_handle,
+                                                cx,
+                                            ))
                                             .tooltip(Tooltip::for_action_title(
-                                                "Replace the file's text with this revision (undoable, save to keep)",
+                                                "Replace the file's text with this revision (undo to go back, save to keep)",
                                                 &RevertToRevision,
                                             ))
                                             .on_click(cx.listener(
@@ -548,8 +689,17 @@ impl LocalHistoryView {
                                                 "Copy revision text",
                                             )
                                             .label_size(LabelSize::Small)
-                                            .tab_index(0i16)
-                                            .disabled(!can_use)
+                                            .track_focus(&copy_focus)
+                                            .disabled(copy_blocker.is_some())
+                                            .aria_description(description(
+                                                copy_blocker,
+                                                "Copies this revision's text to the clipboard.",
+                                            ))
+                                            .key_binding(KeyBinding::for_action_in(
+                                                &CopyRevisionText,
+                                                &self.focus_handle,
+                                                cx,
+                                            ))
                                             .tooltip(Tooltip::for_action_title(
                                                 "Copy this revision's text",
                                                 &CopyRevisionText,
@@ -584,7 +734,11 @@ impl LocalHistoryView {
 }
 
 fn message(text: impl Into<SharedString>) -> gpui::AnyElement {
+    let text = text.into();
     v_flex()
+        .id("zenith-history-message")
+        .role(Role::Status)
+        .aria_label(text.clone())
         .size_full()
         .items_center()
         .justify_center()
@@ -728,12 +882,11 @@ impl Item for LocalHistoryView {
 impl Render for LocalHistoryView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let body = match &self.state {
-            State::Loading => self.placeholder("Loading history…".into(), None, cx),
-            State::Failed(reason) => self.placeholder(reason.clone(), None, cx),
+            State::Loading => self.placeholder("Loading history…".into(), None),
+            State::Failed(reason) => self.placeholder(reason.clone(), None),
             State::Ready if self.entries.is_empty() => self.placeholder(
                 format!("No local history for {} yet.", self.name).into(),
                 Some("A revision is recorded when a file is opened and each time it is saved."),
-                cx,
             ),
             State::Ready => self.render_split(cx).into_any_element(),
         };
@@ -742,9 +895,31 @@ impl Render for LocalHistoryView {
             // On the root, so the actions work from the list and from the diff.
             .on_action(cx.listener(Self::revert))
             .on_action(cx.listener(Self::copy_revision))
+            .on_action(cx.listener(Self::cancel))
+            .on_action(cx.listener(Self::focus_next_control))
+            .on_action(cx.listener(Self::focus_previous_control))
             .size_full()
             .bg(cx.theme().colors().editor_background)
-            .child(body)
+            .child(div().flex_1().min_h_0().child(body))
+            // Always present, so a screen reader sees the text change when it does.
+            .child(
+                div()
+                    .id("zenith-history-status")
+                    .role(Role::Status)
+                    .aria_label(self.status.clone().unwrap_or_default())
+                    .flex_none()
+                    .when_some(self.status.clone(), |this, status| {
+                        this.px_2()
+                            .py_1()
+                            .border_t_1()
+                            .border_color(cx.theme().colors().border_variant)
+                            .child(
+                                Label::new(status)
+                                    .color(Color::Muted)
+                                    .size(LabelSize::Small),
+                            )
+                    }),
+            )
     }
 }
 

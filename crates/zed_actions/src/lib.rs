@@ -1021,10 +1021,6 @@ pub mod zenith_local_history {
         [
             /// Shows the local history of the current file.
             ShowFileHistory,
-            /// Replaces the file's text with the selected local history revision, as one undoable edit. Save to keep it.
-            RevertToRevision,
-            /// Copies the text of the selected local history revision.
-            CopyRevisionText,
             /// Lists deleted files that have local history and restores them.
             RecoverDeletedFiles,
         ]

@@ -3102,6 +3102,17 @@ mod tests {
     mod zenith_scratches {
         gpui::actions!(zenith_scratches, [NewScratchFile]);
     }
+    mod zenith_local_history {
+        gpui::actions!(
+            zenith_local_history,
+            [
+                RevertToRevision,
+                CopyRevisionText,
+                FocusNextControl,
+                FocusPreviousControl
+            ]
+        );
+    }
 
     #[gpui::test]
     fn test_keymap_opens_search_like_phpstorm(cx: &mut TestAppContext) {
