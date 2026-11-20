@@ -163,8 +163,15 @@ impl RefactorPlan {
         for diff in &writes {
             let path = &diff.file_path;
             if new_file == Some(path) {
+                // A case-only rename on a case-insensitive disk "exists" as the source itself.
+                let is_the_source = match &self.kind {
+                    RefactorKind::MoveClass { source_path, .. } => {
+                        is_same_file(fs, source_path, path).await?
+                    }
+                    _ => false,
+                };
                 ensure!(
-                    fs.metadata(path).await?.is_none(),
+                    is_the_source || fs.metadata(path).await?.is_none(),
                     "{} already exists; nothing was written",
                     path.display()
                 );
@@ -199,6 +206,13 @@ impl RefactorPlan {
         }
 
         if let Some((source, shown)) = removal {
+            // After a case-only rename on a case-insensitive disk the "old" path is the file
+            // just written; removing it would delete the result.
+            if let Some(target) = new_file
+                && is_same_file(fs, source, target).await?
+            {
+                return Ok(affected);
+            }
             let on_disk = fs.load(source).await.ok();
             ensure!(
                 on_disk.as_deref() == Some(shown),
@@ -219,6 +233,21 @@ impl RefactorPlan {
 
         Ok(affected)
     }
+}
+
+/// Whether two paths name the same file: the same inode when the disk reports one, otherwise
+/// (inode unavailable) the same path ignoring case. Paths that do not both exist are different.
+async fn is_same_file(fs: &dyn Fs, a: &Path, b: &Path) -> Result<bool> {
+    if a == b {
+        return Ok(true);
+    }
+    Ok(match (fs.metadata(a).await?, fs.metadata(b).await?) {
+        (Some(x), Some(y)) if x.inode != 0 && y.inode != 0 => x.inode == y.inode,
+        (Some(_), Some(_)) => {
+            a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase()
+        }
+        _ => false,
+    })
 }
 
 /// Refuses paths that leave the project: relative paths, `..`, anything outside `roots`
@@ -1440,6 +1469,60 @@ function calculate_tax($subtotal, $rate) {
                 .await
                 .unwrap(),
             ORDER_CONTROLLER
+        );
+    }
+
+    /// `user.php` -> `User.php`: on a case-insensitive disk (default APFS) both names are one
+    /// file, and writing the new one then removing the old one used to delete the result. The
+    /// result must survive on either kind of disk.
+    #[gpui::test]
+    async fn test_case_only_move_keeps_the_file(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let source = root.join("user.php");
+        let target = root.join("User.php");
+        let content = "<?php\nnamespace App\\Models;\nclass User {}\n";
+        std::fs::write(&source, content).unwrap();
+
+        let plan = plan_move_class(
+            "User",
+            &source,
+            &target,
+            "App\\Models",
+            "App\\Entities",
+            content,
+            &[],
+        );
+        let fs = fs::RealFs::new(None, cx.executor());
+        plan.apply_to_disk(fs.as_ref(), std::slice::from_ref(&root))
+            .await
+            .unwrap();
+
+        let written = std::fs::read_to_string(&target).unwrap();
+        assert!(written.contains("namespace App\\Entities;"), "{written}");
+        let names: Vec<String> = std::fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        // Case-sensitive disk: the old name was removed. Case-insensitive: it was the same
+        // file and stays. Either way exactly one file is left, with the new content.
+        assert_eq!(names.len(), 1, "{names:?}");
+    }
+
+    #[gpui::test]
+    async fn test_is_same_file(cx: &mut TestAppContext) {
+        let fs = project_fs(cx).await;
+        let (a, b) = (
+            Path::new("/project/app/Services/OldService.php"),
+            Path::new("/project/app/Controllers/OrderController.php"),
+        );
+        assert!(is_same_file(fs.as_ref(), a, a).await.unwrap());
+        assert!(!is_same_file(fs.as_ref(), a, b).await.unwrap());
+        assert!(
+            !is_same_file(fs.as_ref(), a, Path::new("/project/missing.php"))
+                .await
+                .unwrap()
         );
     }
 }
