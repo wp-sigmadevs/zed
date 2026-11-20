@@ -8589,6 +8589,7 @@ mod zenith_tests {
 
     // zenith_templates depends on project_panel, so it cannot be a dev-dependency (cycle, two
     // project_panel copies, duplicate actions). Declare its action here so the menu names resolve.
+    // The real name is pinned by zenith_templates' `test_new_from_template_action_name`.
     mod zenith_templates {
         gpui::actions!(zenith_templates, [NewFromTemplate]);
     }
