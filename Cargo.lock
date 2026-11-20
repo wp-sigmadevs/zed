@@ -23197,18 +23197,23 @@ dependencies = [
 name = "zenith_refactor"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "collections",
+ "fs",
  "gpui",
  "icons",
  "log",
  "menu",
  "pretty_assertions",
+ "project",
  "regex",
  "schemars 1.0.4",
  "serde",
  "serde_json",
  "settings",
  "tempfile",
+ "theme",
+ "theme_settings",
  "ui",
  "util",
  "workspace",

@@ -1,6 +1,8 @@
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use anyhow::{Context as _, Result, bail, ensure};
+use fs::{Fs, RemoveOptions};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::path::{Component, Path, PathBuf};
 
 pub mod preview_modal;
 pub use preview_modal::*;
@@ -81,39 +83,155 @@ impl RefactorPlan {
         results
     }
 
-    pub fn apply_to_disk(&self) -> std::io::Result<Vec<PathBuf>> {
-        let mut affected = Vec::new();
-
+    /// Every file the ticked rows write or remove.
+    pub fn touched_paths(&self) -> Vec<&Path> {
+        let mut paths: Vec<&Path> = self
+            .file_diffs
+            .iter()
+            .filter(|diff| diff.is_included)
+            .map(|diff| diff.file_path.as_path())
+            .collect();
         if let RefactorKind::MoveClass {
             source_path,
             target_path,
             ..
         } = &self.kind
+            && paths.contains(&target_path.as_path())
         {
-            if source_path != target_path && source_path.exists() {
-                let _ = std::fs::remove_file(source_path);
-            }
+            paths.push(source_path);
+        }
+        paths
+    }
+
+    /// Writes every ticked row, then (for a move) removes the old file.
+    ///
+    /// Every path is checked before anything is written: it must lie inside one of `roots`
+    /// (the project's worktrees) with no `..` and no symlink on the way. The source of a move
+    /// is only removed when the target row is ticked, every write succeeded and the file still
+    /// holds what the preview showed. Files are written atomically (temp file and rename).
+    pub async fn apply_to_disk(&self, fs: &dyn Fs, roots: &[PathBuf]) -> Result<Vec<PathBuf>> {
+        let mut checked_roots = Vec::with_capacity(roots.len());
+        for root in roots {
+            let canonical = fs
+                .canonicalize(root)
+                .await
+                .with_context(|| format!("cannot resolve project folder {}", root.display()))?;
+            checked_roots.push((root.clone(), canonical));
         }
 
-        if let RefactorKind::SafeDelete { file_path, .. } = &self.kind {
-            if self.file_diffs.is_empty() && file_path.exists() {
-                let _ = std::fs::remove_file(file_path);
-                affected.push(file_path.clone());
-            }
+        let writes: Vec<&FileDiff> = self
+            .file_diffs
+            .iter()
+            .filter(|diff| diff.is_included)
+            .collect();
+        // The old file goes only when its replacement is ticked: (path, content the preview showed).
+        let removal = match &self.kind {
+            RefactorKind::MoveClass {
+                source_path,
+                target_path,
+                ..
+            } if source_path != target_path => writes
+                .iter()
+                .find(|diff| &diff.file_path == target_path)
+                .map(|diff| (source_path, diff.original_content.as_str())),
+            _ => None,
+        };
+        let removal = match removal {
+            Some((path, shown)) if fs.metadata(path).await?.is_some() => Some((path, shown)),
+            _ => None,
+        };
+
+        for path in writes
+            .iter()
+            .map(|diff| &diff.file_path)
+            .chain(removal.map(|(path, _)| path))
+        {
+            check_inside_project(fs, &checked_roots, path).await?;
         }
 
-        for diff in &self.file_diffs {
-            if diff.is_included {
-                if let Some(parent) = diff.file_path.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
-                std::fs::write(&diff.file_path, &diff.modified_content)?;
-                affected.push(diff.file_path.clone());
+        let mut affected = Vec::new();
+        for diff in &writes {
+            if let Some(parent) = diff.file_path.parent() {
+                fs.create_dir(parent)
+                    .await
+                    .with_context(|| format!("cannot create {}", parent.display()))?;
             }
+            fs.atomic_write(diff.file_path.clone(), diff.modified_content.clone())
+                .await
+                .with_context(|| format!("cannot write {}", diff.file_path.display()))?;
+            affected.push(diff.file_path.clone());
+        }
+
+        if let Some((source, shown)) = removal {
+            let on_disk = fs.load(source).await.ok();
+            ensure!(
+                on_disk.as_deref() == Some(shown),
+                "{} changed since the preview; it was left in place (the new file was written)",
+                source.display()
+            );
+            fs.remove_file(
+                source,
+                RemoveOptions {
+                    recursive: false,
+                    ignore_if_not_exists: true,
+                },
+            )
+            .await
+            .with_context(|| format!("cannot remove {}", source.display()))?;
+            affected.push(source.clone());
         }
 
         Ok(affected)
     }
+}
+
+/// Refuses paths that leave the project: relative paths, `..`, anything outside `roots`
+/// (given path and its canonical form), and any symlink below a root.
+async fn check_inside_project(
+    fs: &dyn Fs,
+    roots: &[(PathBuf, PathBuf)],
+    path: &Path,
+) -> Result<()> {
+    ensure!(
+        path.is_absolute(),
+        "{} is not an absolute path",
+        path.display()
+    );
+    ensure!(
+        !path
+            .components()
+            .any(|component| matches!(component, Component::ParentDir | Component::CurDir)),
+        "{} contains a relative component",
+        path.display()
+    );
+    let Some((given, canonical)) = roots.iter().find(|(given, _)| path.starts_with(given)) else {
+        bail!("{} is outside the project", path.display());
+    };
+
+    let mut current = given.clone();
+    for component in path.strip_prefix(given)?.components() {
+        current.push(component);
+        match fs.metadata(&current).await? {
+            Some(metadata) if metadata.is_symlink => {
+                bail!("{} goes through a symlink", path.display())
+            }
+            Some(_) => {}
+            None => break,
+        }
+    }
+
+    // The deepest part that exists must also resolve inside the project.
+    let mut existing = path;
+    while fs.metadata(existing).await?.is_none() {
+        existing = existing.parent().context("path has no existing ancestor")?;
+    }
+    let resolved = fs.canonicalize(existing).await?;
+    ensure!(
+        resolved.starts_with(canonical),
+        "{} is outside the project",
+        path.display()
+    );
+    Ok(())
 }
 
 pub fn derive_psr4_namespace(base_path: &Path, file_path: &Path, vendor_prefix: &str) -> String {
@@ -236,10 +354,105 @@ pub fn plan_move_class(
     }
 }
 
+/// Scans PHP text from `start` (just after an opening bracket) to the bracket that closes it.
+/// Returns the byte index of that closing bracket and the byte ranges of the top-level
+/// comma-separated pieces. Strings and comments are skipped; `None` when unbalanced.
+fn scan_balanced(text: &str, start: usize) -> Option<(usize, Vec<(usize, usize)>)> {
+    let bytes = text.as_bytes();
+    let mut depth = 1usize;
+    let mut pieces = Vec::new();
+    let mut piece_start = start;
+    let mut i = start;
+    while i < bytes.len() {
+        match bytes[i] {
+            quote @ (b'\'' | b'"') => {
+                i += 1;
+                while i < bytes.len() && bytes[i] != quote {
+                    if bytes[i] == b'\\' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                i = text[i + 2..].find("*/").map(|end| i + 2 + end + 1)?;
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'/') => {
+                i = text[i..].find('\n').map_or(bytes.len(), |end| i + end);
+            }
+            b'#' if bytes.get(i + 1) != Some(&b'[') => {
+                i = text[i..].find('\n').map_or(bytes.len(), |end| i + end);
+            }
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    pieces.push((piece_start, i));
+                    return Some((i, pieces));
+                }
+            }
+            b',' if depth == 1 => {
+                pieces.push((piece_start, i));
+                piece_start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+fn pieces_of(text: &str, ranges: &[(usize, usize)]) -> Vec<String> {
+    ranges
+        .iter()
+        .filter_map(|&(start, end)| text.get(start..end))
+        .map(|piece| piece.trim().to_string())
+        .filter(|piece| !piece.is_empty())
+        .collect()
+}
+
+fn line_of(text: &str, byte: usize) -> usize {
+    text.get(..byte).map_or(1, |head| head.lines().count() + 1)
+}
+
+/// The byte range of the top-level definition of `name` (class, interface, trait, enum or
+/// function), from the start of its line through the closing brace and the rest of that line.
+fn symbol_definition_range(content: &str, name: &str) -> Option<(usize, usize)> {
+    let pattern = format!(
+        r"(?m)^([ \t]*(?:<\?php[ \t]+)?)(?:(?:abstract|final|readonly)[ \t]+)*(?:class|interface|trait|enum|function)[ \t]+&?{}\b",
+        regex::escape(name)
+    );
+    let captures = regex::Regex::new(&pattern).ok()?.captures(content)?;
+    let found = captures.get(0)?;
+    // A one-line file may open with `<?php class X {}`: keep the opening tag.
+    let prefix = captures.get(1)?;
+    let start = if prefix.as_str().contains("<?php") {
+        prefix.end()
+    } else {
+        found.start()
+    };
+    let after_header = content.get(found.end()..)?;
+    let open = found.end() + after_header.find('{')?;
+    // A `;` first means a declaration without a body.
+    if content.get(found.end()..open)?.contains(';') {
+        return None;
+    }
+    let (close, _) = scan_balanced(content, open + 1)?;
+    let mut end = close + 1;
+    let rest = content.get(end..)?;
+    let blank = rest
+        .find('\n')
+        .filter(|&newline| rest[..newline].trim().is_empty());
+    if let Some(newline) = blank {
+        end += newline + 1;
+    }
+    Some((start, end))
+}
+
 pub fn plan_safe_delete(
     symbol_name: &str,
     file_path: &Path,
-    _file_content: &str,
+    file_content: &str,
     project_files: &[(PathBuf, String)],
 ) -> RefactorPlan {
     let mut warnings = Vec::new();
@@ -288,6 +501,34 @@ pub fn plan_safe_delete(
         }
     }
 
+    let has_usages = !warnings.is_empty();
+
+    // Only the symbol's own definition is removed; the rest of its file stays.
+    match symbol_definition_range(file_content, symbol_name) {
+        Some((start, end)) => {
+            let mut modified = file_content.to_string();
+            modified.replace_range(start..end, "");
+            file_diffs.insert(
+                0,
+                FileDiff {
+                    file_path: file_path.to_path_buf(),
+                    original_content: file_content.to_string(),
+                    modified_content: modified,
+                    replacements: vec![TextReplacement {
+                        line: line_of(file_content, start),
+                        old_text: file_content[start..end].trim().to_string(),
+                        new_text: String::new(),
+                    }],
+                    is_included: !has_usages,
+                },
+            );
+        }
+        None => warnings.push(format!(
+            "Could not find the definition of '{symbol_name}' in {}; nothing would be deleted",
+            file_path.display()
+        )),
+    }
+
     let can_apply_safely = warnings.is_empty();
 
     RefactorPlan {
@@ -302,6 +543,55 @@ pub fn plan_safe_delete(
     }
 }
 
+/// A call of the function found in a file.
+struct CallSite {
+    start: usize,
+    end: usize,
+    args: Vec<String>,
+}
+
+/// Calls of the plain function `name(`. Method calls (`->name(`, `::name(`), other namespaces'
+/// functions, `new name(` and definitions are not calls of it; they are counted in `skipped`.
+/// Calls whose parentheses cannot be matched, or that sit inside another call, are counted in
+/// `unclear`.
+fn find_calls(content: &str, name: &str) -> (Vec<CallSite>, usize, usize) {
+    let mut calls: Vec<CallSite> = Vec::new();
+    let (mut skipped, mut unclear) = (0, 0);
+    let Ok(reg) = regex::Regex::new(&format!(r"\b{}\s*\(", regex::escape(name))) else {
+        return (calls, skipped, unclear);
+    };
+    for found in reg.find_iter(content) {
+        let before = content[..found.start()].trim_end();
+        let qualified_elsewhere = before
+            .strip_suffix('\\')
+            .is_some_and(|rest| rest.ends_with(|c: char| c.is_alphanumeric() || c == '_'));
+        let word_before = before
+            .rsplit(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .next()
+            .unwrap_or("");
+        if before.ends_with("->") || before.ends_with("::") || qualified_elsewhere {
+            skipped += 1;
+            continue;
+        }
+        if matches!(word_before, "function" | "new" | "fn") || before.ends_with("function &") {
+            continue;
+        }
+        if calls.last().is_some_and(|call| found.start() < call.end) {
+            unclear += 1;
+            continue;
+        }
+        match scan_balanced(content, found.end()) {
+            Some((close, pieces)) => calls.push(CallSite {
+                start: found.start(),
+                end: close + 1,
+                args: pieces_of(content, &pieces),
+            }),
+            None => unclear += 1,
+        }
+    }
+    (calls, skipped, unclear)
+}
+
 pub fn plan_change_signature(
     function_name: &str,
     def_file: &Path,
@@ -311,42 +601,26 @@ pub fn plan_change_signature(
     caller_files: &[(PathBuf, String)],
 ) -> RefactorPlan {
     let mut file_diffs = Vec::new();
+    let mut warnings = Vec::new();
+    let mut can_apply_safely = true;
 
-    let fn_header_pattern = format!(r"function\s+{}\s*\(([^)]*)\)", regex::escape(function_name));
-    let Ok(fn_header_reg) = regex::Regex::new(&fn_header_pattern) else {
-        return RefactorPlan {
-            kind: RefactorKind::ChangeSignature {
-                function_name: function_name.to_string(),
-                file_path: def_file.to_path_buf(),
-                reordered_indices: reordered_indices.to_vec(),
-                added_params: added_params.to_vec(),
-            },
-            description: format!("Change signature for {function_name}"),
-            file_diffs: Vec::new(),
-            can_apply_safely: false,
-            warnings: vec!["Could not parse function signature regex".to_string()],
-        };
-    };
+    let definition = regex::Regex::new(&format!(
+        r"function\s+&?\s*{}\s*\(",
+        regex::escape(function_name)
+    ))
+    .ok()
+    .and_then(|reg| reg.find(def_content))
+    .and_then(|found| {
+        let (close, pieces) = scan_balanced(def_content, found.end())?;
+        Some((found.start(), close + 1, pieces_of(def_content, &pieces)))
+    });
 
-    let mut def_replacements = Vec::new();
-    let mut modified_def = def_content.to_string();
-
-    if let Some(caps) = fn_header_reg.captures(def_content) {
-        if let Some(params_match) = caps.get(1) {
-            let original_params_str = params_match.as_str();
-            let raw_params: Vec<String> = original_params_str
-                .split(',')
-                .map(|p| p.trim().to_string())
-                .filter(|p| !p.is_empty())
+    match definition {
+        Some((start, end, raw_params)) => {
+            let mut new_params: Vec<String> = reordered_indices
+                .iter()
+                .filter_map(|&idx| raw_params.get(idx).cloned())
                 .collect();
-
-            let mut new_params: Vec<String> = Vec::new();
-            for &idx in reordered_indices {
-                if let Some(p) = raw_params.get(idx) {
-                    new_params.push(p.clone());
-                }
-            }
-
             for added in added_params {
                 let mut param_str = String::new();
                 if let Some(ref th) = added.type_hint {
@@ -363,88 +637,83 @@ pub fn plan_change_signature(
                 }
                 new_params.push(param_str);
             }
-
-            let new_params_str = new_params.join(", ");
-            let old_full = caps.get(0).unwrap().as_str();
-            let new_full = format!("function {function_name}({new_params_str})");
-
-            let line_num = def_content[..caps.get(0).unwrap().start()].lines().count() + 1;
-            def_replacements.push(TextReplacement {
-                line: line_num,
-                old_text: old_full.to_string(),
-                new_text: new_full.clone(),
+            let new_full = format!("function {function_name}({})", new_params.join(", "));
+            let mut modified_def = def_content.to_string();
+            modified_def.replace_range(start..end, &new_full);
+            file_diffs.push(FileDiff {
+                file_path: def_file.to_path_buf(),
+                original_content: def_content.to_string(),
+                modified_content: modified_def,
+                replacements: vec![TextReplacement {
+                    line: line_of(def_content, start),
+                    old_text: def_content[start..end].to_string(),
+                    new_text: new_full,
+                }],
+                is_included: true,
             });
-
-            modified_def = modified_def.replacen(old_full, &new_full, 1);
+        }
+        None => {
+            can_apply_safely = false;
+            warnings.push(format!(
+                "Could not read the signature of '{function_name}' in {}; nothing was changed",
+                def_file.display()
+            ));
         }
     }
 
-    file_diffs.push(FileDiff {
-        file_path: def_file.to_path_buf(),
-        original_content: def_content.to_string(),
-        modified_content: modified_def,
-        replacements: def_replacements,
-        is_included: true,
-    });
+    for (caller_path, caller_content) in caller_files {
+        if caller_path == def_file {
+            continue;
+        }
+        let (calls, skipped, unclear) = find_calls(caller_content, function_name);
+        if skipped > 0 {
+            warnings.push(format!(
+                "{skipped} method-style or other-namespace call(s) of '{function_name}' in {} were left unchanged; check them by hand",
+                caller_path.display()
+            ));
+        }
+        if unclear > 0 {
+            can_apply_safely = false;
+            warnings.push(format!(
+                "{unclear} call(s) of '{function_name}' in {} are nested or could not be parsed and were left unchanged",
+                caller_path.display()
+            ));
+        }
 
-    let call_pattern = format!(r"\b{}\s*\(([^)]*)\)", regex::escape(function_name));
-    if let Ok(call_reg) = regex::Regex::new(&call_pattern) {
-        for (caller_path, caller_content) in caller_files {
-            if caller_path == def_file {
-                continue;
+        let mut replacements = Vec::new();
+        let mut modified = caller_content.clone();
+        // Later calls first, so earlier byte offsets stay valid.
+        for call in calls.iter().rev() {
+            let mut args: Vec<String> = reordered_indices
+                .iter()
+                .filter_map(|&idx| call.args.get(idx).cloned())
+                .collect();
+            for added in added_params {
+                args.push(
+                    added
+                        .default_value
+                        .clone()
+                        .unwrap_or_else(|| "null".to_string()),
+                );
             }
+            let new_call = format!("{function_name}({})", args.join(", "));
+            replacements.push(TextReplacement {
+                line: line_of(caller_content, call.start),
+                old_text: caller_content[call.start..call.end].to_string(),
+                new_text: new_call.clone(),
+            });
+            modified.replace_range(call.start..call.end, &new_call);
+        }
+        replacements.reverse();
 
-            let mut caller_replacements = Vec::new();
-            let mut modified_caller = caller_content.clone();
-
-            for caps in call_reg.captures_iter(caller_content) {
-                if let Some(args_match) = caps.get(1) {
-                    let old_args_str = args_match.as_str();
-                    let raw_args: Vec<String> = old_args_str
-                        .split(',')
-                        .map(|a| a.trim().to_string())
-                        .filter(|a| !a.is_empty())
-                        .collect();
-
-                    let mut reordered_args: Vec<String> = Vec::new();
-                    for &idx in reordered_indices {
-                        if let Some(arg) = raw_args.get(idx) {
-                            reordered_args.push(arg.clone());
-                        }
-                    }
-
-                    for added in added_params {
-                        if let Some(ref def_val) = added.default_value {
-                            reordered_args.push(def_val.clone());
-                        } else {
-                            reordered_args.push("null".to_string());
-                        }
-                    }
-
-                    let new_args_str = reordered_args.join(", ");
-                    let old_call = caps.get(0).unwrap().as_str();
-                    let new_call = format!("{function_name}({new_args_str})");
-
-                    let line_num = caller_content[..caps.get(0).unwrap().start()].lines().count() + 1;
-                    caller_replacements.push(TextReplacement {
-                        line: line_num,
-                        old_text: old_call.to_string(),
-                        new_text: new_call.clone(),
-                    });
-
-                    modified_caller = modified_caller.replacen(old_call, &new_call, 1);
-                }
-            }
-
-            if !caller_replacements.is_empty() {
-                file_diffs.push(FileDiff {
-                    file_path: caller_path.clone(),
-                    original_content: caller_content.clone(),
-                    modified_content: modified_caller,
-                    replacements: caller_replacements,
-                    is_included: true,
-                });
-            }
+        if !replacements.is_empty() {
+            file_diffs.push(FileDiff {
+                file_path: caller_path.clone(),
+                original_content: caller_content.clone(),
+                modified_content: modified,
+                replacements,
+                is_included: true,
+            });
         }
     }
 
@@ -457,8 +726,8 @@ pub fn plan_change_signature(
         },
         description: format!("Change signature for {function_name}"),
         file_diffs,
-        can_apply_safely: true,
-        warnings: Vec::new(),
+        can_apply_safely,
+        warnings,
     }
 }
 
@@ -540,7 +809,9 @@ class OrderController {
         let plan = plan_safe_delete("UserService", &file_path, content, &caller_files);
         assert!(!plan.can_apply_safely);
         assert_eq!(plan.warnings.len(), 1);
-        assert_eq!(plan.file_diffs[0].replacements.len(), 2);
+        // Row 0 is the definition (left unticked while usages exist), row 1 the usages.
+        assert!(!plan.file_diffs[0].is_included);
+        assert_eq!(plan.file_diffs[1].replacements.len(), 2);
         assert!(plan.warnings[0].contains("UserController.php"));
     }
 
@@ -592,60 +863,15 @@ function calculate_tax($subtotal, $rate) {
         let applied = plan.apply();
 
         let modified_def = applied.get(&def_path).expect("def should exist");
-        assert!(modified_def.contains("function calculate_tax($rate, $subtotal, string $currency = 'USD')"));
+        assert!(
+            modified_def
+                .contains("function calculate_tax($rate, $subtotal, string $currency = 'USD')")
+        );
 
         let modified_caller = applied
             .get(&PathBuf::from("app/cart.php"))
             .expect("caller should exist");
         assert!(modified_caller.contains("calculate_tax(0.05, $amount, 'USD')"));
-    }
-
-    #[test]
-    fn test_apply_to_disk_and_exclusions() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let base = temp_dir.path();
-
-        let src_file = base.join("app/Services/OldService.php");
-        let target_file = base.join("app/Billing/OldService.php");
-        let caller_file = base.join("app/Controllers/OrderController.php");
-
-        std::fs::create_dir_all(src_file.parent().unwrap()).unwrap();
-        std::fs::create_dir_all(caller_file.parent().unwrap()).unwrap();
-
-        let src_content = "<?php\nnamespace App\\Services;\nclass OldService {}";
-        let caller_content = "<?php\nuse App\\Services\\OldService;\nclass OrderController {}";
-
-        std::fs::write(&src_file, src_content).unwrap();
-        std::fs::write(&caller_file, caller_content).unwrap();
-
-        let project_files = vec![(caller_file.clone(), caller_content.to_string())];
-
-        let mut plan = plan_move_class(
-            "OldService",
-            &src_file,
-            &target_file,
-            "App\\Services",
-            "App\\Billing",
-            src_content,
-            &project_files,
-        );
-
-        assert_eq!(plan.file_diffs.len(), 2);
-
-        // Exclude the caller file from application
-        plan.file_diffs[1].is_included = false;
-
-        let affected = plan.apply_to_disk().unwrap();
-        assert_eq!(affected.len(), 1);
-        assert_eq!(affected[0], target_file);
-
-        let written_target = std::fs::read_to_string(&target_file).unwrap();
-        assert!(written_target.contains("namespace App\\Billing;"));
-
-        assert!(!src_file.exists());
-
-        let untouched_caller = std::fs::read_to_string(&caller_file).unwrap();
-        assert!(untouched_caller.contains("use App\\Services\\OldService;"));
     }
 
     #[gpui::test]
@@ -668,15 +894,13 @@ function calculate_tax($subtotal, $rate) {
             &caller_files,
         );
 
-        let modal = cx.new(|cx| {
-            RefactorPreviewModal {
-                plan,
-                selected_file_index: 0,
-                focus_handle: cx.focus_handle(),
-                workspace: gpui::WeakEntity::new_invalid(),
-                is_applying: false,
-                status_message: None,
-            }
+        let modal = cx.new(|cx| RefactorPreviewModal {
+            plan,
+            selected_file_index: 0,
+            focus_handle: cx.focus_handle(),
+            workspace: gpui::WeakEntity::new_invalid(),
+            is_applying: false,
+            status_message: None,
         });
 
         modal.update(cx, |this, cx| {
@@ -702,5 +926,415 @@ function calculate_tax($subtotal, $rate) {
             this.select_file(1, cx);
             assert_eq!(this.selected_file_index, 1);
         });
+    }
+
+    use fs::FakeFs;
+    use gpui::TestAppContext;
+    use serde_json::json;
+    use std::sync::Arc;
+
+    const OLD_SERVICE: &str = "<?php\nnamespace App\\Services;\nclass OldService {}\n";
+    const ORDER_CONTROLLER: &str =
+        "<?php\nuse App\\Services\\OldService;\nclass OrderController {}\n";
+
+    fn move_plan(root: &str) -> RefactorPlan {
+        plan_move_class(
+            "OldService",
+            &PathBuf::from(format!("{root}/app/Services/OldService.php")),
+            &PathBuf::from(format!("{root}/app/Billing/OldService.php")),
+            "App\\Services",
+            "App\\Billing",
+            OLD_SERVICE,
+            &[(
+                PathBuf::from(format!("{root}/app/Controllers/OrderController.php")),
+                ORDER_CONTROLLER.to_string(),
+            )],
+        )
+    }
+
+    async fn project_fs(cx: &TestAppContext) -> Arc<FakeFs> {
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            "/project",
+            json!({
+                "app": {
+                    "Services": { "OldService.php": OLD_SERVICE },
+                    "Controllers": { "OrderController.php": ORDER_CONTROLLER },
+                }
+            }),
+        )
+        .await;
+        fs
+    }
+
+    fn roots() -> Vec<PathBuf> {
+        vec![PathBuf::from("/project")]
+    }
+
+    #[gpui::test]
+    async fn test_move_writes_then_removes_source_and_respects_unticked(cx: &mut TestAppContext) {
+        let fs = project_fs(cx).await;
+        let mut plan = move_plan("/project");
+        assert_eq!(plan.file_diffs.len(), 2);
+        plan.file_diffs[1].is_included = false;
+
+        let affected = plan.apply_to_disk(fs.as_ref(), &roots()).await.unwrap();
+        assert_eq!(
+            affected,
+            vec![
+                PathBuf::from("/project/app/Billing/OldService.php"),
+                PathBuf::from("/project/app/Services/OldService.php")
+            ]
+        );
+        let target = fs
+            .load(Path::new("/project/app/Billing/OldService.php"))
+            .await
+            .unwrap();
+        assert!(target.contains("namespace App\\Billing;"));
+        assert!(
+            !fs.is_file(Path::new("/project/app/Services/OldService.php"))
+                .await
+        );
+        let caller = fs
+            .load(Path::new("/project/app/Controllers/OrderController.php"))
+            .await
+            .unwrap();
+        assert_eq!(caller, ORDER_CONTROLLER, "an unticked row is not written");
+    }
+
+    #[gpui::test]
+    async fn test_unticked_target_keeps_the_source(cx: &mut TestAppContext) {
+        let fs = project_fs(cx).await;
+        let mut plan = move_plan("/project");
+        plan.file_diffs[0].is_included = false;
+
+        plan.apply_to_disk(fs.as_ref(), &roots()).await.unwrap();
+        assert!(
+            fs.is_file(Path::new("/project/app/Services/OldService.php"))
+                .await
+        );
+        assert!(
+            !fs.is_file(Path::new("/project/app/Billing/OldService.php"))
+                .await
+        );
+    }
+
+    #[gpui::test]
+    async fn test_unwritable_target_keeps_the_source(cx: &mut TestAppContext) {
+        let fs = project_fs(cx).await;
+        // `app/Billing` is a file, so the target cannot be created.
+        fs.insert_file("/project/app/Billing", b"x".to_vec()).await;
+        let plan = move_plan("/project");
+
+        assert!(plan.apply_to_disk(fs.as_ref(), &roots()).await.is_err());
+        assert!(
+            fs.is_file(Path::new("/project/app/Services/OldService.php"))
+                .await
+        );
+    }
+
+    #[gpui::test]
+    async fn test_failed_later_write_keeps_the_source(cx: &mut TestAppContext) {
+        let fs = project_fs(cx).await;
+        fs.insert_file("/project/blocked", b"x".to_vec()).await;
+        let mut plan = move_plan("/project");
+        plan.file_diffs[1].file_path = PathBuf::from("/project/blocked/OrderController.php");
+
+        assert!(plan.apply_to_disk(fs.as_ref(), &roots()).await.is_err());
+        assert!(
+            fs.is_file(Path::new("/project/app/Services/OldService.php"))
+                .await,
+            "the old file stays when any write failed"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_source_changed_since_preview_is_not_removed(cx: &mut TestAppContext) {
+        let fs = project_fs(cx).await;
+        let plan = move_plan("/project");
+        fs.insert_file(
+            "/project/app/Services/OldService.php",
+            b"<?php // edited since".to_vec(),
+        )
+        .await;
+
+        let error = plan.apply_to_disk(fs.as_ref(), &roots()).await.unwrap_err();
+        assert!(
+            error.to_string().contains("changed since the preview"),
+            "{error:#}"
+        );
+        assert!(
+            fs.is_file(Path::new("/project/app/Services/OldService.php"))
+                .await
+        );
+    }
+
+    #[gpui::test]
+    async fn test_paths_outside_the_project_or_through_symlinks_are_refused(
+        cx: &mut TestAppContext,
+    ) {
+        let fs = project_fs(cx).await;
+        fs.insert_tree("/outside", json!({})).await;
+        fs.create_symlink(Path::new("/project/link"), PathBuf::from("/outside"))
+            .await
+            .unwrap();
+
+        let one_file = |path: &str| RefactorPlan {
+            kind: RefactorKind::ChangeSignature {
+                function_name: "f".into(),
+                file_path: PathBuf::from(path),
+                reordered_indices: vec![],
+                added_params: vec![],
+            },
+            description: String::new(),
+            file_diffs: vec![FileDiff {
+                file_path: PathBuf::from(path),
+                original_content: String::new(),
+                modified_content: "<?php // pwned".into(),
+                replacements: vec![],
+                is_included: true,
+            }],
+            can_apply_safely: true,
+            warnings: vec![],
+        };
+
+        for path in [
+            "/project/link/x.php",
+            "/outside/x.php",
+            "/project/../outside/x.php",
+            "/project/app/../../outside/x.php",
+            "relative.php",
+        ] {
+            let result = one_file(path).apply_to_disk(fs.as_ref(), &roots()).await;
+            assert!(result.is_err(), "{path} must be refused");
+        }
+        assert!(!fs.is_file(Path::new("/outside/x.php")).await);
+        // A file inside the project is fine.
+        one_file("/project/app/ok.php")
+            .apply_to_disk(fs.as_ref(), &roots())
+            .await
+            .unwrap();
+    }
+
+    #[gpui::test]
+    async fn test_symlinked_source_is_not_followed_for_removal(cx: &mut TestAppContext) {
+        let fs = project_fs(cx).await;
+        fs.insert_tree("/outside", json!({ "Secret.php": OLD_SERVICE }))
+            .await;
+        fs.create_symlink(Path::new("/project/linked"), PathBuf::from("/outside"))
+            .await
+            .unwrap();
+        let plan = plan_move_class(
+            "OldService",
+            Path::new("/project/linked/Secret.php"),
+            Path::new("/project/app/Billing/OldService.php"),
+            "App\\Services",
+            "App\\Billing",
+            OLD_SERVICE,
+            &[],
+        );
+        assert!(plan.apply_to_disk(fs.as_ref(), &roots()).await.is_err());
+        assert!(fs.is_file(Path::new("/outside/Secret.php")).await);
+    }
+
+    #[gpui::test]
+    async fn test_safe_delete_removes_only_the_symbol(cx: &mut TestAppContext) {
+        let fs = FakeFs::new(cx.executor());
+        let content = "<?php\nclass Dead {\n    function a() { return '}'; }\n}\n\nclass Live {}\n";
+        fs.insert_tree("/project", json!({ "lib.php": content }))
+            .await;
+
+        let plan = plan_safe_delete("Dead", Path::new("/project/lib.php"), content, &[]);
+        assert!(plan.can_apply_safely);
+        plan.apply_to_disk(fs.as_ref(), &roots()).await.unwrap();
+        let after = fs.load(Path::new("/project/lib.php")).await.unwrap();
+        assert_eq!(after, "<?php\n\nclass Live {}\n");
+
+        // A SafeDelete plan with no rows (the old whole-file case) touches nothing.
+        let empty = RefactorPlan {
+            kind: RefactorKind::SafeDelete {
+                symbol_name: "Live".into(),
+                file_path: PathBuf::from("/project/lib.php"),
+            },
+            description: String::new(),
+            file_diffs: vec![],
+            can_apply_safely: true,
+            warnings: vec![],
+        };
+        empty.apply_to_disk(fs.as_ref(), &roots()).await.unwrap();
+        assert!(
+            fs.is_file(Path::new("/project/lib.php")).await,
+            "the file is never removed"
+        );
+    }
+
+    #[test]
+    fn test_safe_delete_without_definition_warns() {
+        let plan = plan_safe_delete("Nope", Path::new("/p/a.php"), "<?php class Other {}", &[]);
+        assert!(!plan.can_apply_safely);
+        assert!(plan.file_diffs.is_empty());
+        assert!(plan.warnings[0].contains("Could not find the definition"));
+    }
+
+    #[test]
+    fn test_scan_balanced_skips_strings_and_nesting() {
+        let text = "f(a, g(b, c), 'x)', \"y,\", [1, 2]) tail";
+        let open = text.find('(').unwrap() + 1;
+        let (close, pieces) = scan_balanced(text, open).unwrap();
+        assert_eq!(&text[close..], ") tail");
+        assert_eq!(
+            pieces_of(text, &pieces),
+            vec!["a", "g(b, c)", "'x)'", "\"y,\"", "[1, 2]"]
+        );
+        assert!(scan_balanced("f(a, g(b", 2).is_none());
+    }
+
+    fn change(content: &str, callers: &str) -> RefactorPlan {
+        plan_change_signature(
+            "calc",
+            Path::new("/p/def.php"),
+            content,
+            &[1, 0],
+            &[],
+            &[(PathBuf::from("/p/use.php"), callers.to_string())],
+        )
+    }
+
+    #[test]
+    fn test_change_signature_handles_nested_calls_and_defaults() {
+        let def = "<?php\nfunction calc($a, $b = array(1, 2)) { return 1; }\n";
+        let plan = change(def, "<?php $x = calc(round($v, 2), 5);\n$y = calc(1, 2);\n");
+        let applied = plan.apply();
+        assert!(applied[Path::new("/p/def.php")].contains("function calc($b = array(1, 2), $a)"));
+        let caller = &applied[Path::new("/p/use.php")];
+        assert_eq!(
+            caller,
+            "<?php $x = calc(5, round($v, 2));\n$y = calc(2, 1);\n"
+        );
+        assert!(plan.can_apply_safely);
+    }
+
+    #[test]
+    fn test_change_signature_rewrites_every_call_even_when_lengths_change() {
+        let def = "<?php\nfunction calc($a, $b) {}\n";
+        let plan = plan_change_signature(
+            "calc",
+            Path::new("/p/def.php"),
+            def,
+            &[0],
+            &[],
+            &[(
+                PathBuf::from("/p/use.php"),
+                "<?php calc(1, 22222); calc(3, 4); calc(5, 6);".to_string(),
+            )],
+        );
+        assert_eq!(
+            plan.apply()[Path::new("/p/use.php")],
+            "<?php calc(1); calc(3); calc(5);"
+        );
+    }
+
+    #[test]
+    fn test_change_signature_leaves_method_calls_and_says_so() {
+        let def = "<?php\nfunction calc($a, $b) {}\n";
+        let plan = change(
+            def,
+            "<?php $this->calc(1, 2); Foo::calc(3, 4); Other\\calc(5, 6); new calc(7, 8); calc(9, 10);",
+        );
+        let caller = &plan.apply()[Path::new("/p/use.php")];
+        assert_eq!(
+            caller,
+            "<?php $this->calc(1, 2); Foo::calc(3, 4); Other\\calc(5, 6); new calc(7, 8); calc(10, 9);"
+        );
+        assert!(
+            plan.warnings
+                .iter()
+                .any(|w| w.contains("3 method-style or other-namespace call(s)")),
+            "{:?}",
+            plan.warnings
+        );
+    }
+
+    #[test]
+    fn test_change_signature_refuses_what_it_cannot_parse() {
+        let def = "<?php\nfunction calc($a, $b) {}\n";
+        let plan = change(def, "<?php calc(1, 2;");
+        assert!(!plan.can_apply_safely);
+        assert_eq!(plan.file_diffs.len(), 1, "only the definition");
+        let missing = change("<?php // nothing here", "<?php calc(1, 2);");
+        assert!(!missing.can_apply_safely);
+        assert!(missing.warnings[0].contains("Could not read the signature"));
+    }
+
+    #[gpui::test]
+    async fn test_modal_apply_respects_unticked_rows_and_unsaved_editors(cx: &mut TestAppContext) {
+        use workspace::MultiWorkspace;
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+        let fs = project_fs(cx).await;
+        let project = project::Project::test(fs.clone(), ["/project".as_ref()], cx).await;
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let cx = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+
+        let mut plan = move_plan("/project");
+        plan.file_diffs[1].is_included = false;
+        let modal = cx.new(|cx| RefactorPreviewModal {
+            plan: plan.clone(),
+            selected_file_index: 0,
+            focus_handle: cx.focus_handle(),
+            workspace: workspace.downgrade(),
+            is_applying: false,
+            status_message: None,
+        });
+
+        // An editor with unsaved changes on a ticked file blocks the apply.
+        let buffer = project
+            .update(cx, |project, cx| {
+                project.open_local_buffer("/project/app/Services/OldService.php", cx)
+            })
+            .await
+            .unwrap();
+        buffer.update(cx, |buffer, cx| {
+            buffer.edit([(0..0, "// local edit\n")], None, cx)
+        });
+        modal.update_in(cx, |modal, window, cx| modal.apply(window, cx));
+        cx.run_until_parked();
+        modal.read_with(cx, |modal, _| {
+            assert!(
+                modal
+                    .status_message
+                    .as_deref()
+                    .is_some_and(|m| m.contains("unsaved")),
+                "{:?}",
+                modal.status_message
+            );
+            assert!(!modal.is_applying);
+        });
+        assert!(
+            !fs.is_file(Path::new("/project/app/Billing/OldService.php"))
+                .await
+        );
+
+        // Once saved, the apply runs off the main thread and skips the unticked row.
+        buffer.update(cx, |buffer, cx| buffer.undo(cx));
+        modal.update_in(cx, |modal, window, cx| modal.apply(window, cx));
+        cx.run_until_parked();
+        assert!(
+            fs.is_file(Path::new("/project/app/Billing/OldService.php"))
+                .await
+        );
+        assert_eq!(
+            fs.load(Path::new("/project/app/Controllers/OrderController.php"))
+                .await
+                .unwrap(),
+            ORDER_CONTROLLER
+        );
     }
 }

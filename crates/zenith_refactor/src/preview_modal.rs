@@ -1,15 +1,15 @@
+use crate::{RefactorKind, RefactorPlan};
 use gpui::{
-    App, Context, DismissEvent, EventEmitter, FocusHandle, Focusable,
-    InteractiveElement, IntoElement, ParentElement, Render, Styled, WeakEntity, Window,
-    px,
+    App, Context, DismissEvent, EventEmitter, FocusHandle, Focusable, InteractiveElement,
+    IntoElement, ParentElement, Render, Styled, WeakEntity, Window, px,
 };
+use project::Project;
+use std::path::{Path, PathBuf};
 use ui::{
-    Button, ButtonCommon, ButtonStyle, Checkbox, Color,
-    Headline, HeadlineSize, Icon, IconName, Label, LabelCommon, LabelSize, SharedString,
-    ToggleState, v_flex, h_flex, prelude::*,
+    Button, ButtonCommon, ButtonStyle, Checkbox, Color, Headline, HeadlineSize, Icon, IconName,
+    Label, LabelCommon, LabelSize, SharedString, ToggleState, h_flex, prelude::*, v_flex,
 };
 use workspace::{ModalView, Workspace};
-use crate::{RefactorKind, RefactorPlan};
 
 pub fn open_refactor_preview(
     workspace: &mut Workspace,
@@ -81,9 +81,44 @@ impl RefactorPreviewModal {
             return;
         }
 
-        let included_count = self.plan.file_diffs.iter().filter(|d| d.is_included).count();
+        let included_count = self
+            .plan
+            .file_diffs
+            .iter()
+            .filter(|d| d.is_included)
+            .count();
         if included_count == 0 {
             self.status_message = Some("No files selected to apply".to_string());
+            cx.notify();
+            return;
+        }
+
+        let Some(workspace) = self.workspace.upgrade() else {
+            self.status_message = Some("The project is closed".to_string());
+            cx.notify();
+            return;
+        };
+        let project = workspace.read(cx).project().clone();
+        let (fs, roots, unsaved) = {
+            let project = project.read(cx);
+            let roots: Vec<PathBuf> = project
+                .visible_worktrees(cx)
+                .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
+                .collect();
+            let unsaved: Vec<String> = self
+                .plan
+                .touched_paths()
+                .into_iter()
+                .filter(|path| has_unsaved_buffer(project, path, cx))
+                .map(|path| path.display().to_string())
+                .collect();
+            (project.fs().clone(), roots, unsaved)
+        };
+        if !unsaved.is_empty() {
+            self.status_message = Some(format!(
+                "Save or close the unsaved editors first: {}",
+                unsaved.join(", ")
+            ));
             cx.notify();
             return;
         }
@@ -91,18 +126,33 @@ impl RefactorPreviewModal {
         self.is_applying = true;
         cx.notify();
 
-        match self.plan.apply_to_disk() {
-            Ok(affected) => {
-                log::info!("Applied refactoring to {} files", affected.len());
-                cx.emit(DismissEvent);
-            }
-            Err(err) => {
-                self.is_applying = false;
-                self.status_message = Some(format!("Failed to apply: {err}"));
-                cx.notify();
-            }
-        }
+        let plan = self.plan.clone();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move { plan.apply_to_disk(fs.as_ref(), &roots).await })
+                .await;
+            this.update(cx, |this, cx| match result {
+                Ok(affected) => {
+                    log::info!("Applied refactoring to {} files", affected.len());
+                    cx.emit(DismissEvent);
+                }
+                Err(err) => {
+                    this.is_applying = false;
+                    this.status_message = Some(format!("Failed to apply: {err:#}"));
+                    cx.notify();
+                }
+            })
+        })
+        .detach_and_log_err(cx);
     }
+}
+
+/// Whether `path` is open in an editor with changes that are not on disk.
+fn has_unsaved_buffer(project: &Project, path: &Path, cx: &App) -> bool {
+    project
+        .find_project_path(path, cx)
+        .and_then(|project_path| project.get_open_buffer(&project_path, cx))
+        .is_some_and(|buffer| buffer.read(cx).is_dirty() || buffer.read(cx).has_conflict())
 }
 
 impl ModalView for RefactorPreviewModal {}
@@ -118,8 +168,18 @@ impl EventEmitter<DismissEvent> for RefactorPreviewModal {}
 impl Render for RefactorPreviewModal {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let total_files = self.plan.file_diffs.len();
-        let selected_count = self.plan.file_diffs.iter().filter(|d| d.is_included).count();
-        let total_replacements: usize = self.plan.file_diffs.iter().map(|d| d.replacements.len()).sum();
+        let selected_count = self
+            .plan
+            .file_diffs
+            .iter()
+            .filter(|d| d.is_included)
+            .count();
+        let total_replacements: usize = self
+            .plan
+            .file_diffs
+            .iter()
+            .map(|d| d.replacements.len())
+            .sum();
 
         let kind_label = match &self.plan.kind {
             RefactorKind::MoveClass { class_name, .. } => format!("Move Class: {class_name}"),
