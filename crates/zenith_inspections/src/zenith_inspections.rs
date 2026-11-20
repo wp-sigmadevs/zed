@@ -892,12 +892,8 @@ fn inspect_current_file(
             cx,
         );
     }
-    if !zenith_php_tools::worktree_trusted(&project, project_path.worktree_id, cx) {
-        return notify(
-            workspace,
-            "Trust this project to run its PHP tools.".into(),
-            cx,
-        );
+    if let Some(message) = untrusted_message(&project, project_path.worktree_id, cx) {
+        return notify(workspace, message.into(), cx);
     }
     let Some(abs_path) = project.read(cx).absolute_path(&project_path, cx) else {
         return;
@@ -1046,6 +1042,26 @@ fn notify_once<Id: 'static>(
     );
 }
 
+/// Why the tools do not run on a file in this worktree; `None` when they may.
+fn untrusted_message(
+    project: &Entity<Project>,
+    worktree_id: WorktreeId,
+    cx: &mut App,
+) -> Option<&'static str> {
+    trust_message(zenith_php_tools::worktree_trust(project, worktree_id, cx))
+}
+
+const OUTSIDE_FILE_MESSAGE: &str =
+    "This file is outside your trusted folders. Open its folder to run its PHP tools.";
+
+fn trust_message(trust: zenith_php_tools::Trust) -> Option<&'static str> {
+    match trust {
+        zenith_php_tools::Trust::Trusted => None,
+        zenith_php_tools::Trust::Untrusted => Some("Trust this project to run its PHP tools."),
+        zenith_php_tools::Trust::OutsideTrustedFolders => Some(OUTSIDE_FILE_MESSAGE),
+    }
+}
+
 const PHP_NOT_FOUND: &str = "PHP was not found.";
 
 /// The errors not shown yet, now marked shown.
@@ -1137,12 +1153,8 @@ fn fix_current_file(
         );
     }
     let worktree_id = project_path.worktree_id;
-    if !zenith_php_tools::worktree_trusted(&project, worktree_id, cx) {
-        return notify(
-            workspace,
-            "Trust this project to run its PHP tools.".into(),
-            cx,
-        );
+    if let Some(message) = untrusted_message(&project, worktree_id, cx) {
+        return notify(workspace, message.into(), cx);
     }
     let (Some(abs_path), Some(worktree)) = (
         project.read(cx).absolute_path(&project_path, cx),
@@ -1389,9 +1401,24 @@ fn inspect_path_with(
         return gpui::Task::ready(Report::default());
     };
     // Remote paths are not local files, and local tools must not run on them.
-    if !project.read(cx).is_local() || !zenith_php_tools::worktree_trusted(project, worktree_id, cx)
-    {
+    if !project.read(cx).is_local() {
         return gpui::Task::ready(Report::default());
+    }
+    match zenith_php_tools::worktree_trust(project, worktree_id, cx) {
+        zenith_php_tools::Trust::Trusted => {}
+        zenith_php_tools::Trust::Untrusted => return gpui::Task::ready(Report::default()),
+        // Said once per file and session: the note names the file.
+        zenith_php_tools::Trust::OutsideTrustedFolders => {
+            let name = abs_path
+                .file_name()
+                .map_or_else(String::new, |name| name.to_string_lossy().into_owned());
+            return gpui::Task::ready(Report {
+                errors: Vec::new(),
+                notes: vec![format!(
+                    "{name} is outside your trusted folders. Open its folder to run its PHP tools."
+                )],
+            });
+        }
     }
     let root = worktree_folder(&worktree, cx);
     let environment = tool_environment(cx);

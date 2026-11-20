@@ -1606,10 +1606,19 @@ impl ToolTrustEnv {
         visible: bool,
         cx: &mut TestAppContext,
     ) -> (WorktreeId, Entity<project::Worktree>) {
+        self.open(&self.other_file, visible, cx).await
+    }
+
+    async fn open(
+        &self,
+        path: &Path,
+        visible: bool,
+        cx: &mut TestAppContext,
+    ) -> (WorktreeId, Entity<project::Worktree>) {
         let (worktree, _) = self
             .project
             .update(cx, |project, cx| {
-                project.find_or_create_worktree(&self.other_file, visible, cx)
+                project.find_or_create_worktree(path, visible, cx)
             })
             .await
             .unwrap();
@@ -1620,11 +1629,13 @@ impl ToolTrustEnv {
         )
     }
 
-    async fn inspect(&self, id: WorktreeId, file: &Path, cx: &mut TestAppContext) {
+    async fn inspect(&self, id: WorktreeId, file: &Path, cx: &mut TestAppContext) -> Report {
         cx.executor().allow_parking();
-        cx.update(|cx| inspect_path(&self.project, id, file.to_path_buf(), cx))
+        let report = cx
+            .update(|cx| inspect_path(&self.project, id, file.to_path_buf(), cx))
             .await;
         cx.run_until_parked();
+        report
     }
 }
 
@@ -1732,8 +1743,14 @@ async fn test_a_single_file_outside_a_trusted_folder_never_runs_its_folders_tool
     let (id, _worktree) = env.open_other(true, cx).await;
     // The premise: upstream trusts the file because the other folder is trusted.
     assert!(env.upstream_trusts(id, cx));
-    env.inspect(id, &env.other_file, cx).await;
+    let report = env.inspect(id, &env.other_file, cx).await;
     assert!(!ToolTrustEnv::ran(&env.other_file));
+    // Said, so the file is not silently skipped.
+    assert_eq!(
+        report.notes,
+        ["x.php is outside your trusted folders. Open its folder to run its PHP tools."]
+    );
+    assert_eq!(report.errors, Vec::<String>::new());
     // Git is held back the same way.
     let base = cx
         .update(|cx| new_since_branch::base_branch(&env.project, id, cx))
@@ -1748,6 +1765,35 @@ async fn test_an_invisible_worktree_never_runs_its_folders_tools(cx: &mut TestAp
     assert!(env.upstream_trusts(id, cx));
     env.inspect(id, &env.other_file, cx).await;
     assert!(!ToolTrustEnv::ran(&env.other_file));
+}
+
+#[gpui::test]
+async fn test_an_invisible_folder_worktree_never_runs_its_own_tools(cx: &mut TestAppContext) {
+    // A directory (not a file) opened invisibly: its root is the folder itself.
+    let env = tool_trust_env(cx).await;
+    let folder = env.other_file.parent().unwrap().to_path_buf();
+    let (id, worktree) = env.open(&folder, false, cx).await;
+    worktree.read_with(cx, |worktree, _| {
+        assert!(!worktree.is_single_file() && !worktree.is_visible());
+    });
+    assert!(env.upstream_trusts(id, cx));
+    let report = env.inspect(id, &env.other_file, cx).await;
+    assert!(!ToolTrustEnv::ran(&env.other_file));
+    assert_eq!(report.notes.len(), 1);
+}
+
+#[test]
+fn test_trust_messages_tell_the_cases_apart() {
+    use zenith_php_tools::Trust;
+    assert_eq!(trust_message(Trust::Trusted), None);
+    assert_eq!(
+        trust_message(Trust::Untrusted),
+        Some("Trust this project to run its PHP tools.")
+    );
+    assert_eq!(
+        trust_message(Trust::OutsideTrustedFolders),
+        Some("This file is outside your trusted folders. Open its folder to run its PHP tools.")
+    );
 }
 
 #[gpui::test]

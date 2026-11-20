@@ -5,7 +5,7 @@
 use http_client::HttpClient;
 use std::{
     fs,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     sync::Arc,
 };
 
@@ -691,6 +691,25 @@ fn find_composer(path_dirs: &[PathBuf]) -> Option<PathBuf> {
         .find(|candidate| candidate.is_file())
 }
 
+/// Whether a worktree's tools may run, and if not, why.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Trust {
+    Trusted,
+    /// Upstream does not trust the worktree.
+    Untrusted,
+    /// Upstream trusts it (a single file, or an invisible worktree), but its folder
+    /// is not inside a trusted folder.
+    OutsideTrustedFolders,
+}
+
+/// `folder` is `root` or below it, by name: a `..` or `.` step could name any place.
+fn folder_inside(folder: &Path, root: &Path) -> bool {
+    folder.starts_with(root)
+        && !folder
+            .components()
+            .any(|part| matches!(part, Component::ParentDir | Component::CurDir))
+}
+
 /// Running a project's tools runs its code: only in a worktree the user trusts.
 /// True when the trust feature is off.
 ///
@@ -699,8 +718,13 @@ fn find_composer(path_dirs: &[PathBuf]) -> Option<PathBuf> {
 /// `phpstan.neon`), so for those two the folder must lie inside a trusted
 /// directory worktree.
 pub fn worktree_trusted(project: &Entity<Project>, worktree_id: WorktreeId, cx: &mut App) -> bool {
+    worktree_trust(project, worktree_id, cx) == Trust::Trusted
+}
+
+/// [`worktree_trusted`], with the reason when it is not.
+pub fn worktree_trust(project: &Entity<Project>, worktree_id: WorktreeId, cx: &mut App) -> Trust {
     let Some(store) = project::trusted_worktrees::TrustedWorktrees::try_get_global(cx) else {
-        return true;
+        return Trust::Trusted;
     };
     let worktree_store = project.read(cx).worktree_store();
     let trust_all = project::project_settings::ProjectSettings::get_global(cx)
@@ -708,10 +732,10 @@ pub fn worktree_trusted(project: &Entity<Project>, worktree_id: WorktreeId, cx: 
         .trust_all_worktrees;
     store.update(cx, |store, cx| {
         if !store.can_trust(&worktree_store, worktree_id, cx) {
-            return false;
+            return Trust::Untrusted;
         }
         let Some(worktree) = worktree_store.read(cx).worktree_for_id(worktree_id, cx) else {
-            return false;
+            return Trust::Untrusted;
         };
         let (visible, single_file, abs_path) = {
             let worktree = worktree.read(cx);
@@ -722,7 +746,7 @@ pub fn worktree_trusted(project: &Entity<Project>, worktree_id: WorktreeId, cx: 
             )
         };
         if trust_all || (visible && !single_file) {
-            return true;
+            return Trust::Trusted;
         }
         let folder = if single_file {
             abs_path.parent().unwrap_or(&abs_path)
@@ -734,11 +758,16 @@ pub fn worktree_trusted(project: &Entity<Project>, worktree_id: WorktreeId, cx: 
             .visible_worktrees(cx)
             .filter(|other| !other.read(cx).is_single_file())
             .map(|other| (other.read(cx).id(), other.read(cx).abs_path()))
-            .filter(|(id, root)| *id != worktree_id && folder.starts_with(root))
+            .filter(|(id, root)| *id != worktree_id && folder_inside(folder, root))
             .collect();
-        folders
+        if folders
             .into_iter()
             .any(|(id, _)| store.can_trust(&worktree_store, id, cx))
+        {
+            Trust::Trusted
+        } else {
+            Trust::OutsideTrustedFolders
+        }
     })
 }
 
@@ -940,6 +969,18 @@ mod tests {
         let path = root.join(file);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, text).unwrap();
+    }
+
+    #[test]
+    fn test_folder_inside_refuses_dot_steps() {
+        let root = Path::new("/work/trusted");
+        assert!(folder_inside(Path::new("/work/trusted"), root));
+        assert!(folder_inside(Path::new("/work/trusted/sub"), root));
+        assert!(!folder_inside(Path::new("/work/other"), root));
+        // Names the trusted folder first, then climbs out of it.
+        assert!(!folder_inside(Path::new("/work/trusted/../other"), root));
+        assert!(!folder_inside(Path::new("/work/trusted/sub/.."), root));
+        assert!(!folder_inside(Path::new("./work/trusted"), Path::new(".")));
     }
 
     #[test]
