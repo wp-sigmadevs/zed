@@ -336,11 +336,16 @@ pub fn char_column(line: &str, column: u32, tab_width: u32) -> u32 {
     utf16
 }
 
+/// A ruleset is small; a bigger one (or a device) is not read.
+const RULESET_MAX: u64 = 1024 * 1024;
+/// The most of a PHP file read to map tab columns; a bigger one keeps PHPCS's columns.
+const PHP_FILE_MAX: u64 = 16 * 1024 * 1024;
+
 /// The project ruleset's `<arg name="tab-width" value="N"/>`, else PHPCS's default.
 pub fn ruleset_tab_width(root: &Path) -> u32 {
     find_phpcs_ruleset(root)
-        .and_then(|ruleset| std::fs::read_to_string(ruleset).ok())
-        .and_then(|xml| tab_width_in(&xml))
+        .and_then(|ruleset| zenith_php_tools::read_regular(&ruleset, RULESET_MAX))
+        .and_then(|xml| tab_width_in(&String::from_utf8_lossy(&xml)))
         .unwrap_or(PHPCS_TAB_WIDTH)
 }
 
@@ -476,7 +481,9 @@ pub async fn run(
             .parse(&String::from_utf8_lossy(&output.stdout))
             .with_context(|| String::from_utf8_lossy(&output.stderr).trim().to_string())?;
         if analyzer == Analyzer::Phpcs
-            && let Ok(text) = std::fs::read_to_string(file)
+            && let Some(text) = zenith_php_tools::read_regular(file, PHP_FILE_MAX + 1)
+                .filter(|bytes| bytes.len() as u64 <= PHP_FILE_MAX)
+                .and_then(|bytes| String::from_utf8(bytes).ok())
         {
             fix_tab_columns(&mut problems, &text, ruleset_tab_width(root));
         }

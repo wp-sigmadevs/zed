@@ -18,7 +18,7 @@ use language::SymbolKind;
 use open_path_prompt::file_finder_settings::FileFinderSettings;
 use picker::{Picker, PickerDelegate};
 use project::{
-    Candidates, PathMatchCandidateSet, Project, ProjectPath, Symbol, WorktreeId,
+    Candidates, Fs, PathMatchCandidateSet, Project, ProjectPath, Symbol, WorktreeId,
     lsp_store::SymbolLocation,
 };
 use settings::Settings as _;
@@ -513,6 +513,24 @@ impl Render for SearchEverywhere {
     }
 }
 
+/// Line `row` of a closed file, trimmed; `None` when it is empty or the file is
+/// not a regular file (a project can plant a symlink to `/dev/zero`, whose length
+/// reads as 0, or a pipe, which blocks the open) or is over `max_len`. The read
+/// stops at `max_len` even if the file grows after the check.
+async fn snippet_line(fs: &dyn Fs, path: &Path, row: u32, max_len: u64) -> Option<String> {
+    use std::io::Read as _;
+    let metadata = fs.metadata(path).await.ok().flatten()?;
+    if metadata.is_dir || metadata.len > max_len || !fs.is_file(path).await {
+        return None;
+    }
+    let mut reader = fs.open_sync(path).await.ok()?;
+    let mut bytes = Vec::new();
+    reader.by_ref().take(max_len).read_to_end(&mut bytes).ok()?;
+    let text = String::from_utf8(bytes).ok()?;
+    let line = text.lines().nth(row as usize)?.trim();
+    (!line.is_empty()).then(|| line.to_string())
+}
+
 impl SearchEverywhere {
     /// Recent Locations in files no longer open: read their lines from disk in
     /// the background, then show them.
@@ -541,20 +559,8 @@ impl SearchEverywhere {
         cx.spawn(async move |_, cx| {
             let mut found = Vec::new();
             for (ix, path, row) in jobs {
-                let small = fs
-                    .metadata(&path)
-                    .await
-                    .ok()
-                    .flatten()
-                    .is_some_and(|metadata| !metadata.is_dir && metadata.len <= MAX_FILE_LEN);
-                if !small {
-                    continue;
-                }
-                if let Ok(text) = fs.load(&path).await
-                    && let Some(line) = text.lines().nth(row as usize).map(str::trim)
-                    && !line.is_empty()
-                {
-                    found.push((ix, SharedString::from(line.to_string())));
+                if let Some(line) = snippet_line(fs.as_ref(), &path, row, MAX_FILE_LEN).await {
+                    found.push((ix, SharedString::from(line)));
                 }
             }
             picker
@@ -1860,6 +1866,58 @@ mod tests {
     use settings::KeymapFile;
     use util::path;
     use workspace::{AppState, MultiWorkspace};
+
+    /// A folder removed on drop (the crate has no `tempfile` dependency).
+    struct TempDir(std::path::PathBuf);
+
+    impl TempDir {
+        fn new() -> Self {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |time| time.as_nanos());
+            let path =
+                std::env::temp_dir().join(format!("zenith-search-{}-{nanos}", std::process::id()));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).ok();
+        }
+    }
+
+    #[gpui::test]
+    async fn test_snippets_come_only_from_small_regular_files(cx: &mut TestAppContext) {
+        use std::os::unix::fs::symlink;
+        let dir = TempDir::new();
+        std::fs::write(dir.0.join("a.php"), "<?php\n  echo 1;\n").unwrap();
+        std::fs::write(dir.0.join("big.php"), "<?php\n  echo 1;\n").unwrap();
+        // Reads as length 0 and not a folder, so only the file type gives it away.
+        symlink("/dev/zero", dir.0.join("endless.php")).unwrap();
+        #[allow(clippy::disallowed_methods, reason = "mkfifo has no std API")]
+        let made = std::process::Command::new("mkfifo")
+            .arg(dir.0.join("pipe.php"))
+            .status()
+            .unwrap()
+            .success();
+        assert!(made);
+        let real = project::RealFs::new(None, cx.executor());
+        cx.executor().allow_parking();
+        let snippet = |name: &str, row: u32, max: u64| {
+            let path = dir.0.join(name);
+            let real = real.clone();
+            async move { snippet_line(real.as_ref(), &path, row, max).await }
+        };
+        assert_eq!(snippet("a.php", 1, 1024).await, Some("echo 1;".to_string()));
+        assert_eq!(snippet("a.php", 9, 1024).await, None);
+        // Its first line fits the limit, but the file does not.
+        assert_eq!(snippet("big.php", 0, 8).await, None, "over the limit");
+        assert_eq!(snippet("endless.php", 0, 1024).await, None);
+        assert_eq!(snippet("pipe.php", 0, 1024).await, None);
+        assert_eq!(snippet("missing.php", 0, 1024).await, None);
+    }
 
     fn init_test(cx: &mut TestAppContext) -> Arc<AppState> {
         cx.update(|cx| {

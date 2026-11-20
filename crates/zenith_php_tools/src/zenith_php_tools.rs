@@ -41,19 +41,40 @@ fn top_level_php_files(root: &Path) -> impl Iterator<Item = PathBuf> {
         .filter(|path| path.extension().is_some_and(|ext| ext == "php"))
 }
 
-/// WordPress reads headers from the first 8 KB.
-fn has_header(path: &Path, header: &str) -> bool {
-    let Ok(bytes) = fs::read(path) else {
-        return false;
-    };
-    String::from_utf8_lossy(&bytes[..bytes.len().min(8192)]).contains(header)
+/// Up to `max` bytes of a regular file, symlinks followed. `None` for a device,
+/// pipe, folder or unreadable path: a project can plant `x.php -> /dev/zero`,
+/// and an unbounded read of it never ends. A FIFO is refused before it is opened,
+/// since opening one blocks.
+pub fn read_regular(path: &Path, max: u64) -> Option<Vec<u8>> {
+    use std::io::Read as _;
+    if !fs::metadata(path).ok()?.is_file() {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    fs::File::open(path)
+        .ok()?
+        .take(max)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    Some(bytes)
 }
 
-fn composer_requires(root: &Path, package: &str) -> bool {
-    let Ok(text) = fs::read_to_string(root.join("composer.json")) else {
+/// WordPress reads headers from the first 8 KB.
+fn has_header(path: &Path, header: &str) -> bool {
+    let Some(bytes) = read_regular(path, 8192) else {
         return false;
     };
-    let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else {
+    String::from_utf8_lossy(&bytes).contains(header)
+}
+
+/// A `composer.json` is small; a bigger one is not read.
+const COMPOSER_JSON_MAX: u64 = 1024 * 1024;
+
+fn composer_requires(root: &Path, package: &str) -> bool {
+    let Some(text) = read_regular(&root.join("composer.json"), COMPOSER_JSON_MAX) else {
+        return false;
+    };
+    let Ok(json) = serde_json::from_slice::<serde_json::Value>(&text) else {
         return false;
     };
     ["require", "require-dev"].iter().any(|section| {
@@ -969,6 +990,49 @@ mod tests {
         let path = root.join(file);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, text).unwrap();
+    }
+
+    #[test]
+    fn test_read_regular_never_reads_an_endless_file() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "small.txt", "hello world");
+        assert_eq!(
+            read_regular(&dir.path().join("small.txt"), 5),
+            Some(b"hello".to_vec())
+        );
+        // A symlink to an endless source: an unbounded read never comes back.
+        symlink("/dev/zero", dir.path().join("endless.php")).unwrap();
+        assert_eq!(read_regular(&dir.path().join("endless.php"), 8192), None);
+        assert_eq!(read_regular(dir.path(), 8192), None);
+        // A pipe would block the open; it is refused before that.
+        #[allow(clippy::disallowed_methods, reason = "mkfifo has no std API")]
+        let made = std::process::Command::new("mkfifo")
+            .arg(dir.path().join("pipe.php"))
+            .status()
+            .unwrap()
+            .success();
+        assert!(made);
+        assert_eq!(read_regular(&dir.path().join("pipe.php"), 8192), None);
+        assert_eq!(read_regular(&dir.path().join("missing"), 8192), None);
+        // A symlink to a regular file is followed.
+        symlink(dir.path().join("small.txt"), dir.path().join("link.txt")).unwrap();
+        assert_eq!(
+            read_regular(&dir.path().join("link.txt"), 100),
+            Some(b"hello world".to_vec())
+        );
+    }
+
+    #[test]
+    fn test_detect_project_survives_endless_project_files() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        symlink("/dev/zero", dir.path().join("plugin.php")).unwrap();
+        symlink("/dev/zero", dir.path().join("style.css")).unwrap();
+        symlink("/dev/zero", dir.path().join("composer.json")).unwrap();
+        write(dir.path(), "artisan", "");
+        // Returns at all, and finds nothing in the endless files.
+        assert_eq!(detect_project(dir.path()), ProjectKind::Php);
     }
 
     #[test]

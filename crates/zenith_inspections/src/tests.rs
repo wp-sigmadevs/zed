@@ -634,6 +634,50 @@ async fn test_run_fix_names_the_root_ruleset_and_never_a_parent_one(cx: &mut Tes
     );
 }
 
+#[gpui::test]
+async fn test_endless_project_files_are_not_read_whole(cx: &mut TestAppContext) {
+    use std::os::unix::fs::symlink;
+    let root = tempfile::tempdir().unwrap();
+    // A ruleset and the file itself are both symlinks to an endless source.
+    symlink("/dev/zero", root.path().join("phpcs.xml")).unwrap();
+    assert_eq!(ruleset_tab_width(root.path()), PHPCS_TAB_WIDTH);
+    // A ruleset past the size limit is not read to its end.
+    fs::remove_file(root.path().join("phpcs.xml")).unwrap();
+    let padding = " ".repeat(1024 * 1024);
+    fs::write(
+        root.path().join("phpcs.xml"),
+        format!("<ruleset>{padding}<arg name=\"tab-width\" value=\"2\"/></ruleset>"),
+    )
+    .unwrap();
+    assert_eq!(ruleset_tab_width(root.path()), PHPCS_TAB_WIDTH);
+    let bin = root.path().join("vendor/bin");
+    fs::create_dir_all(&bin).unwrap();
+    fs::write(
+        bin.join("phpcs"),
+        "#!/bin/sh\necho '{\"totals\":{\"errors\":0,\"warnings\":0,\"fixable\":0},\"files\":{}}'\n",
+    )
+    .unwrap();
+    fs::set_permissions(bin.join("phpcs"), fs::Permissions::from_mode(0o755)).unwrap();
+    let file = root.path().join("endless.php");
+    symlink("/dev/zero", &file).unwrap();
+    cx.executor().allow_parking();
+    let root_path = root.path().to_path_buf();
+    let problems = cx
+        .background_spawn(async move {
+            run(
+                Analyzer::Phpcs,
+                &root_path,
+                &file,
+                Path::new("/no/php"),
+                None,
+                &[],
+            )
+            .await
+        })
+        .await;
+    assert!(problems.is_some_and(|result| result.is_ok_and(|problems| problems.is_empty())));
+}
+
 #[test]
 fn test_char_column_counts_utf16() {
     // PHPCS counts the emoji as one column; the editor's UTF-16 column counts two.
