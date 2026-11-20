@@ -5,6 +5,12 @@ use std::{fs, os::unix::fs::PermissionsExt as _};
 const PHPCS: &str = include_str!("../fixtures/phpcs-wordpress.json");
 const PHPSTAN: &str = include_str!("../fixtures/phpstan.json");
 
+// Real PHPStan 2.1.40 runs over src/a.php (two undefined variables, one in
+// phpstan-baseline.neon) with paths rewritten to /project.
+const PHPSTAN_BASELINE_SINGLE: &str = include_str!("../fixtures/phpstan-baseline-single-file.json");
+const PHPSTAN_BASELINE_WHOLE: &str =
+    include_str!("../fixtures/phpstan-baseline-whole-project.json");
+
 #[test]
 fn test_phpcs_report_after_php_deprecation_notices() {
     let problems = parse_phpcs(PHPCS).unwrap();
@@ -52,6 +58,29 @@ fn test_phpstan_report_with_trait_context_and_tip() {
         ]
     );
     assert!(problems[2].message.ends_with("discovering-symbols"));
+}
+
+#[test]
+fn test_phpstan_baseline_hides_ignored_findings() {
+    // The baseline entry for `$undefined_old` is gone from the report; only the
+    // finding outside the baseline reaches the editor.
+    let problems = parse_phpstan(PHPSTAN_BASELINE_SINGLE).unwrap();
+    assert_eq!(problems.len(), 1);
+    assert_eq!(problems[0].message, "Undefined variable: $undefined_new");
+    assert_eq!(problems[0].line, 6);
+    // A fully baselined file is an empty report.
+    let clean = r#"{"totals":{"errors":0,"file_errors":0},"files":{},"errors":[]}"#;
+    assert_eq!(parse_phpstan(clean).unwrap(), Vec::new());
+}
+
+#[test]
+fn test_phpstan_baseline_unmatched_patterns() {
+    // Whole-project runs put a path-scoped stale entry in the file's messages
+    // (`ignore.unmatched`, no line) and a global one in top-level `errors`.
+    // Neither becomes a problem; single-file runs report neither.
+    let problems = parse_phpstan(PHPSTAN_BASELINE_WHOLE).unwrap();
+    assert_eq!(problems.len(), 1);
+    assert_eq!(problems[0].rule.as_deref(), Some("variable.undefined"));
 }
 
 #[test]
@@ -978,4 +1007,569 @@ async fn test_inspect_project_action(cx: &mut TestAppContext) {
         dispatched_inspection(cx, Box::new(InspectProject)).await,
         (vec![(text::Point::new(1, 0), "Missing doc comment".to_string())], true)
     );
+}
+
+// "New since branch" (B2). A real git repo holds `a.php` on `main`; branch `feat`
+// changes line 4 and leaves an uncommitted line 5, and adds `b.php`. The fake
+// PHPCS reports lines 2 (old) and 4 (new) of `a.php` and logs the file it is
+// asked about. A clean filter on `*.php` touches `git_marker` whenever git
+// reads a PHP file, so "git ran" is observable.
+const BASE_PHP: &str = "<?php\nfunction one() {}\nfunction two() {}\nfunction three() {}\n";
+
+struct BranchEnv {
+    root: PathBuf,
+    project: Entity<Project>,
+    worktree_id: WorktreeId,
+    git_marker: PathBuf,
+    phpcs_log: PathBuf,
+}
+
+#[allow(clippy::disallowed_methods, reason = "blocking git in a test helper")]
+fn test_git(root: &Path, args: &[&str]) {
+    let output = std::process::Command::new("git")
+        .args([
+            "-c",
+            "commit.gpgsign=false",
+            "-c",
+            "core.hooksPath=/dev/null",
+        ])
+        .args(args)
+        .current_dir(root)
+        .env("GIT_AUTHOR_NAME", "t")
+        .env("GIT_AUTHOR_EMAIL", "t@t")
+        .env("GIT_COMMITTER_NAME", "t")
+        .env("GIT_COMMITTER_EMAIL", "t@t")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// `repo`: the folder is a git repository (real, and a fake one for the project
+/// so it finds a default branch). `trusted`: the worktree is trusted.
+async fn branch_env(cx: &mut TestAppContext, repo: bool, trusted: bool) -> BranchEnv {
+    let root = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(root.keep()).unwrap();
+    let root_path = root.to_str().unwrap().to_string();
+    let git_marker = root.join("git-ran");
+    let phpcs_log = root.join("phpcs-log");
+    let bin = root.join("vendor/bin");
+    fs::create_dir_all(&bin).unwrap();
+    let report = r#"{"totals":{"errors":2,"warnings":0,"fixable":0},"files":{"ROOT/a.php":{"errors":2,"warnings":0,"messages":[{"message":"old","source":"S.Old","severity":5,"fixable":false,"type":"ERROR","line":2,"column":1},{"message":"new","source":"S.New","severity":5,"fixable":false,"type":"ERROR","line":4,"column":1}]}}}"#
+        .replace("ROOT", &root_path);
+    fs::write(
+        bin.join("phpcs"),
+        format!(
+            "#!/bin/sh\nfor last; do :; done\necho \"$last\" >> '{}'\necho '{report}'\nexit 2\n",
+            phpcs_log.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(bin.join("phpcs"), fs::Permissions::from_mode(0o755)).unwrap();
+    let stub_php = root.join("php-stub");
+    fs::write(&stub_php, "#!/bin/sh\necho 'PHP 8.3.0 (cli)'\n").unwrap();
+    fs::set_permissions(&stub_php, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::write(root.join("a.php"), BASE_PHP).unwrap();
+    if repo {
+        test_git(&root, &["init", "-q", "-b", "main"]);
+        fs::write(root.join(".gitattributes"), "*.php filter=probe\n").unwrap();
+        test_git(&root, &["add", "."]);
+        test_git(&root, &["commit", "-qm", "base"]);
+        test_git(&root, &["checkout", "-qb", "feat"]);
+        fs::write(
+            root.join("a.php"),
+            BASE_PHP.replace("three()", "three( $a )"),
+        )
+        .unwrap();
+        fs::write(root.join("b.php"), "<?php\nfunction b() {}\n").unwrap();
+        test_git(&root, &["add", "."]);
+        test_git(&root, &["commit", "-qm", "work"]);
+        // Uncommitted, so git has to read the file (and run the filter) to diff it.
+        let mut text = fs::read_to_string(root.join("a.php")).unwrap();
+        text.push_str("function four() {}\n");
+        fs::write(root.join("a.php"), text).unwrap();
+        test_git(
+            &root,
+            &[
+                "config",
+                "filter.probe.clean",
+                &format!("touch {}; cat", git_marker.display()),
+            ],
+        );
+    }
+
+    use gpui::BorrowAppContext as _;
+    let app_state = cx.update(|cx| {
+        cx.set_global(db::AppDatabase::test_new());
+        let app_state = workspace::AppState::test(cx);
+        theme_settings::init(theme::LoadThemes::JustBase, cx);
+        editor::init(cx);
+        workspace::init(app_state.clone(), cx);
+        init(cx);
+        if !trusted {
+            project::trusted_worktrees::init(Default::default(), cx);
+        }
+        cx.update_global::<settings::SettingsStore, _>(|store, cx| {
+            store
+                .set_user_settings(
+                    &serde_json::json!({ "zenith": { "inspections": { "run_on_save": false, "phpstan": false } } })
+                        .to_string(),
+                    cx,
+                )
+                .unwrap();
+        });
+        cx.set_global(ToolEnvironment {
+            php_candidates: vec![stub_php.clone()],
+            path_dirs: Vec::new(),
+        });
+        app_state
+    });
+    let fake = app_state.fs.as_fake();
+    let mut tree = serde_json::json!({ "a.php": BASE_PHP, "b.php": "<?php\n" });
+    if repo {
+        tree["vendor"] = serde_json::json!({});
+        tree[".git"] = serde_json::json!({});
+    }
+    fake.insert_tree(&root_path, tree).await;
+    if repo {
+        fake.with_git_state(&root.join(".git"), false, |state| {
+            state.default_branch_ref = Some("refs/heads/main".into());
+        })
+        .unwrap();
+    }
+    let project = if trusted {
+        Project::test(app_state.fs.clone(), [Path::new(&root_path)], cx).await
+    } else {
+        Project::test_with_worktree_trust(app_state.fs.clone(), [Path::new(&root_path)], cx).await
+    };
+    cx.run_until_parked();
+    let worktree_id = project.read_with(cx, |project, cx| {
+        project.worktrees(cx).next().unwrap().read(cx).id()
+    });
+    BranchEnv {
+        root,
+        project,
+        worktree_id,
+        git_marker,
+        phpcs_log,
+    }
+}
+
+fn diagnostic_rows(buffer: &Entity<Buffer>, cx: &impl gpui::AppContext) -> Vec<u32> {
+    buffer.read_with(cx, |buffer, _| {
+        let snapshot = buffer.snapshot();
+        let mut rows: Vec<u32> = snapshot
+            .diagnostics_in_range::<_, text::Point>(0..snapshot.len(), false)
+            .map(|entry| entry.range.start.row)
+            .collect();
+        rows.sort();
+        rows
+    })
+}
+
+/// Inspects `a.php`; the rows of its findings afterwards, the errors and the notes shown.
+async fn inspect_a(
+    cx: &mut TestAppContext,
+    env: &BranchEnv,
+) -> (Vec<u32>, Vec<String>, Vec<String>) {
+    let buffer = env
+        .project
+        .update(cx, |project, cx| {
+            project.open_local_buffer(env.root.join("a.php"), cx)
+        })
+        .await
+        .unwrap();
+    cx.executor().allow_parking();
+    let report = cx
+        .update(|cx| inspect_path(&env.project, env.worktree_id, env.root.join("a.php"), cx))
+        .await;
+    cx.run_until_parked();
+    (diagnostic_rows(&buffer, cx), report.errors, report.notes)
+}
+
+fn switch(env: &BranchEnv, on: bool, cx: &mut TestAppContext) {
+    cx.update(|cx| new_since_branch::set_on(&env.root, on, cx));
+}
+
+#[gpui::test]
+async fn test_new_since_branch_shows_only_findings_on_new_lines(cx: &mut TestAppContext) {
+    let env = branch_env(cx, true, true).await;
+    switch(&env, true, cx);
+    // Line 2 (row 1) is old, line 4 (row 3) was changed on the branch.
+    assert_eq!(inspect_a(cx, &env).await, (vec![3], Vec::new(), Vec::new()));
+    // Control for the untrusted test: here git really read the file.
+    assert!(env.git_marker.exists());
+}
+
+#[gpui::test]
+async fn test_new_since_branch_off_shows_all_findings(cx: &mut TestAppContext) {
+    let env = branch_env(cx, true, true).await;
+    assert_eq!(
+        inspect_a(cx, &env).await,
+        (vec![1, 3], Vec::new(), Vec::new())
+    );
+    assert!(!env.git_marker.exists());
+}
+
+#[gpui::test]
+async fn test_new_since_branch_without_a_repository_shows_all_with_a_message(
+    cx: &mut TestAppContext,
+) {
+    let env = branch_env(cx, false, true).await;
+    switch(&env, true, cx);
+    let (rows, errors, notes) = inspect_a(cx, &env).await;
+    assert_eq!(rows, vec![1, 3]);
+    // A notice, not a failure: it must not be shown as "PHP inspections failed".
+    assert_eq!(errors, Vec::<String>::new());
+    assert_eq!(
+        notes,
+        ["New since branch: No git repository was found. Showing all findings."]
+    );
+}
+
+#[gpui::test]
+async fn test_new_since_branch_never_runs_git_in_an_untrusted_project(cx: &mut TestAppContext) {
+    let env = branch_env(cx, true, false).await;
+    switch(&env, true, cx);
+    // Nothing is inspected, so there is no base and no git.
+    assert_eq!(
+        inspect_a(cx, &env).await,
+        (Vec::new(), Vec::new(), Vec::new())
+    );
+    let base = cx
+        .update(|cx| new_since_branch::base_branch(&env.project, env.worktree_id, cx))
+        .await;
+    assert_eq!(base, Err("The project is not trusted.".to_string()));
+    assert!(!env.git_marker.exists());
+    // Once trusted, the same project does get a base and git runs.
+    cx.update(|cx| {
+        let trusted_worktrees =
+            project::trusted_worktrees::TrustedWorktrees::try_get_global(cx).expect("trust store");
+        let worktree_store = env.project.read(cx).worktree_store();
+        trusted_worktrees.update(cx, |store, cx| {
+            store.trust(
+                &worktree_store,
+                [project::trusted_worktrees::PathTrust::Worktree(
+                    env.worktree_id,
+                )]
+                .into_iter()
+                .collect(),
+                cx,
+            )
+        });
+    });
+    let base = cx
+        .update(|cx| new_since_branch::base_branch(&env.project, env.worktree_id, cx))
+        .await;
+    assert_eq!(base, Ok("main".to_string()));
+    assert_eq!(inspect_a(cx, &env).await, (vec![3], Vec::new(), Vec::new()));
+    assert!(env.git_marker.exists());
+}
+
+#[gpui::test]
+async fn test_new_since_branch_switch_persists_across_a_fresh_cache(cx: &mut TestAppContext) {
+    let env = branch_env(cx, false, true).await;
+    let other = env.root.join("other");
+    assert!(!cx.update(|cx| new_since_branch::is_on(&env.root, cx)));
+    switch(&env, true, cx);
+    cx.executor().allow_parking();
+    let key = env.root.to_string_lossy().into_owned();
+    for _ in 0..250 {
+        cx.run_until_parked();
+        let stored = cx.update(|cx| {
+            db::kvp::KeyValueStore::global(cx)
+                .scoped("zenith_inspections")
+                .read(&key)
+                .unwrap()
+        });
+        if stored.is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    cx.update(|cx| {
+        cx.remove_global::<new_since_branch::NewSinceBranch>();
+        assert!(new_since_branch::is_on(&env.root, cx));
+        assert!(!new_since_branch::is_on(&other, cx));
+    });
+}
+
+#[test]
+fn test_keep_new_filters_by_line() {
+    let problem = |line| Problem {
+        path: PathBuf::from("/a.php"),
+        line,
+        column: 1,
+        severity: Severity::Error,
+        message: String::new(),
+        rule: None,
+    };
+    let problems = vec![problem(1), problem(3), problem(4)];
+    let ranges = since_branch::NewLines::Ranges(vec![3..4]);
+    assert_eq!(
+        new_since_branch::keep_new(problems.clone(), &ranges),
+        [problem(3)]
+    );
+    assert_eq!(
+        new_since_branch::keep_new(problems.clone(), &since_branch::NewLines::All),
+        problems
+    );
+}
+
+/// Files the fake PHPCS was asked about after dispatching `InspectChangedFiles`,
+/// and how many base lookups that took.
+async fn files_inspected_after(
+    cx: &mut TestAppContext,
+    on: bool,
+    wait_for: usize,
+) -> (Vec<String>, usize) {
+    let env = branch_env(cx, true, true).await;
+    switch(&env, on, cx);
+    let (_workspace, cx) = cx.add_window_view(|window, cx| {
+        workspace::MultiWorkspace::test_new(env.project.clone(), window, cx)
+    });
+    cx.executor().allow_parking();
+    cx.update(|window, cx| window.dispatch_action(Box::new(InspectChangedFiles), cx));
+    let read = || {
+        let mut names: Vec<String> = fs::read_to_string(&env.phpcs_log)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| Some(Path::new(line).file_name()?.to_string_lossy().into_owned()))
+            .collect();
+        names.sort();
+        names
+    };
+    // Real processes run: wait for the expected files, then a little longer so a
+    // wrongly listed one would show up too.
+    for _ in 0..250 {
+        cx.run_until_parked();
+        if read().len() >= wait_for {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    for _ in 0..15 {
+        cx.run_until_parked();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let lookups = cx.update(|_, cx| {
+        cx.try_global::<new_since_branch::BaseLookups>()
+            .map_or(0, |lookups| lookups.0)
+    });
+    (read(), lookups)
+}
+
+#[gpui::test]
+async fn test_changed_files_with_new_since_branch_include_the_branch_files(
+    cx: &mut TestAppContext,
+) {
+    // `a.php` is in git status and in the branch list: inspected once. `b.php`
+    // is committed on the branch only.
+    assert_eq!(
+        files_inspected_after(cx, true, 2).await.0,
+        ["a.php", "b.php"]
+    );
+}
+
+#[gpui::test]
+async fn test_changed_files_without_new_since_branch_use_git_status_only(cx: &mut TestAppContext) {
+    assert_eq!(
+        files_inspected_after(cx, false, 1).await,
+        (vec!["a.php".to_string()], 0)
+    );
+}
+
+#[gpui::test]
+async fn test_toggle_action_reruns_findings_and_flips_the_mode(cx: &mut TestAppContext) {
+    let env = branch_env(cx, true, true).await;
+    assert_eq!(inspect_a(cx, &env).await.0, vec![1, 3]);
+    let buffer = env
+        .project
+        .update(cx, |project, cx| {
+            project.open_local_buffer(env.root.join("a.php"), cx)
+        })
+        .await
+        .unwrap();
+    let (_workspace, cx) = cx.add_window_view(|window, cx| {
+        workspace::MultiWorkspace::test_new(env.project.clone(), window, cx)
+    });
+    cx.executor().allow_parking();
+    for (expected_on, expected_rows) in [(true, vec![3]), (false, vec![1, 3])] {
+        cx.update(|window, cx| window.dispatch_action(Box::new(ToggleNewSinceBranch), cx));
+        for _ in 0..250 {
+            cx.run_until_parked();
+            if diagnostic_rows(&buffer, cx) == expected_rows {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(diagnostic_rows(&buffer, cx), expected_rows);
+        assert_eq!(
+            cx.update(|_, cx| new_since_branch::is_on(&env.root, cx)),
+            expected_on
+        );
+    }
+}
+
+#[gpui::test]
+async fn test_files_to_rerun_include_files_whose_findings_were_all_hidden(cx: &mut TestAppContext) {
+    let env = branch_env(cx, false, true).await;
+    let file = env.root.join("a.php");
+    let rerun = |cx: &mut TestAppContext| {
+        cx.update(|cx| new_since_branch::files_to_rerun(&env.project, cx))
+    };
+    // No diagnostics shown, nothing hidden: nothing to re-run.
+    assert_eq!(rerun(cx), Vec::new());
+    cx.update(|cx| new_since_branch::mark_hidden(&file, true, cx));
+    assert_eq!(rerun(cx), [(env.worktree_id, file.clone())]);
+    cx.update(|cx| new_since_branch::mark_hidden(&file, false, cx));
+    assert_eq!(rerun(cx), Vec::new());
+}
+
+#[gpui::test]
+async fn test_clean_filter_marker_is_created_by_plain_git(cx: &mut TestAppContext) {
+    // Positive control for the untrusted test. GIT_HARDENING does not stop
+    // `filter.<name>.clean`, so plain git (and ours) running in a project folder
+    // runs the repo's filter: the trust gate is the only guard, and this marker
+    // shows git running at all.
+    let env = branch_env(cx, true, true).await;
+    assert!(!env.git_marker.exists());
+    #[allow(clippy::disallowed_methods, reason = "blocking git in a test")]
+    let output = std::process::Command::new("git")
+        .args(["diff", "--merge-base", "main", "--", "a.php"])
+        .current_dir(&env.root)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(env.git_marker.exists());
+}
+
+#[test]
+fn test_changed_files_message_keeps_no_changed_files_wording() {
+    let note = || Some("New since branch: nope.".to_string());
+    assert_eq!(
+        changed_files_message(0, None, None),
+        "No changed PHP files."
+    );
+    assert_eq!(
+        changed_files_message(0, None, note()),
+        "No changed PHP files. New since branch: nope."
+    );
+    let problem = "Not a repository.".to_string();
+    assert_eq!(
+        changed_files_message(0, Some(&problem), note()),
+        "Not a repository. New since branch: nope."
+    );
+    // With files to inspect the runs report the failed base themselves.
+    assert_eq!(
+        changed_files_message(2, None, note()),
+        "Inspecting 2 changed PHP files."
+    );
+    assert_eq!(
+        changed_files_message(1, None, None),
+        "Inspecting 1 changed PHP file."
+    );
+}
+
+#[gpui::test]
+async fn test_inspect_path_uses_the_base_it_is_given(cx: &mut TestAppContext) {
+    use futures::FutureExt as _;
+    // The repo has a real default branch ("main"); a batch hands down its own
+    // lookup instead of each file doing another, so the handed-down result wins.
+    let env = branch_env(cx, true, true).await;
+    switch(&env, true, cx);
+    let buffer = env
+        .project
+        .update(cx, |project, cx| {
+            project.open_local_buffer(env.root.join("a.php"), cx)
+        })
+        .await
+        .unwrap();
+    cx.executor().allow_parking();
+    let given = gpui::Task::ready(Err("Given.".to_string())).shared();
+    let report = cx
+        .update(|cx| {
+            inspect_path_with(
+                &env.project,
+                env.worktree_id,
+                env.root.join("a.php"),
+                Some(given),
+                cx,
+            )
+        })
+        .await;
+    cx.run_until_parked();
+    assert_eq!(
+        report.notes,
+        ["New since branch: Given. Showing all findings."]
+    );
+    assert_eq!(diagnostic_rows(&buffer, cx), vec![1, 3]);
+    assert!(!env.git_marker.exists());
+}
+
+#[gpui::test]
+async fn test_a_batch_looks_up_the_base_once_per_folder(cx: &mut TestAppContext) {
+    // Two files (`a.php`, `b.php`) in one folder: one lookup, shared by the file
+    // list and both runs.
+    let (files, lookups) = files_inspected_after(cx, true, 2).await;
+    assert_eq!(files, ["a.php", "b.php"]);
+    assert_eq!(lookups, 1);
+}
+
+#[gpui::test]
+async fn test_a_single_save_looks_up_the_base_beside_the_tools(cx: &mut TestAppContext) {
+    use futures::FutureExt as _;
+    let env = branch_env(cx, true, true).await;
+    switch(&env, true, cx);
+    let buffer = env
+        .project
+        .update(cx, |project, cx| {
+            project.open_local_buffer(env.root.join("a.php"), cx)
+        })
+        .await
+        .unwrap();
+    cx.executor().allow_parking();
+    // A lookup that only finishes once PHPCS has been started: it is awaited after
+    // the tools, not before them (before them it would time out, ~3 s).
+    let log = env.phpcs_log.clone();
+    let base = cx
+        .background_spawn(async move {
+            // The test scheduler runs background tasks on one thread: yield, never
+            // sleep, so the tools can start.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            while std::time::Instant::now() < deadline {
+                if log.exists() {
+                    return Ok("main".to_string());
+                }
+                let mut yielded = false;
+                std::future::poll_fn(|task| {
+                    if yielded {
+                        return std::task::Poll::Ready(());
+                    }
+                    yielded = true;
+                    task.waker().wake_by_ref();
+                    std::task::Poll::Pending
+                })
+                .await;
+            }
+            Err("The tools never started.".to_string())
+        })
+        .shared();
+    let report = cx
+        .update(|cx| {
+            inspect_path_with(
+                &env.project,
+                env.worktree_id,
+                env.root.join("a.php"),
+                Some(base),
+                cx,
+            )
+        })
+        .await;
+    cx.run_until_parked();
+    assert_eq!(report.notes, Vec::<String>::new());
+    assert_eq!(diagnostic_rows(&buffer, cx), vec![3]);
 }
