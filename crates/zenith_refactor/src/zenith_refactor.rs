@@ -108,7 +108,9 @@ impl RefactorPlan {
     /// Every path is checked before anything is written: it must lie inside one of `roots`
     /// (the project's worktrees) with no `..` and no symlink on the way. The source of a move
     /// is only removed when the target row is ticked, every write succeeded and the file still
-    /// holds what the preview showed. Files are written atomically (temp file and rename).
+    /// holds what the preview showed. Before the first write, every ticked file must still hold
+    /// what the preview showed and a move's new file must not exist yet; otherwise nothing is
+    /// written. Files are written atomically (temp file and rename).
     pub async fn apply_to_disk(&self, fs: &dyn Fs, roots: &[PathBuf]) -> Result<Vec<PathBuf>> {
         let mut checked_roots = Vec::with_capacity(roots.len());
         for root in roots {
@@ -147,6 +149,40 @@ impl RefactorPlan {
             .chain(removal.map(|(path, _)| path))
         {
             check_inside_project(fs, &checked_roots, path).await?;
+        }
+
+        // Check the disk against the preview for every file before the first write.
+        let new_file = match &self.kind {
+            RefactorKind::MoveClass {
+                source_path,
+                target_path,
+                ..
+            } if source_path != target_path => Some(target_path),
+            _ => None,
+        };
+        for diff in &writes {
+            let path = &diff.file_path;
+            if new_file == Some(path) {
+                ensure!(
+                    fs.metadata(path).await?.is_none(),
+                    "{} already exists; nothing was written",
+                    path.display()
+                );
+            } else {
+                let on_disk = fs.load(path).await.ok();
+                ensure!(
+                    on_disk.as_deref() == Some(diff.original_content.as_str()),
+                    "{} changed since the preview (or is gone); nothing was written",
+                    path.display()
+                );
+            }
+        }
+        if let Some((source, shown)) = removal {
+            ensure!(
+                fs.load(source).await.ok().as_deref() == Some(shown),
+                "{} changed since the preview; nothing was written",
+                source.display()
+            );
         }
 
         let mut affected = Vec::new();
@@ -1067,6 +1103,74 @@ function calculate_tax($subtotal, $rate) {
             fs.is_file(Path::new("/project/app/Services/OldService.php"))
                 .await
         );
+        assert!(
+            !fs.is_file(Path::new("/project/app/Billing/OldService.php"))
+                .await
+        );
+    }
+
+    #[gpui::test]
+    async fn test_move_onto_an_existing_target_is_refused(cx: &mut TestAppContext) {
+        let fs = project_fs(cx).await;
+        fs.insert_tree(
+            "/project/app/Billing",
+            json!({ "OldService.php": "<?php // somebody else's class" }),
+        )
+        .await;
+        let plan = move_plan("/project");
+
+        let error = plan.apply_to_disk(fs.as_ref(), &roots()).await.unwrap_err();
+        assert!(error.to_string().contains("already exists"), "{error:#}");
+        assert_eq!(
+            fs.load(Path::new("/project/app/Billing/OldService.php"))
+                .await
+                .unwrap(),
+            "<?php // somebody else's class"
+        );
+        assert!(
+            fs.is_file(Path::new("/project/app/Services/OldService.php"))
+                .await
+        );
+        assert_eq!(
+            fs.load(Path::new("/project/app/Controllers/OrderController.php"))
+                .await
+                .unwrap(),
+            ORDER_CONTROLLER,
+            "nothing else was written either"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_file_changed_after_the_preview_is_refused_and_untouched(cx: &mut TestAppContext) {
+        let fs = project_fs(cx).await;
+        let plan = move_plan("/project");
+        let edited = "<?php // edited after the preview\nuse App\\Services\\OldService;";
+        fs.insert_file(
+            "/project/app/Controllers/OrderController.php",
+            edited.as_bytes().to_vec(),
+        )
+        .await;
+
+        let error = plan.apply_to_disk(fs.as_ref(), &roots()).await.unwrap_err();
+        assert!(
+            error.to_string().contains("changed since the preview"),
+            "{error:#}"
+        );
+        assert_eq!(
+            fs.load(Path::new("/project/app/Controllers/OrderController.php"))
+                .await
+                .unwrap(),
+            edited
+        );
+        assert!(
+            !fs.is_file(Path::new("/project/app/Billing/OldService.php"))
+                .await,
+            "the check runs before the first write"
+        );
+        assert!(
+            fs.is_file(Path::new("/project/app/Services/OldService.php"))
+                .await
+        );
     }
 
     #[gpui::test]
@@ -1110,6 +1214,7 @@ function calculate_tax($subtotal, $rate) {
         }
         assert!(!fs.is_file(Path::new("/outside/x.php")).await);
         // A file inside the project is fine.
+        fs.insert_file("/project/app/ok.php", Vec::new()).await;
         one_file("/project/app/ok.php")
             .apply_to_disk(fs.as_ref(), &roots())
             .await

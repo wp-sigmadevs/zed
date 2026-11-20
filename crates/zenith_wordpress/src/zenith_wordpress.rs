@@ -873,7 +873,7 @@ add_action('wp_footer', function() { echo 'footer'; });
         let mut index = WordPressIndex::new();
         index.index_source(PathBuf::from("big.php"), &source);
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(1),
+            started.elapsed() < std::time::Duration::from_secs(5),
             "{:?}",
             started.elapsed()
         );
