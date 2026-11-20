@@ -14,25 +14,40 @@ doctest = false
 
 [dependencies]
 anyhow.workspace = true
+buffer_diff.workspace = true
 futures.workspace = true
+git_ui_core.workspace = true
 gpui.workspace = true
 language.workspace = true
 log.workspace = true
+menu.workspace = true
 paths.workspace = true
 project.workspace = true
+project_panel.workspace = true
 rope.workspace = true
 settings.workspace = true
 sha2.workspace = true
 sqlez.workspace = true
+time.workspace = true
+time_format.workspace = true
+ui.workspace = true
 util.workspace = true
+workspace.workspace = true
 worktree.workspace = true
+zed_actions.workspace = true
 zed_env_vars.workspace = true
 zstd.workspace = true
 
 [dev-dependencies]
+editor = { workspace = true, features = ["test-support"] }
+fs = { workspace = true, features = ["test-support"] }
 gpui = { workspace = true, features = ["test-support"] }
 project = { workspace = true, features = ["test-support"] }
+remote_connection = { workspace = true, features = ["test-support"] }
 serde_json.workspace = true
 settings = { workspace = true, features = ["test-support"] }
 tempfile.workspace = true
+theme.workspace = true
+theme_settings.workspace = true
+workspace = { workspace = true, features = ["test-support"] }
 worktree = { workspace = true, features = ["test-support"] }

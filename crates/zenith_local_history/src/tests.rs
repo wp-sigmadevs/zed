@@ -170,11 +170,15 @@ async fn test_symlinks_are_not_recorded(cx: &mut TestAppContext) {
     )
     .await
     .expect("symlink");
+    // A link to a file inside the worktree is not external, only symlinked.
+    fs.create_symlink(Path::new("/dir/inner.txt"), PathBuf::from("/dir/a.txt"))
+        .await
+        .expect("inner symlink");
     let project = Project::test(fs, [Path::new("/dir")], cx).await;
     cx.run_until_parked();
     // FakeFs cannot save through a symlink, so this pins the "open" baseline;
     // saves go through the same gate.
-    for name in ["a.txt", "link.txt"] {
+    for name in ["a.txt", "link.txt", "inner.txt"] {
         project
             .update(cx, |project, cx| {
                 project.open_local_buffer(format!("/dir/{name}"), cx)
@@ -183,6 +187,7 @@ async fn test_symlinks_are_not_recorded(cx: &mut TestAppContext) {
             .expect("open buffer");
     }
     assert!(revisions(cx, dir.path(), "link.txt").is_empty());
+    assert!(revisions(cx, dir.path(), "inner.txt").is_empty());
     assert_eq!(revisions(cx, dir.path(), "a.txt").len(), 1);
 }
 
@@ -355,5 +360,87 @@ fn test_default_settings_file_matches_the_built_in_defaults() {
             .zenith
             .and_then(|zenith| zenith.local_history)
             .is_some()
+    );
+}
+
+#[gpui::test]
+async fn test_zero_db_size_limit_is_clamped_and_never_wipes_history(cx: &mut TestAppContext) {
+    let dir = history_dir();
+    start(cx, dir.path());
+    configure(cx, |history| history.max_db_size_mb = Some(0));
+    assert_eq!(
+        cx.update(|cx| LocalHistorySettings::get_global(cx).max_db_size_mb),
+        1
+    );
+    let project = project_with(json!({ "a.txt": "base" }), cx).await;
+    open_edit_save(&project, "/dir/a.txt", "x", cx).await;
+    assert_eq!(revisions(cx, dir.path(), "a.txt").len(), 2);
+
+    cx.update(capture::send_prune);
+    assert_eq!(revisions(cx, dir.path(), "a.txt").len(), 2);
+}
+
+// FakeFs cannot hold a non-UTF-8 path, so the key function is pinned directly;
+// capture and the history view both get the key only through it.
+#[cfg(unix)]
+#[test]
+fn test_non_utf8_worktree_root_has_no_key() {
+    use std::{ffi::OsStr, os::unix::ffi::OsStrExt as _};
+    let root = Path::new(OsStr::from_bytes(b"/d\xffir"));
+    assert_eq!(capture::root_key(root), None);
+    assert_eq!(
+        capture::root_key(Path::new("/dir")),
+        Some("/dir".to_string())
+    );
+}
+
+// APFS refuses non-UTF-8 names, so `open_in` fails earlier on macOS; the
+// conversion itself is pinned directly.
+#[cfg(unix)]
+#[test]
+fn test_non_utf8_database_path_is_rejected() {
+    use std::{ffi::OsStr, os::unix::ffi::OsStrExt as _};
+    let bad = Path::new(OsStr::from_bytes(b"/h\xffist/history.db"));
+    assert!(crate::store::utf8_path(bad).is_err());
+    assert_eq!(
+        crate::store::utf8_path(Path::new("/h/history.db")).expect("utf-8"),
+        "/h/history.db"
+    );
+}
+
+#[test]
+fn test_one_undecodable_blob_does_not_hide_the_history() {
+    let dir = history_dir();
+    let store = Store::open_in(dir.path()).expect("store");
+    for (text, ts) in [("one", 1), ("three", 2)] {
+        store
+            .record("/dir", "a.txt", text.as_bytes(), None, "save", ts)
+            .expect("record");
+    }
+    let oldest = store.revisions("/dir", "a.txt").expect("revisions")[1]
+        .blob_hash
+        .clone();
+    let file = dir.path().join("history.db");
+    let connection = sqlez::connection::Connection::open_file(file.to_str().expect("utf-8"));
+    connection
+        .exec(&format!(
+            "UPDATE blobs SET content = X'DEADBEEF' WHERE hash = '{oldest}'"
+        ))
+        .expect("prepare")()
+    .expect("corrupt the blob");
+
+    let entries = capture::list_entries(&store, "/dir", "a.txt").expect("list still works");
+    let sizes: Vec<u64> = entries.iter().map(|entry| entry.size).collect();
+    assert_eq!(sizes, [5, 0]);
+}
+
+#[gpui::test]
+async fn test_max_file_size_is_capped_at_what_can_be_read_back(cx: &mut TestAppContext) {
+    let dir = history_dir();
+    start(cx, dir.path());
+    configure(cx, |history| history.max_file_size_kb = Some(u64::MAX));
+    assert_eq!(
+        cx.update(|cx| LocalHistorySettings::get_global(cx).max_file_size_kb),
+        crate::store::MAX_CONTENT_BYTES / 1024
     );
 }

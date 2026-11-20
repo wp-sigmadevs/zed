@@ -10,7 +10,7 @@ use zed_env_vars::ZED_STATELESS;
 const COMPRESSION_LEVEL: i32 = 3;
 const SECONDS_PER_DAY: i64 = 86_400;
 /// Largest blob `content` will decompress; guards against zstd bombs.
-const MAX_CONTENT_BYTES: u64 = 64 * 1024 * 1024;
+pub(crate) const MAX_CONTENT_BYTES: u64 = 64 * 1024 * 1024;
 /// Estimated SQLite cost of one `revisions` row beyond its two path strings.
 const ROW_OVERHEAD_BYTES: i64 = 64;
 
@@ -70,6 +70,12 @@ fn prepare_private_file(directory: &Path) -> Result<PathBuf> {
         .open(&file)
         .with_context(|| format!("creating {}", file.display()))?;
     Ok(file)
+}
+
+/// SQLite takes a `&str`; a lossy conversion could open a different file.
+pub(crate) fn utf8_path(path: &Path) -> Result<&str> {
+    path.to_str()
+        .with_context(|| format!("{} is not valid UTF-8", path.display()))
 }
 
 /// Files whose contents are likely secrets are never stored. The name comes
@@ -132,7 +138,7 @@ impl Store {
     /// database when the file cannot be opened.
     pub(crate) fn open_in(directory: &Path) -> Result<Self> {
         let file = prepare_private_file(directory)?;
-        let connection = Connection::open_file(&file.to_string_lossy());
+        let connection = Connection::open_file(utf8_path(&file)?);
         anyhow::ensure!(
             connection.persistent(),
             "could not open local history database at {}",

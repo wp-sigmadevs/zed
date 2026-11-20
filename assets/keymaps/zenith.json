@@ -24,6 +24,8 @@
       "secondary-shift-n": "zenith_scratches::NewScratchFile",
       "secondary-shift-f": "zenith_search::FindInFiles",
       "secondary-shift-r": "zenith_search::ReplaceInFiles",
+      // Show History (local history of the file), PhpStorm has no default key for it.
+      "alt-shift-h": "zenith_local_history::ShowFileHistory",
     },
   },
   {

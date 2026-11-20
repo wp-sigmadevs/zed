@@ -1,4 +1,5 @@
 mod capture;
+mod history_view;
 pub mod store;
 #[cfg(test)]
 mod tests;
@@ -6,6 +7,7 @@ mod tests;
 use gpui::App;
 use settings::{RegisterSetting, Settings, SettingsContent};
 
+pub use history_view::LocalHistoryView;
 pub use store::{Revision, Store};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, RegisterSetting)]
@@ -32,10 +34,14 @@ impl Settings for LocalHistorySettings {
                 .max(1),
             max_db_size_mb: history
                 .and_then(|settings| settings.max_db_size_mb)
-                .unwrap_or(500),
+                .unwrap_or(500)
+                // 0 would make every prune delete the whole history.
+                .max(1),
             max_file_size_kb: history
                 .and_then(|settings| settings.max_file_size_kb)
-                .unwrap_or(2048),
+                .unwrap_or(2048)
+                // A larger file could be recorded but never read back.
+                .min(store::MAX_CONTENT_BYTES / 1024),
         }
     }
 }
@@ -43,6 +49,7 @@ impl Settings for LocalHistorySettings {
 /// Records a revision of every local file when it is opened and saved, and
 /// prunes old revisions at start and every 24 hours.
 pub fn init(cx: &mut App) {
+    history_view::init(cx);
     capture::start(cx, |create| {
         if create {
             Store::open().map(Some)

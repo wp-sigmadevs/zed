@@ -1,0 +1,657 @@
+//! "Show History": a center tab with the revisions of one file on the left and a
+//! diff of the selected revision against the file's current text on the right.
+//!
+//! The diff is [`FileDiffView`], so Revert Hunk comes with it: the old side is a
+//! scratch buffer holding the revision, the new side is the project buffer.
+//! Selecting another revision replaces the text of the scratch buffer.
+
+use crate::capture::{self, Entry};
+use anyhow::{Context as _, Result};
+use buffer_diff::BufferDiff;
+use git_ui_core::file_diff_view::{FileDiffView, build_buffer_diff};
+use gpui::{
+    Action as _, App, ClickEvent, Context, Entity, EventEmitter, FocusHandle, Focusable,
+    IntoElement, ParentElement, Render, Role, SharedString, Styled, Task, UniformListScrollHandle,
+    WeakEntity, Window, px, uniform_list,
+};
+use language::Buffer;
+use project::{Project, ProjectPath};
+use project_panel::ProjectPanel;
+use std::ops::Range;
+use time::{OffsetDateTime, UtcOffset};
+use time_format::TimestampFormat;
+use ui::{ListItem, ListItemSpacing, prelude::*};
+use util::size::format_file_size;
+use workspace::{Item, Workspace, item::SaveOptions};
+use zed_actions::zenith_local_history::ShowFileHistory;
+
+const LIST_WIDTH: f32 = 320.;
+const ROW_HEIGHT: f32 = 44.;
+
+pub(crate) fn init(cx: &mut App) {
+    cx.observe_new(|workspace: &mut Workspace, _, _| {
+        workspace.register_action(|workspace, _: &ShowFileHistory, window, cx| {
+            show_file_history(workspace, window, cx);
+        });
+    })
+    .detach();
+}
+
+/// The file the user means: the project panel's selection while the panel has
+/// focus (its context menu), otherwise the active tab.
+fn target(workspace: &Workspace, window: &Window, cx: &App) -> Option<ProjectPath> {
+    let project = workspace.project().read(cx);
+    let from_panel = workspace
+        .panel::<ProjectPanel>(cx)
+        .filter(|panel| panel.focus_handle(cx).contains_focused(window, cx))
+        .and_then(|panel| panel.read(cx).selected_entry_project_path(cx))
+        .filter(|path| {
+            project
+                .entry_for_path(path, cx)
+                .is_some_and(|entry| entry.is_file())
+        });
+    from_panel.or_else(|| workspace.active_item(cx)?.project_path(cx))
+}
+
+fn show_file_history(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
+    let Some(project_path) = target(workspace, window, cx) else {
+        return;
+    };
+    if !workspace.project().read(cx).is_local() {
+        return; // snapshots are recorded for local projects only
+    }
+    let existing = workspace
+        .items_of_type::<LocalHistoryView>(cx)
+        .find(|view| view.read(cx).project_path == project_path);
+    let view = match existing {
+        Some(view) => {
+            workspace.activate_item(&view, true, true, window, cx);
+            view
+        }
+        None => {
+            let view = cx.new(|cx| {
+                LocalHistoryView::new(workspace.weak_handle(), project_path, workspace, cx)
+            });
+            workspace.add_item_to_active_pane(Box::new(view.clone()), None, true, window, cx);
+            view
+        }
+    };
+    // Pressing the key again in the diff brings focus back to the list.
+    view.update(cx, |view, cx| {
+        window.focus(&view.focus_handle, cx);
+        view.load(window, cx);
+    });
+}
+
+enum State {
+    Loading,
+    Ready,
+    Failed(SharedString),
+}
+
+/// The mounted diff and the scratch buffer holding the selected revision.
+struct DiffPane {
+    view: Entity<FileDiffView>,
+    old_buffer: Entity<Buffer>,
+    #[cfg_attr(not(test), allow(dead_code))]
+    diff: Entity<BufferDiff>,
+}
+
+pub struct LocalHistoryView {
+    workspace: WeakEntity<Workspace>,
+    project: Entity<Project>,
+    project_path: ProjectPath,
+    name: SharedString,
+    focus_handle: FocusHandle,
+    scroll_handle: UniformListScrollHandle,
+    state: State,
+    entries: Vec<Entry>,
+    selected: usize,
+    /// The project buffer: the "new" side of the diff.
+    current: Option<Entity<Buffer>>,
+    diff: Option<DiffPane>,
+    /// Why the diff pane is empty, when it is not just loading.
+    note: Option<SharedString>,
+    load_task: Task<()>,
+    content_task: Task<()>,
+}
+
+impl LocalHistoryView {
+    fn new(
+        workspace_handle: WeakEntity<Workspace>,
+        project_path: ProjectPath,
+        workspace: &Workspace,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let project = workspace.project().read(cx);
+        // A single-file worktree has an empty relative path: use the worktree's name.
+        let name = project_path
+            .path
+            .file_name()
+            .map(str::to_owned)
+            .or_else(|| {
+                let worktree = project.worktree_for_id(project_path.worktree_id, cx)?;
+                let abs_path = worktree.read(cx).abs_path();
+                Some(abs_path.file_name()?.to_string_lossy().into_owned())
+            })
+            .unwrap_or_else(|| "file".to_owned());
+        Self {
+            workspace: workspace_handle,
+            project: workspace.project().clone(),
+            project_path,
+            name: name.into(),
+            focus_handle: cx.focus_handle().tab_stop(true),
+            scroll_handle: UniformListScrollHandle::new(),
+            state: State::Loading,
+            entries: Vec::new(),
+            selected: 0,
+            current: None,
+            diff: None,
+            note: None,
+            load_task: Task::ready(()),
+            content_task: Task::ready(()),
+        }
+    }
+
+    /// Opens the file's buffer, then reads its revisions. The buffer goes first:
+    /// opening it records the "Opened" baseline, which the list must include.
+    fn load(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(worktree) = self
+            .project
+            .read(cx)
+            .worktree_for_id(self.project_path.worktree_id, cx)
+        else {
+            self.state = State::Failed("The folder is no longer open.".into());
+            return cx.notify();
+        };
+        let Some(root) = capture::root_key(&worktree.read(cx).abs_path()) else {
+            self.state = State::Failed(
+                "This folder's path is not valid UTF-8, so it has no local history.".into(),
+            );
+            return cx.notify();
+        };
+        let rel_path = self.project_path.path.as_unix_str().to_owned();
+        let open = self.project.update(cx, |project, cx| {
+            project.open_buffer(self.project_path.clone(), cx)
+        });
+        self.load_task = cx.spawn_in(window, async move |this, cx| {
+            let result: Result<_> = async {
+                let buffer = open.await.context("opening the file")?;
+                // Checked when shown, not only when recorded: a file that is private,
+                // ignored or a symlink by now must not expose its old revisions.
+                let trackable = this.update(cx, |_, cx| {
+                    worktree::File::from_dyn(buffer.read(cx).file())
+                        .is_some_and(|file| capture::is_trackable(file, cx))
+                })?;
+                if !trackable {
+                    return Ok((buffer, Vec::new()));
+                }
+                let list = this.update(cx, |_, cx| capture::list(cx, root, rel_path))?;
+                Ok((buffer, list.await.context("reading the history")?))
+            }
+            .await;
+            this.update_in(cx, |this, window, cx| match result {
+                Ok((buffer, entries)) => {
+                    this.current = Some(buffer);
+                    this.entries = entries;
+                    this.state = State::Ready;
+                    this.select(0, window, cx);
+                }
+                Err(error) => {
+                    log::error!("local history: {error:#}");
+                    this.state =
+                        State::Failed(format!("Could not load the history: {error:#}").into());
+                    cx.notify();
+                }
+            })
+            .ok();
+        });
+    }
+
+    fn select(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(entry) = self.entries.get(ix) else {
+            return;
+        };
+        self.selected = ix;
+        self.scroll_handle
+            .scroll_to_item(ix, gpui::ScrollStrategy::Center);
+        let content = capture::content(cx, entry.revision.blob_hash.clone());
+        // A newer selection replaces this task, which cancels it.
+        self.content_task = cx.spawn_in(window, async move |this, cx| {
+            let text = match content.await {
+                Ok(Some(bytes)) => String::from_utf8_lossy(&bytes).into_owned(),
+                other => {
+                    let reason = other.err().map_or_else(
+                        || "This revision was removed by the retention limits.".to_string(),
+                        |error| format!("{error:#}"),
+                    );
+                    this.update(cx, |this, cx| {
+                        this.diff = None;
+                        this.note = Some(reason.into());
+                        cx.notify();
+                    })
+                    .ok();
+                    return;
+                }
+            };
+            let Ok(Some((existing, current))) = this.update(cx, |this, _| {
+                let current = this.current.clone()?;
+                Some((
+                    this.diff.as_ref().map(|pane| pane.old_buffer.clone()),
+                    current,
+                ))
+            }) else {
+                return;
+            };
+            if let Some(old_buffer) = existing {
+                // FileDiffView re-diffs on the buffer edit, after its debounce.
+                old_buffer.update(cx, |buffer, cx| {
+                    buffer.set_text(text, cx);
+                });
+                this.update(cx, |this, cx| {
+                    this.note = None;
+                    cx.notify();
+                })
+                .ok();
+                return;
+            }
+            let language = current.read_with(cx, |buffer, _| buffer.language().cloned());
+            let old_buffer = cx.new(|cx| {
+                let mut buffer = Buffer::local(text, cx);
+                buffer.set_language(language, cx);
+                buffer
+            });
+            let diff = match build_buffer_diff(&old_buffer, &current, cx).await {
+                Ok(diff) => diff,
+                Err(error) => {
+                    this.update(cx, |this, cx| {
+                        this.note = Some(format!("Could not compare: {error:#}").into());
+                        cx.notify();
+                    })
+                    .ok();
+                    return;
+                }
+            };
+            this.update_in(cx, |this, window, cx| {
+                this.mount_diff(old_buffer, current, diff, window, cx)
+            })
+            .ok();
+        });
+        cx.notify();
+    }
+
+    fn mount_diff(
+        &mut self,
+        old_buffer: Entity<Buffer>,
+        current: Entity<Buffer>,
+        diff: Entity<BufferDiff>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let project = self.project.clone();
+        let view = cx.new(|cx| {
+            FileDiffView::new(
+                old_buffer.clone(),
+                current,
+                diff.clone(),
+                project,
+                workspace,
+                window,
+                cx,
+            )
+        });
+        self.diff = Some(DiffPane {
+            view,
+            old_buffer,
+            diff,
+        });
+        self.note = None;
+        cx.notify();
+    }
+
+    fn select_next(&mut self, _: &menu::SelectNext, window: &mut Window, cx: &mut Context<Self>) {
+        let last = self.entries.len().saturating_sub(1);
+        self.select((self.selected + 1).min(last), window, cx);
+    }
+
+    fn select_previous(
+        &mut self,
+        _: &menu::SelectPrevious,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.select(self.selected.saturating_sub(1), window, cx);
+    }
+
+    fn select_first(&mut self, _: &menu::SelectFirst, window: &mut Window, cx: &mut Context<Self>) {
+        self.select(0, window, cx);
+    }
+
+    fn select_last(&mut self, _: &menu::SelectLast, window: &mut Window, cx: &mut Context<Self>) {
+        self.select(self.entries.len().saturating_sub(1), window, cx);
+    }
+
+    /// Enter moves into the diff, so hunks can be reverted from the keyboard.
+    fn confirm(&mut self, _: &menu::Confirm, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(pane) = &self.diff {
+            window.focus(&pane.view.focus_handle(cx), cx);
+        }
+    }
+
+    fn cancel(&mut self, _: &menu::Cancel, window: &mut Window, cx: &mut Context<Self>) {
+        window.dispatch_action(workspace::CloseActiveItem::default().boxed_clone(), cx);
+    }
+
+    fn render_row(&self, ix: usize, cx: &mut Context<Self>) -> impl IntoElement {
+        let entry = &self.entries[ix];
+        let selected = ix == self.selected;
+        let title = row_title(entry);
+        let when = format_time(entry.revision.ts);
+        let detail = match entry.revision.label {
+            Some(_) => format!("{} · {when}", source_name(&entry.revision.source)),
+            None => when,
+        };
+        let delta = size_delta(entry, self.entries.get(ix + 1));
+        ListItem::new(("zenith-history-row", ix))
+            .spacing(ListItemSpacing::Dense)
+            .height(px(ROW_HEIGHT))
+            .rounded()
+            .toggle_state(selected)
+            .aria_role(Role::ListItem)
+            .aria_label(format!(
+                "{title}, {detail}, {delta}{}",
+                if selected { ", selected" } else { "" }
+            ))
+            .when(selected, |item| item.aria_active_descendant())
+            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                window.focus(&this.focus_handle, cx);
+                this.select(ix, window, cx);
+            }))
+            .child(
+                v_flex()
+                    .w_full()
+                    .min_w_0()
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .gap_2()
+                            .justify_between()
+                            .child(Label::new(title).truncate())
+                            .child(Label::new(delta).color(Color::Muted).size(LabelSize::Small)),
+                    )
+                    .child(
+                        Label::new(detail)
+                            .color(Color::Muted)
+                            .size(LabelSize::Small)
+                            .truncate(),
+                    ),
+            )
+    }
+
+    /// A centred message that still takes focus, so Escape closes the tab.
+    fn placeholder(
+        &self,
+        text: SharedString,
+        hint: Option<&'static str>,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        v_flex()
+            .id("zenith-history-placeholder")
+            .key_context("LocalHistoryList")
+            .track_focus(&self.focus_handle)
+            .on_action(cx.listener(Self::cancel))
+            .size_full()
+            .items_center()
+            .justify_center()
+            .gap_1()
+            .child(Label::new(text).color(Color::Muted))
+            .when_some(hint, |this, hint| {
+                this.child(Label::new(hint).color(Color::Muted).size(LabelSize::Small))
+            })
+            .into_any_element()
+    }
+
+    fn render_split(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = cx.theme().colors();
+        let list = uniform_list(
+            "zenith-history-rows",
+            self.entries.len(),
+            cx.processor(|this, range: Range<usize>, _, cx| {
+                range
+                    .map(|ix| this.render_row(ix, cx).into_any_element())
+                    .collect::<Vec<_>>()
+            }),
+        )
+        .track_scroll(&self.scroll_handle)
+        .flex_1();
+        let selected = self.entries.get(self.selected);
+        h_flex()
+            .size_full()
+            .child(
+                v_flex()
+                    .id("zenith-history-list")
+                    .role(Role::List)
+                    .aria_label(format!("Revisions of {}", self.name))
+                    .key_context("LocalHistoryList")
+                    .track_focus(&self.focus_handle)
+                    .on_action(cx.listener(Self::select_next))
+                    .on_action(cx.listener(Self::select_previous))
+                    .on_action(cx.listener(Self::select_first))
+                    .on_action(cx.listener(Self::select_last))
+                    .on_action(cx.listener(Self::confirm))
+                    .on_action(cx.listener(Self::cancel))
+                    .w(px(LIST_WIDTH))
+                    .h_full()
+                    .flex_none()
+                    .border_r_1()
+                    .border_color(colors.border)
+                    .p_1()
+                    .child(list),
+            )
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .when_some(selected, |pane, entry| {
+                        pane.child(
+                            h_flex()
+                                .flex_none()
+                                .px_2()
+                                .py_1()
+                                .border_b_1()
+                                .border_color(colors.border_variant)
+                                .child(
+                                    Label::new(format!(
+                                        "{} · {} compared with the current file",
+                                        row_title(entry),
+                                        format_time(entry.revision.ts)
+                                    ))
+                                    .color(Color::Muted)
+                                    .size(LabelSize::Small),
+                                ),
+                        )
+                    })
+                    .child(match &self.diff {
+                        Some(pane) => div()
+                            .flex_1()
+                            .min_h_0()
+                            .child(pane.view.clone())
+                            .into_any_element(),
+                        None => message(
+                            self.note
+                                .clone()
+                                .unwrap_or_else(|| "Loading revision…".into()),
+                        ),
+                    }),
+            )
+    }
+}
+
+fn message(text: impl Into<SharedString>) -> gpui::AnyElement {
+    v_flex()
+        .size_full()
+        .items_center()
+        .justify_center()
+        .gap_1()
+        .child(Label::new(text).color(Color::Muted))
+        .into_any_element()
+}
+
+fn source_name(source: &str) -> String {
+    match source {
+        "open" => "Opened".to_string(),
+        "save" => "Saved".to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn row_title(entry: &Entry) -> String {
+    entry
+        .revision
+        .label
+        .clone()
+        .unwrap_or_else(|| source_name(&entry.revision.source))
+}
+
+/// Size change against the next older revision; the oldest shows its size.
+fn size_delta(entry: &Entry, older: Option<&Entry>) -> String {
+    let Some(older) = older else {
+        return format_file_size(entry.size, false);
+    };
+    match entry.size.cmp(&older.size) {
+        std::cmp::Ordering::Greater => {
+            format!("+{}", format_file_size(entry.size - older.size, false))
+        }
+        std::cmp::Ordering::Less => {
+            format!("-{}", format_file_size(older.size - entry.size, false))
+        }
+        std::cmp::Ordering::Equal => "no size change".to_string(),
+    }
+}
+
+fn format_time(ts: i64) -> String {
+    let Ok(timestamp) = OffsetDateTime::from_unix_timestamp(ts) else {
+        return String::new();
+    };
+    time_format::format_localized_timestamp(
+        timestamp,
+        OffsetDateTime::now_utc(),
+        UtcOffset::current_local_offset().unwrap_or(UtcOffset::UTC),
+        TimestampFormat::EnhancedAbsolute,
+    )
+}
+
+impl EventEmitter<()> for LocalHistoryView {}
+
+impl Focusable for LocalHistoryView {
+    fn focus_handle(&self, _: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+impl Item for LocalHistoryView {
+    type Event = ();
+
+    fn tab_content_text(&self, _detail: usize, _: &App) -> SharedString {
+        format!("History: {}", self.name).into()
+    }
+
+    fn tab_icon(&self, _: &Window, _: &App) -> Option<Icon> {
+        Some(Icon::new(IconName::ZenithHistory).color(Color::Muted))
+    }
+
+    fn tab_tooltip_text(&self, _: &App) -> Option<SharedString> {
+        Some(format!("Local history of {}", self.project_path.path.as_unix_str()).into())
+    }
+
+    fn active_project_path(&self, _: &App) -> Option<ProjectPath> {
+        Some(self.project_path.clone())
+    }
+
+    // Edits and Revert Hunk in the right pane change the project buffer, so
+    // saving, the dirty dot, conflicts and the close prompt follow that buffer.
+    fn is_dirty(&self, cx: &App) -> bool {
+        self.current
+            .as_ref()
+            .is_some_and(|buffer| buffer.read(cx).is_dirty())
+    }
+
+    fn has_conflict(&self, cx: &App) -> bool {
+        self.current
+            .as_ref()
+            .is_some_and(|buffer| buffer.read(cx).has_conflict())
+    }
+
+    fn can_save(&self, cx: &App) -> bool {
+        self.diff
+            .as_ref()
+            .is_some_and(|pane| pane.view.read(cx).can_save(cx))
+    }
+
+    fn save(
+        &mut self,
+        options: SaveOptions,
+        project: Entity<Project>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        match &self.diff {
+            Some(pane) => pane
+                .view
+                .update(cx, |view, cx| view.save(options, project, window, cx)),
+            None => Task::ready(Ok(())),
+        }
+    }
+
+    fn for_each_project_item(
+        &self,
+        cx: &App,
+        f: &mut dyn FnMut(gpui::EntityId, &dyn project::ProjectItem),
+    ) {
+        if let Some(pane) = &self.diff {
+            pane.view.read(cx).for_each_project_item(cx, f);
+        }
+    }
+
+    /// Lets the diff's own toolbar (unified / split) show for this tab.
+    fn act_as_type<'a>(
+        &'a self,
+        type_id: std::any::TypeId,
+        self_handle: &'a Entity<Self>,
+        cx: &'a App,
+    ) -> Option<gpui::AnyEntity> {
+        if type_id == std::any::TypeId::of::<Self>() {
+            return Some(self_handle.clone().into());
+        }
+        let pane = self.diff.as_ref()?;
+        pane.view.read(cx).act_as_type(type_id, &pane.view, cx)
+    }
+}
+
+impl Render for LocalHistoryView {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let body = match &self.state {
+            State::Loading => self.placeholder("Loading history…".into(), None, cx),
+            State::Failed(reason) => self.placeholder(reason.clone(), None, cx),
+            State::Ready if self.entries.is_empty() => self.placeholder(
+                format!("No local history for {} yet.", self.name).into(),
+                Some("A revision is recorded when a file is opened and each time it is saved."),
+                cx,
+            ),
+            State::Ready => self.render_split(cx).into_any_element(),
+        };
+        v_flex()
+            .key_context("LocalHistoryView")
+            .size_full()
+            .bg(cx.theme().colors().editor_background)
+            .child(body)
+    }
+}
+
+#[cfg(test)]
+#[path = "history_view_tests.rs"]
+mod tests;
