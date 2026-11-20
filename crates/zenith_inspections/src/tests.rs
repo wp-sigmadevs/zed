@@ -118,10 +118,17 @@ fn test_arguments_follow_the_project_config() {
 
     fs::write(root.path().join("phpcs.xml.dist"), "").unwrap();
     fs::write(root.path().join("phpstan.neon"), "").unwrap();
-    assert!(
-        !phpcs(ProjectKind::WordPress)
-            .iter()
-            .any(|arg| arg.starts_with("--standard"))
+    // The root's ruleset is named, so PHPCS does not search for one.
+    let standards: Vec<_> = phpcs(ProjectKind::WordPress)
+        .into_iter()
+        .filter(|arg| arg.starts_with("--standard"))
+        .collect();
+    assert_eq!(
+        standards,
+        [format!(
+            "--standard={}",
+            root.path().join("phpcs.xml.dist").display()
+        )]
     );
     assert!(
         Analyzer::Phpstan
@@ -591,6 +598,42 @@ async fn test_run_fix_rewrites_the_file_through_the_project_phpcbf(cx: &mut Test
     );
 }
 
+#[gpui::test]
+async fn test_run_fix_names_the_root_ruleset_and_never_a_parent_one(cx: &mut TestAppContext) {
+    let top = tempfile::tempdir().unwrap();
+    let root = top.path().join("project");
+    let bin = root.join("vendor/bin");
+    fs::create_dir_all(&bin).unwrap();
+    fs::write(top.path().join("phpcs.xml"), "<ruleset/>").unwrap();
+    let phpcbf = bin.join("phpcbf");
+    fs::write(
+        &phpcbf,
+        "#!/bin/sh\nfor last; do :; done\necho \"$@\" > \"$last.args\"\nexit 0\n",
+    )
+    .unwrap();
+    fs::set_permissions(&phpcbf, fs::Permissions::from_mode(0o755)).unwrap();
+    let file = root.join("a.php");
+    fs::write(&file, "<?php\n").unwrap();
+    cx.executor().allow_parking();
+    let fix = |cx: &mut TestAppContext| {
+        let (root, file) = (root.clone(), file.clone());
+        cx.background_spawn(
+            async move { run_fix(&root, &file, Path::new("/no/php"), None, &[]).await },
+        )
+    };
+    fix(cx).await.unwrap().unwrap();
+    let args = fs::read_to_string(root.join("a.php.args")).unwrap();
+    assert!(args.contains("--standard=PSR12"), "{args}");
+    assert!(!args.contains("phpcs.xml"), "{args}");
+    fs::write(root.join("phpcs.xml"), "<ruleset/>").unwrap();
+    fix(cx).await.unwrap().unwrap();
+    let args = fs::read_to_string(root.join("a.php.args")).unwrap();
+    assert!(
+        args.contains(&format!("--standard={}", root.join("phpcs.xml").display())),
+        "{args}"
+    );
+}
+
 #[test]
 fn test_char_column_counts_utf16() {
     // PHPCS counts the emoji as one column; the editor's UTF-16 column counts two.
@@ -617,7 +660,7 @@ fn test_phpstan_top_level_errors() {
 }
 
 #[test]
-fn test_phpcs_ruleset_in_a_parent_folder() {
+fn test_phpcs_ruleset_in_a_parent_folder_is_not_used() {
     let top = tempfile::tempdir().unwrap();
     fs::write(
         top.path().join("phpcs.xml"),
@@ -626,8 +669,24 @@ fn test_phpcs_ruleset_in_a_parent_folder() {
     .unwrap();
     let project = top.path().join("wp-content/plugins/demo");
     fs::create_dir_all(&project).unwrap();
-    assert_eq!(phpcs_standard(&project, ProjectKind::WordPress), None);
-    assert_eq!(ruleset_tab_width(&project), 2);
+    assert_eq!(find_phpcs_ruleset(&project), None);
+    // The default standard is named, which also stops PHPCS climbing to the parent.
+    assert_eq!(
+        phpcs_standard(&project, ProjectKind::WordPress),
+        OsString::from("--standard=WordPress")
+    );
+    assert_eq!(ruleset_tab_width(&project), PHPCS_TAB_WIDTH);
+    // The root's own ruleset is used.
+    fs::write(
+        project.join(".phpcs.xml"),
+        r#"<ruleset><arg name="tab-width" value="3"/></ruleset>"#,
+    )
+    .unwrap();
+    assert_eq!(
+        find_phpcs_ruleset(&project),
+        Some(project.join(".phpcs.xml"))
+    );
+    assert_eq!(ruleset_tab_width(&project), 3);
 }
 
 #[test]

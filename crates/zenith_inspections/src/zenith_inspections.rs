@@ -83,7 +83,7 @@ impl Analyzer {
         let mut args: Vec<OsString> = match self {
             Analyzer::Phpcs => {
                 let mut args = vec!["-q".into(), "--report=json".into(), "--no-colors".into()];
-                args.extend(phpcs_standard(root, kind));
+                args.push(phpcs_standard(root, kind));
                 args
             }
             // Without the project's config PHPStan reports every WordPress or
@@ -105,16 +105,19 @@ impl Analyzer {
     }
 }
 
-/// The standard for projects without a ruleset of their own.
-fn phpcs_standard(root: &Path, kind: ProjectKind) -> Option<OsString> {
-    if find_phpcs_ruleset(root).is_some() {
-        return None;
+/// Always given, so PHPCS never goes looking for a ruleset itself (it climbs
+/// from the working folder into its parents, outside the trusted root): the
+/// root's own ruleset, else the standard for the project's kind.
+fn phpcs_standard(root: &Path, kind: ProjectKind) -> OsString {
+    let mut arg = OsString::from("--standard=");
+    match find_phpcs_ruleset(root) {
+        Some(ruleset) => arg.push(ruleset),
+        None => arg.push(match kind {
+            ProjectKind::WordPress => "WordPress",
+            ProjectKind::Laravel | ProjectKind::Php => "PSR12",
+        }),
     }
-    let standard = match kind {
-        ProjectKind::WordPress => "WordPress",
-        ProjectKind::Laravel | ProjectKind::Php => "PSR12",
-    };
-    Some(format!("--standard={standard}").into())
+    arg
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -148,7 +151,7 @@ pub async fn run_fix(
     let tool = zenith_php_tools::resolve(root, Tool::Phpcbf, managed_bin, path_dirs)?;
     let (program, mut args) = launch(php, &tool.path);
     args.extend(["-q".into(), "--no-colors".into()]);
-    args.extend(phpcs_standard(root, kind));
+    args.push(phpcs_standard(root, kind));
     args.push(file.into());
     let output = util::command::new_command(&program)
         .args(args)
@@ -172,14 +175,13 @@ fn has_any(root: &Path, names: &[&str]) -> bool {
     names.iter().any(|name| root.join(name).is_file())
 }
 
-/// PHPCS looks for a ruleset in the working folder and then its parents.
+/// The ruleset in the worktree root, in PHPCS's own order. Parents are not
+/// searched: a ruleset can load PHP code, and a parent is not the trusted root.
 fn find_phpcs_ruleset(root: &Path) -> Option<PathBuf> {
-    root.ancestors().find_map(|folder| {
-        PHPCS_CONFIGS
-            .iter()
-            .map(|name| folder.join(name))
-            .find(|path| path.is_file())
-    })
+    PHPCS_CONFIGS
+        .iter()
+        .map(|name| root.join(name))
+        .find(|path| path.is_file())
 }
 
 /// PHP prints deprecation notices and PHPStan its config note to stdout ahead of
