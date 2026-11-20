@@ -22944,6 +22944,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "zenith_nextjs"
+version = "0.1.0"
+dependencies = [
+ "collections",
+ "gpui",
+ "pretty_assertions",
+ "schemars 1.0.4",
+ "serde",
+ "serde_json",
+ "settings",
+ "util",
+]
+
+[[package]]
 name = "zenith_welcome"
 version = "0.1.0"
 dependencies = [
