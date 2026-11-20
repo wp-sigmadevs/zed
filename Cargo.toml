@@ -253,6 +253,7 @@ members = [
     "crates/zed_env_vars",
     "crates/zenith",
     "crates/zenith_external_libraries",
+    "crates/zenith_http",
     "crates/zenith_laravel",
     "crates/zenith_nextjs",
     "crates/zenith_postfix",
@@ -535,6 +536,7 @@ zed_credentials_provider = { path = "crates/zed_credentials_provider" }
 zed_env_vars = { path = "crates/zed_env_vars" }
 zenith = { path = "crates/zenith" }
 zenith_external_libraries = { path = "crates/zenith_external_libraries" }
+zenith_http = { path = "crates/zenith_http" }
 zenith_laravel = { path = "crates/zenith_laravel" }
 zenith_nextjs = { path = "crates/zenith_nextjs" }
 zenith_postfix = { path = "crates/zenith_postfix" }

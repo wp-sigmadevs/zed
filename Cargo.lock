@@ -22930,6 +22930,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "zenith_http"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "collections",
+ "futures 0.3.34",
+ "gpui",
+ "http 1.3.1",
+ "http_client",
+ "icons",
+ "log",
+ "pretty_assertions",
+ "schemars 1.0.4",
+ "serde",
+ "serde_json",
+ "settings",
+ "tempfile",
+ "ui",
+ "util",
+ "workspace",
+]
+
+[[package]]
 name = "zenith_laravel"
 version = "0.1.0"
 dependencies = [
