@@ -22958,6 +22958,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "zenith_wordpress"
+version = "0.1.0"
+dependencies = [
+ "collections",
+ "gpui",
+ "pretty_assertions",
+ "schemars 1.0.4",
+ "serde",
+ "serde_json",
+ "settings",
+ "util",
+]
+
+[[package]]
 name = "zeno"
 version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
