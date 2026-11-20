@@ -166,7 +166,7 @@ mod tests {
             ("git_panel", "left"),
             ("agent", "right"),
             ("debugger", "bottom"),
-            ("terminal", "bottom"),
+            ("terminal", "right"),
         ] {
             assert_eq!(defaults[panel]["dock"], side, "{panel}");
         }
