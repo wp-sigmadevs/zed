@@ -1,0 +1,24 @@
+[package]
+name = "zenith_local_history"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/zenith_local_history.rs"
+doctest = false
+
+[dependencies]
+anyhow.workspace = true
+paths.workspace = true
+sha2.workspace = true
+sqlez.workspace = true
+zed_env_vars.workspace = true
+zstd.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
