@@ -106,7 +106,7 @@ impl Panel for LaravelPanel {
     }
 
     fn activation_priority(&self) -> u32 {
-        7
+        ACTIVATION_PRIORITY
     }
 }
 
@@ -324,6 +324,11 @@ impl Render for LaravelPanel {
     }
 }
 
+/// Dock panels need unique priorities (a debug build panics on a clash). Taken: 0 agent,
+/// 1 project, 2 terminal, 3 git, 5 collab, 6 outline, 7 debugger, 8 todo, 9 problems,
+/// 10 scratches, 11 WordPress hooks, 12 Laravel, 13 Next.js, 99 search, 200 workspace tests.
+const ACTIVATION_PRIORITY: u32 = 12;
+
 /// Reads the shared index; a lock poisoned by a panicked indexer still yields the last index
 /// instead of panicking the render.
 pub(crate) fn read_index<T>(index: &RwLock<T>) -> RwLockReadGuard<'_, T> {
@@ -362,5 +367,13 @@ mod tests {
         .unwrap_err();
         assert!(index.is_poisoned());
         assert_eq!(*read_index(&index), 7);
+    }
+
+    #[test]
+    fn test_activation_priority_is_not_taken_by_another_panel() {
+        const TAKEN_BY_OTHERS: [u32; 11] = [0, 1, 2, 3, 5, 6, 7, 8, 9, 10, 99];
+        assert!(!TAKEN_BY_OTHERS.contains(&ACTIVATION_PRIORITY));
+        assert_ne!(ACTIVATION_PRIORITY, 200);
+        assert_eq!(ACTIVATION_PRIORITY, 12);
     }
 }
