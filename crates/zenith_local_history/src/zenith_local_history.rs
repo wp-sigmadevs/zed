@@ -1,5 +1,6 @@
 mod capture;
 mod history_view;
+mod recover;
 pub mod store;
 #[cfg(test)]
 mod tests;
@@ -46,10 +47,12 @@ impl Settings for LocalHistorySettings {
     }
 }
 
-/// Records a revision of every local file when it is opened and saved, and
-/// prunes old revisions at start and every 24 hours.
+/// Records a revision of every local file when it is opened, saved or changed
+/// on disk by something else, and prunes old revisions at start and every 24
+/// hours. Also registers Show History and Recover Deleted Files.
 pub fn init(cx: &mut App) {
     history_view::init(cx);
+    recover::init(cx);
     capture::start(cx, |create| {
         if create {
             Store::open().map(Some)

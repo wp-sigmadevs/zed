@@ -15,13 +15,16 @@ doctest = false
 [dependencies]
 anyhow.workspace = true
 buffer_diff.workspace = true
+fs.workspace = true
 futures.workspace = true
+fuzzy_nucleo.workspace = true
 git_ui_core.workspace = true
 gpui.workspace = true
 language.workspace = true
 log.workspace = true
 menu.workspace = true
 paths.workspace = true
+picker.workspace = true
 project.workspace = true
 project_panel.workspace = true
 rope.workspace = true

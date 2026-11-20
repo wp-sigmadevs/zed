@@ -8,12 +8,12 @@ use settings::{
 };
 use std::path::{Path, PathBuf};
 
-fn history_dir() -> tempfile::TempDir {
+pub(crate) fn history_dir() -> tempfile::TempDir {
     tempfile::tempdir().expect("temp dir")
 }
 
 /// Starts recording into a database under `dir`; call before creating the project.
-fn start(cx: &mut TestAppContext, dir: &Path) {
+pub(crate) fn start(cx: &mut TestAppContext, dir: &Path) {
     let dir = dir.to_path_buf();
     cx.update(|cx| {
         let settings = SettingsStore::test(cx);
@@ -28,7 +28,10 @@ fn start(cx: &mut TestAppContext, dir: &Path) {
     });
 }
 
-fn configure(cx: &mut TestAppContext, update: impl FnOnce(&mut ZenithLocalHistorySettingsContent)) {
+pub(crate) fn configure(
+    cx: &mut TestAppContext,
+    update: impl FnOnce(&mut ZenithLocalHistorySettingsContent),
+) {
     cx.update(|cx| {
         cx.update_global::<SettingsStore, _>(|store, cx| {
             store.update_user_settings(cx, |content| {
@@ -44,11 +47,16 @@ fn configure(cx: &mut TestAppContext, update: impl FnOnce(&mut ZenithLocalHistor
 }
 
 /// Revisions of `/dir/<rel_path>`, newest first, read through a second connection.
-fn revisions(cx: &mut TestAppContext, dir: &Path, rel_path: &str) -> Vec<Revision> {
+pub(crate) fn revisions(cx: &mut TestAppContext, dir: &Path, rel_path: &str) -> Vec<Revision> {
     revisions_in(cx, dir, "/dir", rel_path)
 }
 
-fn revisions_in(cx: &mut TestAppContext, dir: &Path, root: &str, rel_path: &str) -> Vec<Revision> {
+pub(crate) fn revisions_in(
+    cx: &mut TestAppContext,
+    dir: &Path,
+    root: &str,
+    rel_path: &str,
+) -> Vec<Revision> {
     cx.run_until_parked();
     Store::open_in(dir)
         .and_then(|store| store.revisions(root, rel_path))
@@ -62,14 +70,14 @@ async fn single_file_project(name: &str, cx: &mut TestAppContext) -> gpui::Entit
     Project::test(fs, [Path::new("/dir").join(name).as_path()], cx).await
 }
 
-fn sources(revisions: &[Revision]) -> Vec<&str> {
+pub(crate) fn sources(revisions: &[Revision]) -> Vec<&str> {
     revisions
         .iter()
         .map(|revision| revision.source.as_str())
         .collect()
 }
 
-async fn open_edit_save(
+pub(crate) async fn open_edit_save(
     project: &gpui::Entity<Project>,
     path: &str,
     text: &str,
@@ -86,7 +94,10 @@ async fn open_edit_save(
         .expect("save buffer");
 }
 
-async fn project_with(files: serde_json::Value, cx: &mut TestAppContext) -> gpui::Entity<Project> {
+pub(crate) async fn project_with(
+    files: serde_json::Value,
+    cx: &mut TestAppContext,
+) -> gpui::Entity<Project> {
     let fs = FakeFs::new(cx.executor());
     fs.insert_tree("/dir", files).await;
     Project::test(fs, [Path::new("/dir")], cx).await
@@ -443,4 +454,189 @@ async fn test_max_file_size_is_capped_at_what_can_be_read_back(cx: &mut TestAppC
         cx.update(|cx| LocalHistorySettings::get_global(cx).max_file_size_kb),
         crate::store::MAX_CONTENT_BYTES / 1024
     );
+}
+
+// External changes: something other than the editor rewrites a file on disk.
+
+async fn write_on_disk(
+    project: &gpui::Entity<Project>,
+    path: &str,
+    text: &str,
+    cx: &mut TestAppContext,
+) {
+    let fs = project.read_with(cx, |project, _| project.fs().clone());
+    fs.write(Path::new(path), text.as_bytes())
+        .await
+        .expect("write file");
+    settle(cx);
+}
+
+/// Lets queued work finish, including the wait for a file with unsaved edits.
+fn settle(cx: &mut TestAppContext) {
+    cx.run_until_parked();
+    cx.executor()
+        .advance_clock(std::time::Duration::from_secs(3));
+    cx.run_until_parked();
+}
+
+/// Opens a file, which records its "open" baseline, then closes it again.
+async fn open_and_close(project: &gpui::Entity<Project>, path: &str, cx: &mut TestAppContext) {
+    let buffer = project
+        .update(cx, |project, cx| project.open_local_buffer(path, cx))
+        .await
+        .expect("open buffer");
+    cx.run_until_parked();
+    drop(buffer);
+    cx.run_until_parked();
+}
+
+#[gpui::test]
+async fn test_external_change_to_a_clean_open_buffer_is_a_revision(cx: &mut TestAppContext) {
+    let dir = history_dir();
+    start(cx, dir.path());
+    let project = project_with(json!({ "a.txt": "base" }), cx).await;
+    let buffer = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer("/dir/a.txt", cx)
+        })
+        .await
+        .expect("open buffer");
+    write_on_disk(&project, "/dir/a.txt", "from git", cx).await;
+    assert_eq!(
+        buffer.read_with(cx, |buffer, _| buffer.text()),
+        "from git",
+        "the buffer reloaded"
+    );
+    assert_eq!(
+        sources(&revisions(cx, dir.path(), "a.txt")),
+        ["external", "open"]
+    );
+}
+
+#[gpui::test]
+async fn test_external_change_to_a_closed_file_with_history_is_a_revision(cx: &mut TestAppContext) {
+    let dir = history_dir();
+    start(cx, dir.path());
+    let project = project_with(json!({ "a.txt": "base" }), cx).await;
+    open_and_close(&project, "/dir/a.txt", cx).await;
+    write_on_disk(&project, "/dir/a.txt", "from a formatter", cx).await;
+    let revisions = revisions(cx, dir.path(), "a.txt");
+    assert_eq!(sources(&revisions), ["external", "open"]);
+    let store = Store::open_in(dir.path()).expect("store");
+    let text = store.content(&revisions[0].blob_hash).expect("content");
+    assert_eq!(text.as_deref(), Some(b"from a formatter".as_slice()));
+}
+
+#[gpui::test]
+async fn test_external_change_under_unsaved_edits_records_the_disk_text(cx: &mut TestAppContext) {
+    let dir = history_dir();
+    start(cx, dir.path());
+    let project = project_with(json!({ "a.txt": "base" }), cx).await;
+    let buffer = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer("/dir/a.txt", cx)
+        })
+        .await
+        .expect("open buffer");
+    buffer.update(cx, |buffer, cx| buffer.edit([(0..0, "typed ")], None, cx));
+    write_on_disk(&project, "/dir/a.txt", "from git", cx).await;
+    let revisions = revisions(cx, dir.path(), "a.txt");
+    assert_eq!(sources(&revisions), ["external", "open"]);
+    let store = Store::open_in(dir.path()).expect("store");
+    let text = store.content(&revisions[0].blob_hash).expect("content");
+    assert_eq!(text.as_deref(), Some(b"from git".as_slice()));
+}
+
+#[gpui::test]
+async fn test_external_change_to_a_file_without_history_is_not_recorded(cx: &mut TestAppContext) {
+    let dir = history_dir();
+    start(cx, dir.path());
+    let project = project_with(json!({ "a.txt": "base", "seen.txt": "x" }), cx).await;
+    // One tracked file makes sure the database exists.
+    open_and_close(&project, "/dir/seen.txt", cx).await;
+    write_on_disk(&project, "/dir/a.txt", "changed", cx).await;
+    assert!(revisions(cx, dir.path(), "a.txt").is_empty());
+}
+
+#[gpui::test]
+async fn test_external_rewrite_with_the_same_text_is_not_a_revision(cx: &mut TestAppContext) {
+    let dir = history_dir();
+    start(cx, dir.path());
+    let project = project_with(json!({ "a.txt": "one\ntwo" }), cx).await;
+    open_and_close(&project, "/dir/a.txt", cx).await;
+    // A touch, then CRLF line endings and a BOM: none changes the text.
+    for same in ["one\ntwo", "one\r\ntwo", "\u{feff}one\ntwo"] {
+        write_on_disk(&project, "/dir/a.txt", same, cx).await;
+    }
+    assert_eq!(sources(&revisions(cx, dir.path(), "a.txt")), ["open"]);
+}
+
+#[gpui::test]
+async fn test_saving_in_the_editor_is_not_an_external_change(cx: &mut TestAppContext) {
+    let dir = history_dir();
+    start(cx, dir.path());
+    let project = project_with(json!({ "a.txt": "one\r\ntwo" }), cx).await;
+    open_edit_save(&project, "/dir/a.txt", "x", cx).await;
+    settle(cx);
+    assert_eq!(
+        sources(&revisions(cx, dir.path(), "a.txt")),
+        ["save", "open"]
+    );
+}
+
+#[gpui::test]
+async fn test_external_change_goes_through_the_same_gate(cx: &mut TestAppContext) {
+    let dir = history_dir();
+    start(cx, dir.path());
+    let project = project_with(
+        json!({ "off.txt": "a", "big.txt": "a", "private.txt": "a", "ignored.txt": "a" }),
+        cx,
+    )
+    .await;
+    for name in ["off", "big", "private", "ignored"] {
+        open_and_close(&project, &format!("/dir/{name}.txt"), cx).await;
+    }
+    // Each file is tracked; now each is something the gate refuses.
+    cx.update(|cx| {
+        cx.update_global::<SettingsStore, _>(|store, cx| {
+            store.update_user_settings(cx, |content| {
+                content.project.worktree.private_files =
+                    Some(vec!["**/private.txt".to_string()].into());
+            });
+        });
+    });
+    write_on_disk(&project, "/dir/.gitignore", "ignored.txt\n", cx).await;
+    configure(cx, |history| history.max_file_size_kb = Some(1));
+    write_on_disk(&project, "/dir/big.txt", &"x".repeat(2048), cx).await;
+    write_on_disk(&project, "/dir/private.txt", "b", cx).await;
+    write_on_disk(&project, "/dir/ignored.txt", "b", cx).await;
+    configure(cx, |history| history.enabled = Some(false));
+    write_on_disk(&project, "/dir/off.txt", "b", cx).await;
+    for name in ["off", "big", "private", "ignored"] {
+        let found = revisions(cx, dir.path(), &format!("{name}.txt"));
+        assert_eq!(sources(&found), ["open"], "{name}");
+    }
+}
+
+#[gpui::test]
+async fn test_binary_external_change_is_not_recorded(cx: &mut TestAppContext) {
+    let dir = history_dir();
+    start(cx, dir.path());
+    let project = project_with(json!({ "a.txt": "base" }), cx).await;
+    open_and_close(&project, "/dir/a.txt", cx).await;
+    write_on_disk(&project, "/dir/a.txt", "a\0b", cx).await;
+    assert_eq!(sources(&revisions(cx, dir.path(), "a.txt")), ["open"]);
+}
+
+#[gpui::test]
+async fn test_initial_scan_is_not_an_external_change(cx: &mut TestAppContext) {
+    // A file whose history is older than the text now on disk: the first scan
+    // reports it as `Loaded`, which is not a change made while the editor ran.
+    let dir = history_dir();
+    seed(dir.path(), "a.txt", unix_now());
+    start(cx, dir.path());
+    let project = project_with(json!({ "a.txt": "different now" }), cx).await;
+    settle(cx);
+    drop(project);
+    assert_eq!(sources(&revisions(cx, dir.path(), "a.txt")), ["save"]);
 }

@@ -9,26 +9,36 @@
 
 use crate::{LocalHistorySettings, Revision, Store};
 use anyhow::Result;
+use fs::Fs;
 use futures::{
     StreamExt as _,
     channel::{mpsc, oneshot},
 };
 use gpui::{App, AppContext as _, Context, Global, Task};
 use language::{Buffer, BufferEvent};
-use project::{Project, buffer_store::BufferStoreEvent};
+use project::{Project, ProjectPath, buffer_store::BufferStoreEvent};
 use rope::Rope;
 use settings::{Settings, SettingsLocation};
 use std::{
     collections::HashMap,
-    path::Path,
+    path::{Path, PathBuf},
+    sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use util::{ResultExt as _, rel_path::RelPath};
-use worktree::WorktreeSettings;
+use worktree::{PathChange, WorktreeSettings};
 
 const PRUNE_EVERY: Duration = Duration::from_secs(24 * 60 * 60);
 const BYTES_PER_KB: u64 = 1024;
 const BYTES_PER_MB: u64 = 1024 * 1024;
+/// Files looked at per worktree update: a checkout that rewrites thousands of
+/// files must not stall the main thread. The rest of such a burst is skipped.
+const MAX_EXTERNAL_PER_UPDATE: usize = 512;
+/// How long a changed file with unsaved edits waits before it counts as an
+/// external change.
+const DIRTY_SETTLE: Duration = Duration::from_secs(2);
+/// Most files "Recover Deleted Files" reads from the database.
+pub(crate) const MAX_DELETED_LISTED: i64 = 5000;
 
 enum Job {
     Record {
@@ -36,6 +46,17 @@ enum Job {
         rel_path: String,
         rope: Rope,
         source: &'static str,
+        ts: i64,
+    },
+    /// A file changed on disk behind the editor's back (checkout, formatter,
+    /// another tool) and no clean buffer shows it. Only files that already
+    /// have history are recorded, which bounds the cost of a large checkout.
+    External {
+        worktree_root: String,
+        rel_path: String,
+        abs_path: PathBuf,
+        fs: Arc<dyn Fs>,
+        max_bytes: u64,
         ts: i64,
     },
     Prune {
@@ -53,6 +74,11 @@ enum Job {
     Content {
         hash: String,
         reply: oneshot::Sender<Result<Option<Vec<u8>>>>,
+    },
+    /// The newest revision of each file of one worktree.
+    Latest {
+        worktree_root: String,
+        reply: oneshot::Sender<Result<Vec<Revision>>>,
     },
 }
 
@@ -98,12 +124,20 @@ pub(crate) fn start(cx: &mut App, open: impl Fn(bool) -> Result<Option<Store>> +
         cx.subscribe(&buffer_store, |_, _, event, cx| {
             if let BufferStoreEvent::BufferAdded(buffer) = event {
                 capture(buffer, "open", cx);
-                cx.subscribe(buffer, |_, buffer, event, cx| {
-                    if matches!(event, BufferEvent::Saved) {
-                        capture(&buffer, "save", cx);
-                    }
+                cx.subscribe(buffer, |_, buffer, event, cx| match event {
+                    BufferEvent::Saved => capture(&buffer, "save", cx),
+                    // The buffer took a change made on disk by something else.
+                    BufferEvent::Reloaded => capture(&buffer, "external", cx),
+                    _ => {}
                 })
                 .detach();
+            }
+        })
+        .detach();
+        let this = cx.entity();
+        cx.subscribe(&this, |project, _, event, cx| {
+            if let project::Event::WorktreeUpdatedEntries(worktree_id, changes) = event {
+                capture_external(project, *worktree_id, changes, cx);
             }
         })
         .detach();
@@ -115,15 +149,15 @@ async fn own_store(
     mut receiver: mpsc::UnboundedReceiver<Job>,
     open: impl Fn(bool) -> Result<Option<Store>>,
 ) {
-    let mut store = None;
+    let mut opened = None;
     let mut create_failed = false;
     while let Some(job) = receiver.next().await {
         let create = matches!(job, Job::Record { .. });
-        if store.is_none() && !(create && create_failed) {
-            store = open(create).log_err().flatten();
-            create_failed = create && store.is_none();
+        if opened.is_none() && !(create && create_failed) {
+            opened = open(create).log_err().flatten();
+            create_failed = create && opened.is_none();
         }
-        let Some(store) = &store else { continue };
+        let Some(store) = &opened else { continue };
         match job {
             Job::Record {
                 worktree_root,
@@ -138,6 +172,31 @@ async fn own_store(
                 }
                 store
                     .record(&worktree_root, &rel_path, &bytes, None, source, ts)
+                    .log_err();
+            }
+            Job::External {
+                worktree_root,
+                rel_path,
+                abs_path,
+                fs,
+                max_bytes,
+                ts,
+            } => {
+                if !store
+                    .has_history(&worktree_root, &rel_path)
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
+                // ponytail: the read blocks this queue; fine for files under the size
+                // cap, give reads their own task if a slow disk makes history lists lag.
+                let Some(bytes) = read_text(fs.as_ref(), &abs_path, max_bytes).await else {
+                    continue;
+                };
+                // Not the borrow from before the await: `Store` is not `Sync`.
+                let Some(store) = &opened else { continue };
+                store
+                    .record(&worktree_root, &rel_path, &bytes, None, "external", ts)
                     .log_err();
             }
             Job::Prune {
@@ -159,8 +218,33 @@ async fn own_store(
             Job::Content { hash, reply } => {
                 reply.send(store.content(&hash)).ok();
             }
+            Job::Latest {
+                worktree_root,
+                reply,
+            } => {
+                reply
+                    .send(store.latest_per_path(&worktree_root, MAX_DELETED_LISTED))
+                    .ok();
+            }
         }
     }
+}
+
+/// The text of a file as a buffer would hold it: UTF-8 without BOM, `\n` line
+/// endings, so a rewrite that only changes line endings or a BOM is no new
+/// revision. `None` for a file that is too large, binary or not UTF-8.
+async fn read_text(fs: &dyn Fs, path: &Path, max_bytes: u64) -> Option<Vec<u8>> {
+    let metadata = fs.metadata(path).await.ok().flatten()?;
+    if metadata.is_dir || metadata.is_fifo || metadata.len > max_bytes {
+        return None;
+    }
+    let bytes = fs.load_bytes(path).await.ok()?;
+    if bytes.len() as u64 > max_bytes || bytes.contains(&0) {
+        return None;
+    }
+    let text = String::from_utf8(bytes).ok()?;
+    let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
+    Some(text.replace("\r\n", "\n").into_bytes())
 }
 
 /// Revisions newest first, each with its content size.
@@ -217,6 +301,24 @@ pub(crate) fn content(cx: &App, hash: String) -> Task<Result<Option<Vec<u8>>>> {
             return Ok(None);
         }
         receiver.await.unwrap_or(Ok(None))
+    })
+}
+
+/// The newest revision of every file ever recorded under `worktree_root`.
+pub(crate) fn latest(cx: &App, worktree_root: String) -> Task<Result<Vec<Revision>>> {
+    let (reply, receiver) = oneshot::channel();
+    let sent = send(
+        cx,
+        Job::Latest {
+            worktree_root,
+            reply,
+        },
+    );
+    cx.background_spawn(async move {
+        if !sent {
+            return Ok(Vec::new());
+        }
+        receiver.await.unwrap_or_else(|_| Ok(Vec::new()))
     })
 }
 
@@ -301,6 +403,110 @@ pub(crate) fn is_viewable(file: &worktree::File, cx: &App) -> bool {
         && !entry.is_some_and(|entry| {
             entry.is_ignored || entry.is_external || entry.canonical_path.is_some()
         })
+}
+
+/// Files changed on disk: queue the ones no clean open buffer already covers
+/// (its reload records them), through the same gate as every other capture.
+///
+/// A file whose buffer has unsaved edits waits [`DIRTY_SETTLE`] first: the editor's
+/// own save reaches the worktree before it marks the buffer clean, and that must
+/// stay a "save", not an "external" change. If the buffer is still dirty then,
+/// the disk text is a real conflict and is recorded before a later save overwrites it.
+fn capture_external(
+    project: &Project,
+    worktree_id: worktree::WorktreeId,
+    changes: &[(Arc<RelPath>, project::ProjectEntryId, PathChange)],
+    cx: &mut Context<Project>,
+) {
+    if !cx.has_global::<LocalHistory>() || !project.is_local() {
+        return;
+    }
+    let Some(worktree) = project.worktree_for_id(worktree_id, cx) else {
+        return;
+    };
+    let abs_root = worktree.read(cx).abs_path();
+    let Some(worktree_root) = root_key(&abs_root) else {
+        return;
+    };
+    let max_bytes = LocalHistorySettings::get_global(cx)
+        .max_file_size_kb
+        .saturating_mul(BYTES_PER_KB);
+    let mut now_jobs = Vec::new();
+    let mut later_jobs = Vec::new();
+    for (path, _, change) in changes.iter().take(MAX_EXTERNAL_PER_UPDATE) {
+        // Never `Loaded`: that is the initial scan, not a change.
+        if !matches!(
+            change,
+            PathChange::Added | PathChange::Updated | PathChange::AddedOrUpdated
+        ) {
+            continue;
+        }
+        let Some(entry) = worktree.read(cx).entry_for_path(path) else {
+            continue;
+        };
+        if !entry.is_file() || path.is_empty() {
+            continue;
+        }
+        let project_path = ProjectPath {
+            worktree_id,
+            path: path.clone(),
+        };
+        let buffer = project.buffer_store().read(cx).get_by_path(&project_path);
+        if buffer
+            .as_ref()
+            .is_some_and(|buffer| !buffer.read(cx).is_dirty())
+        {
+            continue;
+        }
+        let file = worktree::File::for_entry(entry.clone(), worktree.clone());
+        let Ok(len) = usize::try_from(entry.size) else {
+            continue;
+        };
+        if !should_record(&file, len, cx) {
+            continue;
+        }
+        let job = Job::External {
+            worktree_root: worktree_root.clone(),
+            rel_path: path.as_unix_str().to_owned(),
+            abs_path: abs_root.join(path.as_std_path()),
+            fs: project.fs().clone(),
+            max_bytes,
+            ts: now(),
+        };
+        if buffer.is_some() {
+            later_jobs.push((job, project_path));
+        } else {
+            now_jobs.push(job);
+        }
+    }
+    send_all(cx, now_jobs);
+    if later_jobs.is_empty() {
+        return;
+    }
+    cx.spawn(async move |project, cx| {
+        cx.background_executor().timer(DIRTY_SETTLE).await;
+        project
+            .update(cx, |project, cx| {
+                let still_dirty = later_jobs.into_iter().filter(|(_, path)| {
+                    project
+                        .buffer_store()
+                        .read(cx)
+                        .get_by_path(path)
+                        .is_none_or(|buffer| buffer.read(cx).is_dirty())
+                });
+                send_all(cx, still_dirty.map(|(job, _)| job));
+            })
+            .ok();
+    })
+    .detach();
+}
+
+fn send_all(cx: &App, jobs: impl IntoIterator<Item = Job>) {
+    if let Some(history) = cx.try_global::<LocalHistory>() {
+        for job in jobs {
+            history.jobs.unbounded_send(job).log_err();
+        }
+    }
 }
 
 pub(crate) fn capture(buffer: &gpui::Entity<Buffer>, source: &'static str, cx: &mut App) {

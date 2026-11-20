@@ -752,6 +752,7 @@ fn source_name(source: &str) -> String {
         "open" => "Opened".to_string(),
         "save" => "Saved".to_string(),
         "before-revert" => "Before revert".to_string(),
+        "external" => "External change".to_string(),
         other => other.to_string(),
     }
 }
@@ -780,7 +781,7 @@ fn size_delta(entry: &Entry, older: Option<&Entry>) -> String {
     }
 }
 
-fn format_time(ts: i64) -> String {
+pub(crate) fn format_time(ts: i64) -> String {
     let Ok(timestamp) = OffsetDateTime::from_unix_timestamp(ts) else {
         return String::new();
     };

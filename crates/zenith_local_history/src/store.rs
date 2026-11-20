@@ -26,6 +26,20 @@ pub struct Revision {
     pub source: String,
 }
 
+type Row = (i64, String, String, String, i64, Option<String>, String);
+
+fn revision_from_row((id, worktree_root, rel_path, blob_hash, ts, label, source): Row) -> Revision {
+    Revision {
+        id,
+        worktree_root,
+        rel_path,
+        blob_hash,
+        ts,
+        label,
+        source,
+    }
+}
+
 struct LocalHistoryDomain;
 
 impl Domain for LocalHistoryDomain {
@@ -81,7 +95,7 @@ pub(crate) fn utf8_path(path: &Path) -> Result<&str> {
 /// Files whose contents are likely secrets are never stored. The name comes
 /// from the absolute path: a single-file worktree (`/dir/.env`) has an empty
 /// relative path.
-fn is_secret_file(abs_path: &Path) -> bool {
+pub(crate) fn is_secret_file(abs_path: &Path) -> bool {
     let Some(name) = abs_path.file_name().and_then(|name| name.to_str()) else {
         return false;
     };
@@ -208,33 +222,31 @@ impl Store {
 
     /// Revisions of one file, newest first.
     pub fn revisions(&self, worktree_root: &str, rel_path: &str) -> Result<Vec<Revision>> {
-        let rows = self.connection.select_bound::<(&str, &str), (
-            i64,
-            String,
-            String,
-            String,
-            i64,
-            Option<String>,
-            String,
-        )>(
+        let rows = self.connection.select_bound::<(&str, &str), Row>(
             "SELECT id, worktree_root, rel_path, blob_hash, ts, label, source
              FROM revisions WHERE worktree_root = ? AND rel_path = ?
              ORDER BY id DESC",
         )?((worktree_root, rel_path))?;
-        Ok(rows
-            .into_iter()
-            .map(
-                |(id, worktree_root, rel_path, blob_hash, ts, label, source)| Revision {
-                    id,
-                    worktree_root,
-                    rel_path,
-                    blob_hash,
-                    ts,
-                    label,
-                    source,
-                },
-            )
-            .collect())
+        Ok(rows.into_iter().map(revision_from_row).collect())
+    }
+
+    /// Whether any revision of the file exists.
+    pub(crate) fn has_history(&self, worktree_root: &str, rel_path: &str) -> Result<bool> {
+        Ok(self.connection.select_row_bound::<(&str, &str), i64>(
+            "SELECT 1 FROM revisions WHERE worktree_root = ? AND rel_path = ? LIMIT 1",
+        )?((worktree_root, rel_path))?
+        .is_some())
+    }
+
+    /// The newest revision of each file of a worktree, at most `limit` files.
+    pub(crate) fn latest_per_path(&self, worktree_root: &str, limit: i64) -> Result<Vec<Revision>> {
+        let rows = self.connection.select_bound::<(&str, &str, i64), Row>(
+            "SELECT id, worktree_root, rel_path, blob_hash, ts, label, source
+             FROM revisions WHERE id IN (
+                 SELECT MAX(id) FROM revisions WHERE worktree_root = ? GROUP BY rel_path
+             ) AND worktree_root = ? ORDER BY id DESC LIMIT ?",
+        )?((worktree_root, worktree_root, limit))?;
+        Ok(rows.into_iter().map(revision_from_row).collect())
     }
 
     /// Decompressed content of a blob, `None` if the hash is unknown.
