@@ -1012,3 +1012,17 @@ pub mod zenith_inspections {
         ]
     );
 }
+
+pub mod zenith_local_history {
+    use gpui::actions;
+
+    actions!(
+        zenith_local_history,
+        [
+            /// Shows the local history of the current file.
+            ShowFileHistory,
+            /// Lists deleted files that have local history and restores them.
+            RecoverDeletedFiles,
+        ]
+    );
+}
