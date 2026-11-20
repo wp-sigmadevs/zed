@@ -1,9 +1,9 @@
 pub mod wp_hooks_panel;
 pub use wp_hooks_panel::{ToggleWpHooksPanel, WpHooksPanel};
 
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum HookKind {
@@ -132,7 +132,11 @@ pub const CORE_HOOKS: &[CoreHookSpec] = &[
         parameters: &[
             ("post_ID", "int", "Post ID."),
             ("post", "WP_Post", "Post object."),
-            ("update", "bool", "Whether this is an existing post being updated."),
+            (
+                "update",
+                "bool",
+                "Whether this is an existing post being updated.",
+            ),
         ],
     },
     CoreHookSpec {
@@ -201,7 +205,11 @@ pub const CORE_HOOKS: &[CoreHookSpec] = &[
         description: "Filters the list of CSS body class names for the current post or page.",
         parameters: &[
             ("classes", "string[]", "An array of body class names."),
-            ("class", "string[]", "An array of additional class names added to the body."),
+            (
+                "class",
+                "string[]",
+                "An array of additional class names added to the body.",
+            ),
         ],
     },
     CoreHookSpec {
@@ -211,7 +219,11 @@ pub const CORE_HOOKS: &[CoreHookSpec] = &[
         description: "Filters the action links displayed for each plugin in the Plugins list table.",
         parameters: &[
             ("actions", "string[]", "An array of plugin action links."),
-            ("plugin_file", "string", "Path to the plugin file relative to the plugins directory."),
+            (
+                "plugin_file",
+                "string",
+                "Path to the plugin file relative to the plugins directory.",
+            ),
             ("plugin_data", "array", "An array of plugin data."),
             ("context", "string", "The plugin context."),
         ],
@@ -222,7 +234,11 @@ pub const CORE_HOOKS: &[CoreHookSpec] = &[
         since: "2.0.0",
         description: "Filters the list of allowed mime types and file extensions.",
         parameters: &[
-            ("t", "array", "Mime types keyed by the file extension regex."),
+            (
+                "t",
+                "array",
+                "Mime types keyed by the file extension regex.",
+            ),
             ("user", "int|WP_User", "User ID or object."),
         ],
     },
@@ -240,8 +256,13 @@ impl WordPressIndex {
         Self::default()
     }
 
+    /// Indexes one PHP file, replacing what it had before. Files over
+    /// [`MAX_INDEXED_FILE_BYTES`] (generated or minified code) are left out of the index.
     pub fn index_source(&mut self, file_path: PathBuf, content: &str) {
         self.remove_file(&file_path);
+        if content.len() > MAX_INDEXED_FILE_BYTES {
+            return;
+        }
         let (definitions, listeners) = scan_php_source(&file_path, content);
         for def in definitions {
             self.definitions_by_name
@@ -396,20 +417,33 @@ impl WordPressIndex {
     }
 }
 
-pub fn scan_php_source(file_path: &Path, content: &str) -> (Vec<HookDefinition>, Vec<HookListener>) {
+/// Largest PHP file the index reads.
+pub const MAX_INDEXED_FILE_BYTES: usize = 2 * 1024 * 1024;
+/// Most lines one docblock may span; longer comments are cut there.
+const MAX_DOCBLOCK_LINES: usize = 500;
+/// Most characters kept of one docblock's description.
+const MAX_DOCBLOCK_DESCRIPTION: usize = 8 * 1024;
+
+pub fn scan_php_source(
+    file_path: &Path,
+    content: &str,
+) -> (Vec<HookDefinition>, Vec<HookListener>) {
     let mut definitions = Vec::new();
     let mut listeners = Vec::new();
 
     let lines: Vec<&str> = content.lines().collect();
     let mut current_docblock: Option<(String, Option<String>, Vec<HookParameter>)> = None;
 
-    for (line_index, line) in lines.iter().enumerate() {
+    // Each line is visited once: a docblock is consumed whole, then scanning goes on after it.
+    let mut line_index = 0;
+    while let Some(line) = lines.get(line_index) {
         let trimmed = line.trim();
 
         if trimmed.starts_with("/**") || trimmed.starts_with('*') {
-            if current_docblock.is_none() {
-                current_docblock = Some(parse_docblock_stream(&lines, line_index));
-            }
+            let (docblock, end) = parse_docblock_stream(&lines, line_index);
+            current_docblock = Some(docblock);
+            line_index = end + 1;
+            continue;
         } else if !trimmed.is_empty() && !trimmed.starts_with("//") && !trimmed.starts_with('#') {
             scan_line_for_hooks(
                 file_path,
@@ -421,6 +455,7 @@ pub fn scan_php_source(file_path: &Path, content: &str) -> (Vec<HookDefinition>,
             );
             current_docblock = None;
         }
+        line_index += 1;
     }
 
     (definitions, listeners)
@@ -466,7 +501,8 @@ fn scan_line_for_hooks(
                 continue;
             }
 
-            let open_paren_idx = func_start + keyword.len() + (after_func.len() - trimmed_after.len());
+            let open_paren_idx =
+                func_start + keyword.len() + (after_func.len() - trimmed_after.len());
             let inside_call = &line[open_paren_idx + 1..];
 
             if let Some((hook_name, rest_args)) = extract_first_string_literal(inside_call) {
@@ -574,9 +610,9 @@ fn parse_listener_args(rest: &str) -> (CallbackTarget, i32, usize) {
         callback = CallbackTarget::Closure;
         callback_end_pos = after_comma.find(',').unwrap_or(after_comma.len());
     } else {
-        let first_arg_end = after_comma.find(',').unwrap_or_else(|| {
-            after_comma.find(')').unwrap_or(after_comma.len())
-        });
+        let first_arg_end = after_comma
+            .find(',')
+            .unwrap_or_else(|| after_comma.find(')').unwrap_or(after_comma.len()));
         let raw = after_comma[..first_arg_end].trim();
         callback = CallbackTarget::Unknown(raw.to_string());
         callback_end_pos = first_arg_end;
@@ -585,7 +621,9 @@ fn parse_listener_args(rest: &str) -> (CallbackTarget, i32, usize) {
     let remainder = after_comma[callback_end_pos..].trim_start();
     if let Some(stripped) = remainder.strip_prefix(',') {
         let after_prio = stripped.trim_start();
-        let prio_end = after_prio.find(|c: char| c == ',' || c == ')' || c.is_whitespace()).unwrap_or(after_prio.len());
+        let prio_end = after_prio
+            .find(|c: char| c == ',' || c == ')' || c.is_whitespace())
+            .unwrap_or(after_prio.len());
         if let Ok(p) = after_prio[..prio_end].parse::<i32>() {
             priority = p;
         }
@@ -593,7 +631,9 @@ fn parse_listener_args(rest: &str) -> (CallbackTarget, i32, usize) {
         let rem_args = after_prio[prio_end..].trim_start();
         if let Some(stripped_args) = rem_args.strip_prefix(',') {
             let after_args = stripped_args.trim_start();
-            let args_end = after_args.find(|c: char| c == ',' || c == ')' || c.is_whitespace()).unwrap_or(after_args.len());
+            let args_end = after_args
+                .find(|c: char| c == ',' || c == ')' || c.is_whitespace())
+                .unwrap_or(after_args.len());
             if let Ok(a) = after_args[..args_end].parse::<usize>() {
                 accepted_args = a;
             }
@@ -615,7 +655,9 @@ fn parse_array_callback(inside: &str) -> CallbackTarget {
     let method_name = if let Some((name, _)) = extract_first_string_literal(method_part) {
         name
     } else {
-        method_part.trim_matches(|c| c == '\'' || c == '"').to_string()
+        method_part
+            .trim_matches(|c| c == '\'' || c == '"')
+            .to_string()
     };
 
     if class_part == "$this" {
@@ -641,18 +683,32 @@ fn parse_array_callback(inside: &str) -> CallbackTarget {
     }
 }
 
-fn parse_docblock_stream(lines: &[&str], start_index: usize) -> (String, Option<String>, Vec<HookParameter>) {
+/// Reads the docblock starting at `start_index`. It runs while lines keep starting with `*` (or
+/// open with `/**`), ends at the line with `*/` or after [`MAX_DOCBLOCK_LINES`], and never reads
+/// past the first line that is not comment. Returns the docblock and the index of its last line.
+fn parse_docblock_stream(
+    lines: &[&str],
+    start_index: usize,
+) -> ((String, Option<String>, Vec<HookParameter>), usize) {
     let mut desc_lines = Vec::new();
+    let mut desc_len = 0;
     let mut since = None;
     let mut parameters = Vec::new();
 
+    let mut end = start_index;
     let mut i = start_index;
-    while i < lines.len() {
+    while i < lines.len() && i - start_index < MAX_DOCBLOCK_LINES {
         let trimmed = lines[i].trim();
+        if i > start_index && !trimmed.starts_with('*') {
+            // Not part of the comment: this line is code, leave it to the caller.
+            break;
+        }
+        end = i;
+        // The closing `*/` goes first, or a bare ` */` line would leave a stray `/`.
         let cleaned = trimmed
             .trim_start_matches("/**")
-            .trim_start_matches('*')
             .trim_end_matches("*/")
+            .trim_start_matches('*')
             .trim();
 
         if cleaned.starts_with("@since") {
@@ -675,7 +731,11 @@ fn parse_docblock_stream(lines: &[&str], start_index: usize) -> (String, Option<
                     });
                 }
             }
-        } else if !cleaned.is_empty() && !cleaned.starts_with('@') {
+        } else if !cleaned.is_empty()
+            && !cleaned.starts_with('@')
+            && desc_len < MAX_DOCBLOCK_DESCRIPTION
+        {
+            desc_len += cleaned.len();
             desc_lines.push(cleaned);
         }
 
@@ -685,7 +745,7 @@ fn parse_docblock_stream(lines: &[&str], start_index: usize) -> (String, Option<
         i += 1;
     }
 
-    (desc_lines.join(" "), since, parameters)
+    ((desc_lines.join(" "), since, parameters), end)
 }
 
 #[cfg(test)]
@@ -706,7 +766,9 @@ mod tests {
     #[test]
     fn test_core_hooks_hover() {
         let index = WordPressIndex::new();
-        let hover = index.hover("save_post").expect("save_post hover should exist");
+        let hover = index
+            .hover("save_post")
+            .expect("save_post hover should exist");
 
         assert_eq!(hover.name, "save_post");
         assert_eq!(hover.kind, HookKind::Action);
@@ -755,7 +817,10 @@ add_action('wp_footer', function() { echo 'footer'; });
 
         let init_listeners = index.find_listeners("init");
         assert_eq!(init_listeners.len(), 1);
-        assert_eq!(init_listeners[0].callback, CallbackTarget::Function("my_custom_init".to_string()));
+        assert_eq!(
+            init_listeners[0].callback,
+            CallbackTarget::Function("my_custom_init".to_string())
+        );
         assert_eq!(init_listeners[0].priority, 20);
         assert_eq!(init_listeners[0].accepted_args, 2);
 
@@ -798,5 +863,88 @@ add_action('wp_footer', function() { echo 'footer'; });
 
         index.remove_file(&path);
         assert_eq!(index.find_definitions("temp_hook").len(), 0);
+    }
+
+    #[test]
+    fn test_docblock_scan_is_linear_on_unterminated_comment_lines() {
+        // Every `*` line used to rescan the rest of the file looking for `*/`.
+        let source = format!("<?php\n{}", "*\ndo_action('a');\n".repeat(20_000));
+        let started = std::time::Instant::now();
+        let mut index = WordPressIndex::new();
+        index.index_source(PathBuf::from("big.php"), &source);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            index.find_definitions("a").len(),
+            20_000,
+            "every call is still found"
+        );
+    }
+
+    #[test]
+    fn test_docblock_stops_at_code_and_keeps_following_calls() {
+        let source = "<?php\n/**\n * One.\n * @since 1.0\n*/\ndo_action('one');\n/**\n * Two.\ndo_action('two');\n";
+        let (defs, _) = scan_php_source(Path::new("a.php"), source);
+        assert_eq!(defs.len(), 2);
+        assert_eq!(defs[0].docblock.as_deref(), Some("One."));
+        assert_eq!(defs[0].since.as_deref(), Some("1.0"));
+        assert_eq!(
+            defs[1].docblock.as_deref(),
+            Some("Two."),
+            "an unterminated docblock ends at the code line"
+        );
+    }
+
+    #[test]
+    fn test_huge_docblock_is_capped_without_losing_the_call() {
+        let comment = format!(
+            "/**\n{}",
+            " * lots of words here\n".repeat(MAX_DOCBLOCK_LINES * 4)
+        );
+        let source = format!("<?php\n{comment}do_action('late');\n");
+        let (defs, _) = scan_php_source(Path::new("a.php"), &source);
+        assert_eq!(defs.len(), 1);
+        let description = defs[0].docblock.as_deref().unwrap_or("");
+        assert!(
+            description.len() <= MAX_DOCBLOCK_DESCRIPTION + 64,
+            "{}",
+            description.len()
+        );
+    }
+
+    #[test]
+    fn test_oversized_files_are_not_indexed() {
+        let mut index = WordPressIndex::new();
+        let filler = " ".repeat(MAX_INDEXED_FILE_BYTES);
+        index.index_source(
+            PathBuf::from("min.php"),
+            &format!("<?php do_action('big');{filler}"),
+        );
+        assert!(index.find_definitions("big").is_empty());
+        index.index_source(PathBuf::from("ok.php"), "<?php do_action('small');");
+        assert_eq!(index.find_definitions("small").len(), 1);
+        // A file that grew past the cap drops its stale entries.
+        index.index_source(
+            PathBuf::from("ok.php"),
+            &format!("<?php do_action('small');{filler}"),
+        );
+        assert!(index.find_definitions("small").is_empty());
+    }
+
+    #[test]
+    fn test_long_docblock_description_is_capped() {
+        let line = format!(" * {}\n", "x".repeat(200));
+        let source = format!("<?php\n/**\n{}*/\ndo_action('long');\n", line.repeat(100));
+        let (defs, _) = scan_php_source(Path::new("a.php"), &source);
+        let description = defs[0].docblock.as_deref().unwrap_or("");
+        assert!(!description.is_empty());
+        assert!(
+            description.len() <= MAX_DOCBLOCK_DESCRIPTION + 256,
+            "{}",
+            description.len()
+        );
     }
 }
