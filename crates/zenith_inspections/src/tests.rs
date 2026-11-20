@@ -123,13 +123,7 @@ fn test_arguments_follow_the_project_config() {
         .into_iter()
         .filter(|arg| arg.starts_with("--standard"))
         .collect();
-    assert_eq!(
-        standards,
-        [format!(
-            "--standard={}",
-            root.path().join("phpcs.xml.dist").display()
-        )]
-    );
+    assert_eq!(standards, ["--standard=phpcs.xml.dist".to_string()]);
     assert!(
         Analyzer::Phpstan
             .args(root.path(), ProjectKind::Php, &file)
@@ -629,7 +623,8 @@ async fn test_run_fix_names_the_root_ruleset_and_never_a_parent_one(cx: &mut Tes
     fix(cx).await.unwrap().unwrap();
     let args = fs::read_to_string(root.join("a.php.args")).unwrap();
     assert!(
-        args.contains(&format!("--standard={}", root.join("phpcs.xml").display())),
+        args.split_whitespace()
+            .any(|arg| arg == "--standard=phpcs.xml"),
         "{args}"
     );
 }
@@ -676,6 +671,46 @@ async fn test_endless_project_files_are_not_read_whole(cx: &mut TestAppContext) 
         })
         .await;
     assert!(problems.is_some_and(|result| result.is_ok_and(|problems| problems.is_empty())));
+}
+
+#[gpui::test]
+async fn test_ruleset_goes_by_file_name_when_the_root_has_a_comma(cx: &mut TestAppContext) {
+    // PHPCS splits `--standard` at commas, so the root's own path must not be in it.
+    let top = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(top.path()).unwrap().join("acme,inc");
+    fs::create_dir_all(root.join("vendor/bin")).unwrap();
+    fs::write(root.join("phpcs.xml"), "<ruleset/>").unwrap();
+    for tool in ["phpcs", "phpcbf"] {
+        let path = root.join("vendor/bin").join(tool);
+        fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\necho \"$@\" > '{0}/{tool}.args'\npwd > '{0}/{tool}.cwd'\necho '{{\"totals\":{{\"errors\":0,\"warnings\":0,\"fixable\":0}},\"files\":{{}}}}'\nexit 0\n",
+                root.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let file = root.join("a.php");
+    fs::write(&file, "<?php\n").unwrap();
+    cx.executor().allow_parking();
+    let (r, f) = (root.clone(), file.clone());
+    cx.background_spawn(async move {
+        run(Analyzer::Phpcs, &r, &f, Path::new("/no/php"), None, &[]).await;
+        run_fix(&r, &f, Path::new("/no/php"), None, &[]).await;
+    })
+    .await;
+    for tool in ["phpcs", "phpcbf"] {
+        let args = fs::read_to_string(root.join(format!("{tool}.args"))).unwrap();
+        let standards: Vec<_> = args
+            .split_whitespace()
+            .filter(|arg| arg.starts_with("--standard"))
+            .collect();
+        assert_eq!(standards, ["--standard=phpcs.xml"], "{tool}: {args}");
+        let cwd = fs::read_to_string(root.join(format!("{tool}.cwd"))).unwrap();
+        assert_eq!(Path::new(cwd.trim()), root, "{tool}");
+    }
 }
 
 #[test]

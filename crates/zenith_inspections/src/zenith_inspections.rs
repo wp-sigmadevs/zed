@@ -107,11 +107,13 @@ impl Analyzer {
 
 /// Always given, so PHPCS never goes looking for a ruleset itself (it climbs
 /// from the working folder into its parents, outside the trusted root): the
-/// root's own ruleset, else the standard for the project's kind.
+/// root's own ruleset, else the standard for the project's kind. The ruleset goes
+/// by file name, relative to the working folder (the root): PHPCS splits
+/// `--standard` at commas, so a root named `acme,inc` would break an absolute path.
 fn phpcs_standard(root: &Path, kind: ProjectKind) -> OsString {
     let mut arg = OsString::from("--standard=");
     match find_phpcs_ruleset(root) {
-        Some(ruleset) => arg.push(ruleset),
+        Some(ruleset) => arg.push(ruleset.file_name().unwrap_or(ruleset.as_os_str())),
         None => arg.push(match kind {
             ProjectKind::WordPress => "WordPress",
             ProjectKind::Laravel | ProjectKind::Php => "PSR12",
