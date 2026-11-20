@@ -484,6 +484,7 @@ use gpui::{
     actions,
 };
 use project::{Project, WorktreeId};
+use settings::Settings as _;
 use ui::{Button, ButtonCommon as _, ButtonSize, Clickable as _, LabelSize, Tooltip, prelude::*};
 use workspace::{
     HideStatusItem, ItemHandle, StatusItemView, Workspace,
@@ -692,13 +693,52 @@ fn find_composer(path_dirs: &[PathBuf]) -> Option<PathBuf> {
 
 /// Running a project's tools runs its code: only in a worktree the user trusts.
 /// True when the trust feature is off.
+///
+/// Upstream trusts a single-file worktree once any folder is trusted, and an
+/// invisible one always. Tools run in the file's own folder (`vendor/bin`, rulesets,
+/// `phpstan.neon`), so for those two the folder must lie inside a trusted
+/// directory worktree.
 pub fn worktree_trusted(project: &Entity<Project>, worktree_id: WorktreeId, cx: &mut App) -> bool {
     let Some(store) = project::trusted_worktrees::TrustedWorktrees::try_get_global(cx) else {
         return true;
     };
     let worktree_store = project.read(cx).worktree_store();
+    let trust_all = project::project_settings::ProjectSettings::get_global(cx)
+        .session
+        .trust_all_worktrees;
     store.update(cx, |store, cx| {
-        store.can_trust(&worktree_store, worktree_id, cx)
+        if !store.can_trust(&worktree_store, worktree_id, cx) {
+            return false;
+        }
+        let Some(worktree) = worktree_store.read(cx).worktree_for_id(worktree_id, cx) else {
+            return false;
+        };
+        let (visible, single_file, abs_path) = {
+            let worktree = worktree.read(cx);
+            (
+                worktree.is_visible(),
+                worktree.is_single_file(),
+                worktree.abs_path(),
+            )
+        };
+        if trust_all || (visible && !single_file) {
+            return true;
+        }
+        let folder = if single_file {
+            abs_path.parent().unwrap_or(&abs_path)
+        } else {
+            &abs_path
+        };
+        let folders: Vec<_> = worktree_store
+            .read(cx)
+            .visible_worktrees(cx)
+            .filter(|other| !other.read(cx).is_single_file())
+            .map(|other| (other.read(cx).id(), other.read(cx).abs_path()))
+            .filter(|(id, root)| *id != worktree_id && folder.starts_with(root))
+            .collect();
+        folders
+            .into_iter()
+            .any(|(id, _)| store.can_trust(&worktree_store, id, cx))
     })
 }
 

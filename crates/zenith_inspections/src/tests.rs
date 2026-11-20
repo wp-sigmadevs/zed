@@ -1573,3 +1573,202 @@ async fn test_a_single_save_looks_up_the_base_beside_the_tools(cx: &mut TestAppC
     assert_eq!(report.notes, Vec::<String>::new());
     assert_eq!(diagnostic_rows(&buffer, cx), vec![3]);
 }
+
+/// A trusted folder and an unrelated one, each with a `vendor/bin/phpcs` that
+/// leaves a `ran` file in its own folder when it runs.
+struct ToolTrustEnv {
+    project: Entity<Project>,
+    trusted_id: WorktreeId,
+    trusted_file: PathBuf,
+    other_file: PathBuf,
+}
+
+impl ToolTrustEnv {
+    fn ran(file: &Path) -> bool {
+        file.parent()
+            .is_some_and(|folder| folder.join("ran").exists())
+    }
+
+    /// Upstream trust for a worktree, which is what `can_trust` says.
+    fn upstream_trusts(&self, id: WorktreeId, cx: &mut TestAppContext) -> bool {
+        cx.update(|cx| {
+            let store = project::trusted_worktrees::TrustedWorktrees::try_get_global(cx)
+                .expect("trust store");
+            let worktree_store = self.project.read(cx).worktree_store();
+            store.update(cx, |store, cx| store.can_trust(&worktree_store, id, cx))
+        })
+    }
+
+    /// Opens `other/x.php` on its own, as Zed does for a file outside the project.
+    /// The worktree is returned too: the project holds invisible ones weakly.
+    async fn open_other(
+        &self,
+        visible: bool,
+        cx: &mut TestAppContext,
+    ) -> (WorktreeId, Entity<project::Worktree>) {
+        let (worktree, _) = self
+            .project
+            .update(cx, |project, cx| {
+                project.find_or_create_worktree(&self.other_file, visible, cx)
+            })
+            .await
+            .unwrap();
+        cx.run_until_parked();
+        (
+            worktree.read_with(cx, |worktree, _| worktree.id()),
+            worktree,
+        )
+    }
+
+    async fn inspect(&self, id: WorktreeId, file: &Path, cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        cx.update(|cx| inspect_path(&self.project, id, file.to_path_buf(), cx))
+            .await;
+        cx.run_until_parked();
+    }
+}
+
+async fn tool_trust_env(cx: &mut TestAppContext) -> ToolTrustEnv {
+    let base = fs::canonicalize(tempfile::tempdir().unwrap().keep()).unwrap();
+    let stub_php = base.join("php-stub");
+    fs::write(&stub_php, "#!/bin/sh\necho 'PHP 8.3.0 (cli)'\n").unwrap();
+    fs::set_permissions(&stub_php, fs::Permissions::from_mode(0o755)).unwrap();
+    let mut files = Vec::new();
+    for folder in ["trusted", "other"] {
+        let dir = base.join(folder);
+        fs::create_dir_all(dir.join("vendor/bin")).unwrap();
+        let phpcs = dir.join("vendor/bin/phpcs");
+        fs::write(
+            &phpcs,
+            format!(
+                "#!/bin/sh\n: > '{}'\necho '{{\"totals\":{{\"errors\":0,\"warnings\":0,\"fixable\":0}},\"files\":{{}}}}'\n",
+                dir.join("ran").display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&phpcs, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(dir.join("x.php"), "<?php\n").unwrap();
+        files.push(dir.join("x.php"));
+    }
+    let (trusted_file, other_file) = (files.remove(0), files.remove(0));
+
+    use gpui::BorrowAppContext as _;
+    let app_state = cx.update(|cx| {
+        cx.set_global(db::AppDatabase::test_new());
+        let app_state = workspace::AppState::test(cx);
+        theme_settings::init(theme::LoadThemes::JustBase, cx);
+        editor::init(cx);
+        workspace::init(app_state.clone(), cx);
+        init(cx);
+        project::trusted_worktrees::init(Default::default(), cx);
+        cx.update_global::<settings::SettingsStore, _>(|store, cx| {
+            store
+                .set_user_settings(
+                    &serde_json::json!({ "zenith": { "inspections": { "run_on_save": false, "phpstan": false } } })
+                        .to_string(),
+                    cx,
+                )
+                .unwrap();
+        });
+        cx.set_global(ToolEnvironment {
+            php_candidates: vec![stub_php.clone()],
+            path_dirs: Vec::new(),
+        });
+        app_state
+    });
+    let fake = app_state.fs.as_fake();
+    for folder in ["trusted", "other"] {
+        fake.insert_tree(
+            base.join(folder).to_str().unwrap(),
+            serde_json::json!({ "x.php": "<?php\n" }),
+        )
+        .await;
+    }
+    let project = Project::test_with_worktree_trust(
+        app_state.fs.clone(),
+        [base.join("trusted").as_path()],
+        cx,
+    )
+    .await;
+    cx.run_until_parked();
+    let trusted_id = project.read_with(cx, |project, cx| {
+        project.worktrees(cx).next().unwrap().read(cx).id()
+    });
+    cx.update(|cx| {
+        let store =
+            project::trusted_worktrees::TrustedWorktrees::try_get_global(cx).expect("trust store");
+        let worktree_store = project.read(cx).worktree_store();
+        store.update(cx, |store, cx| {
+            store.trust(
+                &worktree_store,
+                [project::trusted_worktrees::PathTrust::Worktree(trusted_id)]
+                    .into_iter()
+                    .collect(),
+                cx,
+            )
+        });
+    });
+    ToolTrustEnv {
+        project,
+        trusted_id,
+        trusted_file,
+        other_file,
+    }
+}
+
+#[gpui::test]
+async fn test_a_file_in_a_trusted_folder_gets_its_project_tool(cx: &mut TestAppContext) {
+    // Positive control: the tool runs here, so "not run" below means refused.
+    let env = tool_trust_env(cx).await;
+    env.inspect(env.trusted_id, &env.trusted_file, cx).await;
+    assert!(ToolTrustEnv::ran(&env.trusted_file));
+}
+
+#[gpui::test]
+async fn test_a_single_file_outside_a_trusted_folder_never_runs_its_folders_tools(
+    cx: &mut TestAppContext,
+) {
+    let env = tool_trust_env(cx).await;
+    let (id, _worktree) = env.open_other(true, cx).await;
+    // The premise: upstream trusts the file because the other folder is trusted.
+    assert!(env.upstream_trusts(id, cx));
+    env.inspect(id, &env.other_file, cx).await;
+    assert!(!ToolTrustEnv::ran(&env.other_file));
+    // Git is held back the same way.
+    let base = cx
+        .update(|cx| new_since_branch::base_branch(&env.project, id, cx))
+        .await;
+    assert_eq!(base, Err("The project is not trusted.".to_string()));
+}
+
+#[gpui::test]
+async fn test_an_invisible_worktree_never_runs_its_folders_tools(cx: &mut TestAppContext) {
+    let env = tool_trust_env(cx).await;
+    let (id, _worktree) = env.open_other(false, cx).await;
+    assert!(env.upstream_trusts(id, cx));
+    env.inspect(id, &env.other_file, cx).await;
+    assert!(!ToolTrustEnv::ran(&env.other_file));
+}
+
+#[gpui::test]
+async fn test_a_single_file_inside_a_trusted_folder_gets_its_folders_tool(cx: &mut TestAppContext) {
+    let env = tool_trust_env(cx).await;
+    // The file's own worktree (`create_worktree` does not reuse the folder's).
+    let worktree = env
+        .project
+        .update(cx, |project, cx| {
+            project.worktree_store().update(cx, |store, cx| {
+                store.create_worktree(&env.trusted_file, true, cx)
+            })
+        })
+        .await
+        .unwrap();
+    cx.run_until_parked();
+    let id = worktree.read_with(cx, |worktree, _| {
+        assert!(worktree.is_single_file());
+        worktree.id()
+    });
+    assert_ne!(id, env.trusted_id);
+    env.inspect(id, &env.trusted_file, cx).await;
+    assert!(ToolTrustEnv::ran(&env.trusted_file));
+}
