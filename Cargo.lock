@@ -22907,6 +22907,7 @@ dependencies = [
  "onboarding",
  "zenith_folds",
  "zenith_inspections",
+ "zenith_local_history",
  "zenith_look",
  "zenith_markdown",
  "zenith_php_tools",
@@ -22961,6 +22962,19 @@ dependencies = [
  "workspace",
  "zed_actions",
  "zenith_php_tools",
+]
+
+[[package]]
+name = "zenith_local_history"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "paths",
+ "sha2",
+ "sqlez",
+ "tempfile",
+ "zed_env_vars",
+ "zstd",
 ]
 
 [[package]]

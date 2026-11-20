@@ -257,6 +257,7 @@ members = [
     "crates/zenith_markdown",
     "crates/zenith_php_tools",
     "crates/zenith_problems",
+    "crates/zenith_local_history",
     "crates/zenith_look",
     "crates/zenith_splash",
     "crates/zenith_rails",
@@ -546,6 +547,7 @@ zenith_inspections = { path = "crates/zenith_inspections" }
 zenith_markdown = { path = "crates/zenith_markdown" }
 zenith_php_tools = { path = "crates/zenith_php_tools" }
 zenith_problems = { path = "crates/zenith_problems" }
+zenith_local_history = { path = "crates/zenith_local_history" }
 zenith_look = { path = "crates/zenith_look" }
 zenith_splash = { path = "crates/zenith_splash" }
 zenith_rails = { path = "crates/zenith_rails" }
