@@ -1319,8 +1319,13 @@ fn test_keep_new_filters_by_line() {
     );
 }
 
-/// Files the fake PHPCS was asked about, after dispatching `action`.
-async fn files_inspected_after(cx: &mut TestAppContext, on: bool, wait_for: usize) -> Vec<String> {
+/// Files the fake PHPCS was asked about after dispatching `InspectChangedFiles`,
+/// and how many base lookups that took.
+async fn files_inspected_after(
+    cx: &mut TestAppContext,
+    on: bool,
+    wait_for: usize,
+) -> (Vec<String>, usize) {
     let env = branch_env(cx, true, true).await;
     switch(&env, on, cx);
     let (_workspace, cx) = cx.add_window_view(|window, cx| {
@@ -1350,7 +1355,11 @@ async fn files_inspected_after(cx: &mut TestAppContext, on: bool, wait_for: usiz
         cx.run_until_parked();
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    read()
+    let lookups = cx.update(|_, cx| {
+        cx.try_global::<new_since_branch::BaseLookups>()
+            .map_or(0, |lookups| lookups.0)
+    });
+    (read(), lookups)
 }
 
 #[gpui::test]
@@ -1359,12 +1368,18 @@ async fn test_changed_files_with_new_since_branch_include_the_branch_files(
 ) {
     // `a.php` is in git status and in the branch list: inspected once. `b.php`
     // is committed on the branch only.
-    assert_eq!(files_inspected_after(cx, true, 2).await, ["a.php", "b.php"]);
+    assert_eq!(
+        files_inspected_after(cx, true, 2).await.0,
+        ["a.php", "b.php"]
+    );
 }
 
 #[gpui::test]
 async fn test_changed_files_without_new_since_branch_use_git_status_only(cx: &mut TestAppContext) {
-    assert_eq!(files_inspected_after(cx, false, 1).await, ["a.php"]);
+    assert_eq!(
+        files_inspected_after(cx, false, 1).await,
+        (vec!["a.php".to_string()], 0)
+    );
 }
 
 #[gpui::test]
@@ -1487,7 +1502,74 @@ async fn test_inspect_path_uses_the_base_it_is_given(cx: &mut TestAppContext) {
         })
         .await;
     cx.run_until_parked();
-    assert_eq!(report.notes, ["New since branch: Given. Showing all findings."]);
+    assert_eq!(
+        report.notes,
+        ["New since branch: Given. Showing all findings."]
+    );
     assert_eq!(diagnostic_rows(&buffer, cx), vec![1, 3]);
     assert!(!env.git_marker.exists());
+}
+
+#[gpui::test]
+async fn test_a_batch_looks_up_the_base_once_per_folder(cx: &mut TestAppContext) {
+    // Two files (`a.php`, `b.php`) in one folder: one lookup, shared by the file
+    // list and both runs.
+    let (files, lookups) = files_inspected_after(cx, true, 2).await;
+    assert_eq!(files, ["a.php", "b.php"]);
+    assert_eq!(lookups, 1);
+}
+
+#[gpui::test]
+async fn test_a_single_save_looks_up_the_base_beside_the_tools(cx: &mut TestAppContext) {
+    use futures::FutureExt as _;
+    let env = branch_env(cx, true, true).await;
+    switch(&env, true, cx);
+    let buffer = env
+        .project
+        .update(cx, |project, cx| {
+            project.open_local_buffer(env.root.join("a.php"), cx)
+        })
+        .await
+        .unwrap();
+    cx.executor().allow_parking();
+    // A lookup that only finishes once PHPCS has been started: it is awaited after
+    // the tools, not before them (before them it would time out, ~3 s).
+    let log = env.phpcs_log.clone();
+    let base = cx
+        .background_spawn(async move {
+            // The test scheduler runs background tasks on one thread: yield, never
+            // sleep, so the tools can start.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            while std::time::Instant::now() < deadline {
+                if log.exists() {
+                    return Ok("main".to_string());
+                }
+                let mut yielded = false;
+                std::future::poll_fn(|task| {
+                    if yielded {
+                        return std::task::Poll::Ready(());
+                    }
+                    yielded = true;
+                    task.waker().wake_by_ref();
+                    std::task::Poll::Pending
+                })
+                .await;
+            }
+            Err("The tools never started.".to_string())
+        })
+        .shared();
+    let report = cx
+        .update(|cx| {
+            inspect_path_with(
+                &env.project,
+                env.worktree_id,
+                env.root.join("a.php"),
+                Some(base),
+                cx,
+            )
+        })
+        .await;
+    cx.run_until_parked();
+    assert_eq!(report.notes, Vec::<String>::new());
+    assert_eq!(diagnostic_rows(&buffer, cx), vec![3]);
 }

@@ -19,6 +19,14 @@ use workspace::Workspace;
 /// A base lookup that every file of a batch awaits.
 pub(crate) type SharedBase = futures::future::Shared<Task<Result<String, String>>>;
 
+/// Test-only: how many base lookups this app has run.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct BaseLookups(pub(crate) usize);
+
+#[cfg(test)]
+impl gpui::Global for BaseLookups {}
+
 const NAMESPACE: &str = "zenith_inspections";
 
 /// The switch per project folder, and the files it has cut findings from. The
@@ -100,6 +108,10 @@ pub(crate) fn base_branch(
     // therefore no git (see the module doc of `since_branch`).
     if !zenith_php_tools::worktree_trusted(project, worktree_id, cx) {
         return Task::ready(Err("The project is not trusted.".into()));
+    }
+    #[cfg(test)]
+    {
+        cx.default_global::<BaseLookups>().0 += 1;
     }
     let folder = ProjectPath {
         worktree_id,
