@@ -1,3 +1,6 @@
+pub mod laravel_panel;
+pub use laravel_panel::{LaravelPanel, LaravelPanelTab, ToggleLaravelPanel};
+
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
