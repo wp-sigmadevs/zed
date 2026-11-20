@@ -1,0 +1,25 @@
+[package]
+name = "zenith_laravel"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/zenith_laravel.rs"
+doctest = false
+
+[dependencies]
+collections.workspace = true
+gpui.workspace = true
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+settings.workspace = true
+util.workspace = true
+
+[dev-dependencies]
+pretty_assertions.workspace = true

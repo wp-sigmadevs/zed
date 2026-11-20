@@ -253,6 +253,7 @@ members = [
     "crates/zed_env_vars",
     "crates/zenith",
     "crates/zenith_external_libraries",
+    "crates/zenith_laravel",
     "crates/zenith_welcome",
     "crates/zenith_wordpress",
     "crates/zeta_prompt",
@@ -531,6 +532,7 @@ zed_credentials_provider = { path = "crates/zed_credentials_provider" }
 zed_env_vars = { path = "crates/zed_env_vars" }
 zenith = { path = "crates/zenith" }
 zenith_external_libraries = { path = "crates/zenith_external_libraries" }
+zenith_laravel = { path = "crates/zenith_laravel" }
 zenith_welcome = { path = "crates/zenith_welcome" }
 zenith_wordpress = { path = "crates/zenith_wordpress" }
 zeta_prompt = { path = "crates/zeta_prompt" }
