@@ -1,3 +1,6 @@
+pub mod wp_hooks_panel;
+pub use wp_hooks_panel::{ToggleWpHooksPanel, WpHooksPanel};
+
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
