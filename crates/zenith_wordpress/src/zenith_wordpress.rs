@@ -423,6 +423,32 @@ pub const MAX_INDEXED_FILE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_DOCBLOCK_LINES: usize = 500;
 /// Most characters kept of one docblock's description.
 const MAX_DOCBLOCK_DESCRIPTION: usize = 8 * 1024;
+/// Most bytes read from one docblock line (a longer one is cut, not skipped).
+const MAX_DOCBLOCK_LINE_BYTES: usize = 1024;
+/// Most `@param` entries kept per docblock.
+const MAX_DOCBLOCK_PARAMS: usize = 64;
+/// Most bytes of one code line searched for hooks; the rest of a longer line (minified code) is
+/// not read. ponytail: a hook past this offset on a huge line is missed; split the scan by
+/// statement if minified plugins need support.
+const MAX_SCANNED_LINE_BYTES: usize = 4 * 1024;
+/// Most hook calls taken from one line.
+const MAX_HOOKS_PER_LINE: usize = 64;
+/// Most definitions plus listeners taken from one file.
+const MAX_HOOKS_PER_FILE: usize = 10_000;
+/// Most bytes searched for the end of a callback array.
+const MAX_CALLBACK_ARRAY_BYTES: usize = 512;
+
+/// `text` cut to at most `max` bytes at a character boundary.
+fn prefix(text: &str, max: usize) -> &str {
+    if text.len() <= max {
+        return text;
+    }
+    let mut end = max;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
 
 pub fn scan_php_source(
     file_path: &Path,
@@ -437,6 +463,9 @@ pub fn scan_php_source(
     // Each line is visited once: a docblock is consumed whole, then scanning goes on after it.
     let mut line_index = 0;
     while let Some(line) = lines.get(line_index) {
+        if definitions.len() + listeners.len() >= MAX_HOOKS_PER_FILE {
+            break;
+        }
         let trimmed = line.trim();
 
         if trimmed.starts_with("/**") || trimmed.starts_with('*') {
@@ -447,9 +476,9 @@ pub fn scan_php_source(
         } else if !trimmed.is_empty() && !trimmed.starts_with("//") && !trimmed.starts_with('#') {
             scan_line_for_hooks(
                 file_path,
-                line,
+                prefix(line, MAX_SCANNED_LINE_BYTES),
                 line_index + 1,
-                &current_docblock,
+                &mut current_docblock,
                 &mut definitions,
                 &mut listeners,
             );
@@ -465,10 +494,11 @@ fn scan_line_for_hooks(
     file_path: &Path,
     line: &str,
     line_number: usize,
-    docblock: &Option<(String, Option<String>, Vec<HookParameter>)>,
+    docblock: &mut Option<(String, Option<String>, Vec<HookParameter>)>,
     definitions: &mut Vec<HookDefinition>,
     listeners: &mut Vec<HookListener>,
 ) {
+    let mut hooks_on_line = 0;
     let patterns = [
         ("do_action", HookKind::Action, true),
         ("do_action_ref_array", HookKind::Action, true),
@@ -481,6 +511,9 @@ fn scan_line_for_hooks(
     for &(keyword, kind, is_definition) in &patterns {
         let mut search_start = 0;
         while let Some(relative_pos) = line[search_start..].find(keyword) {
+            if hooks_on_line >= MAX_HOOKS_PER_LINE {
+                return;
+            }
             let func_start = search_start + relative_pos;
             search_start = func_start + keyword.len();
 
@@ -507,11 +540,13 @@ fn scan_line_for_hooks(
 
             if let Some((hook_name, rest_args)) = extract_first_string_literal(inside_call) {
                 let column = open_paren_idx + 1;
+                hooks_on_line += 1;
                 if is_definition {
-                    let (desc, since, params) = if let Some((d, s, p)) = docblock {
-                        (Some(d.clone()), s.clone(), p.clone())
-                    } else {
-                        (None, None, Vec::new())
+                    // The docblock documents the first call after it; handing it over (not
+                    // cloning it) keeps a line of many calls from multiplying it.
+                    let (desc, since, params) = match docblock.take() {
+                        Some((d, s, p)) => (Some(d), s, p),
+                        None => (None, None, Vec::new()),
                     };
 
                     definitions.push(HookDefinition {
@@ -591,10 +626,16 @@ fn parse_listener_args(rest: &str) -> (CallbackTarget, i32, usize) {
             callback = CallbackTarget::Unknown(String::new());
             callback_end_pos = 0;
         }
-    } else if after_comma.starts_with('[') || after_comma.to_lowercase().starts_with("array(") {
+    } else if after_comma.starts_with('[')
+        || after_comma
+            .get(..6)
+            .is_some_and(|head| head.eq_ignore_ascii_case("array("))
+    {
         let is_bracket = after_comma.starts_with('[');
         let closing = if is_bracket { ']' } else { ')' };
-        if let Some(close_idx) = after_comma.find(closing) {
+        // A callback array is short; do not search the rest of a long line for its end.
+        let window = prefix(after_comma, MAX_CALLBACK_ARRAY_BYTES);
+        if let Some(close_idx) = window.find(closing) {
             let inside_array = if is_bracket {
                 &after_comma[1..close_idx]
             } else {
@@ -705,7 +746,7 @@ fn parse_docblock_stream(
         }
         end = i;
         // The closing `*/` goes first, or a bare ` */` line would leave a stray `/`.
-        let cleaned = trimmed
+        let cleaned = prefix(trimmed, MAX_DOCBLOCK_LINE_BYTES)
             .trim_start_matches("/**")
             .trim_end_matches("*/")
             .trim_start_matches('*')
@@ -716,7 +757,7 @@ fn parse_docblock_stream(
         } else if cleaned.starts_with("@param") {
             if let Some(param_spec) = cleaned.strip_prefix("@param") {
                 let parts: Vec<&str> = param_spec.trim().split_whitespace().collect();
-                if parts.len() >= 2 {
+                if parts.len() >= 2 && parameters.len() < MAX_DOCBLOCK_PARAMS {
                     let type_hint = parts[0].to_string();
                     let name = parts[1].trim_start_matches('$').to_string();
                     let description = if parts.len() > 2 {
@@ -735,8 +776,10 @@ fn parse_docblock_stream(
             && !cleaned.starts_with('@')
             && desc_len < MAX_DOCBLOCK_DESCRIPTION
         {
-            desc_len += cleaned.len();
-            desc_lines.push(cleaned);
+            // Only what still fits: one huge line must not be kept whole.
+            let piece = prefix(cleaned, MAX_DOCBLOCK_DESCRIPTION - desc_len);
+            desc_len += piece.len();
+            desc_lines.push(piece);
         }
 
         if trimmed.contains("*/") {
@@ -879,8 +922,8 @@ add_action('wp_footer', function() { echo 'footer'; });
         );
         assert_eq!(
             index.find_definitions("a").len(),
-            20_000,
-            "every call is still found"
+            MAX_HOOKS_PER_FILE,
+            "scanning reaches the per-file cap, not just the first lines"
         );
     }
 
@@ -943,6 +986,94 @@ add_action('wp_footer', function() { echo 'footer'; });
         assert!(!description.is_empty());
         assert!(
             description.len() <= MAX_DOCBLOCK_DESCRIPTION + 256,
+            "{}",
+            description.len()
+        );
+    }
+
+    /// Bytes of docblock text an index keeps alive.
+    fn retained_docblock_bytes(defs: &[HookDefinition]) -> usize {
+        defs.iter()
+            .map(|def| {
+                def.docblock.as_deref().map_or(0, str::len)
+                    + def
+                        .parameters
+                        .iter()
+                        .map(|p| p.name.len() + p.description.as_deref().map_or(0, str::len))
+                        .sum::<usize>()
+            })
+            .sum()
+    }
+
+    #[test]
+    fn test_huge_docblock_line_is_not_multiplied_across_many_calls() {
+        // A 1 MB docblock line, then one line with 80,000 calls: the old code kept the line
+        // whole and cloned it into every definition.
+        let source = format!(
+            "<?php\n/**\n * {}\n * @param int $x {}\n */\n{}\n",
+            "w".repeat(1_000_000),
+            "d".repeat(1_000_000),
+            "do_action('a');".repeat(80_000)
+        );
+        let (defs, _) = scan_php_source(Path::new("a.php"), &source);
+        assert!(defs.len() <= MAX_HOOKS_PER_LINE, "{}", defs.len());
+        assert!(
+            retained_docblock_bytes(&defs)
+                <= MAX_DOCBLOCK_DESCRIPTION + 4 * MAX_DOCBLOCK_LINE_BYTES,
+            "{}",
+            retained_docblock_bytes(&defs)
+        );
+        assert!(defs[0].docblock.is_some(), "the first call keeps the docs");
+    }
+
+    #[test]
+    fn test_definitions_are_capped_per_file() {
+        let source = "<?php\n".to_string() + &"do_action('a');\n".repeat(MAX_HOOKS_PER_FILE * 3);
+        let (defs, listeners) = scan_php_source(Path::new("a.php"), &source);
+        assert_eq!(defs.len() + listeners.len(), MAX_HOOKS_PER_FILE);
+    }
+
+    #[test]
+    fn test_long_line_of_unfinished_listeners_is_bounded_work() {
+        // `[` never closes: every call used to search the rest of the 2 MiB line.
+        let unit = "add_action('a', [";
+        let line = unit.repeat(2 * 1024 * 1024 / unit.len());
+        let started = std::time::Instant::now();
+        let (_, listeners) = scan_php_source(Path::new("a.php"), &format!("<?php\n{line}\n"));
+        assert!(listeners.len() <= MAX_HOOKS_PER_LINE, "{}", listeners.len());
+        // Quadratic work here is minutes; linear is milliseconds.
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn test_array_callback_detection_is_case_insensitive_and_bounded() {
+        let (_, listeners) = scan_php_source(
+            Path::new("a.php"),
+            "<?php add_action('a', ARRAY('Foo', 'bar'));",
+        );
+        assert_eq!(
+            listeners[0].callback,
+            CallbackTarget::Method {
+                class_name: Some("Foo".into()),
+                method_name: "bar".into(),
+                is_static: true
+            }
+        );
+    }
+
+    #[test]
+    fn test_description_stops_exactly_at_its_budget() {
+        let line = format!(" * {}\n", "x".repeat(MAX_DOCBLOCK_LINE_BYTES - 8));
+        let source = format!("<?php\n/**\n{}*/\ndo_action('a');\n", line.repeat(40));
+        let (defs, _) = scan_php_source(Path::new("a.php"), &source);
+        let description = defs[0].docblock.as_deref().unwrap_or("");
+        // The budget plus the spaces that join the pieces.
+        assert!(
+            description.len() <= MAX_DOCBLOCK_DESCRIPTION + 16,
             "{}",
             description.len()
         );
