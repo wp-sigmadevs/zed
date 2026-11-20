@@ -39,19 +39,34 @@ impl HttpRequest {
         }
 
         if let Some(ref b) = self.body {
-            parts.push("--data".to_string());
+            // --data-raw: plain --data reads a file when the text starts with `@`.
+            parts.push("--data-raw".to_string());
             parts.push(shell_quote(b));
         }
 
+        // After --url, a URL that looks like an option (`-Kfile`) stays a URL.
+        parts.push("--url".to_string());
         parts.push(shell_quote(&self.url));
         parts.join(" ")
     }
 }
 
-/// Quotes `text` for a POSIX shell: inside single quotes nothing is special, so only the
-/// quote itself needs the `'\\''` dance.
+/// Quotes `text` as one word for POSIX sh, bash, zsh and fish alike. Inside single quotes sh
+/// treats everything literally, but fish gives `\'` and `\\` meaning there, so a quote and a
+/// backslash are written outside them as `'"'"'` and `'"\\"'` (double quotes read `\\` as one
+/// backslash in every one of those shells).
 pub fn shell_quote(text: &str) -> String {
-    format!("'{}'", text.replace('\'', "'\\''"))
+    let mut quoted = String::with_capacity(text.len() + 2);
+    quoted.push('\'');
+    for c in text.chars() {
+        match c {
+            '\'' => quoted.push_str("'\"'\"'"),
+            '\\' => quoted.push_str("'\"\\\\\"'"),
+            _ => quoted.push(c),
+        }
+    }
+    quoted.push('\'');
+    quoted
 }
 
 pub fn parse_http_file(content: &str) -> Vec<HttpRequest> {
@@ -280,6 +295,9 @@ pub fn parse_curl(curl_cmd: &str) -> Result<HttpRequest, String> {
                 method = "POST".to_string();
             }
             i += 2;
+        } else if part == "--url" && i + 1 < parts.len() {
+            url = parts[i + 1].clone();
+            i += 2;
         } else if !part.starts_with('-') && url.is_empty() {
             url = part.clone();
             i += 1;
@@ -433,7 +451,7 @@ DELETE https://api.example.com/v1/users/42
         let curl = req.to_curl();
         assert!(curl.contains("-X 'POST'"));
         assert!(curl.contains("-H 'Content-Type: application/json'"));
-        assert!(curl.contains("--data '{\"title\":\"Zenith\"}'"));
+        assert!(curl.contains("--data-raw '{\"title\":\"Zenith\"}'"));
 
         let imported = parse_curl(&curl).expect("parse curl");
         assert_eq!(imported.method, "POST");
@@ -446,13 +464,54 @@ DELETE https://api.example.com/v1/users/42
     #[test]
     fn test_shell_quote() {
         assert_eq!(shell_quote("plain"), "'plain'");
-        assert_eq!(shell_quote("it's"), "'it'\\''s'");
+        assert_eq!(shell_quote("it's"), "'it'\"'\"'s'");
+        assert_eq!(shell_quote("a\\b"), "'a'\"\\\\\"'b'");
+        // fish reads \' and \\ inside single quotes as escapes: neither may appear there.
+        let quoted = shell_quote("x\\'y\\");
+        let mut inside_single = false;
+        let mut chars = quoted.chars().peekable();
+        while let Some(c) = chars.next() {
+            match c {
+                '\'' => inside_single = !inside_single,
+                '"' if !inside_single => {
+                    for c in chars.by_ref() {
+                        if c == '"' {
+                            break;
+                        }
+                    }
+                }
+                '\\' => assert!(!inside_single, "{quoted}"),
+                _ => {}
+            }
+        }
+    }
+
+    /// Prints each argument `shell` receives for the words after `curl`, NUL separated.
+    /// `None` when the shell is not installed.
+    // A real shell is the point; a blocking spawn is fine in a unit test.
+    #[allow(clippy::disallowed_methods)]
+    fn args_through(shell: &str, curl: &str) -> Option<Vec<String>> {
+        let words = &curl["curl".len()..];
+        let script = match shell {
+            "fish" => format!("set args {words}; for a in $args; printf '%s\\0' $a; end"),
+            _ => format!("set -- {words}; for a in \"$@\"; do printf '%s\\0' \"$a\"; done"),
+        };
+        let out = std::process::Command::new(shell)
+            .arg("-c")
+            .arg(script)
+            .output()
+            .ok()?;
+        Some(
+            out.stdout
+                .split(|b| *b == 0)
+                .filter(|a| !a.is_empty())
+                .map(|a| String::from_utf8_lossy(a).to_string())
+                .collect(),
+        )
     }
 
     /// The nastiest values must come back out of the shell as the same single words.
-    // The point of this test is a real `sh`; a blocking spawn is fine in a unit test.
     #[test]
-    #[allow(clippy::disallowed_methods)]
     fn test_curl_export_quotes_hostile_values() {
         // Hostile values only ever `touch` a marker in a scratch directory, never anything real.
         let scratch = tempfile::tempdir().unwrap();
@@ -466,41 +525,38 @@ DELETE https://api.example.com/v1/users/42
             format!("line1\ntouch {marker}\nline3"),
             "it's a 'quote'".to_string(),
             "back\\slash $HOME ${IFS}".to_string(),
+            // Backslash next to a quote: fish would read `\'` as an escaped quote.
+            "a\\'b".to_string(),
+            "trailing\\".to_string(),
+            "\\\\'\\\\".to_string(),
+            format!("\\'; touch {marker}; echo '"),
         ];
+        let mut ran_in = vec!["sh"];
+        if args_through("fish", "curl 'x'").is_some() {
+            ran_in.push("fish");
+        }
         for value in nasty.iter().map(String::as_str) {
             let mut req = HttpRequest::new("GET", &format!("https://x.test/?q={value}"), 1);
             req.headers.push(("X-Test".to_string(), value.to_string()));
             req.body = Some(value.to_string());
             let curl = req.to_curl();
 
-            // Real shell: print each argument on its own line, NUL separated.
-            let out = std::process::Command::new("sh")
-                .arg("-c")
-                .arg(format!(
-                    "set -- {}; for a in \"$@\"; do printf '%s\\0' \"$a\"; done",
-                    &curl["curl".len()..]
-                ))
-                .output()
-                .unwrap();
-            let args: Vec<String> = out
-                .stdout
-                .split(|b| *b == 0)
-                .filter(|a| !a.is_empty())
-                .map(|a| String::from_utf8_lossy(a).to_string())
-                .collect();
-            assert_eq!(
-                args,
-                vec![
-                    "-X".to_string(),
-                    "GET".to_string(),
-                    "-H".to_string(),
-                    format!("X-Test: {value}"),
-                    "--data".to_string(),
-                    value.to_string(),
-                    format!("https://x.test/?q={value}"),
-                ],
-                "{curl}"
-            );
+            for shell in &ran_in {
+                assert_eq!(
+                    args_through(shell, &curl).unwrap(),
+                    vec![
+                        "-X".to_string(),
+                        "GET".to_string(),
+                        "-H".to_string(),
+                        format!("X-Test: {value}"),
+                        "--data-raw".to_string(),
+                        value.to_string(),
+                        "--url".to_string(),
+                        format!("https://x.test/?q={value}"),
+                    ],
+                    "{shell}: {curl}"
+                );
+            }
 
             // And our own importer agrees.
             let back = parse_curl(&curl).unwrap();
@@ -512,6 +568,28 @@ DELETE https://api.example.com/v1/users/42
             !scratch.path().join("pwned").exists(),
             "a value was executed by the shell"
         );
+        // fish is optional on a dev machine; sh always ran.
+        eprintln!("shells exercised: {ran_in:?}");
+    }
+
+    #[test]
+    fn test_option_like_url_and_file_body_stay_data() {
+        let mut req = HttpRequest::new("POST", "-Kevil.cfg", 1);
+        req.body = Some("@/some/file".to_string());
+        let curl = req.to_curl();
+        assert!(curl.contains("--url '-Kevil.cfg'"), "{curl}");
+        assert!(curl.contains("--data-raw '@/some/file'"), "{curl}");
+        assert!(!curl.contains(" --data "), "{curl}");
+
+        let args = args_through("sh", &curl).unwrap();
+        // The URL is the argument right after --url, never a bare option.
+        let url_at = args.iter().position(|a| a == "--url").unwrap();
+        assert_eq!(args[url_at + 1], "-Kevil.cfg");
+
+        let back = parse_curl(&curl).unwrap();
+        assert_eq!(back.url, "-Kevil.cfg");
+        assert_eq!(back.body.as_deref(), Some("@/some/file"));
+        assert_eq!(back.method, "POST");
     }
 
     #[test]
