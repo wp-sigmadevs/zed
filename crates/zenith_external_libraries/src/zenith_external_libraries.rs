@@ -311,6 +311,26 @@ pub fn apply(
     true
 }
 
+/// Whether `abs` is a folder the user added with "Add Library Path…" (or inside one). Its
+/// worktree is shown read-only under an "External Libraries" node, never as a project root.
+pub fn is_library_worktree(abs: &std::path::Path, cx: &App) -> bool {
+    zenith_local_settings_trust::is_library_root(abs, cx)
+}
+
+/// Rewrites the visible entries of a user-added library worktree: the whole tree moves under
+/// its own "External Libraries" row, shown only while that row is expanded.
+pub fn apply_library_worktree(
+    worktree_id: WorktreeId,
+    expanded_dir_ids: &[ProjectEntryId],
+    entries: &mut Vec<GitEntry>,
+) {
+    let tree = std::mem::take(entries);
+    entries.push(create_external_libraries_root_entry(worktree_id));
+    if is_section_expanded(worktree_id, expanded_dir_ids) {
+        entries.extend(tree);
+    }
+}
+
 fn append_children_recursive(
     snapshot: &WorktreeSnapshot,
     parent_path: &RelPath,
@@ -347,8 +367,11 @@ pub fn is_library_file(project: &Project, path: &ProjectPath, cx: &App) -> bool 
     // Id 0 is never the synthetic section id, so only the path decides.
     is_enabled(cx)
         && may_be_library_path(&path.path)
-        && row_kind(&worktree.snapshot(), ProjectEntryId::from_proto(0), &path.path)
-            == Some(RowKind::Inside)
+        && row_kind(
+            &worktree.snapshot(),
+            ProjectEntryId::from_proto(0),
+            &path.path,
+        ) == Some(RowKind::Inside)
 }
 
 #[cfg(test)]

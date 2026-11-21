@@ -4,8 +4,9 @@
 
 use super::*;
 use zenith_external_libraries::{
-    RowDecoration, decorate_row, detect_libraries, is_enabled, is_under_library,
-    may_be_library_path, row_kind, section_worktree, set_section_expanded,
+    RowDecoration, apply_library_worktree, decorate_row, detect_libraries, is_enabled,
+    is_library_worktree, is_under_library, may_be_library_path, row_kind, section_worktree,
+    set_section_expanded,
 };
 
 impl ProjectPanel {
@@ -41,29 +42,35 @@ impl ProjectPanel {
     }
 
     /// Moves library folders out of each worktree's entries and adds the "External Libraries"
-    /// node. Runs on the freshly derived state, before the panel repaints.
+    /// node; a user-added library worktree moves entirely under its own node. Runs on the
+    /// freshly derived state, before the panel repaints.
     pub(super) fn zenith_libraries(&mut self, cx: &mut Context<Self>) {
         if !is_enabled(cx) {
             return;
         }
         let project = self.project.read(cx);
         let mut changed = false;
-        // One "External Libraries" node for the whole panel: it goes under the last worktree
-        // that has libraries. Libraries of earlier worktrees stay in their own trees.
-        for visible in self.state.visible_entries.iter_mut().rev() {
+        for visible in self.state.visible_entries.iter_mut() {
             let Some(worktree) = project.worktree_for_id(visible.worktree_id, cx) else {
                 continue;
             };
-            let snapshot = worktree.read(cx).snapshot();
+            let worktree = worktree.read(cx);
             let expanded_dir_ids = self
                 .state
                 .expanded_dir_ids
                 .get(&visible.worktree_id)
                 .map_or(&[][..], Vec::as_slice);
-            if zenith_external_libraries::apply(&snapshot, expanded_dir_ids, &mut visible.entries) {
+            if is_library_worktree(&worktree.abs_path(), cx) {
+                apply_library_worktree(visible.worktree_id, expanded_dir_ids, &mut visible.entries);
                 visible.index = OnceCell::new();
                 changed = true;
-                break;
+            } else if zenith_external_libraries::apply(
+                &worktree.snapshot(),
+                expanded_dir_ids,
+                &mut visible.entries,
+            ) {
+                visible.index = OnceCell::new();
+                changed = true;
             }
         }
         if changed {
@@ -72,25 +79,26 @@ impl ProjectPanel {
         }
     }
 
-    /// Whether the worktree of `entry_id` is the one hosting the node: no later visible worktree
-    /// has libraries. Only asked for rows already known to be library rows.
-    fn zenith_hosts_node(&self, entry_id: &ProjectEntryId, cx: &App) -> bool {
-        let project = self.project.read(cx);
-        let Some(worktree_id) = project.worktree_id_for_entry(*entry_id, cx) else {
-            return false;
-        };
-        self.state
-            .visible_entries
-            .iter()
-            .skip_while(|visible| visible.worktree_id != worktree_id)
-            .skip(1)
-            .all(|visible| {
-                project
-                    .worktree_for_id(visible.worktree_id, cx)
-                    .is_none_or(|worktree| {
-                        detect_libraries(&worktree.read(cx).snapshot()).is_empty()
-                    })
-            })
+    /// Whether `worktree_id` is a user-added library worktree (read-only, no project root).
+    fn zenith_library_worktree(&self, worktree_id: WorktreeId, cx: &App) -> bool {
+        is_enabled(cx)
+            && self
+                .project
+                .read(cx)
+                .worktree_for_id(worktree_id, cx)
+                .is_some_and(|worktree| is_library_worktree(&worktree.read(cx).abs_path(), cx))
+    }
+
+    /// The depth the row is drawn at, for the indent guides and sticky rows: they are computed
+    /// from the raw entries and would otherwise draw (and capture clicks) over the chevrons of
+    /// rows this module moved or indented.
+    pub(super) fn zenith_depth(&self, entry: &Entry, depth: usize, cx: &App) -> usize {
+        let worktree_id = section_worktree(entry.id)
+            .or_else(|| self.project.read(cx).worktree_id_for_entry(entry.id, cx));
+        worktree_id.map_or(depth, |worktree_id| {
+            self.zenith_decorate(entry, worktree_id, String::new(), None, depth, cx)
+                .2
+        })
     }
 
     /// Context menu of the "External Libraries" row (a synthetic entry, so the regular menu has
@@ -151,11 +159,24 @@ impl ProjectPanel {
     pub(super) fn zenith_decorate(
         &self,
         entry: &Entry,
+        worktree_id: WorktreeId,
         filename: String,
         icon: Option<SharedString>,
         depth: usize,
         cx: &App,
     ) -> (String, Option<SharedString>, usize) {
+        // A user-added library worktree sits one level under its node, root row labelled.
+        if section_worktree(entry.id).is_none() && self.zenith_library_worktree(worktree_id, cx) {
+            return if entry.path.is_empty() {
+                (
+                    format!("{filename} (read-only)"),
+                    Some(SharedString::from(IconName::BookCopy.path())),
+                    depth + 1,
+                )
+            } else {
+                (filename, icon, depth + 1)
+            };
+        }
         let project = self.project.read(cx);
         let worktree = match section_worktree(entry.id) {
             Some(worktree_id) => project.worktree_for_id(worktree_id, cx),
@@ -168,10 +189,6 @@ impl ProjectPanel {
         let Some(kind) = kind else {
             return (filename, icon, depth);
         };
-        // Rows of a worktree that does not host the node are still in its own tree.
-        if section_worktree(entry.id).is_none() && !self.zenith_hosts_node(&entry.id, cx) {
-            return (filename, icon, depth);
-        }
         // Mirrors the upstream rule that hides the root row.
         let root_visible = !(ProjectPanelSettings::get_global(cx).hide_root
             && project.visible_worktrees(cx).count() == 1);
@@ -198,17 +215,16 @@ impl ProjectPanel {
         details: &EntryDetails,
         cx: &App,
     ) -> ProjectPanelSettings {
-        if settings.drag_and_drop
-            && (section_worktree(entry_id).is_some() || may_be_library_path(&details.path))
-            && is_enabled(cx)
-        {
-            let is_library_row = self
-                .project
-                .read(cx)
-                .worktree_for_id(details.worktree_id, cx)
-                .is_some_and(|worktree| {
-                    row_kind(worktree.read(cx), entry_id, &details.path).is_some()
-                });
+        if settings.drag_and_drop && is_enabled(cx) {
+            let is_library_row = self.zenith_library_worktree(details.worktree_id, cx)
+                || ((section_worktree(entry_id).is_some() || may_be_library_path(&details.path))
+                    && self
+                        .project
+                        .read(cx)
+                        .worktree_for_id(details.worktree_id, cx)
+                        .is_some_and(|worktree| {
+                            row_kind(worktree.read(cx), entry_id, &details.path).is_some()
+                        }));
             settings.drag_and_drop &= !is_library_row;
         }
         settings
@@ -235,7 +251,9 @@ impl ProjectPanel {
         let Some(entry) = worktree.entry_for_id(entry_id) else {
             return menu;
         };
-        if !is_under_library(&detect_libraries(&worktree.snapshot()), &entry.path) {
+        if !is_library_worktree(&worktree.abs_path(), cx)
+            && !is_under_library(&detect_libraries(&worktree.snapshot()), &entry.path)
+        {
             return menu;
         }
         let is_dir = entry.is_dir();

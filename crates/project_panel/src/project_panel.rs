@@ -7224,7 +7224,7 @@ impl ProjectPanel {
             entry_file_name(entry, root_name).to_string()
         };
 
-        let (filename, icon, depth) = self.zenith_decorate(entry, filename, icon, depth, cx);
+        let (filename, icon, depth) = self.zenith_decorate(entry, worktree_id, filename, icon, depth, cx);
 
         let selection = SelectedEntry {
             worktree_id,
@@ -7836,11 +7836,12 @@ impl Render for ProjectPanel {
                                                 range,
                                                 window,
                                                 cx,
-                                                &mut |entry, _, entries, _, _| {
+                                                &mut |entry, _, entries, _, cx| {
                                                     let (depth, _) =
                                                         Self::calculate_depth_and_difference(
                                                             entry, entries,
                                                         );
+                                                    let depth = this.zenith_depth(entry, depth, cx);
                                                     items.push(depth);
                                                 },
                                             );
@@ -7950,11 +7951,12 @@ impl Render for ProjectPanel {
                                             range,
                                             window,
                                             cx,
-                                            &mut |entry, index, entries, _, _| {
+                                            &mut |entry, index, entries, _, cx| {
                                                 let (depth, _) =
                                                     Self::calculate_depth_and_difference(
                                                         entry, entries,
                                                     );
+                                                let depth = this.zenith_depth(entry, depth, cx);
                                                 let candidate =
                                                     StickyProjectPanelCandidate { index, depth };
                                                 items.push(candidate);
