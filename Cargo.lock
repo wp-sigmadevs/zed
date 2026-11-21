@@ -22914,6 +22914,7 @@ dependencies = [
  "zenith_local_history",
  "zenith_look",
  "zenith_markdown",
+ "zenith_nextjs",
  "zenith_php_tools",
  "zenith_problems",
  "zenith_rails",

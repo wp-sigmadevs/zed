@@ -26,6 +26,9 @@
       // Laravel tool window, routes and views (Laravel projects only). PhpStorm has no key for it;
       // ⌘⇧8 is free in the macOS, Linux and JetBrains keymaps.
       "secondary-shift-8": "zenith_laravel::ToggleLaravelPanel",
+      // Next.js tool window, App Router routes (Next.js projects only). PhpStorm has no key for
+      // it; ⌘⇧9 is unbound in the macOS, Linux and JetBrains keymaps.
+      "secondary-shift-9": "zenith_nextjs::ToggleNextJsPanel",
       // New Scratch File, as in PhpStorm (⌘⇧N); overrides Go to File and New Window.
       "secondary-shift-n": "zenith_scratches::NewScratchFile",
       "secondary-shift-f": "zenith_search::FindInFiles",
@@ -63,6 +66,15 @@
     "bindings": {
       "left": "zenith_laravel::ShowRoutes",
       "right": "zenith_laravel::ShowViews",
+    },
+  },
+  {
+    // Filters (all / pages / route handlers) of the Next.js tool window. Its list is flat, so
+    // left and right are free in this context.
+    "context": "NextJsPanel",
+    "bindings": {
+      "left": "zenith_nextjs::PreviousFilter",
+      "right": "zenith_nextjs::NextFilter",
     },
   },
   {
