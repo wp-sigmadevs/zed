@@ -3023,6 +3023,10 @@
       // Move detected library folders under an "External Libraries" node.
       "enabled": true,
     },
+    // WordPress Hooks tool window: hooks and listeners of a WordPress project.
+    "wordpress": {
+      "enabled": true,
+    },
   },
   // The server to connect to. If the environment variable
   // ZED_SERVER_URL is set, it will override this setting.
