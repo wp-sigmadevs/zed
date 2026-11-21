@@ -1,6 +1,7 @@
-//! Points PHPantom (built from `main`, plan 42) at WordPress stubs and the user's library
-//! roots through its GLOBAL `.phpantom.toml`, and at the Zenith-built binary through
-//! `lsp.phpantom.binary.path`. Everything here is additive and idempotent: user content in
+//! Points PHPantom (built from `main`, plan 42) at the user's library roots through its
+//! GLOBAL `.phpantom.toml`, and at the Zenith-built binary through
+//! `lsp.phpantom.binary.path`. Stub packages are not written: PHPantom discovers
+//! Composer-installed ones per project, and a global path would let any opened repo poison it. Everything here is additive and idempotent: user content in
 //! the file is never overwritten or reordered, and only entries Zenith added itself (recorded
 //! in a sidecar file) are ever removed.
 
@@ -24,7 +25,8 @@ fn binary_path(home: &Path) -> PathBuf {
     home.join(".local/share/zenith/tools/phpantom/current/phpantom_lsp")
 }
 
-/// Entries Zenith added to the config file: `{"include": [...], "stubs": [...]}`.
+/// Entries Zenith added to the config file: `{"include": [...]}`. Older versions also
+/// recorded `"stubs"`; those are removed from the config once, then forgotten.
 fn managed_entries_file(home: &Path) -> PathBuf {
     home.join(".local/share/zenith/tools/phpantom/managed-entries.json")
 }
@@ -40,7 +42,8 @@ fn config_file(home: &Path, xdg: Option<PathBuf>) -> PathBuf {
 #[derive(Default, PartialEq)]
 struct Managed {
     include: Vec<String>,
-    stubs: Vec<String>,
+    /// Legacy `[stubs] paths` entries to migrate away; never populated by a new sync.
+    legacy_stubs: Vec<String>,
 }
 
 fn load_managed(path: &Path) -> Managed {
@@ -61,14 +64,27 @@ fn load_managed(path: &Path) -> Managed {
     };
     Managed {
         include: list("include"),
-        stubs: list("stubs"),
+        legacy_stubs: list("stubs"),
     }
 }
 
-/// What the config should contain, from the current settings and open projects.
-struct Wanted {
-    include: Vec<String>,
-    stubs: Vec<String>,
+/// Writes `text` to a temp file next to `path`, then renames it over `path`: PHPantom polls
+/// the file, and a torn read at startup would mean defaults for the whole session.
+fn write_atomic(path: &Path, text: &str) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("{} has no parent directory", path.display()))?;
+    std::fs::create_dir_all(parent)
+        .map_err(|error| format!("creating {}: {error}", parent.display()))?;
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".{}.tmp", std::process::id()));
+    let temp = parent.join(name);
+    std::fs::write(&temp, text)
+        .and_then(|()| std::fs::rename(&temp, path))
+        .map_err(|error| {
+            std::fs::remove_file(&temp).ok();
+            format!("writing {}: {error}", path.display())
+        })
 }
 
 /// Adds `add` to the `key` array of `[table]`, removes the previously managed entries that
@@ -127,9 +143,9 @@ fn sync_list(
     Ok(managed)
 }
 
-/// Brings the global `.phpantom.toml` in line with `wanted`. A file that does not parse is
+/// Brings the global `.phpantom.toml` in line with the wanted `include` list. A file that does not parse is
 /// left untouched. Writes only when the content changes.
-fn sync_config(home: &Path, xdg: Option<PathBuf>, wanted: &Wanted) -> Result<(), String> {
+fn sync_config(home: &Path, xdg: Option<PathBuf>, include: &[String]) -> Result<(), String> {
     let _guard = SYNC_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -147,43 +163,38 @@ fn sync_config(home: &Path, xdg: Option<PathBuf>, wanted: &Wanted) -> Result<(),
             config.display()
         )
     })?;
+    // One-time migration: drop only the stub entries an older Zenith added.
+    if !previous.legacy_stubs.is_empty() {
+        sync_list(
+            &mut doc,
+            "stubs",
+            "paths",
+            &[],
+            &previous.legacy_stubs,
+            |_| false,
+        )
+        .ok();
+    }
     let managed = Managed {
         include: sync_list(
             &mut doc,
             "indexing",
             "include",
-            &wanted.include,
+            include,
             &previous.include,
-            |entry| wanted.include.contains(entry),
+            |entry| include.contains(entry),
         )?,
-        // Stubs come from whichever project is open, and another window may still use one
-        // that this window does not show: keep an entry while its folder exists.
-        stubs: sync_list(
-            &mut doc,
-            "stubs",
-            "paths",
-            &wanted.stubs,
-            &previous.stubs,
-            |entry| wanted.stubs.contains(entry) || Path::new(entry).is_dir(),
-        )?,
+        legacy_stubs: Vec::new(),
     };
     let new_text = doc.to_string();
     if new_text != text {
-        if let Some(parent) = config.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|error| format!("creating {}: {error}", parent.display()))?;
-        }
-        std::fs::write(&config, new_text)
-            .map_err(|error| format!("writing {}: {error}", config.display()))?;
+        write_atomic(&config, &new_text)?;
     }
     if managed != previous {
-        let json = serde_json::json!({ "include": managed.include, "stubs": managed.stubs });
-        if let Some(parent) = sidecar.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|error| format!("creating {}: {error}", parent.display()))?;
-        }
-        std::fs::write(&sidecar, json.to_string())
-            .map_err(|error| format!("writing {}: {error}", sidecar.display()))?;
+        write_atomic(
+            &sidecar,
+            &serde_json::json!({ "include": managed.include }).to_string(),
+        )?;
     }
     Ok(())
 }
@@ -219,30 +230,14 @@ pub(crate) fn sync(project: &Entity<Project>, cx: &mut App) {
         .and_then(|lsp| lsp.binary.as_ref())
         .and_then(|binary| binary.path.as_ref())
         .is_none();
-    let project = project.read(cx);
-    let roots: Vec<PathBuf> = if project.is_local() {
-        project
-            .visible_worktrees(cx)
-            .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
-            .collect()
-    } else {
-        Vec::new()
-    };
-    let fs = project.fs().clone();
+    let fs = project.read(cx).fs().clone();
     let home = crate::home_dir();
     let xdg = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from);
     cx.spawn(async move |cx| {
         let binary = binary_path(&home);
         let set_binary = cx
             .background_spawn(async move {
-                let stubs = roots
-                    .iter()
-                    .filter(|root| crate::detect_project(root) == crate::ProjectKind::WordPress)
-                    .map(|root| root.join("vendor/php-stubs/wordpress-stubs"))
-                    .filter(|dir| dir.is_dir())
-                    .map(|dir| dir.display().to_string())
-                    .collect();
-                if let Err(error) = sync_config(&home, xdg, &Wanted { include, stubs }) {
+                if let Err(error) = sync_config(&home, xdg, &include) {
                     log::warn!("phpantom config: {error}");
                 }
                 binary_unset
