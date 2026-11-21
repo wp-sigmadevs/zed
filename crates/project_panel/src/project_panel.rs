@@ -7222,8 +7222,7 @@ impl ProjectPanel {
             entry_file_name(entry, root_name).to_string()
         };
 
-        let (filename, icon, chevron, depth) =
-            self.zenith_decorate(entry, worktree_id, (filename, icon, chevron, depth), cx);
+        let (filename, icon, depth) = self.zenith_decorate(entry, filename, icon, depth, cx);
 
         let selection = SelectedEntry {
             worktree_id,
