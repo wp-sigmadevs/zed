@@ -791,6 +791,32 @@ impl FindInFilesModal {
         self.mask_enabled = false;
     }
 
+    /// What clicking the "Aa" chip does; the chips have no action to dispatch.
+    #[cfg(test)]
+    pub(crate) fn click_case_chip(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.toggle(window, cx, |this| {
+            this.case_sensitive = !this.case_sensitive
+        });
+    }
+
+    /// What clicking the "W" chip does.
+    #[cfg(test)]
+    pub(crate) fn click_word_chip(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.toggle(window, cx, |this| this.whole_word = !this.whole_word);
+    }
+
+    /// What clicking the ".*" chip does.
+    #[cfg(test)]
+    pub(crate) fn click_regex_chip(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.toggle(window, cx, |this| this.regex = !this.regex);
+    }
+
+    /// What clicking the "File mask:" checkbox does.
+    #[cfg(test)]
+    pub(crate) fn click_mask_checkbox(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.toggle(window, cx, |this| this.mask_enabled = !this.mask_enabled);
+    }
+
     #[cfg(test)]
     pub(crate) fn focus_mask(&self, window: &mut Window, cx: &mut App) {
         window.focus(&self.mask.read(cx).focus_handle(cx), cx);

@@ -1844,10 +1844,10 @@ fn symbol_badge_letter(kind: SymbolKind) -> (&'static str, BadgeColor) {
 mod tests {
     use super::*;
     use futures::StreamExt as _;
-    use std::{cell::RefCell, rc::Rc};
     use gpui::{TestAppContext, VisualTestContext};
     use serde_json::json;
     use settings::KeymapFile;
+    use std::{cell::RefCell, rc::Rc};
     use util::path;
     use workspace::{AppState, MultiWorkspace};
 
@@ -2808,7 +2808,14 @@ mod tests {
             cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
         let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
         let worktree_id = workspace.read_with(cx, |workspace, cx| {
-            workspace.project().read(cx).worktrees(cx).next().unwrap().read(cx).id()
+            workspace
+                .project()
+                .read(cx)
+                .worktrees(cx)
+                .next()
+                .unwrap()
+                .read(cx)
+                .id()
         });
         workspace
             .update_in(cx, |workspace, window, cx| {
@@ -2926,7 +2933,9 @@ mod tests {
         cx.run_until_parked();
         assert_eq!(summary(cx), "4 matches in 2 files");
         // Narrowing the query updates the header without any other action.
-        modal.update_in(cx, |m, window, cx| m.set_query("echo $services", window, cx));
+        modal.update_in(cx, |m, window, cx| {
+            m.set_query("echo $services", window, cx)
+        });
         cx.run_until_parked();
         assert_eq!(summary(cx), "1 match in 1 file");
         modal.update_in(cx, |m, window, cx| m.set_query("zzz", window, cx));
@@ -3024,7 +3033,10 @@ mod tests {
             )
         });
         assert_eq!((path.path.as_unix_str(), row), ("a.php", 2));
-        assert!(workspace.read_with(cx, |w, cx| w.active_modal::<find_in_files::FindInFilesModal>(cx).is_none()));
+        assert!(workspace.read_with(cx, |w, cx| {
+            w.active_modal::<find_in_files::FindInFilesModal>(cx)
+                .is_none()
+        }));
         // Ticked: Enter sends the results to a search tab, with the query.
         let modal = reopen(cx);
         modal.update(cx, |m, _| m.set_open_in_tab(true));
@@ -3056,7 +3068,9 @@ mod tests {
             ["a.php:1", "c.js:1"]
         );
         // PhpStorm's absolute path means the same.
-        modal.update_in(cx, |m, window, cx| m.set_directory(path!("/root/src"), window, cx));
+        modal.update_in(cx, |m, window, cx| {
+            m.set_directory(path!("/root/src"), window, cx)
+        });
         cx.run_until_parked();
         assert_eq!(modal.read_with(cx, |m, _| m.hit_labels()), ["b.php:1"]);
         // The mask applies inside the directory.
@@ -3292,6 +3306,156 @@ mod tests {
         cx.run_until_parked();
         assert_eq!(modal.read_with(cx, |m, _| m.scope()), Scope::Project);
         assert_eq!(rows(cx).len(), 4);
+    }
+
+    #[gpui::test]
+    async fn test_find_in_files_match_case_chip_keeps_only_the_exact_case(cx: &mut TestAppContext) {
+        let (_, modal, cx) =
+            open_find_in_files(serde_json::json!({ "a.php": "Foo\nfoo\nFOO\n" }), cx).await;
+        let rows = |cx: &mut VisualTestContext| modal.read_with(cx, |m, _| m.hit_labels());
+        modal.update_in(cx, |m, window, cx| m.set_query("foo", window, cx));
+        cx.run_until_parked();
+        assert_eq!(rows(cx), ["a.php:1", "a.php:2", "a.php:3"]);
+        modal.update_in(cx, |m, window, cx| m.click_case_chip(window, cx));
+        cx.run_until_parked();
+        assert_eq!(rows(cx), ["a.php:2"]);
+        modal.update_in(cx, |m, window, cx| m.set_query("Foo", window, cx));
+        cx.run_until_parked();
+        assert_eq!(rows(cx), ["a.php:1"]);
+        // Off again: every case is back.
+        modal.update_in(cx, |m, window, cx| m.click_case_chip(window, cx));
+        cx.run_until_parked();
+        assert_eq!(rows(cx), ["a.php:1", "a.php:2", "a.php:3"]);
+    }
+
+    #[gpui::test]
+    async fn test_find_in_files_words_chip_drops_longer_words(cx: &mut TestAppContext) {
+        let (_, modal, cx) = open_find_in_files(
+            serde_json::json!({ "a.php": "foo\nfoobar\nbar foo baz\nbarfoo\n" }),
+            cx,
+        )
+        .await;
+        let rows = |cx: &mut VisualTestContext| modal.read_with(cx, |m, _| m.hit_labels());
+        modal.update_in(cx, |m, window, cx| m.set_query("foo", window, cx));
+        cx.run_until_parked();
+        assert_eq!(rows(cx), ["a.php:1", "a.php:2", "a.php:3", "a.php:4"]);
+        modal.update_in(cx, |m, window, cx| m.click_word_chip(window, cx));
+        cx.run_until_parked();
+        assert_eq!(rows(cx), ["a.php:1", "a.php:3"]);
+        modal.update_in(cx, |m, window, cx| m.click_word_chip(window, cx));
+        cx.run_until_parked();
+        assert_eq!(rows(cx).len(), 4);
+    }
+
+    #[gpui::test]
+    async fn test_find_in_files_regex_chip_switches_between_pattern_and_literal(
+        cx: &mut TestAppContext,
+    ) {
+        let (_, modal, cx) = open_find_in_files(
+            serde_json::json!({
+                "a.php": "foo bar\nfooo\nfox\n",
+                "b.php": "x fo+\\b y\n",
+            }),
+            cx,
+        )
+        .await;
+        let rows = |cx: &mut VisualTestContext| modal.read_with(cx, |m, _| m.hit_labels());
+        let summary = |cx: &mut VisualTestContext| modal.read_with(cx, |m, cx| m.summary_text(cx));
+        modal.update_in(cx, |m, window, cx| m.set_query(r"fo+\b", window, cx));
+        cx.run_until_parked();
+        // Off: the query is literal text, found only where it is written out.
+        assert_eq!(rows(cx), ["b.php:1"]);
+        modal.update_in(cx, |m, window, cx| m.click_regex_chip(window, cx));
+        cx.run_until_parked();
+        // On: "fo" then more o's then a word edge; "fox" has none.
+        assert_eq!(rows(cx), ["a.php:1", "a.php:2", "b.php:1"]);
+        // An unfinished pattern is no error: nothing listed, nothing thrown.
+        modal.update_in(cx, |m, window, cx| m.set_query("fo(", window, cx));
+        cx.run_until_parked();
+        assert!(rows(cx).is_empty());
+        assert_eq!(summary(cx), "0 matches in 0 files");
+        // Finishing it brings the hits back.
+        modal.update_in(cx, |m, window, cx| m.set_query("fo(o)+$", window, cx));
+        cx.run_until_parked();
+        assert_eq!(rows(cx), ["a.php:2"]);
+        // Off again, the same text is literal: "fo(" is not special and not found.
+        modal.update_in(cx, |m, window, cx| m.click_regex_chip(window, cx));
+        modal.update_in(cx, |m, window, cx| m.set_query("fo(", window, cx));
+        cx.run_until_parked();
+        assert!(rows(cx).is_empty());
+    }
+
+    #[gpui::test]
+    async fn test_find_in_files_mask_ticks_itself_and_narrows_until_unticked(
+        cx: &mut TestAppContext,
+    ) {
+        let (_, modal, cx) = open_find_in_files(
+            serde_json::json!({
+                "a.php": "needle\n",
+                "b.js": "needle\n",
+                "c.css": "needle\n",
+            }),
+            cx,
+        )
+        .await;
+        let rows = |cx: &mut VisualTestContext| modal.read_with(cx, |m, _| m.hit_labels());
+        let enabled = |cx: &mut VisualTestContext| modal.read_with(cx, |m, _| m.mask_enabled());
+        modal.update_in(cx, |m, window, cx| m.set_query("needle", window, cx));
+        cx.run_until_parked();
+        assert!(!enabled(cx));
+        assert_eq!(rows(cx).len(), 3);
+        // A blank mask does not tick the box.
+        modal.update_in(cx, |m, window, cx| m.set_mask("  ", window, cx));
+        cx.run_until_parked();
+        assert!(!enabled(cx));
+        // Typing a mask ticks it and narrows the list.
+        modal.update_in(cx, |m, window, cx| m.set_mask("*.php", window, cx));
+        cx.run_until_parked();
+        assert!(enabled(cx));
+        assert_eq!(rows(cx), ["a.php:1"]);
+        // Unticking widens the list and keeps the text.
+        modal.update_in(cx, |m, window, cx| m.click_mask_checkbox(window, cx));
+        cx.run_until_parked();
+        assert!(!enabled(cx));
+        assert_eq!(modal.read_with(cx, |m, cx| m.mask_text(cx)), "*.php");
+        assert_eq!(rows(cx), ["a.php:1", "b.js:1", "c.css:1"]);
+        // Ticking again brings the same mask back.
+        modal.update_in(cx, |m, window, cx| m.click_mask_checkbox(window, cx));
+        cx.run_until_parked();
+        assert!(enabled(cx));
+        assert_eq!(rows(cx), ["a.php:1"]);
+        // Several masks, comma-separated.
+        modal.update_in(cx, |m, window, cx| m.set_mask("*.php, *.js", window, cx));
+        cx.run_until_parked();
+        assert_eq!(rows(cx), ["a.php:1", "b.js:1"]);
+        assert_eq!(modal.read_with(cx, |m, cx| m.globs(cx)), ["*.php", "*.js"]);
+    }
+
+    #[gpui::test]
+    async fn test_find_in_files_mask_applies_inside_the_directory_when_ticked(
+        cx: &mut TestAppContext,
+    ) {
+        let (_, modal, cx) = open_find_in_files(
+            serde_json::json!({
+                "inc": { "a.php": "needle\n", "c.js": "needle\n", "d.css": "needle\n" },
+                "src": { "b.php": "needle\n" },
+            }),
+            cx,
+        )
+        .await;
+        let rows = |cx: &mut VisualTestContext| modal.read_with(cx, |m, _| m.hit_labels());
+        let globs = |cx: &mut VisualTestContext| modal.read_with(cx, |m, cx| m.globs(cx));
+        modal.update_in(cx, |m, window, cx| m.set_query("needle", window, cx));
+        modal.update_in(cx, |m, window, cx| m.set_directory("inc", window, cx));
+        modal.update_in(cx, |m, window, cx| m.set_mask("*.php, *.js", window, cx));
+        cx.run_until_parked();
+        assert_eq!(globs(cx), ["inc/**/*.php", "inc/**/*.js"]);
+        assert_eq!(rows(cx), ["a.php:1", "c.js:1"]);
+        // Unticked, the whole directory is searched again, and nothing outside it.
+        modal.update_in(cx, |m, window, cx| m.click_mask_checkbox(window, cx));
+        cx.run_until_parked();
+        assert_eq!(globs(cx), ["inc"]);
+        assert_eq!(rows(cx), ["a.php:1", "c.js:1", "d.css:1"]);
     }
 
     #[gpui::test]
