@@ -14028,6 +14028,7 @@ dependencies = [
  "which",
  "worktree",
  "zed_credentials_provider",
+ "zenith_local_settings_trust",
  "zeroize",
  "zlog",
  "ztracing",
@@ -23069,6 +23070,18 @@ dependencies = [
  "zed_actions",
  "zed_env_vars",
  "zstd",
+]
+
+[[package]]
+name = "zenith_local_settings_trust"
+version = "0.1.0"
+dependencies = [
+ "fs",
+ "gpui",
+ "serde_json",
+ "settings",
+ "util",
+ "worktree",
 ]
 
 [[package]]

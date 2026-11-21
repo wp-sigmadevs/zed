@@ -1,0 +1,26 @@
+[package]
+name = "zenith_local_settings_trust"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/zenith_local_settings_trust.rs"
+doctest = false
+
+[dependencies]
+gpui.workspace = true
+settings.workspace = true
+util.workspace = true
+worktree.workspace = true
+
+[dev-dependencies]
+fs = { workspace = true, features = ["test-support"] }
+gpui = { workspace = true, features = ["test-support"] }
+serde_json.workspace = true
+settings = { workspace = true, features = ["test-support"] }
+worktree = { workspace = true, features = ["test-support"] }
