@@ -6162,6 +6162,7 @@ impl ProjectPanel {
         let is_sticky = details.sticky.is_some();
         let sticky_index = details.sticky.as_ref().map(|this| this.sticky_index);
         let settings = ProjectPanelSettings::get_global(cx);
+        let settings = &self.zenith_dnd(*settings, entry_id, &details, cx);
         let show_editor = details.is_editing && !details.is_processing;
 
         let selection = SelectedEntry {
