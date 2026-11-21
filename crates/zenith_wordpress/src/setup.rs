@@ -23,12 +23,19 @@ use workspace::Workspace;
 use worktree::{Snapshot, Worktree};
 use zenith_php_tools::{ProjectKind, detect_project, read_regular, worktree_trusted};
 
-use crate::{MAX_INDEXED_FILE_BYTES, ToggleWpHooksPanel, WordPressIndex, WpHooksPanel};
+use crate::{
+    MAX_INDEXED_FILE_BYTES, ToggleWpHooksPanel, WordPressIndex, WpHooksPanel, scan_php_source,
+    wp_hooks_panel::read_index,
+};
 
 /// Most PHP files indexed per worktree; the rest are left out.
 /// ponytail: a core install plus plugins is a few thousand files. Raise it, or index in the
 /// background by directory, if a monorepo needs more.
 const MAX_INDEXED_FILES: usize = 20_000;
+
+/// Files the worker reads per round. The panel fills round by round, and a removed folder or a
+/// closed workspace stops the work between rounds.
+const FILES_PER_BATCH: usize = 500;
 
 #[derive(Clone, Debug, PartialEq, RegisterSetting)]
 pub struct WordPressSettings {
@@ -81,6 +88,9 @@ struct Wiring {
     /// Files waiting for the worker: `true` = (re)index, `false` = forget.
     pending: HashMap<PathBuf, bool>,
     worker: Option<Task<()>>,
+    /// Roots removed while the worker was busy: its running batch may have put their files back,
+    /// so they are forgotten again once it is done.
+    stale_roots: Vec<Arc<Path>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -115,6 +125,7 @@ impl Wiring {
             wordpress: HashMap::new(),
             pending: HashMap::new(),
             worker: None,
+            stale_roots: Vec::new(),
             _subscriptions: subscriptions,
         };
         this.refresh(cx);
@@ -211,7 +222,11 @@ impl Wiring {
             project::Event::WorktreeRemoved(id) => {
                 self.scans.remove(id);
                 if let Some(root) = self.wordpress.remove(id) {
+                    self.pending.retain(|path, _| !path.starts_with(&root));
                     write_index(&self.index).remove_dir(&root);
+                    if self.worker.is_some() {
+                        self.stale_roots.push(root);
+                    }
                     self.notify_panel(cx);
                 }
             }
@@ -228,10 +243,9 @@ impl Wiring {
         changes: &UpdatedEntriesSet,
         cx: &mut Context<Self>,
     ) {
-        if !WordPressSettings::get_global(cx).enabled
-            || !self.wordpress.contains_key(&id)
-            || !worktree_trusted(&self.project, id, cx)
-        {
+        // Once a folder is indexed its changes are followed whatever the setting says (the setting
+        // only decides whether a folder is picked up) or the index would go stale while it is off.
+        if !self.wordpress.contains_key(&id) {
             return;
         }
         let Some(worktree) = self.project.read(cx).worktree_for_id(id, cx) else {
@@ -272,28 +286,59 @@ impl Wiring {
         let index = self.index.clone();
         self.worker = Some(cx.spawn(async move |this, cx| {
             loop {
-                let Ok(batch) = this.update(cx, |this, _| std::mem::take(&mut this.pending)) else {
+                let Ok(job) = this.update(cx, |this, cx| this.next_batch(cx)) else {
                     return;
                 };
-                if batch.is_empty() {
-                    // Detached on purpose: this task is the worker, and it ends right here.
-                    this.update(cx, |this, _| this.worker.take().map(Task::detach))
-                        .ok();
+                let Some((batch, roots)) = job else {
                     return;
-                }
+                };
                 let index = index.clone();
-                cx.background_spawn(async move { apply_changes(&index, batch) })
-                    .await;
-                if this.update(cx, |this, cx| this.notify_panel(cx)).is_err() {
-                    return;
-                }
+                cx.background_spawn(async move {
+                    apply_changes(&index, batch, &roots, MAX_INDEXED_FILES)
+                })
+                .await;
             }
         }));
     }
 
+    /// The worker's next round: up to [`FILES_PER_BATCH`] waiting files that lie under a folder
+    /// still in the project, with those folders. `None` ends the worker.
+    fn next_batch(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Option<(HashMap<PathBuf, bool>, Vec<Arc<Path>>)> {
+        // Forget before taking more, so a re-added folder's files are queued after it.
+        let stale = std::mem::take(&mut self.stale_roots);
+        if !stale.is_empty() {
+            let mut index = write_index(&self.index);
+            for root in &stale {
+                index.remove_dir(root);
+            }
+        }
+        // The previous round's results are in the index now.
+        self.notify_panel(cx);
+        let roots: Vec<Arc<Path>> = self.wordpress.values().cloned().collect();
+        let paths: Vec<PathBuf> = self.pending.keys().take(FILES_PER_BATCH).cloned().collect();
+        let mut batch = HashMap::new();
+        for path in paths {
+            let live = self.pending.remove(&path).unwrap_or(false);
+            if roots.iter().any(|root| path.starts_with(root)) {
+                batch.insert(path, live);
+            }
+        }
+        if batch.is_empty() && self.pending.is_empty() {
+            // Detached on purpose: this task is the worker, and it ends right here.
+            if let Some(worker) = self.worker.take() {
+                worker.detach();
+            }
+            return None;
+        }
+        Some((batch, roots))
+    }
+
     fn notify_panel(&self, cx: &mut Context<Self>) {
         if let Some(panel) = &self.panel {
-            panel.update(cx, |_, cx| cx.notify());
+            panel.update(cx, |panel, cx| panel.index_changed(cx));
         }
     }
 }
@@ -325,17 +370,49 @@ fn php_files(snapshot: &Snapshot) -> Vec<(PathBuf, bool)> {
 
 /// Reads and indexes (`true`) or forgets (`false`) each file. The read is bounded and refuses
 /// pipes and devices: a project can plant `x.php -> /dev/zero`. A file that cannot be read or
-/// is over the size cap leaves the index.
-fn apply_changes(index: &RwLock<WordPressIndex>, batch: HashMap<PathBuf, bool>) {
+/// is over the size cap leaves the index. A file outside `roots` is ignored, and a new file is
+/// left out once its root holds `max_files` indexed files. The parse runs without the lock; the
+/// lock is held only to insert or remove.
+fn apply_changes(
+    index: &RwLock<WordPressIndex>,
+    batch: HashMap<PathBuf, bool>,
+    roots: &[Arc<Path>],
+    max_files: usize,
+) {
+    // Room left per root, from what is really indexed (the initial listing, branch switches and
+    // later events all end up here).
+    let mut room: Vec<usize> = {
+        let index = read_index(index);
+        roots
+            .iter()
+            .map(|root| max_files.saturating_sub(index.file_count_under(root)))
+            .collect()
+    };
     for (path, live) in batch {
-        let source = live
+        let Some(slot) = roots.iter().position(|root| path.starts_with(root)) else {
+            continue;
+        };
+        let known = read_index(index).contains_file(&path);
+        if live && !known && room[slot] == 0 {
+            continue;
+        }
+        let scanned = live
             .then(|| read_regular(&path, MAX_INDEXED_FILE_BYTES as u64 + 1))
             .flatten()
-            .filter(|bytes| bytes.len() <= MAX_INDEXED_FILE_BYTES);
+            .filter(|bytes| bytes.len() <= MAX_INDEXED_FILE_BYTES)
+            .map(|bytes| scan_php_source(&path, &String::from_utf8_lossy(&bytes)));
         let mut index = write_index(index);
-        match source {
-            Some(bytes) => index.index_source(path, &String::from_utf8_lossy(&bytes)),
-            None => index.remove_file(&path),
+        let indexed = match scanned {
+            Some((definitions, listeners)) => index.insert_scanned(path, definitions, listeners),
+            None => {
+                index.remove_file(&path);
+                false
+            }
+        };
+        match (known, indexed) {
+            (false, true) => room[slot] -= 1,
+            (true, false) => room[slot] += 1,
+            _ => {}
         }
     }
 }
@@ -350,7 +427,6 @@ mod tests {
     use crate::wp_hooks_panel::read_index;
     use gpui::{BorrowAppContext as _, TestAppContext};
     use serde_json::json;
-    use std::time::Duration;
 
     fn rel(path: &str) -> std::borrow::Cow<'_, RelPath> {
         RelPath::new_test(path)
@@ -400,6 +476,16 @@ mod tests {
         assert_eq!(kept[0].as_unix_str(), "b.php");
     }
 
+    /// `apply_changes` for a single root that covers every path, with the real cap.
+    fn apply(index: &RwLock<WordPressIndex>, batch: HashMap<PathBuf, bool>) {
+        apply_changes(
+            index,
+            batch,
+            &[Arc::from(Path::new("/"))],
+            MAX_INDEXED_FILES,
+        );
+    }
+
     #[test]
     fn test_apply_changes_reads_bounded_and_forgets_what_vanished() {
         let dir = tempfile::tempdir().unwrap();
@@ -426,17 +512,17 @@ mod tests {
             names
         };
         let missing = dir.path().join("gone.php");
-        apply_changes(
+        apply(
             &index,
             HashMap::from([(hook.clone(), true), (huge, true), (missing, true)]),
         );
         assert_eq!(names(&index), ["my_hook"], "the oversized file is left out");
-        apply_changes(&index, HashMap::from([(hook.clone(), false)]));
+        apply(&index, HashMap::from([(hook.clone(), false)]));
         assert!(names(&index).is_empty());
         // A file that disappears between the event and the read leaves the index.
-        apply_changes(&index, HashMap::from([(hook.clone(), true)]));
+        apply(&index, HashMap::from([(hook.clone(), true)]));
         std::fs::remove_file(&hook).unwrap();
-        apply_changes(&index, HashMap::from([(hook, true)]));
+        apply(&index, HashMap::from([(hook, true)]));
         assert!(names(&index).is_empty());
     }
 
@@ -445,7 +531,7 @@ mod tests {
     fn test_apply_changes_does_not_read_a_device() {
         let index = RwLock::new(WordPressIndex::new());
         // Would never finish, were it read to the end.
-        apply_changes(&index, HashMap::from([(PathBuf::from("/dev/zero"), true)]));
+        apply(&index, HashMap::from([(PathBuf::from("/dev/zero"), true)]));
         assert!(read_index(&index).find_listeners("x").is_empty());
     }
 
@@ -516,21 +602,6 @@ mod tests {
         (project, workspace, cx)
     }
 
-    /// Detection and file reads run on real threads: let them finish.
-    fn settle(
-        cx: &mut gpui::VisualTestContext,
-        done: impl Fn(&mut gpui::VisualTestContext) -> bool,
-    ) {
-        cx.executor().allow_parking();
-        for _ in 0..100 {
-            cx.run_until_parked();
-            if done(cx) {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-    }
-
     fn panel_of(
         workspace: &Entity<Workspace>,
         cx: &mut gpui::VisualTestContext,
@@ -571,9 +642,9 @@ mod tests {
     async fn test_panel_is_added_for_a_trusted_wordpress_worktree(cx: &mut TestAppContext) {
         let env = setup(cx, json!({}), false).await;
         let (_, workspace, cx) = open_workspace(&env, cx).await;
-        settle(cx, |cx| panel_of(&workspace, cx).is_some());
+        cx.run_until_parked();
         let panel = panel_of(&workspace, cx).expect("panel added");
-        settle(cx, |cx| !hook_names(&panel, cx).is_empty());
+        cx.run_until_parked();
         // The vendor/ copy stays out.
         assert_eq!(hook_names(&panel, cx), ["plugin_loaded_hook"]);
 
@@ -589,7 +660,7 @@ mod tests {
     async fn test_no_panel_when_the_setting_is_off(cx: &mut TestAppContext) {
         let env = setup(cx, json!({ "wordpress": { "enabled": false } }), false).await;
         let (_, workspace, cx) = open_workspace(&env, cx).await;
-        settle(cx, |cx| panel_of(&workspace, cx).is_some());
+        cx.run_until_parked();
         assert!(panel_of(&workspace, cx).is_none());
 
         // Turning it on adds the panel without a restart.
@@ -603,7 +674,7 @@ mod tests {
                     .unwrap();
             });
         });
-        settle(cx, |cx| panel_of(&workspace, cx).is_some());
+        cx.run_until_parked();
         assert!(panel_of(&workspace, cx).is_some());
     }
 
@@ -611,13 +682,13 @@ mod tests {
     async fn test_untrusted_worktree_is_not_indexed_until_trusted(cx: &mut TestAppContext) {
         let env = setup(cx, json!({}), true).await;
         let (project, workspace, cx) = open_workspace(&env, cx).await;
-        settle(cx, |cx| panel_of(&workspace, cx).is_some());
+        cx.run_until_parked();
         assert!(panel_of(&workspace, cx).is_none(), "restricted worktree");
 
         trust(&project, cx);
-        settle(cx, |cx| panel_of(&workspace, cx).is_some());
+        cx.run_until_parked();
         let panel = panel_of(&workspace, cx).expect("panel added once trusted");
-        settle(cx, |cx| !hook_names(&panel, cx).is_empty());
+        cx.run_until_parked();
         assert_eq!(hook_names(&panel, cx), ["plugin_loaded_hook"]);
     }
 
@@ -625,9 +696,9 @@ mod tests {
     async fn test_a_changed_file_is_reindexed(cx: &mut TestAppContext) {
         let env = setup(cx, json!({}), false).await;
         let (_, workspace, cx) = open_workspace(&env, cx).await;
-        settle(cx, |cx| panel_of(&workspace, cx).is_some());
+        cx.run_until_parked();
         let panel = panel_of(&workspace, cx).expect("panel added");
-        settle(cx, |cx| !hook_names(&panel, cx).is_empty());
+        cx.run_until_parked();
 
         let path = env.dir.path().join("new.php");
         let source = "<?php\ndo_action('fresh_hook');\n";
@@ -637,9 +708,217 @@ mod tests {
             .as_fake()
             .insert_file(path.to_str().unwrap(), source.as_bytes().to_vec())
             .await;
-        settle(cx, |cx| {
-            hook_names(&panel, cx).contains(&"fresh_hook".into())
-        });
+        cx.run_until_parked();
         assert_eq!(hook_names(&panel, cx), ["fresh_hook", "plugin_loaded_hook"]);
+    }
+
+    /// A second wiring for the test to drive by hand. The setting is off, so it does nothing by
+    /// itself (nor does the workspace's own); it still follows the project's events.
+    fn manual_wiring(
+        workspace: &Entity<Workspace>,
+        project: &Entity<Project>,
+        cx: &mut gpui::VisualTestContext,
+    ) -> Entity<Wiring> {
+        let this = workspace.downgrade();
+        let project = project.clone();
+        cx.update(|window, cx| {
+            let handle = window.window_handle();
+            cx.new(|cx| Wiring::new(this, handle, project, cx))
+        })
+    }
+
+    fn queue_plugin(
+        wiring: &Entity<Wiring>,
+        project: &Entity<Project>,
+        env: &Env,
+        cx: &mut gpui::VisualTestContext,
+    ) -> WorktreeId {
+        let (id, root) = project.read_with(cx, |project, cx| {
+            let worktree = project.worktrees(cx).next().unwrap().read(cx);
+            (worktree.id(), worktree.abs_path())
+        });
+        let plugin = env.dir.path().join("plugin.php");
+        wiring.update(cx, |wiring, cx| {
+            wiring.wordpress.insert(id, root);
+            wiring.queue([(plugin, true)], false, cx);
+        });
+        id
+    }
+
+    fn indexed(wiring: &Entity<Wiring>, cx: &mut gpui::VisualTestContext) -> bool {
+        let index = wiring.read_with(cx, |wiring, _| wiring.index.clone());
+        let found = read_index(&index).contains_file(
+            &wiring
+                .read_with(cx, |wiring, _| wiring.wordpress.values().next().cloned())
+                .map(|root| root.join("plugin.php"))
+                .unwrap_or_default(),
+        );
+        found
+    }
+
+    #[gpui::test]
+    async fn test_removing_a_worktree_drops_the_files_still_queued(cx: &mut TestAppContext) {
+        let env = setup(cx, json!({ "wordpress": { "enabled": false } }), false).await;
+        let (project, workspace, cx) = open_workspace(&env, cx).await;
+        cx.run_until_parked();
+        let wiring = manual_wiring(&workspace, &project, cx);
+        let id = queue_plugin(&wiring, &project, &env, cx);
+        assert_eq!(wiring.read_with(cx, |wiring, _| wiring.pending.len()), 1);
+
+        project.update(cx, |project, cx| project.remove_worktree(id, cx));
+        cx.run_until_parked();
+
+        wiring.read_with(cx, |wiring, _| {
+            assert!(wiring.pending.is_empty());
+            assert!(wiring.worker.is_none(), "the worker has nothing left to do");
+            assert!(
+                read_index(&wiring.index)
+                    .hook_summaries()
+                    .iter()
+                    .all(|hook| { hook.name != "plugin_loaded_hook" })
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_removing_a_worktree_during_a_running_batch_forgets_what_it_adds(
+        cx: &mut TestAppContext,
+    ) {
+        let env = setup(cx, json!({ "wordpress": { "enabled": false } }), false).await;
+        let (project, workspace, cx) = open_workspace(&env, cx).await;
+        cx.run_until_parked();
+        let wiring = manual_wiring(&workspace, &project, cx);
+        let id = queue_plugin(&wiring, &project, &env, cx);
+
+        // Step the executor until the worker has taken the batch but not yet applied it.
+        let mut taken = false;
+        for _ in 0..200 {
+            cx.executor().tick();
+            if wiring.read_with(cx, |wiring, _| wiring.pending.is_empty()) {
+                taken = true;
+                break;
+            }
+        }
+        assert!(taken, "the worker took the batch");
+        assert!(!indexed(&wiring, cx), "the batch is still running");
+
+        project.update(cx, |project, cx| project.remove_worktree(id, cx));
+        cx.run_until_parked();
+
+        wiring.read_with(cx, |wiring, _| {
+            assert!(wiring.stale_roots.is_empty());
+            assert!(
+                read_index(&wiring.index)
+                    .hook_summaries()
+                    .iter()
+                    .all(|hook| { hook.name != "plugin_loaded_hook" })
+            );
+            assert_eq!(
+                read_index(&wiring.index).file_count_under(Path::new("/")),
+                0
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_a_deleted_file_leaves_the_index_while_the_setting_is_off(
+        cx: &mut TestAppContext,
+    ) {
+        let env = setup(cx, json!({}), false).await;
+        let (project, workspace, cx) = open_workspace(&env, cx).await;
+        cx.run_until_parked();
+        let panel = panel_of(&workspace, cx).expect("panel added");
+        cx.run_until_parked();
+        assert_eq!(hook_names(&panel, cx), ["plugin_loaded_hook"]);
+
+        cx.update(|_, cx| {
+            cx.update_global::<SettingsStore, _>(|store, cx| {
+                store
+                    .set_user_settings(
+                        &json!({ "zenith": { "wordpress": { "enabled": false } } }).to_string(),
+                        cx,
+                    )
+                    .unwrap();
+            });
+        });
+        cx.run_until_parked();
+        std::fs::remove_file(env.dir.path().join("plugin.php")).unwrap();
+        let deleted = project.update(cx, |project, cx| {
+            let worktree_id = project.worktrees(cx).next().unwrap().read(cx).id();
+            project.delete_file(
+                project::ProjectPath {
+                    worktree_id,
+                    path: util::rel_path::rel_path("plugin.php").into(),
+                },
+                cx,
+            )
+        });
+        deleted.expect("the file is in the project").await.unwrap();
+        cx.run_until_parked();
+
+        assert!(hook_names(&panel, cx).is_empty());
+    }
+
+    #[test]
+    fn test_new_files_stop_at_the_cap_whatever_path_brings_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let root: Arc<Path> = Arc::from(dir.path());
+        let roots = [root.clone()];
+        let write = |name: &str| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, format!("<?php\ndo_action('{name}_hook');\n")).unwrap();
+            path
+        };
+        let paths: Vec<PathBuf> = ["a.php", "b.php", "c.php", "d.php"].map(write).into();
+        let index = RwLock::new(WordPressIndex::new());
+        let files = |index: &RwLock<WordPressIndex>| read_index(index).file_count_under(&root);
+
+        // The first batch (the initial listing) fills the root up to the cap.
+        let first = paths[..3].iter().map(|path| (path.clone(), true)).collect();
+        apply_changes(&index, first, &roots, 2);
+        assert_eq!(files(&index), 2);
+
+        // A later event for a new file finds no room ...
+        apply_changes(&index, HashMap::from([(paths[3].clone(), true)]), &roots, 2);
+        assert!(!read_index(&index).contains_file(&paths[3]));
+        assert_eq!(files(&index), 2);
+
+        // ... an indexed file may still change, and deleting one makes room again.
+        let indexed_path = paths
+            .iter()
+            .find(|path| read_index(&index).contains_file(path))
+            .unwrap()
+            .clone();
+        apply_changes(
+            &index,
+            HashMap::from([(indexed_path.clone(), true)]),
+            &roots,
+            2,
+        );
+        assert_eq!(files(&index), 2);
+        apply_changes(&index, HashMap::from([(indexed_path, false)]), &roots, 2);
+        apply_changes(&index, HashMap::from([(paths[3].clone(), true)]), &roots, 2);
+        assert!(read_index(&index).contains_file(&paths[3]));
+        assert_eq!(files(&index), 2);
+    }
+
+    #[test]
+    fn test_apply_changes_stops_at_the_total_hook_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let roots = [Arc::<Path>::from(dir.path())];
+        let two_hooks = |name: &str| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, "<?php\ndo_action('x');\ndo_action('y');\n").unwrap();
+            path
+        };
+        let (a, b, c) = (two_hooks("a.php"), two_hooks("b.php"), two_hooks("c.php"));
+        let index = RwLock::new(WordPressIndex::with_hook_cap(4));
+        let batch = [&a, &b, &c].map(|path| (path.clone(), true)).into();
+        apply_changes(&index, batch, &roots, MAX_INDEXED_FILES);
+        let held = [&a, &b, &c]
+            .iter()
+            .filter(|path| read_index(&index).contains_file(path))
+            .count();
+        assert_eq!(held, 2, "two files of two hooks fill a cap of four");
     }
 }

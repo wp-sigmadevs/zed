@@ -246,11 +246,28 @@ pub const CORE_HOOKS: &[CoreHookSpec] = &[
     },
 ];
 
-#[derive(Default)]
 pub struct WordPressIndex {
     definitions_by_name: HashMap<String, Vec<HookDefinition>>,
     listeners_by_name: HashMap<String, Vec<HookListener>>,
     indexed_files: HashSet<PathBuf>,
+    /// Definitions plus listeners held, kept in step with the two maps.
+    hook_count: usize,
+    hook_cap: usize,
+}
+
+impl Default for WordPressIndex {
+    fn default() -> Self {
+        Self::with_hook_cap(MAX_INDEXED_HOOKS)
+    }
+}
+
+/// One hook as the panel lists it: no docblock, so building the list copies only names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HookSummary {
+    pub name: String,
+    pub kind: HookKind,
+    pub listeners: usize,
+    pub definitions: usize,
 }
 
 impl WordPressIndex {
@@ -258,14 +275,46 @@ impl WordPressIndex {
         Self::default()
     }
 
+    /// An index that stops taking files once it holds `hook_cap` hooks.
+    pub fn with_hook_cap(hook_cap: usize) -> Self {
+        Self {
+            definitions_by_name: HashMap::new(),
+            listeners_by_name: HashMap::new(),
+            indexed_files: HashSet::new(),
+            hook_count: 0,
+            hook_cap,
+        }
+    }
+
     /// Indexes one PHP file, replacing what it had before. Files over
     /// [`MAX_INDEXED_FILE_BYTES`] (generated or minified code) are left out of the index.
+    /// Callers that hold a lock should run [`scan_php_source`] first and call
+    /// [`Self::insert_scanned`], so the lock is not held for the parse.
     pub fn index_source(&mut self, file_path: PathBuf, content: &str) {
-        self.remove_file(&file_path);
         if content.len() > MAX_INDEXED_FILE_BYTES {
+            self.remove_file(&file_path);
             return;
         }
         let (definitions, listeners) = scan_php_source(&file_path, content);
+        self.insert_scanned(file_path, definitions, listeners);
+    }
+
+    /// Replaces a file's hooks with a finished scan. Returns whether the file is now indexed:
+    /// a file that would take the index past [`MAX_INDEXED_HOOKS`] is left out.
+    pub fn insert_scanned(
+        &mut self,
+        file_path: PathBuf,
+        definitions: Vec<HookDefinition>,
+        listeners: Vec<HookListener>,
+    ) -> bool {
+        self.remove_file(&file_path);
+        // ponytail: a flat ceiling on hooks held (about 500k fit in a few hundred MiB); a smarter
+        // eviction (oldest file first) only matters if real trees reach it.
+        let added = definitions.len() + listeners.len();
+        if self.hook_count + added > self.hook_cap {
+            return false;
+        }
+        self.hook_count += added;
         for def in definitions {
             self.definitions_by_name
                 .entry(def.name.clone())
@@ -279,33 +328,76 @@ impl WordPressIndex {
                 .push(listener);
         }
         self.indexed_files.insert(file_path);
+        true
+    }
+
+    pub fn contains_file(&self, file_path: &Path) -> bool {
+        self.indexed_files.contains(file_path)
+    }
+
+    /// How many indexed files lie under `root`.
+    pub fn file_count_under(&self, root: &Path) -> usize {
+        self.indexed_files
+            .iter()
+            .filter(|file| file.starts_with(root))
+            .count()
     }
 
     pub fn remove_file(&mut self, file_path: &Path) {
-        if !self.indexed_files.remove(file_path) {
-            return;
+        if self.indexed_files.contains(file_path) {
+            self.forget(|path| path == file_path);
         }
-        for defs in self.definitions_by_name.values_mut() {
-            defs.retain(|d| d.file_path != file_path);
-        }
-        for listeners in self.listeners_by_name.values_mut() {
-            listeners.retain(|l| l.file_path != file_path);
-        }
-        self.definitions_by_name.retain(|_, v| !v.is_empty());
-        self.listeners_by_name.retain(|_, v| !v.is_empty());
     }
 
     /// Forgets every file under `root` (a worktree that left the project).
     pub fn remove_dir(&mut self, root: &Path) {
-        self.indexed_files.retain(|file| !file.starts_with(root));
+        self.forget(|path| path.starts_with(root));
+    }
+
+    fn forget(&mut self, gone: impl Fn(&Path) -> bool) {
+        self.indexed_files.retain(|file| !gone(file));
+        let mut removed = 0;
         for defs in self.definitions_by_name.values_mut() {
-            defs.retain(|d| !d.file_path.starts_with(root));
+            let before = defs.len();
+            defs.retain(|d| !gone(&d.file_path));
+            removed += before - defs.len();
         }
         for listeners in self.listeners_by_name.values_mut() {
-            listeners.retain(|l| !l.file_path.starts_with(root));
+            let before = listeners.len();
+            listeners.retain(|l| !gone(&l.file_path));
+            removed += before - listeners.len();
         }
+        self.hook_count -= removed;
         self.definitions_by_name.retain(|_, v| !v.is_empty());
         self.listeners_by_name.retain(|_, v| !v.is_empty());
+    }
+
+    /// Every known hook (core ones included) by name, with how often it is defined and listened
+    /// to. Same names and kinds as `completions("")`, without the docblocks.
+    pub fn hook_summaries(&self) -> Vec<HookSummary> {
+        let mut kinds: BTreeMap<&str, HookKind> = BTreeMap::new();
+        for core_hook in CORE_HOOKS {
+            kinds.insert(core_hook.name, core_hook.kind);
+        }
+        for (name, defs) in &self.definitions_by_name {
+            if let Some(first) = defs.first() {
+                kinds.entry(name).or_insert(first.kind);
+            }
+        }
+        for (name, listeners) in &self.listeners_by_name {
+            if let Some(first) = listeners.first() {
+                kinds.entry(name).or_insert(first.kind);
+            }
+        }
+        kinds
+            .into_iter()
+            .map(|(name, kind)| HookSummary {
+                name: name.to_string(),
+                kind,
+                listeners: self.listeners_by_name.get(name).map_or(0, Vec::len),
+                definitions: self.definitions_by_name.get(name).map_or(0, Vec::len),
+            })
+            .collect()
     }
 
     pub fn find_definitions(&self, hook_name: &str) -> Vec<&HookDefinition> {
@@ -434,6 +526,8 @@ impl WordPressIndex {
 
 /// Largest PHP file the index reads.
 pub const MAX_INDEXED_FILE_BYTES: usize = 2 * 1024 * 1024;
+/// Most definitions plus listeners the whole index holds; later files are left out.
+pub const MAX_INDEXED_HOOKS: usize = 500_000;
 /// Most lines one docblock may span; longer comments are cut there.
 const MAX_DOCBLOCK_LINES: usize = 500;
 /// Most characters kept of one docblock's description.
@@ -908,6 +1002,60 @@ add_action('wp_footer', function() { echo 'footer'; });
         let footer_listeners = index.find_listeners("wp_footer");
         assert_eq!(footer_listeners.len(), 1);
         assert_eq!(footer_listeners[0].callback, CallbackTarget::Closure);
+    }
+
+    #[test]
+    fn test_hooks_past_the_total_cap_are_not_indexed() {
+        let hooks = |names: &[&str]| {
+            format!(
+                "<?php\n{}",
+                names
+                    .iter()
+                    .map(|n| format!("do_action('{n}');\n"))
+                    .collect::<String>()
+            )
+        };
+        let mut index = WordPressIndex::with_hook_cap(3);
+        index.index_source(PathBuf::from("a.php"), &hooks(&["a1", "a2"]));
+        // Two more would make four: the whole file is left out, not cut.
+        index.index_source(PathBuf::from("b.php"), &hooks(&["b1", "b2"]));
+        assert!(index.contains_file(Path::new("a.php")));
+        assert!(!index.contains_file(Path::new("b.php")));
+        assert!(index.find_definitions("b1").is_empty());
+        // One more still fits.
+        index.index_source(PathBuf::from("c.php"), &hooks(&["c1"]));
+        assert!(index.contains_file(Path::new("c.php")));
+        // Re-indexing a file counts its old hooks out first, and removal gives room back.
+        index.index_source(PathBuf::from("a.php"), &hooks(&["a1", "a2"]));
+        assert!(index.contains_file(Path::new("a.php")));
+        index.remove_dir(Path::new(""));
+        index.index_source(PathBuf::from("b.php"), &hooks(&["b1", "b2", "b3"]));
+        assert!(index.contains_file(Path::new("b.php")));
+    }
+
+    #[test]
+    fn test_summaries_match_completions() {
+        let mut index = WordPressIndex::new();
+        index.index_source(
+            PathBuf::from("p.php"),
+            "<?php\n/** Docs. */\ndo_action('mine');\nadd_filter('mine', 'cb');\nadd_action('init', 'boot');\napply_filters('zz', 1);\n",
+        );
+        let summaries = index.hook_summaries();
+        let completions = index.completions("");
+        assert_eq!(
+            summaries
+                .iter()
+                .map(|s| (&s.name, s.kind))
+                .collect::<Vec<_>>(),
+            completions
+                .iter()
+                .map(|c| (&c.name, c.kind))
+                .collect::<Vec<_>>()
+        );
+        let mine = summaries.iter().find(|s| s.name == "mine").unwrap();
+        assert_eq!((mine.definitions, mine.listeners), (1, 1));
+        let init = summaries.iter().find(|s| s.name == "init").unwrap();
+        assert_eq!((init.definitions, init.listeners), (0, 1));
     }
 
     #[test]
