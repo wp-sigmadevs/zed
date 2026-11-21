@@ -23,6 +23,9 @@
       // WordPress Hooks tool window (WordPress projects only). PhpStorm has no key for it; free
       // in the macOS, Linux and JetBrains keymaps.
       "secondary-shift-7": "zenith_wordpress::ToggleWpHooksPanel",
+      // Laravel tool window, routes and views (Laravel projects only). PhpStorm has no key for it;
+      // ⌘⇧8 is free in the macOS, Linux and JetBrains keymaps.
+      "secondary-shift-8": "zenith_laravel::ToggleLaravelPanel",
       // New Scratch File, as in PhpStorm (⌘⇧N); overrides Go to File and New Window.
       "secondary-shift-n": "zenith_scratches::NewScratchFile",
       "secondary-shift-f": "zenith_search::FindInFiles",
