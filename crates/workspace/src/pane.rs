@@ -8844,7 +8844,8 @@ mod tests {
             cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
         let pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
 
-        cx.simulate_resize(size(px(300.), px(300.)));
+        // Zenith: compact tabs (no empty indicator slot) need a narrower window to overflow.
+        cx.simulate_resize(size(px(240.), px(300.)));
 
         add_labeled_item(&pane, "untitled", false, cx);
         add_labeled_item(&pane, "untitled", false, cx);
@@ -10055,5 +10056,34 @@ mod zenith_tests {
     #[gpui::test]
     async fn test_no_active_tab_line_without_islands(cx: &mut TestAppContext) {
         assert!(!active_tab_line(cx, false).await);
+    }
+
+    /// A clean tab reserves no dirty-dot slot: it is narrower than a dirty tab with the same label.
+    #[gpui::test]
+    async fn test_clean_tab_reserves_no_indicator_slot(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let store = SettingsStore::test(cx);
+            cx.set_global(store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+        let project = Project::test(FakeFs::new(cx.executor()), None, cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+        let pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+        pane.update_in(cx, |pane, window, cx| {
+            for dirty in [false, true] {
+                let item = Box::new(
+                    cx.new(|cx| TestItem::new(cx).with_label("same.php").with_dirty(dirty)),
+                );
+                pane.add_item(item, true, true, None, window, cx);
+            }
+        });
+        cx.run_until_parked();
+        let clean = cx.debug_bounds("TAB-0").expect("clean tab").size.width;
+        let dirty = cx.debug_bounds("TAB-1").expect("dirty tab").size.width;
+        assert!(
+            clean < dirty,
+            "clean {clean:?} should be narrower than dirty {dirty:?}"
+        );
     }
 }
