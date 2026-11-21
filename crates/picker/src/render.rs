@@ -176,6 +176,9 @@ impl<D: PickerDelegate> Picker<D> {
                     window,
                 )
             })
+            .when_some(self.embedded_size, |this, (w, h)| {
+                this.w(w).when_some(h, |this, h| this.h(h))
+            })
             .child(
                 canvas(
                     move |bounds, _window, _cx| {

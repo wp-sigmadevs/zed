@@ -31,7 +31,10 @@ use ui::{
 use util::paths::PathMatcher;
 use workspace::{ModalView, Workspace, pane::DeploySearch, searchable::SearchableItem};
 
-use super::{DragPopup, NoDragPreview, POPUP_BAND, POPUP_FOOTER};
+use super::{
+    POPUP_BAND, POPUP_FOOTER,
+    popup::{Frame, PopupKind},
+};
 
 /// More hits than this say "refine the query", not "scroll".
 const MAX_HITS: usize = 300;
@@ -72,9 +75,8 @@ pub struct FindInFilesModal {
     /// Enter sends the results to a project search tab instead of opening one hit.
     open_in_tab: bool,
     search: Task<()>,
-    /// How far the popup has been dragged from where the modal layer put it.
-    offset: gpui::Point<Pixels>,
-    drag_last: Option<gpui::Point<Pixels>>,
+    /// The card: dragging the header moves it, the corner grip resizes it.
+    frame: Frame,
     #[cfg(test)]
     previewed: Option<(ProjectPath, u32)>,
     _subscriptions: Vec<Subscription>,
@@ -195,8 +197,7 @@ impl FindInFilesModal {
             scope: Scope::Project,
             open_in_tab: false,
             search: Task::ready(()),
-            offset: gpui::Point::default(),
-            drag_last: None,
+            frame: Frame::default(),
             #[cfg(test)]
             previewed: None,
             _subscriptions: subscriptions,
@@ -511,9 +512,23 @@ impl FindInFilesModal {
         cx.notify();
     }
 
+    /// A grip drag from `from` to `to`, which may be outside the window.
+    #[cfg(test)]
+    pub(crate) fn resize_between(
+        &mut self,
+        from: gpui::Point<Pixels>,
+        to: gpui::Point<Pixels>,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.frame.resize_to(PopupKind::Find, from, window, cx);
+        self.frame.resize_to(PopupKind::Find, to, window, cx);
+        cx.notify();
+    }
+
     #[cfg(test)]
     pub(crate) fn dragged(&self) -> bool {
-        self.offset.x > px(0.) && self.offset.y > px(0.)
+        self.frame.moved()
     }
 
     #[cfg(test)]
@@ -549,20 +564,6 @@ impl FindInFilesModal {
     #[cfg(test)]
     pub(crate) fn previewed(&self) -> Option<(ProjectPath, u32)> {
         self.previewed.clone()
-    }
-
-    /// Moves the popup with the pointer, keeping it within reach of the window.
-    fn drag_to(&mut self, position: gpui::Point<Pixels>, window: &Window, cx: &mut Context<Self>) {
-        if let Some(last) = self.drag_last {
-            let viewport = window.viewport_size();
-            let offset = self.offset + (position - last);
-            self.offset = gpui::point(
-                offset.x.clamp(-viewport.width / 2., viewport.width / 2.),
-                offset.y.clamp(-viewport.height / 4., viewport.height / 2.),
-            );
-            cx.notify();
-        }
-        self.drag_last = Some(position);
     }
 
     /// A rounded box round an editor whose border turns blue while it has focus.
@@ -627,17 +628,7 @@ impl FindInFilesModal {
                             .child(div().flex_1().child(self.mask.clone())),
                     ),
             );
-        // Dragging the header moves the popup, as in Search Everywhere.
-        div()
-            .id("zenith-popup-drag")
-            .debug_selector(|| "zenith-popup-drag".into())
-            .cursor_grab()
-            .on_mouse_down(
-                gpui::MouseButton::Left,
-                cx.listener(|this, _, _, _| this.drag_last = None),
-            )
-            .on_drag(DragPopup, |_, _, _, cx| cx.new(|_| NoDragPreview))
-            .child(header)
+        header
     }
 
     fn render_search_box(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement + use<> {
@@ -741,11 +732,19 @@ impl FindInFilesModal {
             })
     }
 
-    fn render_results(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+    fn render_results(
+        &self,
+        sized: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        // Until the popup is resized the list shows a fixed number of rows;
+        // after, it takes whatever height the body has left.
         let list = div()
             .id("zenith-find-results")
-            .h(px(ROW_HEIGHT * VISIBLE_ROWS))
-            .relative();
+            .relative()
+            .when(sized, |list| list.flex_1().min_h_0())
+            .when(!sized, |list| list.h(px(ROW_HEIGHT * VISIBLE_ROWS)));
         if self.hits.is_empty() {
             let text = if self.query.read(cx).text(cx).trim().is_empty() {
                 "Type search query to find in files"
@@ -857,6 +856,7 @@ impl FindInFilesModal {
 
     fn render_footer(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         h_flex()
+            .debug_selector(|| "zenith-popup-footer".into())
             .h_12()
             .px_4()
             .gap_2()
@@ -900,37 +900,18 @@ impl FindInFilesModal {
 
 impl Render for FindInFilesModal {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let (_, height) = self.frame.size(PopupKind::Find, window, cx);
         let header = self.render_header(window, cx);
         let search = self.render_search_box(window, cx);
         let scope = self.render_scope(window, cx);
-        let results = self.render_results(window, cx);
+        let results = self.render_results(height.is_some(), window, cx);
         let preview = self.render_preview(cx);
         let footer = self.render_footer(cx);
-        v_flex()
-            // "Picker" makes the keymap's up, down, escape and tab work in the search box.
-            .key_context("FindInFiles Picker")
-            .relative()
-            .left(self.offset.x)
-            .top(self.offset.y)
-            .on_drag_move::<DragPopup>(cx.listener(
-                |this, event: &gpui::DragMoveEvent<DragPopup>, window, cx| {
-                    this.drag_to(event.event.position, window, cx)
-                },
-            ))
-            .on_action(cx.listener(Self::select_next))
-            .on_action(cx.listener(Self::select_previous))
-            .on_action(cx.listener(Self::select_first))
-            .on_action(cx.listener(Self::select_last))
-            .on_action(cx.listener(Self::confirm))
-            .on_action(cx.listener(Self::secondary_confirm))
-            .on_action(cx.listener(Self::cancel))
-            .on_action(cx.listener(Self::focus_next_field))
-            .w(rems(44.))
-            .elevation_3(cx)
-            .overflow_hidden()
-            .child(header)
+        let body = v_flex()
+            .size_full()
             .child(
                 v_flex()
+                    .flex_none()
                     .px_4()
                     .pt_3()
                     .pb_2()
@@ -939,8 +920,28 @@ impl Render for FindInFilesModal {
                     .child(scope),
             )
             .child(results)
-            .child(preview)
-            .child(footer)
+            .child(v_flex().flex_none().child(preview))
+            .child(v_flex().flex_none().child(footer));
+        let root = v_flex()
+            // "Picker" makes the keymap's up, down, escape and tab work in the search box.
+            .key_context("FindInFiles Picker")
+            .on_action(cx.listener(Self::select_next))
+            .on_action(cx.listener(Self::select_previous))
+            .on_action(cx.listener(Self::select_first))
+            .on_action(cx.listener(Self::select_last))
+            .on_action(cx.listener(Self::confirm))
+            .on_action(cx.listener(Self::secondary_confirm))
+            .on_action(cx.listener(Self::cancel))
+            .on_action(cx.listener(Self::focus_next_field));
+        self.frame.render(
+            PopupKind::Find,
+            root,
+            header,
+            body,
+            |this: &mut Self| &mut this.frame,
+            window,
+            cx,
+        )
     }
 }
 
