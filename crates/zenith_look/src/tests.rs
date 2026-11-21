@@ -132,3 +132,184 @@ impl gpui::Render for Root {
             .child(self.indicator.clone())
     }
 }
+
+mod hover_card_tests {
+    use crate::hover_card::{self, diagnostic_text};
+    use editor::{
+        Anchor, DiagnosticRenderer, Editor, EditorSnapshot,
+        hover_popover::{
+            hover_at,
+            zenith_card::{HoverCardDiagnostic, HoverCardSeverity},
+        },
+        test::editor_lsp_test_context::EditorLspTestContext,
+    };
+    use futures::StreamExt as _;
+    use gpui::{App, AppContext as _, BorrowAppContext as _, Bounds, Context, Pixels, ScrollHandle, SharedString, Window};
+    use indoc::indoc;
+    use markdown::Markdown;
+    use settings::{Settings as _, SettingsStore};
+    use std::{ops::Range, sync::Arc, time::Duration};
+
+    struct TestDiagnosticRenderer;
+
+    impl DiagnosticRenderer for TestDiagnosticRenderer {
+        fn render_group(
+            &self,
+            _: Vec<language::DiagnosticEntryRef<'_, text::Point>>,
+            _: text::BufferId,
+            _: EditorSnapshot,
+            _: gpui::WeakEntity<Editor>,
+            _: Option<Arc<language::LanguageRegistry>>,
+            _: &mut App,
+        ) -> Vec<editor::display_map::BlockProperties<Anchor>> {
+            Vec::new()
+        }
+
+        fn render_hover(
+            &self,
+            _: Vec<language::DiagnosticEntryRef<'_, text::Point>>,
+            _: Range<text::Point>,
+            _: text::BufferId,
+            _: Option<Arc<language::LanguageRegistry>>,
+            cx: &mut App,
+        ) -> Option<gpui::Entity<Markdown>> {
+            Some(cx.new(|cx| Markdown::new("diagnostic".into(), None, None, cx)))
+        }
+
+        fn open_link(&self, _: &mut Editor, _: SharedString, _: &mut Window, _: &mut Context<Editor>) {}
+    }
+
+    /// An editor hovered over `test` with BOTH a diagnostic and docs showing,
+    /// and the real card renderer registered.
+    async fn hovered_with_diagnostic_and_docs(cx: &mut gpui::TestAppContext) -> EditorLspTestContext {
+        cx.update(|cx| {
+            assets::Assets.load_test_fonts(cx);
+            let store = SettingsStore::test(cx);
+            cx.set_global(store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            release_channel::init(semver::Version::new(0, 0, 0), cx);
+            editor::init(cx);
+            hover_card::init(cx);
+            editor::set_diagnostic_renderer(TestDiagnosticRenderer, cx);
+        });
+        let mut cx = EditorLspTestContext::new_rust(
+            lsp::ServerCapabilities {
+                hover_provider: Some(lsp::HoverProviderCapability::Simple(true)),
+                ..Default::default()
+            },
+            cx,
+        )
+        .await;
+        cx.set_state(indoc! {"
+            fn ˇtest() {}
+        "});
+        let range = lsp::Range::new(lsp::Position::new(0, 3), lsp::Position::new(0, 7));
+        cx.lsp
+            .notify::<lsp::notification::PublishDiagnostics>(lsp::PublishDiagnosticsParams {
+                uri: cx.buffer_lsp_url.clone(),
+                diagnostics: vec![lsp::Diagnostic {
+                    range,
+                    severity: Some(lsp::DiagnosticSeverity::ERROR),
+                    source: Some("phpcs".into()),
+                    code: Some(lsp::NumberOrString::String("Sniff.Code".into())),
+                    message: "message".into(),
+                    ..Default::default()
+                }],
+                version: None,
+            });
+        let mut requests =
+            cx.set_request_handler::<lsp::request::HoverRequest, _, _>(move |_, _, _| async move {
+                Ok(Some(lsp::Hover {
+                    contents: lsp::HoverContents::Markup(lsp::MarkupContent {
+                        kind: lsp::MarkupKind::Markdown,
+                        value: "some docs".to_string(),
+                    }),
+                    range: Some(range),
+                }))
+            });
+        cx.run_until_parked();
+        cx.update_editor(|editor, window, cx| {
+            let anchor = editor.selections.newest_anchor().head();
+            hover_at(editor, Some(anchor), None, window, cx)
+        });
+        let delay = cx.read(|cx: &App| editor::EditorSettings::get_global(cx).hover_popover_delay.0);
+        cx.background_executor
+            .advance_clock(Duration::from_millis(delay + 100));
+        requests.next().await;
+        cx.run_until_parked();
+        cx.update_editor(|editor, _, _| {
+            assert!(editor.hover_state.diagnostic_popover.is_some());
+            assert_eq!(editor.hover_state.info_popovers.len(), 1);
+        });
+        cx
+    }
+
+    /// Forgets every popover's bounds, redraws, and returns the bounds the
+    /// draw wrote: (diagnostic popover, info popover).
+    fn redraw(cx: &mut EditorLspTestContext) -> (Option<Bounds<Pixels>>, Option<Bounds<Pixels>>) {
+        cx.update_editor(|editor, _, cx| {
+            let state = &editor.hover_state;
+            state.diagnostic_popover.iter().for_each(|p| p.last_bounds.set(None));
+            state.info_popovers.iter().for_each(|p| p.last_bounds.set(None));
+            cx.notify();
+        });
+        cx.run_until_parked();
+        cx.update_editor(|editor, _, _| {
+            let state = &editor.hover_state;
+            (
+                state.diagnostic_popover.as_ref().and_then(|p| p.last_bounds.get()),
+                state.info_popovers[0].last_bounds.get(),
+            )
+        })
+    }
+
+    #[gpui::test]
+    async fn test_card_merges_diagnostic_and_docs(cx: &mut gpui::TestAppContext) {
+        let mut cx = hovered_with_diagnostic_and_docs(cx).await;
+        // One card: the diagnostic and the docs share one painted rectangle.
+        let (diagnostic, docs) = redraw(&mut cx);
+        assert!(diagnostic.is_some(), "the card was painted");
+        assert_eq!(diagnostic, docs);
+    }
+
+    #[gpui::test]
+    async fn test_card_off_uses_upstream(cx: &mut gpui::TestAppContext) {
+        let mut cx = hovered_with_diagnostic_and_docs(cx).await;
+        cx.update(|_, cx| {
+            cx.update_global::<SettingsStore, _>(|store, cx| {
+                store.update_user_settings(cx, |content| {
+                    content.zenith = Some(settings::ZenithSettingsContent {
+                        hover_card: Some(settings::ZenithHoverCardSettingsContent {
+                            enabled: Some(false),
+                        }),
+                        ..Default::default()
+                    });
+                });
+            });
+        });
+        // Upstream's two popovers: both painted, each in its own rectangle.
+        let (diagnostic, docs) = redraw(&mut cx);
+        assert!(diagnostic.is_some() && docs.is_some(), "both popovers painted");
+        assert_ne!(diagnostic, docs);
+    }
+
+    #[gpui::test]
+    fn test_diagnostic_text_source_first(cx: &mut gpui::TestAppContext) {
+        let text = |source: Option<&str>, code: Option<&str>, cx: &mut gpui::TestAppContext| {
+            let markdown = cx.new(|cx| Markdown::new("m".into(), None, None, cx));
+            diagnostic_text(&HoverCardDiagnostic {
+                severity: HoverCardSeverity::Error,
+                source: source.map(|s| s.to_string().into()),
+                code: code.map(|c| c.to_string().into()),
+                message: "message".into(),
+                range_start: Anchor::Min,
+                markdown,
+                scroll_handle: ScrollHandle::new(),
+            })
+        };
+        assert_eq!(text(Some("phpcs"), Some("Sniff.Code"), cx), "phpcs: Sniff.Code: message");
+        assert_eq!(text(None, Some("Sniff.Code"), cx), "Sniff.Code: message");
+        assert_eq!(text(Some("phpcs"), None, cx), "phpcs: message");
+        assert_eq!(text(None, None, cx), "message");
+    }
+}
