@@ -22916,6 +22916,7 @@ dependencies = [
  "zenith_markdown",
  "zenith_nextjs",
  "zenith_php_tools",
+ "zenith_postfix",
  "zenith_problems",
  "zenith_rails",
  "zenith_scratches",
@@ -23194,8 +23195,10 @@ name = "zenith_postfix"
 version = "0.1.0"
 dependencies = [
  "collections",
+ "editor",
  "gpui",
  "icons",
+ "language",
  "log",
  "pretty_assertions",
  "schemars 1.0.4",

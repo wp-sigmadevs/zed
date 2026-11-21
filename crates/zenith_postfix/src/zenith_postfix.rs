@@ -1,3 +1,6 @@
+mod editor_actions;
+pub use editor_actions::init;
+
 use std::path::Path;
 use serde::{Deserialize, Serialize};
 

@@ -14,8 +14,10 @@ doctest = false
 
 [dependencies]
 collections.workspace = true
+editor.workspace = true
 gpui.workspace = true
 icons.workspace = true
+language.workspace = true
 log.workspace = true
 schemars.workspace = true
 serde.workspace = true

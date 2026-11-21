@@ -14,7 +14,7 @@ test = false
 doctest = false
 
 [features]
-default = ["welcome", "search", "rails", "php", "inspections", "look", "todo", "splash", "markdown", "problems", "folds", "templates", "scratches", "local_history", "wordpress", "laravel", "external_libraries", "nextjs"]
+default = ["welcome", "search", "rails", "php", "inspections", "look", "todo", "splash", "markdown", "problems", "folds", "templates", "scratches", "local_history", "wordpress", "laravel", "external_libraries", "nextjs", "postfix"]
 welcome = ["dep:zenith_welcome"]
 search = ["dep:zenith_search"]
 rails = ["dep:zenith_rails"]
@@ -33,6 +33,7 @@ local_history = ["dep:zenith_local_history"]
 wordpress = ["dep:zenith_wordpress"]
 laravel = ["dep:zenith_laravel"]
 nextjs = ["dep:zenith_nextjs"]
+postfix = ["dep:zenith_postfix"]
 
 [dependencies]
 gpui.workspace = true
@@ -55,3 +56,4 @@ zenith_templates = { workspace = true, optional = true }
 zenith_todo = { workspace = true, optional = true }
 zenith_welcome = { workspace = true, optional = true }
 zenith_wordpress = { workspace = true, optional = true }
+zenith_postfix = { workspace = true, optional = true }

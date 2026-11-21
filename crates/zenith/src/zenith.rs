@@ -48,6 +48,8 @@ pub fn init(cx: &mut App) {
     zenith_laravel::init(cx);
     #[cfg(feature = "nextjs")]
     zenith_nextjs::init(cx);
+    #[cfg(feature = "postfix")]
+    zenith_postfix::init(cx);
     #[cfg(feature = "external_libraries")]
     zenith_external_libraries::init(cx);
 }
