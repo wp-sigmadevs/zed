@@ -3031,6 +3031,10 @@
     "laravel": {
       "enabled": true,
     },
+    // Next.js tool window: App Router routes of a Next.js project.
+    "nextjs": {
+      "enabled": true,
+    },
     // Hover card: one card for the diagnostic and the documentation under the pointer.
     "hover_card": {
       // Show the combined card instead of separate popovers.
