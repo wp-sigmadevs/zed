@@ -242,3 +242,160 @@ pub(crate) fn render(
             .into_any_element(),
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{editor_tests::init_test, test::editor_lsp_test_context::EditorLspTestContext};
+    use futures::StreamExt as _;
+    use indoc::indoc;
+    use settings::SettingsStore;
+    use text::Bias;
+
+    thread_local! {
+        /// (has diagnostic, doc count, has scroll handle) of the last render.
+        static SEEN: Cell<Option<(bool, usize, bool)>> = const { Cell::new(None) };
+    }
+
+    fn record_parts(
+        parts: HoverCardParts,
+        _: Size<Pixels>,
+        _: &mut Window,
+        _: &mut App,
+    ) -> Option<AnyElement> {
+        SEEN.set(Some((
+            parts.diagnostic.is_some(),
+            parts.docs.len(),
+            parts.scroll_handle.is_some(),
+        )));
+        Some(div().size_full().into_any_element())
+    }
+
+    fn decline(
+        _: HoverCardParts,
+        _: Size<Pixels>,
+        _: &mut Window,
+        _: &mut App,
+    ) -> Option<AnyElement> {
+        None
+    }
+
+    /// An editor with a doc popover showing over `println!`.
+    async fn hovered(cx: &mut gpui::TestAppContext) -> EditorLspTestContext {
+        init_test(cx, |_| {});
+        let mut cx = EditorLspTestContext::new_rust(
+            lsp::ServerCapabilities {
+                hover_provider: Some(lsp::HoverProviderCapability::Simple(true)),
+                ..Default::default()
+            },
+            cx,
+        )
+        .await;
+        cx.set_state(indoc! {"
+            fn ˇtest() { println!(); }
+        "});
+        let hover_point = cx.display_point(indoc! {"
+            fn test() { printˇln!(); }
+        "});
+        let symbol_range = cx.lsp_range(indoc! {"
+            fn test() { «println!»(); }
+        "});
+        let mut requests =
+            cx.set_request_handler::<lsp::request::HoverRequest, _, _>(move |_, _, _| async move {
+                Ok(Some(lsp::Hover {
+                    contents: lsp::HoverContents::Markup(lsp::MarkupContent {
+                        kind: lsp::MarkupKind::Markdown,
+                        value: "some basic docs".to_string(),
+                    }),
+                    range: Some(symbol_range),
+                }))
+            });
+        cx.update_editor(|editor, window, cx| {
+            let snapshot = editor.snapshot(window, cx);
+            let anchor = snapshot
+                .buffer_snapshot()
+                .anchor_before(hover_point.to_offset(&snapshot, Bias::Left));
+            crate::hover_popover::hover_at(editor, Some(anchor), None, window, cx)
+        });
+        let delay = cx.read(|cx: &App| EditorSettings::get_global(cx).hover_popover_delay.0);
+        cx.background_executor
+            .advance_clock(Duration::from_millis(delay + 100));
+        requests.next().await;
+        cx.run_until_parked();
+        cx
+    }
+
+    fn render_card(cx: &mut EditorLspTestContext) -> bool {
+        cx.update_editor(|editor, window, cx| {
+            let max_size = gpui::size(px(400.), px(300.));
+            render(&editor.hover_state, max_size, window, cx).is_some()
+        })
+    }
+
+    #[gpui::test]
+    async fn test_no_card_without_a_renderer(cx: &mut gpui::TestAppContext) {
+        let mut cx = hovered(cx).await;
+        assert!(!render_card(&mut cx));
+    }
+
+    #[gpui::test]
+    async fn test_card_gets_the_docs_and_the_scroll_handle(cx: &mut gpui::TestAppContext) {
+        let mut cx = hovered(cx).await;
+        cx.update(|_, cx| set_hover_card_renderer(record_parts, cx));
+        SEEN.set(None);
+        assert!(render_card(&mut cx));
+        assert_eq!(SEEN.get(), Some((false, 1, true)));
+    }
+
+    #[gpui::test]
+    async fn test_declining_renderer_falls_back_to_upstream(cx: &mut gpui::TestAppContext) {
+        let mut cx = hovered(cx).await;
+        cx.update(|_, cx| set_hover_card_renderer(decline, cx));
+        assert!(!render_card(&mut cx));
+    }
+
+    #[gpui::test]
+    async fn test_no_card_when_the_setting_is_off(cx: &mut gpui::TestAppContext) {
+        let mut cx = hovered(cx).await;
+        cx.update(|_, cx| set_hover_card_renderer(record_parts, cx));
+        assert!(render_card(&mut cx));
+        cx.update(|_, cx| {
+            cx.update_global::<SettingsStore, _>(|store, cx| {
+                store.update_user_settings(cx, |content| {
+                    content.zenith = Some(settings::ZenithSettingsContent {
+                        hover_card: Some(settings::ZenithHoverCardSettingsContent {
+                            enabled: Some(false),
+                        }),
+                        ..Default::default()
+                    });
+                });
+            });
+        });
+        assert!(!render_card(&mut cx));
+    }
+
+    #[gpui::test]
+    async fn test_painted_card_sets_the_bounds_of_every_popover(cx: &mut gpui::TestAppContext) {
+        let mut cx = hovered(cx).await;
+        cx.update_editor(|editor, _, _| {
+            for popover in &editor.hover_state.info_popovers {
+                popover.last_bounds.set(None);
+            }
+        });
+        cx.update(|_, cx| set_hover_card_renderer(record_parts, cx));
+        cx.update_editor(|_, _, cx| cx.notify());
+        cx.run_until_parked();
+        cx.update_editor(|editor, _, _| {
+            assert!(!editor.hover_state.info_popovers.is_empty());
+            for popover in &editor.hover_state.info_popovers {
+                assert!(popover.last_bounds.get().is_some());
+            }
+        });
+    }
+
+    #[gpui::test]
+    async fn test_card_is_on_by_default(cx: &mut gpui::TestAppContext) {
+        init_test(cx, |_| {});
+        assert!(cx.update(|cx| ZenithHoverCardSettings::get_global(cx).enabled));
+    }
+}
