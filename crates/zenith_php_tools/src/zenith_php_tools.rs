@@ -207,6 +207,58 @@ pub fn managed_bin(home: &Path, profile: Profile) -> PathBuf {
         .join("vendor/bin")
 }
 
+/// `<managed root>/wordpress/vendor/php-stubs/wordpress-stubs`. The WordPress
+/// profile's lock already pins it (a dependency of `szepeviktor/phpstan-wordpress`),
+/// so the tools install is also the stubs install.
+pub fn wordpress_stubs_dir(home: &Path) -> PathBuf {
+    managed_root(home).join("wordpress/vendor/php-stubs/wordpress-stubs")
+}
+
+/// Adds `stubs.paths = [dir]` to PHPantom's initialization options, keeping
+/// everything else and never duplicating. `stubs.paths` is the key in PHPantom's
+/// `.phpantom.toml` schema; its editor-options page documents only `indexing`,
+/// so the editor-side key is the same name by assumption (UNVERIFIED).
+fn add_phpantom_stubs(options: &mut Option<serde_json::Value>, dir: &str) {
+    let value = options.get_or_insert_with(|| serde_json::json!({}));
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    let Some(stubs) = object
+        .entry("stubs")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+    else {
+        return;
+    };
+    let Some(paths) = stubs
+        .entry("paths")
+        .or_insert_with(|| serde_json::json!([]))
+        .as_array_mut()
+    else {
+        return;
+    };
+    if !paths.iter().any(|path| path.as_str() == Some(dir)) {
+        paths.push(serde_json::Value::String(dir.to_string()));
+    }
+}
+
+/// For a consenting WordPress user with the stubs installed, points PHPantom at them.
+fn wire_phpantom_stubs(project: &Entity<Project>, profile: Profile, cx: &mut App) {
+    if profile != Profile::WordPress {
+        return;
+    }
+    let home = home_dir();
+    let dir = wordpress_stubs_dir(&home);
+    if load_consent(&home, profile) != Consent::Yes || !dir.is_dir() {
+        return;
+    }
+    let dir = dir.display().to_string();
+    settings::update_settings_file(project.read(cx).fs().clone(), cx, move |content, _| {
+        let lsp = content.project.lsp.0.entry("phpantom".into()).or_default();
+        add_phpantom_stubs(&mut lsp.initialization_options, &dir);
+    });
+}
+
 /// Where a PHP binary may live, best first: Herd, Homebrew, then the `PATH`.
 pub fn php_candidates(home: &Path, path_dirs: &[PathBuf]) -> Vec<PathBuf> {
     let mut dirs = vec![
@@ -821,6 +873,7 @@ fn maybe_offer(
     .into_iter()
     .any(|tool| resolve(root, tool, Some(&managed), &path_dirs).is_some());
     let project = workspace.project().clone();
+    wire_phpantom_stubs(&project, profile, cx);
     let local = project.read(cx).is_local();
     let worktree_id = project
         .read(cx)
@@ -918,7 +971,9 @@ fn start_install(
         std::fs::write(&log, text).ok();
         workspace
             .update_in(cx, |workspace, _, cx| match result {
-                Ok(_) => workspace.show_notification(
+                Ok(_) => {
+                    wire_phpantom_stubs(&workspace.project().clone(), profile, cx);
+                    workspace.show_notification(
                     BannerId::unique::<InstallProgress>(),
                     cx,
                     |cx| {
@@ -932,7 +987,8 @@ fn start_install(
                             )
                         })
                     },
-                ),
+                    );
+                }
                 Err(error) => {
                     let weak = cx.entity().downgrade();
                     workspace.show_notification(
