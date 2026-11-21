@@ -36,6 +36,10 @@ gpui::actions!(
 const ROW_HEIGHT: f32 = 26.;
 const ITEM_INDENT: f32 = 16.;
 
+/// A line's identity across rebuilds: its hook name and, for a definition (`true`) or listener
+/// (`false`) line, its ordinal.
+type RowKey = (String, Option<(bool, usize)>);
+
 /// One line of the list. A hook line holds an index into [`WpHooksPanel::hooks`]; the lines of an
 /// expanded hook follow it, flat, so every row keeps the same height.
 enum Row {
@@ -104,11 +108,30 @@ impl WpHooksPanel {
     }
 
     fn reload_hooks(&mut self) {
+        let selected = self.selected_key();
         self.hooks = read_index(&self.index).hook_summaries();
-        self.rebuild_rows();
+        self.build_rows(selected);
     }
 
     fn rebuild_rows(&mut self) {
+        let selected = self.selected_key();
+        self.build_rows(selected);
+    }
+
+    /// Who the selected line is, so the selection can follow it when `rows` changes: the hook's
+    /// name, and for one of its lines whether it is a definition and which one it is.
+    fn selected_key(&self) -> Option<RowKey> {
+        let (hook, child) = match self.rows.get(self.selected?)? {
+            Row::Hook(hook) => (hook, None),
+            Row::Definition { hook, ordinal, .. } => (hook, Some((true, *ordinal))),
+            Row::Listener { hook, ordinal, .. } => (hook, Some((false, *ordinal))),
+        };
+        Some((self.hooks.get(*hook)?.name.clone(), child))
+    }
+
+    /// Rebuilds `rows`, then selects `selected` again: its own line, else its hook's line, else
+    /// (it is gone) the old position kept within the list.
+    fn build_rows(&mut self, selected: Option<RowKey>) {
         let query = self.search_query.to_lowercase();
         let index = self.index.clone();
         let index = read_index(&index);
@@ -144,11 +167,29 @@ impl WpHooksPanel {
                 });
             }
         }
-        self.selected = self
-            .rows
-            .len()
-            .checked_sub(1)
-            .and_then(|last| self.selected.map(|ix| ix.min(last)));
+        let previous = self.selected;
+        let position = |key: &RowKey| {
+            let mut keys = self.rows.iter().map(|row| match row {
+                Row::Hook(hook) => (&self.hooks[*hook].name, None),
+                Row::Definition { hook, ordinal, .. } => {
+                    (&self.hooks[*hook].name, Some((true, *ordinal)))
+                }
+                Row::Listener { hook, ordinal, .. } => {
+                    (&self.hooks[*hook].name, Some((false, *ordinal)))
+                }
+            });
+            keys.position(|(name, child)| *name == key.0 && child == key.1)
+        };
+        self.selected = selected
+            .and_then(|key| position(&key).or_else(|| position(&(key.0, None))))
+            .or_else(|| {
+                let last = self.rows.len().checked_sub(1)?;
+                previous.map(|ix| ix.min(last))
+            });
+        if let Some(ix) = self.selected.filter(|ix| Some(*ix) != previous) {
+            self.scroll_handle
+                .scroll_to_item(ix, ScrollStrategy::Nearest);
+        }
     }
 
     fn select(&mut self, ix: usize, cx: &mut Context<Self>) {
@@ -642,6 +683,77 @@ mod tests {
             assert_eq!(panel.shown_hooks, 1);
             panel.set_filter_kind(Some(HookKind::Action), cx);
             assert!(panel.rows.is_empty());
+        });
+    }
+
+    fn selected_hook(panel: &WpHooksPanel) -> Option<&str> {
+        match panel.rows.get(panel.selected?)? {
+            Row::Hook(hook) | Row::Definition { hook, .. } | Row::Listener { hook, .. } => {
+                Some(&panel.hooks[*hook].name)
+            }
+        }
+    }
+
+    #[gpui::test]
+    fn test_selection_follows_its_hook_when_the_index_changes(cx: &mut App) {
+        let index = Arc::new(RwLock::new(WordPressIndex::new()));
+        index.write().unwrap().index_source(
+            PathBuf::from("m.php"),
+            "<?php\napply_filters('zz_m', 1);\nadd_filter('zz_m', 'cb');\n",
+        );
+        let panel = cx.new(|cx| WpHooksPanel::new(WeakEntity::new_invalid(), index.clone(), cx));
+        panel.update(cx, |panel, cx| {
+            panel.set_search_query("zz_".into(), cx);
+            panel.toggle_expand("zz_m", cx);
+            // Rows: zz_m, its definition, its listener. Select the listener.
+            panel.selected = Some(2);
+        });
+
+        // A hook sorting above the selected one arrives: the listener row moves down by one.
+        index
+            .write()
+            .unwrap()
+            .index_source(PathBuf::from("a.php"), "<?php\ndo_action('zz_a');\n");
+        panel.update(cx, |panel, cx| panel.index_changed(cx));
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(panel.rows.len(), 4);
+            assert_eq!(panel.selected, Some(3));
+            assert!(matches!(panel.rows[3], Row::Listener { .. }));
+            assert_eq!(selected_hook(panel), Some("zz_m"));
+        });
+
+        // Collapsing the hook removes the selected line: the hook's own line takes the selection.
+        panel.update(cx, |panel, cx| panel.toggle_expand("zz_m", cx));
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(panel.selected, Some(1));
+            assert_eq!(selected_hook(panel), Some("zz_m"));
+        });
+    }
+
+    #[gpui::test]
+    fn test_selection_follows_its_hook_when_the_filter_changes(cx: &mut App) {
+        let index = Arc::new(RwLock::new(WordPressIndex::new()));
+        index.write().unwrap().index_source(
+            PathBuf::from("m.php"),
+            "<?php\ndo_action('zz_action');\napply_filters('zz_filter', 1);\n",
+        );
+        let panel = cx.new(|cx| WpHooksPanel::new(WeakEntity::new_invalid(), index, cx));
+        panel.update(cx, |panel, cx| {
+            panel.set_search_query("zz_".into(), cx);
+            panel.selected = Some(1);
+            assert_eq!(selected_hook(panel), Some("zz_filter"));
+
+            panel.set_filter_kind(Some(HookKind::Filter), cx);
+            assert_eq!((panel.rows.len(), panel.selected), (1, Some(0)));
+            assert_eq!(selected_hook(panel), Some("zz_filter"));
+
+            panel.set_filter_kind(None, cx);
+            assert_eq!((panel.rows.len(), panel.selected), (2, Some(1)));
+            assert_eq!(selected_hook(panel), Some("zz_filter"));
+
+            // The selected hook is filtered out: the position is kept within the list.
+            panel.set_filter_kind(Some(HookKind::Action), cx);
+            assert_eq!((panel.rows.len(), panel.selected), (1, Some(0)));
         });
     }
 
