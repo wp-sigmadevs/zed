@@ -44,4 +44,6 @@ pub fn init(cx: &mut App) {
     zenith_local_history::init(cx);
     #[cfg(feature = "wordpress")]
     zenith_wordpress::init(cx);
+    #[cfg(feature = "laravel")]
+    zenith_laravel::init(cx);
 }
