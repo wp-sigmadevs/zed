@@ -141,6 +141,7 @@ pub struct Picker<D: PickerDelegate> {
     show_scrollbar: bool,
     /// How the picker is presented, which controls its chrome and behavior.
     presentation: Presentation,
+    embedded_size: Option<(Pixels, Option<Pixels>)>,
     /// Bounds tracking for the picker container (for aside positioning)
     picker_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     /// Bounds tracking for items (for aside positioning) - maps item index to bounds
@@ -639,6 +640,7 @@ impl<D: PickerDelegate> Picker<D> {
             presentation: Presentation::Modal {
                 resizable: has_preview,
             },
+            embedded_size: None,
             picker_bounds: Rc::new(Cell::new(None)),
             item_bounds: Rc::new(RefCell::new(HashMap::default())),
             size_bounds,
@@ -722,6 +724,7 @@ impl<D: PickerDelegate> Picker<D> {
         self.preview
             .as_ref()
             .is_some_and(|preview| preview.layout != preview::Layout::Hidden)
+            || self.embedded_size.is_some_and(|(_, h)| h.is_some())
     }
 
     pub fn show_scrollbar(mut self, show_scrollbar: bool) -> Self {
@@ -753,6 +756,12 @@ impl<D: PickerDelegate> Picker<D> {
     pub fn embedded(mut self) -> Self {
         self.presentation = Presentation::Embedded;
         self
+    }
+
+    pub fn set_embedded_size(&mut self, size: (Pixels, Option<Pixels>), cx: &mut Context<Self>) {
+        if self.embedded_size.replace(size) != Some(size) {
+            cx.notify();
+        }
     }
 
     /// Presents the picker as a popover surface: it draws its own elevated
