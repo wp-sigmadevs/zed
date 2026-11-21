@@ -1806,8 +1806,8 @@
     // Settings for inline diagnostics
     "inline": {
       // Whether to show diagnostics inline or not
-      // Zenith: on by default, as in PhpStorm.
-      "enabled": true,
+      // Zenith: off by default (squiggle + hover, as in PhpStorm); noisy language servers made it unusable.
+      "enabled": false,
       // The delay in milliseconds to show inline diagnostics after the
       // last diagnostic update.
       "update_debounce_ms": 150,
@@ -2635,7 +2635,7 @@
       },
     },
     "PHP": {
-      "language_servers": ["intelephense", "phpactor", "!phptools", "!phpantom", "..."],
+      "language_servers": ["intelephense", "!phpactor", "!phptools", "!phpantom", "..."],
       "prettier": {
         "allowed": true,
         "plugins": ["@prettier/plugin-php"],
