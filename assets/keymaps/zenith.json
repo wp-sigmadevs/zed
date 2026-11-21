@@ -103,6 +103,9 @@
     "context": "!AcpThread > Editor && mode == full",
     "bindings": {
       "secondary-shift-e": "zenith_search::RecentLocations",
+      // Show Usages popup (⌘⌥F7), as in PhpStorm; the JetBrains keymap's own binding
+      // for these keys opens the usages in a tab, which the popup's button still does.
+      "secondary-alt-f7": "zenith_search::ShowUsages",
     },
   },
   {
@@ -115,6 +118,18 @@
       // Switcher: more ⌃Tab steps down the list, ⌃⇧Tab back up.
       "ctrl-tab": "zenith_search::Switcher",
       "ctrl-shift-tab": "menu::SelectPrevious",
+    },
+  },
+  {
+    // Find in Files toggles, as PhpStorm's Match Case, Words, Regex and File mask.
+    // The query box is an Editor inside this context; no Editor binding uses these keys on macOS
+    // or in the JetBrains keymaps (theirs are in BufferSearchBar and ProjectSearchBar).
+    "context": "FindInFiles",
+    "bindings": {
+      "alt-c": "zenith_search::ToggleFindCase",
+      "alt-w": "zenith_search::ToggleFindWord",
+      "alt-x": "zenith_search::ToggleFindRegex",
+      "alt-m": "zenith_search::ToggleFindMask",
     },
   },
   {

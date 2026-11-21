@@ -23295,6 +23295,7 @@ dependencies = [
  "anyhow",
  "command_palette",
  "command_palette_hooks",
+ "db",
  "editor",
  "file_finder",
  "file_icons",
