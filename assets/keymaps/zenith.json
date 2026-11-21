@@ -57,6 +57,15 @@
     },
   },
   {
+    // Routes / Views tabs of the Laravel tool window. Its list is flat, so left and right are
+    // free; no default or JetBrains binding for them applies in this context.
+    "context": "LaravelPanel",
+    "bindings": {
+      "left": "zenith_laravel::ShowRoutes",
+      "right": "zenith_laravel::ShowViews",
+    },
+  },
+  {
     // Collapse / expand a file in the Problems tool window.
     "context": "ProblemsPanel",
     "bindings": {

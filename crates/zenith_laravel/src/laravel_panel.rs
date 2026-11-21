@@ -144,7 +144,8 @@ impl LaravelPanel {
     }
 
     /// Rebuilds `rows`, then selects `selected` again: its own line, else (it is gone) the old
-    /// position kept within the list.
+    /// position kept within the list, else (there was none) the first row, so Enter works on
+    /// arrival.
     fn build_rows(&mut self, selected: Option<RowKey>) {
         let query = self.search_query.to_lowercase();
         let contains = |text: &str| query.is_empty() || text.to_lowercase().contains(&query);
@@ -173,7 +174,7 @@ impl LaravelPanel {
             .and_then(|key| self.rows.iter().position(|&ix| self.is_key(ix, &key)))
             .or_else(|| {
                 let last = self.rows.len().checked_sub(1)?;
-                previous.map(|ix| ix.min(last))
+                Some(previous.map_or(0, |ix| ix.min(last)))
             });
         if let Some(ix) = self.selected.filter(|ix| Some(*ix) != previous) {
             self.scroll_handle
@@ -234,10 +235,10 @@ impl LaravelPanel {
 
     /// Enter or click: a route opens its file at its line, a view opens its file.
     fn activate(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
-        self.select(ix, cx);
         let Some(&row) = self.rows.get(ix) else {
             return;
         };
+        self.select(ix, cx);
         match self.active_tab {
             LaravelPanelTab::Routes => {
                 let route = &self.routes[row];
@@ -277,10 +278,11 @@ impl LaravelPanel {
         .into()
     }
 
-    /// What assistive technology reads for a row.
+    /// What assistive technology reads for a row; the selection is said in words, not only by
+    /// the row's colour.
     fn row_label(&self, ix: usize) -> String {
         let row = self.rows[ix];
-        match self.active_tab {
+        let text = match self.active_tab {
             LaravelPanelTab::Routes => {
                 let route = &self.routes[row];
                 format!(
@@ -296,6 +298,11 @@ impl LaravelPanel {
                 let view = &self.views[row];
                 format!("View {}, {}", view.dot_name, file_name(&view.file_path))
             }
+        };
+        if self.selected == Some(ix) {
+            format!("{text}, selected")
+        } else {
+            text
         }
     }
 
@@ -541,13 +548,13 @@ impl Render for LaravelPanel {
                     .child(tab_button(
                         "tab-routes",
                         "Routes",
-                        "Show routes",
+                        "Routes tab",
                         LaravelPanelTab::Routes,
                     ))
                     .child(tab_button(
                         "tab-views",
                         "Views",
-                        "Show views",
+                        "Views tab",
                         LaravelPanelTab::Views,
                     )),
             )
@@ -727,8 +734,24 @@ mod tests {
             assert_eq!(selected_key(panel).as_deref(), Some("c"));
         });
         panel.update(cx, |panel, cx| {
+            // The views selection (row 2) is dropped, not carried over; the first row is taken.
             panel.set_tab(LaravelPanelTab::Routes, cx);
-            assert_eq!(panel.selected, None);
+            assert_eq!(panel.selected, Some(0));
+        });
+    }
+
+    #[gpui::test]
+    fn test_first_row_is_selected_on_arrival_and_none_when_empty(cx: &mut App) {
+        let index = Arc::new(RwLock::new(LaravelIndex::new()));
+        let panel = cx.new(|cx| LaravelPanel::new(WeakEntity::new_invalid(), index.clone(), cx));
+        panel.read_with(cx, |panel, _| assert_eq!(panel.selected, None));
+        index
+            .write()
+            .unwrap()
+            .index_route_file(PathBuf::from("/p/routes/web.php"), WEB);
+        panel.update(cx, |panel, cx| panel.index_changed(cx));
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(selected_key(panel).as_deref(), Some("b.two"));
         });
     }
 
@@ -781,6 +804,22 @@ mod tests {
         });
     }
 
+    #[gpui::test]
+    fn test_row_labels_say_which_row_is_selected(cx: &mut App) {
+        let index = index_with(&[("/p/routes/web.php", WEB)]);
+        let panel = cx.new(|cx| LaravelPanel::new(WeakEntity::new_invalid(), index, cx));
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                panel.row_label(0),
+                "Route GET /b, name b.two, at web.php:2, selected"
+            );
+            assert_eq!(
+                panel.row_label(1),
+                "Route GET /d, name d.four, at web.php:3"
+            );
+        });
+    }
+
     struct Fixture {
         workspace: Entity<Workspace>,
         panel: Entity<LaravelPanel>,
@@ -800,6 +839,8 @@ mod tests {
                 gpui::KeyBinding::new("up", menu::SelectPrevious, panel),
                 gpui::KeyBinding::new("enter", menu::Confirm, panel),
                 gpui::KeyBinding::new("escape", menu::Cancel, panel),
+                gpui::KeyBinding::new("left", ShowRoutes, panel),
+                gpui::KeyBinding::new("right", ShowViews, panel),
             ]);
             app_state
         });
@@ -875,9 +916,7 @@ mod tests {
         };
         assert!(focused(cx));
 
-        // Rows: b.two, d.four.
-        assert_eq!(selected(&fixture, cx), (None, 2));
-        cx.simulate_keystrokes("down");
+        // Rows: b.two, d.four. The first is selected on arrival.
         assert_eq!(selected(&fixture, cx), (Some(0), 2));
         cx.simulate_keystrokes("down down down up");
         assert_eq!(selected(&fixture, cx), (Some(0), 2));
@@ -899,14 +938,14 @@ mod tests {
         cx.simulate_keystrokes("escape");
         assert!(!focused(cx));
 
-        // The tab actions switch the list; a view opens at the top.
+        // Right and left switch the tab; a view opens at the top.
         fixture.workspace.update_in(cx, |workspace, window, cx| {
             workspace.focus_panel::<LaravelPanel>(window, cx);
         });
         cx.run_until_parked();
-        cx.dispatch_action(ShowViews);
-        assert_eq!(selected(&fixture, cx), (None, 1));
-        cx.simulate_keystrokes("down enter");
+        cx.simulate_keystrokes("right");
+        assert_eq!(selected(&fixture, cx), (Some(0), 1));
+        cx.simulate_keystrokes("enter");
         cx.run_until_parked();
         assert_eq!(
             cursor(&fixture, cx),
@@ -918,8 +957,18 @@ mod tests {
         fixture.workspace.update_in(cx, |workspace, window, cx| {
             workspace.focus_panel::<LaravelPanel>(window, cx);
         });
-        cx.dispatch_action(ShowRoutes);
-        assert_eq!(selected(&fixture, cx), (None, 2));
+        cx.simulate_keystrokes("left");
+        assert_eq!(selected(&fixture, cx), (Some(0), 2));
+    }
+
+    /// A click on a row that is no longer there (the list shrank) selects nothing.
+    #[gpui::test]
+    async fn activating_a_missing_row_changes_nothing(cx: &mut TestAppContext) {
+        let (fixture, cx) = fixture(cx).await;
+        fixture.panel.update_in(cx, |panel, window, cx| {
+            panel.activate(99, window, cx);
+        });
+        assert_eq!(selected(&fixture, cx), (Some(0), 2));
     }
 
     /// The shipped Zenith keymap gives the panel its toggle key.
@@ -944,6 +993,8 @@ mod tests {
             })
         };
         assert!(bound(&ToggleLaravelPanel, "8", "Workspace"));
+        assert!(bound(&ShowRoutes, "left", "LaravelPanel"));
+        assert!(bound(&ShowViews, "right", "LaravelPanel"));
     }
 
     #[test]
