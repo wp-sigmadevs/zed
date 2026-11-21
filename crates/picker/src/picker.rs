@@ -141,8 +141,6 @@ pub struct Picker<D: PickerDelegate> {
     show_scrollbar: bool,
     /// How the picker is presented, which controls its chrome and behavior.
     presentation: Presentation,
-    /// Zenith: the exact size an embedding popup gives its picker (see
-    /// [`Picker::set_embedded_size`]); `None` keeps the picker's own sizing.
     embedded_size: Option<(Pixels, Option<Pixels>)>,
     /// Bounds tracking for the picker container (for aside positioning)
     picker_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
@@ -726,6 +724,7 @@ impl<D: PickerDelegate> Picker<D> {
         self.preview
             .as_ref()
             .is_some_and(|preview| preview.layout != preview::Layout::Hidden)
+            || self.embedded_size.is_some_and(|(_, h)| h.is_some())
     }
 
     pub fn show_scrollbar(mut self, show_scrollbar: bool) -> Self {
@@ -759,11 +758,8 @@ impl<D: PickerDelegate> Picker<D> {
         self
     }
 
-    /// Zenith: sizes an embedded picker to its container. The width replaces the
-    /// picker's own; a height makes the results fill it instead of shrinking to fit.
-    pub fn set_embedded_size(&mut self, width: Pixels, height: Option<Pixels>, cx: &mut Context<Self>) {
-        if self.embedded_size != Some((width, height)) {
-            self.embedded_size = Some((width, height));
+    pub fn set_embedded_size(&mut self, size: (Pixels, Option<Pixels>), cx: &mut Context<Self>) {
+        if self.embedded_size.replace(size) != Some(size) {
             cx.notify();
         }
     }

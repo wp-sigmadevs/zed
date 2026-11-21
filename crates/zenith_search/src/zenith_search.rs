@@ -458,7 +458,7 @@ impl Render for SearchEverywhere {
             inner
         };
         self.picker
-            .update(cx, |picker, cx| picker.set_embedded_size(picker_width, height, cx));
+            .update(cx, |picker, cx| picker.set_embedded_size((picker_width, height), cx));
         let body = if current_tab == Tab::Recent {
             h_flex()
                 .items_start()
