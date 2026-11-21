@@ -9,7 +9,7 @@ use gpui::{
     Bounds, Context, DragMoveEvent, Global, MouseButton, MouseDownEvent, Pixels, Point, Rems, Size,
     Window, canvas, point, px, rems, size,
 };
-use ui::prelude::*;
+use ui::{Tooltip, prelude::*};
 
 /// The card's border, both sides: its children are this much narrower than it.
 pub(crate) const BORDER: Pixels = px(2.);
@@ -74,15 +74,17 @@ impl Render for NoDragPreview {
     }
 }
 
-/// Limits `wanted` to what fits in `max`, but never below the kind's minimum.
+/// Limits `wanted` to what fits in `max`. The kind's minimum applies unless the
+/// window is smaller still: then the card fits the window, so its footer and
+/// grip stay on screen.
 fn clamp_size(
     kind: PopupKind,
     wanted: Size<Pixels>,
     max: Size<Pixels>,
     rem: Pixels,
 ) -> Size<Pixels> {
-    let min_width = kind.min_width().to_pixels(rem);
-    let min_height = kind.min_body_height();
+    let min_width = kind.min_width().to_pixels(rem).min(max.width);
+    let min_height = kind.min_body_height().min(max.height);
     size(
         wanted.width.min(max.width).max(min_width),
         wanted.height.min(max.height).max(min_height),
@@ -103,6 +105,14 @@ pub(crate) struct Frame {
 }
 
 impl Frame {
+    /// The largest card: most of the window, leaving the header and some air.
+    fn max_size(viewport: Size<Pixels>) -> Size<Pixels> {
+        size(
+            viewport.width * 0.95,
+            (viewport.height - px(180.)).max(Pixels::ZERO),
+        )
+    }
+
     /// The card width, and the body height once the user has set one.
     pub(crate) fn size(
         &self,
@@ -112,7 +122,7 @@ impl Frame {
     ) -> (Pixels, Option<Pixels>) {
         let rem = window.rem_size();
         let viewport = window.viewport_size();
-        let max = size(viewport.width * 0.95, viewport.height - px(180.));
+        let max = Self::max_size(viewport);
         let stored = cx
             .try_global::<PopupSizes>()
             .and_then(|sizes| sizes.0.get(&kind))
@@ -157,9 +167,11 @@ impl Frame {
                 .unwrap_or(kind.min_body_height());
             let origin = body.map_or(Point::default(), |body| body.origin);
             let margin = px(8.);
+            // The same cap `size` applies, or the card would drift when the two disagree.
+            let cap = Self::max_size(viewport);
             let max = size(
-                viewport.width - origin.x - margin,
-                viewport.height - origin.y - margin,
+                cap.width.min(viewport.width - origin.x - margin),
+                cap.height.min(viewport.height - origin.y - margin),
             );
             let delta = position - last;
             let next = clamp_size(kind, size(width + delta.x, height + delta.y), max, rem);
@@ -219,8 +231,6 @@ impl Frame {
         let grip = div()
             .id("zenith-popup-resize")
             .debug_selector(|| "zenith-popup-resize".into())
-            .role(gpui::Role::Button)
-            .aria_label("Resize")
             .absolute()
             .bottom_0()
             .right_0()
@@ -229,6 +239,7 @@ impl Frame {
             .items_end()
             .justify_end()
             .cursor_nwse_resize()
+            .tooltip(Tooltip::text("Drag to resize"))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, event: &MouseDownEvent, _, _| {
@@ -262,5 +273,24 @@ impl Frame {
             .child(header)
             .child(body)
             .child(grip)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_card_fits_a_window_smaller_than_its_minimum() {
+        let rem = px(14.);
+        let window = size(px(300.), px(100.));
+        let max = Frame::max_size(window);
+        let card = clamp_size(PopupKind::Find, size(px(900.), px(900.)), max, rem);
+        assert!(card.width <= window.width, "{card:?}");
+        assert!(card.height <= window.height, "{card:?}");
+        // In a roomy window the minimum holds.
+        let roomy_max = Frame::max_size(size(px(1900.), px(1000.)));
+        let roomy = clamp_size(PopupKind::Find, size(px(1.), px(1.)), roomy_max, rem);
+        assert_eq!(roomy, size(rems(36.).to_pixels(rem), px(440.)));
     }
 }

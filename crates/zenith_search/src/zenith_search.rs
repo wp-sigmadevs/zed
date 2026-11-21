@@ -457,8 +457,9 @@ impl Render for SearchEverywhere {
         } else {
             inner
         };
-        self.picker
-            .update(cx, |picker, cx| picker.set_embedded_size((picker_width, height), cx));
+        self.picker.update(cx, |picker, cx| {
+            picker.set_embedded_size((picker_width, height), cx)
+        });
         let body = if current_tab == Tab::Recent {
             h_flex()
                 .items_start()
@@ -475,8 +476,15 @@ impl Render for SearchEverywhere {
             .on_action(
                 cx.listener(|this, _: &PreviousTab, window, cx| this.cycle_tab(-1, window, cx)),
             );
-        self.frame
-            .render(kind, root, header, body, |this: &mut Self| &mut this.frame, window, cx)
+        self.frame.render(
+            kind,
+            root,
+            header,
+            body,
+            |this: &mut Self| &mut this.frame,
+            window,
+            cx,
+        )
     }
 }
 
@@ -3117,7 +3125,6 @@ mod tests {
         assert!(cx.debug_bounds("zenith-search-filter").is_some());
     }
 
-
     /// A workspace with `src/main.rs` and `src/lib.rs` already opened.
     async fn workspace_with_recent_files(
         cx: &mut TestAppContext,
@@ -3137,7 +3144,14 @@ mod tests {
         let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
         cx.run_until_parked();
         let worktree_id = workspace.read_with(cx, |workspace, cx| {
-            workspace.project().read(cx).worktrees(cx).next().unwrap().read(cx).id()
+            workspace
+                .project()
+                .read(cx)
+                .worktrees(cx)
+                .next()
+                .unwrap()
+                .read(cx)
+                .id()
         });
         for file in ["src/main.rs", "src/lib.rs"] {
             workspace
@@ -3175,7 +3189,11 @@ mod tests {
             let left = cx
                 .debug_bounds("zenith-tool-windows")
                 .map_or(Pixels::ZERO, |tools| tools.size.width);
-            assert_eq!(footer.size.width + left, card, "{tab:?}: dead strip at the right");
+            assert_eq!(
+                footer.size.width + left,
+                card,
+                "{tab:?}: dead strip at the right"
+            );
             workspace.update_in(cx, |w, window, cx| w.hide_modal(window, cx));
         }
         // Find in Files owns its list, so check its rows and footer too.
@@ -3204,7 +3222,11 @@ mod tests {
         let none = gpui::Modifiers::none();
         cx.simulate_mouse_down(start, gpui::MouseButton::Left, none);
         for step in 1..=4 {
-            cx.simulate_mouse_move(start + by * (step as f32 / 4.), gpui::MouseButton::Left, none);
+            cx.simulate_mouse_move(
+                start + by * (step as f32 / 4.),
+                gpui::MouseButton::Left,
+                none,
+            );
         }
         cx.simulate_mouse_up(start + by, gpui::MouseButton::Left, none);
         cx.run_until_parked();
@@ -3217,14 +3239,16 @@ mod tests {
         cx: &mut VisualTestContext,
     ) {
         let modal = workspace.update(cx, |workspace, cx| {
-            workspace.active_modal::<SearchEverywhere>(cx).expect("open")
+            workspace
+                .active_modal::<SearchEverywhere>(cx)
+                .expect("open")
         });
         let grip = cx.debug_bounds("zenith-popup-resize").unwrap().center();
         modal.update_in(cx, |modal, window, cx| {
             modal.frame.resize_to(PopupKind::Search, grip, window, cx);
-            modal.frame.resize_to(PopupKind::Search, grip + by, window, cx);
-            // Mouse-up forgets the drag.
-            modal.frame.resize_to(PopupKind::Search, grip + by, window, cx);
+            modal
+                .frame
+                .resize_to(PopupKind::Search, grip + by, window, cx);
             cx.notify();
         });
         cx.run_until_parked();
@@ -3250,13 +3274,19 @@ mod tests {
         resize_by(&workspace, gpui::point(px(5000.), px(5000.)), cx);
         let window = cx.update(|window, _| window.viewport_size());
         let huge = card_size(cx);
-        assert!(huge.width <= window.width * 0.95 + px(0.5), "{huge:?} in {window:?}");
+        assert!(
+            huge.width <= window.width * 0.95 + px(0.5),
+            "{huge:?} in {window:?}"
+        );
         assert!(huge.height < window.height, "{huge:?} in {window:?}");
         // Too small: held above the minimum, still usable.
         resize_by(&workspace, gpui::point(px(-9000.), px(-9000.)), cx);
         let tiny = card_size(cx);
         let rem = cx.update(|window, _| window.rem_size());
-        assert!(tiny.width >= rem * 28. - popup::BORDER - px(0.5), "{tiny:?}");
+        assert!(
+            tiny.width >= rem * 28. - popup::BORDER - px(0.5),
+            "{tiny:?}"
+        );
         assert!(tiny.height >= px(120.), "{tiny:?}");
         // The list and its footer still fill the resized card.
         cx.simulate_input("main");
@@ -3272,6 +3302,36 @@ mod tests {
         // Recent Files keeps a size of its own.
         open_on(Tab::Recent, &workspace, cx);
         assert_ne!(card_size(cx).width, sized.width);
+    }
+
+    #[gpui::test]
+    async fn test_widening_a_card_dragged_to_the_left_edge_does_not_move_its_corner(
+        cx: &mut TestAppContext,
+    ) {
+        let (workspace, cx) = workspace_with_recent_files(cx).await;
+        open_on(Tab::Files, &workspace, cx);
+        let modal = workspace.update(cx, |workspace, cx| {
+            workspace
+                .active_modal::<SearchEverywhere>(cx)
+                .expect("open")
+        });
+        let from = gpui::point(px(900.), px(100.));
+        modal.update_in(cx, |modal, window, cx| {
+            modal.frame.drag_to(from, window);
+            modal
+                .frame
+                .drag_to(from - gpui::point(px(660.), px(0.)), window);
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let left = cx.debug_bounds("zenith-popup-drag").unwrap().origin.x;
+        assert!(left < px(60.), "{left:?}");
+        // Wider than the window allows: the cap in `resize_to` and in `size` agree.
+        resize_by(&workspace, gpui::point(px(5000.), px(0.)), cx);
+        let bounds = cx.debug_bounds("zenith-popup-drag").unwrap();
+        assert_eq!(bounds.origin.x, left);
+        let window = cx.update(|window, _| window.viewport_size());
+        assert!(bounds.size.width <= window.width * 0.95, "{bounds:?}");
     }
 
     #[gpui::test]
@@ -3291,7 +3351,10 @@ mod tests {
         assert_eq!(width_of(cx, "zenith-find-hit-0"), after.width);
         // The extra height goes to the result list.
         let footer = cx.debug_bounds("zenith-popup-footer").unwrap();
-        assert_eq!(footer.bottom(), cx.debug_bounds("zenith-popup-resize").unwrap().bottom());
+        assert_eq!(
+            footer.bottom(),
+            cx.debug_bounds("zenith-popup-resize").unwrap().bottom()
+        );
         // Shrinking stops where the query fields, the preview and the footer still fit.
         let grip = cx.debug_bounds("zenith-popup-resize").unwrap().center();
         modal.update_in(cx, |m, window, cx| {
