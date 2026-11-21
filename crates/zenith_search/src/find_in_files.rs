@@ -17,6 +17,7 @@ use gpui::{
     StyledText, Subscription, Task, UniformListScrollHandle, WeakEntity, Window, div, prelude::*,
     px, uniform_list,
 };
+use language::{BufferSnapshot, HighlightId, LanguageAwareStyling};
 use picker::{MatchLocation, PreviewBackend, PreviewLayout, PreviewUpdate};
 use project::{
     Project, ProjectPath,
@@ -26,7 +27,8 @@ use settings::SeedQuerySetting;
 use text::{Point, ToOffset as _, ToPoint as _};
 use ui::{
     Button, ButtonSize, ButtonStyle, Checkbox, ContextMenu, IconButton, IconPosition, Label,
-    PopoverMenu, ScrollAxes, Scrollbars, TintColor, Tooltip, WithScrollbar, prelude::*,
+    PopoverMenu, PopoverMenuHandle, ScrollAxes, Scrollbars, TintColor, Tooltip, WithScrollbar,
+    prelude::*,
 };
 use util::paths::PathMatcher;
 use workspace::{
@@ -34,7 +36,7 @@ use workspace::{
 };
 
 use super::{
-    CycleFindContext, CycleFindScope, TogglePinFindPopup,
+    CycleFindContext, CycleFindScope, ToggleFileMaskHistory, TogglePinFindPopup, mask_history,
     popup::{Frame, PopupKind},
     style::{
         FIELD_HEIGHT, FOOTER_HEIGHT, HEADER_GAP, HEADER_HEIGHT, MASK_WIDTH, PADDING, POPUP_BAND,
@@ -161,6 +163,8 @@ pub struct FindInFilesModal {
     regex: bool,
     /// The file mask only narrows the search while its box is ticked.
     mask_enabled: bool,
+    /// The dropdown of recently used masks.
+    mask_menu: PopoverMenuHandle<ContextMenu>,
     scope: Scope,
     /// The funnel: which kinds of match are listed.
     context: SearchContext,
@@ -212,6 +216,7 @@ impl FindInFilesModal {
         if let Some(open) = workspace.active_modal::<Self>(cx) {
             open.update(cx, |open, _| open.closing = true);
         }
+        mask_history::load(cx);
         let module_root = module_root(workspace, cx);
         let open_buffers: Vec<_> = workspace
             .items_of_type::<Editor>(cx)
@@ -311,6 +316,7 @@ impl FindInFilesModal {
             whole_word: false,
             regex: false,
             mask_enabled: false,
+            mask_menu: PopoverMenuHandle::default(),
             scope: Scope::Project,
             context: SearchContext::default(),
             pinned: false,
@@ -425,8 +431,13 @@ impl FindInFilesModal {
                 let SearchResult::Buffer { buffer, ranges } = result else {
                     continue;
                 };
-                let found = cx.update(|_, cx| Hit::from_buffer(&buffer, &ranges, context, cx));
-                let Ok(found) = found else { return };
+                let source = cx.update(|_, cx| HitSource::new(&buffer, cx));
+                let Ok(source) = source else { return };
+                let Some(source) = source else { continue };
+                // Lines and their syntax colours are read off the main thread.
+                let found = cx
+                    .background_spawn(async move { source.hits(&ranges, context) })
+                    .await;
                 hits.extend(found);
                 if hits.len() >= MAX_HITS {
                     hits.truncate(MAX_HITS);
@@ -500,6 +511,11 @@ impl FindInFilesModal {
     }
 
     fn select_next(&mut self, _: &menu::SelectNext, window: &mut Window, cx: &mut Context<Self>) {
+        // In the mask box the arrows open its history, as in a combo box.
+        if self.mask.read(cx).focus_handle(cx).is_focused(window) {
+            self.mask_menu.toggle(window, cx);
+            return;
+        }
         if !self.hits.is_empty() {
             self.select((self.selected + 1) % self.hits.len(), window, cx);
         }
@@ -511,6 +527,10 @@ impl FindInFilesModal {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.mask.read(cx).focus_handle(cx).is_focused(window) {
+            self.mask_menu.toggle(window, cx);
+            return;
+        }
         if !self.hits.is_empty() {
             let len = self.hits.len();
             self.select((self.selected + len - 1) % len, window, cx);
@@ -602,6 +622,7 @@ impl FindInFilesModal {
         let Some(hit) = self.hits.get(self.selected).cloned() else {
             return;
         };
+        self.remember_mask(cx);
         let workspace = self.workspace.clone();
         self.closing = true;
         cx.spawn_in(window, async move |_, cx| {
@@ -636,8 +657,17 @@ impl FindInFilesModal {
         cx.notify();
     }
 
+    /// A search that used the mask was confirmed: keep the mask for the dropdown.
+    fn remember_mask(&self, cx: &mut Context<Self>) {
+        if self.mask_enabled {
+            let mask = self.mask.read(cx).text(cx);
+            mask_history::remember(&mask, cx);
+        }
+    }
+
     /// Hands the query to the project search tab, which also does replacing.
     fn open_in_find_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.remember_mask(cx);
         let included = self.include_globs(cx).join(",");
         let action = DeploySearch {
             replace_enabled: self.replace.is_some(),
@@ -732,6 +762,43 @@ impl FindInFilesModal {
         cx: &mut Context<Self>,
     ) {
         self.set_context(context, window, cx);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mask_text(&self, cx: &App) -> String {
+        self.mask.read(cx).text(cx)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mask_enabled(&self) -> bool {
+        self.mask_enabled
+    }
+
+    /// What picking the `ix`th entry of the mask dropdown does.
+    #[cfg(test)]
+    pub(crate) fn pick_history_entry(
+        &mut self,
+        ix: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mask = mask_history::entries(cx)[ix].clone();
+        self.pick_mask(&mask, window, cx);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn untick_mask(&mut self) {
+        self.mask_enabled = false;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn focus_mask(&self, window: &mut Window, cx: &mut App) {
+        window.focus(&self.mask.read(cx).focus_handle(cx), cx);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mask_menu_open(&self) -> bool {
+        self.mask_menu.is_deployed()
     }
 
     #[cfg(test)]
@@ -849,7 +916,8 @@ impl FindInFilesModal {
                     .child(
                         self.field(&self.mask, window, cx)
                             .w(MASK_WIDTH)
-                            .child(div().flex_1().child(self.mask.clone())),
+                            .child(div().flex_1().child(self.mask.clone()))
+                            .child(self.render_mask_history(cx)),
                     )
                     .child(self.render_context_menu(cx))
                     .child(
@@ -872,6 +940,60 @@ impl FindInFilesModal {
                     ),
             );
         header
+    }
+
+    /// The chevron in the mask box: the masks used before, most recent first.
+    fn render_mask_history(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let modal = cx.entity().downgrade();
+        let current = self.mask.read(cx).text(cx).trim().to_string();
+        let label = "File mask history";
+        PopoverMenu::new("zenith-find-mask-menu")
+            .with_handle(self.mask_menu.clone())
+            .trigger(
+                IconButton::new("zenith-find-mask-history", IconName::ChevronDown)
+                    .icon_size(IconSize::XSmall)
+                    .tooltip(Tooltip::text(label))
+                    .aria_label(label),
+            )
+            .menu(move |window, cx| {
+                let modal = modal.clone();
+                let current = current.clone();
+                let masks = mask_history::entries(cx);
+                Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                    for mask in masks {
+                        let modal = modal.clone();
+                        let picked = mask.clone();
+                        menu = menu.toggleable_entry(
+                            mask.clone(),
+                            mask == current,
+                            IconPosition::Start,
+                            None,
+                            move |window, cx| {
+                                modal
+                                    .update(cx, |modal, cx| modal.pick_mask(&picked, window, cx))
+                                    .ok();
+                            },
+                        );
+                    }
+                    menu
+                }))
+            })
+    }
+
+    /// Puts a mask from the dropdown in the box; editing the box ticks it and
+    /// searches again.
+    fn pick_mask(&mut self, mask: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.mask
+            .update(cx, |editor, cx| editor.set_text(mask, window, cx));
+    }
+
+    fn toggle_mask_history(
+        &mut self,
+        _: &ToggleFileMaskHistory,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.mask_menu.toggle(window, cx);
     }
 
     /// The funnel: which kinds of match to list, as PhpStorm's menu.
@@ -1068,13 +1190,8 @@ impl FindInFilesModal {
             background_color: Some(colors.search_match_background),
             ..Default::default()
         };
-        let highlights: Vec<_> = hit
-            .matches
-            .iter()
-            .map(|range| clamp_range(&hit.line, range))
-            .filter(|range| !range.is_empty())
-            .map(|range| (range, chip))
-            .collect();
+        let syntax = cx.theme().syntax().resolve_runs(&hit.syntax);
+        let highlights = row_highlights(&hit.line, syntax, &hit.matches, chip);
         let text_color = if is_comment_line(&hit.line) {
             colors.text_muted
         } else {
@@ -1219,7 +1336,8 @@ impl Render for FindInFilesModal {
             .on_action(cx.listener(Self::focus_next_field))
             .on_action(cx.listener(Self::toggle_pin))
             .on_action(cx.listener(Self::cycle_scope))
-            .on_action(cx.listener(Self::cycle_context));
+            .on_action(cx.listener(Self::cycle_context))
+            .on_action(cx.listener(Self::toggle_mask_history));
         self.frame.render(
             PopupKind::Find,
             root,
@@ -1246,41 +1364,54 @@ pub struct Hit {
     /// The line with leading space removed, and the byte ranges that matched in it.
     line: String,
     matches: Vec<Range<usize>>,
+    /// The syntax colours of `line`, found once with the hit and turned into styles
+    /// with the current theme when the row is drawn.
+    syntax: Vec<(Range<usize>, HighlightId)>,
 }
 
-impl Hit {
-    fn from_buffer(
-        buffer: &Entity<language::Buffer>,
-        ranges: &[Range<text::Anchor>],
-        context: SearchContext,
-        cx: &App,
-    ) -> Vec<Hit> {
-        let buffer_entity = buffer;
-        let buffer = buffer.read(cx);
-        let Some(file) = buffer.file() else {
-            return Vec::new();
-        };
-        let project_path = ProjectPath {
-            worktree_id: file.worktree_id(cx),
-            path: file.path().clone(),
-        };
-        let file_name: SharedString = file
-            .path()
-            .file_name()
-            .unwrap_or_default()
-            .to_string()
-            .into();
-        let directory: SharedString = file
-            .path()
-            .parent()
-            .map(|parent| parent.as_unix_str().to_string())
-            .unwrap_or_default()
-            .into();
-        let snapshot = buffer.snapshot();
+/// What one buffer's hits are built from. Made on the main thread, which owns the
+/// buffer; [`HitSource::hits`] then runs anywhere.
+struct HitSource {
+    buffer: Entity<language::Buffer>,
+    snapshot: BufferSnapshot,
+    project_path: ProjectPath,
+    file_name: SharedString,
+    directory: SharedString,
+}
+
+impl HitSource {
+    /// `None` for a buffer without a file, which has no path to list.
+    fn new(buffer: &Entity<language::Buffer>, cx: &App) -> Option<Self> {
+        let snapshot_source = buffer.read(cx);
+        let file = snapshot_source.file()?;
+        Some(Self {
+            buffer: buffer.clone(),
+            project_path: ProjectPath {
+                worktree_id: file.worktree_id(cx),
+                path: file.path().clone(),
+            },
+            file_name: file
+                .path()
+                .file_name()
+                .unwrap_or_default()
+                .to_string()
+                .into(),
+            directory: file
+                .path()
+                .parent()
+                .map(|parent| parent.as_unix_str().to_string())
+                .unwrap_or_default()
+                .into(),
+            snapshot: snapshot_source.snapshot(),
+        })
+    }
+
+    fn hits(&self, ranges: &[Range<text::Anchor>], context: SearchContext) -> Vec<Hit> {
+        let snapshot = &self.snapshot;
         let mut hits: Vec<Hit> = Vec::new();
         for range in ranges {
-            let start = range.start.to_point(&snapshot);
-            let end = range.end.to_point(&snapshot);
+            let start = range.start.to_point(snapshot);
+            let end = range.end.to_point(snapshot);
             let line_len = snapshot.line_len(start.row);
             let text: String = snapshot
                 .text_for_range(Point::new(start.row, 0)..Point::new(start.row, line_len))
@@ -1306,19 +1437,76 @@ impl Hit {
                 continue;
             }
             hits.push(Hit {
-                buffer: buffer_entity.clone(),
+                buffer: self.buffer.clone(),
                 anchors: range.clone(),
-                offsets: range.start.to_offset(&snapshot)..range.end.to_offset(&snapshot),
-                project_path: project_path.clone(),
-                file_name: file_name.clone(),
-                directory: directory.clone(),
+                offsets: range.start.to_offset(snapshot)..range.end.to_offset(snapshot),
+                project_path: self.project_path.clone(),
+                file_name: self.file_name.clone(),
+                directory: self.directory.clone(),
                 point: start,
                 line: text[lead..].to_string(),
                 matches: vec![matched],
+                syntax: line_syntax(snapshot, start.row, line_len, lead),
             });
         }
         hits
     }
+}
+
+/// The syntax colours along a line, past its `lead` bytes of leading space.
+fn line_syntax(
+    snapshot: &BufferSnapshot,
+    row: u32,
+    line_len: u32,
+    lead: usize,
+) -> Vec<(Range<usize>, HighlightId)> {
+    let chunks = snapshot
+        .chunks(
+            Point::new(row, 0)..Point::new(row, line_len),
+            LanguageAwareStyling {
+                tree_sitter: true,
+                diagnostics: false,
+            },
+        )
+        .map(|chunk| (chunk.text.len(), chunk.syntax_highlight_id));
+    runs_after_lead(chunks, lead)
+}
+
+/// The coloured runs of consecutive `(length, colour)` chunks, moved left by `lead`
+/// bytes; what falls in the first `lead` bytes is dropped.
+fn runs_after_lead<Id>(
+    chunks: impl IntoIterator<Item = (usize, Option<Id>)>,
+    lead: usize,
+) -> Vec<(Range<usize>, Id)> {
+    let mut runs = Vec::new();
+    let mut at = 0;
+    for (len, id) in chunks {
+        let end = at + len;
+        if let Some(id) = id
+            && end > lead
+        {
+            runs.push((at.max(lead) - lead..end - lead, id));
+        }
+        at = end;
+    }
+    runs
+}
+
+/// What a row's text is drawn with: the syntax colours with the matches in a chip on
+/// top, all cut back to character boundaries of `line`.
+fn row_highlights(
+    line: &str,
+    syntax: impl IntoIterator<Item = (Range<usize>, HighlightStyle)>,
+    matches: &[Range<usize>],
+    chip: HighlightStyle,
+) -> Vec<(Range<usize>, HighlightStyle)> {
+    gpui::combine_highlights(
+        syntax
+            .into_iter()
+            .map(|(range, style)| (clamp_range(line, &range), style)),
+        matches.iter().map(|range| (clamp_range(line, range), chip)),
+    )
+    .collect()
 }
 
 /// "4 matches in 1 file"; a capped search adds a plus, as there may be more.
@@ -1455,6 +1643,80 @@ fn clamp_range(line: &str, range: &Range<usize>) -> Range<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const KEYWORD: u8 = 1;
+    const STRING: u8 = 2;
+
+    #[test]
+    fn test_runs_after_lead_shift_left_and_drop_the_indent() {
+        // "    echo 'x';": 4 blank, a keyword, a blank, a string, plain tail.
+        let chunks = [
+            (4, None),
+            (4, Some(KEYWORD)),
+            (1, None),
+            (3, Some(STRING)),
+            (1, None),
+        ];
+        assert_eq!(
+            runs_after_lead(chunks, 4),
+            [(0..4, KEYWORD), (5..8, STRING)]
+        );
+        // A run that starts inside the indent keeps only what is past it.
+        assert_eq!(
+            runs_after_lead([(6, Some(KEYWORD)), (2, None)], 4),
+            [(0..2, KEYWORD)]
+        );
+        assert_eq!(runs_after_lead([(3, Some(KEYWORD))], 4), []);
+        assert_eq!(runs_after_lead::<u8>([], 0), []);
+    }
+
+    #[test]
+    fn test_row_highlights_lay_the_match_chip_over_the_syntax_colours() {
+        let colour = |hsla| HighlightStyle {
+            color: Some(hsla),
+            ..Default::default()
+        };
+        let keyword = colour(gpui::red());
+        let chip = HighlightStyle {
+            background_color: Some(gpui::blue()),
+            ..Default::default()
+        };
+        // "echo 'é';": the keyword is 0..4, the string 5..9 ('é' takes two bytes).
+        let line = "echo 'é';";
+        let string = colour(gpui::green());
+        let runs = row_highlights(
+            line,
+            [(0..4, keyword), (5..9, string)],
+            // The match covers `ho` of the keyword and runs into the string, ending
+            // inside 'é' (bytes 6..8), which it must not split.
+            &[2..7],
+            chip,
+        );
+        let both = |style: HighlightStyle| style.highlight(chip);
+        assert_eq!(
+            runs,
+            [
+                (0..2, keyword),
+                (2..4, both(keyword)),
+                (4..5, chip),
+                (5..6, both(string)),
+                (6..9, string),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_row_highlights_cut_ranges_back_to_character_boundaries() {
+        let chip = HighlightStyle {
+            background_color: Some(gpui::blue()),
+            ..Default::default()
+        };
+        // 'é' is bytes 1..3: a range ending or starting inside it must not split it,
+        // and one past the end of the line is cut to the line.
+        let line = "aéb";
+        let runs = row_highlights(line, [], &[2..3, 3..40], chip);
+        assert_eq!(runs, [(1..3, chip), (3..4, chip)]);
+    }
 
     #[test]
     fn test_summary_is_singular_and_marks_a_capped_search() {

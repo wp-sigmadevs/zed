@@ -34,6 +34,7 @@ use std::{
     time::Duration,
 };
 mod find_in_files;
+mod mask_history;
 mod popup;
 mod style;
 use popup::{Frame, PopupKind};
@@ -82,6 +83,9 @@ actions!(
         /// Moves Find in Files to the next search context: Anywhere, In Comments,
         /// In String Literals and the "Except" ones.
         CycleFindContext,
+        /// Opens the recently used file masks of Find in Files; Up or Down in the mask
+        /// box does the same.
+        ToggleFileMaskHistory,
         /// Moves to the next Search Everywhere tab.
         NextTab,
         /// Moves to the previous Search Everywhere tab.
@@ -3117,6 +3121,54 @@ mod tests {
         assert_eq!(rows(cx), ["a.php:2", "a.php:4"]);
         // The funnel and the pin are on screen.
         assert!(cx.debug_bounds("zenith-popup-header").is_some());
+    }
+
+    #[gpui::test]
+    async fn test_find_in_files_mask_history_pick_sets_the_mask_and_ticks_it(
+        cx: &mut TestAppContext,
+    ) {
+        let (_, modal, cx) = open_find_in_files(
+            serde_json::json!({ "a.php": "needle\n", "b.js": "needle\n" }),
+            cx,
+        )
+        .await;
+        cx.update(|_, cx| mask_history::remember("*.php", cx));
+        modal.update_in(cx, |m, window, cx| m.set_query("needle", window, cx));
+        cx.run_until_parked();
+        // No mask yet: both files match.
+        assert!(!modal.read_with(cx, |m, _| m.mask_enabled()));
+        assert_eq!(modal.read_with(cx, |m, _| m.match_count()), 2);
+        // The action opens the dropdown and closes it again.
+        cx.dispatch_action(ToggleFileMaskHistory);
+        assert!(modal.read_with(cx, |m, _| m.mask_menu_open()));
+        cx.dispatch_action(ToggleFileMaskHistory);
+        assert!(!modal.read_with(cx, |m, _| m.mask_menu_open()));
+        // In the mask box the arrow keys open it too, as in a combo box; in the
+        // query box they still move the selection.
+        cx.dispatch_action(menu::SelectNext);
+        assert!(!modal.read_with(cx, |m, _| m.mask_menu_open()));
+        modal.update_in(cx, |m, window, cx| m.focus_mask(window, cx));
+        cx.dispatch_action(menu::SelectNext);
+        assert!(modal.read_with(cx, |m, _| m.mask_menu_open()));
+        cx.dispatch_action(menu::SelectPrevious);
+        assert!(!modal.read_with(cx, |m, _| m.mask_menu_open()));
+        // Picking the most recent mask sets the box, ticks it and narrows the list.
+        modal.update_in(cx, |m, window, cx| m.pick_history_entry(0, window, cx));
+        cx.run_until_parked();
+        assert_eq!(modal.read_with(cx, |m, cx| m.mask_text(cx)), "*.php");
+        assert!(modal.read_with(cx, |m, _| m.mask_enabled()));
+        assert_eq!(modal.read_with(cx, |m, _| m.hit_labels()), ["a.php:1"]);
+        // Picking the mask already in an unticked box still ticks it.
+        modal.update(cx, |m, _| m.untick_mask());
+        modal.update_in(cx, |m, window, cx| m.pick_history_entry(0, window, cx));
+        cx.run_until_parked();
+        assert!(modal.read_with(cx, |m, _| m.mask_enabled()));
+        // Confirming a search that used a mask puts that mask first.
+        modal.update_in(cx, |m, window, cx| m.set_mask("*.js", window, cx));
+        cx.run_until_parked();
+        cx.dispatch_action(menu::Confirm);
+        cx.run_until_parked();
+        assert_eq!(cx.update(|_, cx| mask_history::entries(cx))[0], "*.js");
     }
 
     #[gpui::test]
