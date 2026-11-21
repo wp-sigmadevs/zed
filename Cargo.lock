@@ -23079,6 +23079,7 @@ dependencies = [
  "assets",
  "editor",
  "gpui",
+ "markdown",
  "paths",
  "serde_json",
  "settings",

@@ -13,6 +13,7 @@ use theme::ThemeRegistry;
 use util::ResultExt as _;
 use workspace::Workspace;
 
+mod hover_card;
 mod indent;
 pub use indent::{IndentIndicator, indent_label};
 
@@ -20,6 +21,7 @@ pub const ICONS_PREFIX: &str = "icon_themes/archipelago-icons/";
 const THEME_FILE: &str = "icon_themes/archipelago-icons.json";
 
 pub fn init(cx: &mut App) {
+    hover_card::init(cx);
     cx.observe_new(|workspace: &mut Workspace, window, cx| {
         let Some(window) = window else { return };
         let item = cx.new(|_| IndentIndicator::default());
