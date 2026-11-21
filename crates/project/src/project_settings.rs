@@ -1259,7 +1259,7 @@ impl SettingsObserver {
         };
 
         let mut settings_contents = Vec::new();
-        for (path, _, change) in changes.iter() {
+        for (path, _, change) in zenith_local_settings_trust::gate(worktree, changes, cx) {
             let (settings_dir, kind) = if path.ends_with(local_settings_file_relative_path())
                 || path.ends_with(legacy_local_settings_file_relative_path())
             {
