@@ -126,7 +126,9 @@ pub fn init(cx: &mut App) {
         workspace.register_action(|workspace, _: &ReplaceInFiles, window, cx| {
             find_in_files::FindInFilesModal::open(workspace, true, window, cx)
         });
-        
+        workspace.register_action(|workspace, _: &ShowUsages, window, cx| {
+            usages::UsagesModal::open(workspace, window, cx)
+        });
         workspace.register_action(|workspace, _: &GoToClass, window, cx| {
             SearchEverywhere::open(workspace, Tab::Classes, window, cx)
         });
