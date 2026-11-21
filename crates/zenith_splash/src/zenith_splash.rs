@@ -8,7 +8,7 @@ use gpui::{
     Animation, AnimationExt as _, AnyWindowHandle, App, Bounds, Context, FontWeight, Global,
     IntoElement, ParentElement, PathBuilder, Pixels, Render, Styled, TitlebarOptions, Window,
     WindowBackgroundAppearance, WindowBounds, WindowKind, WindowOptions, canvas, div, hsla,
-    linear_color_stop, linear_gradient, point, prelude::*, px, relative, rgb, size,
+    bounce, ease_in_out, linear_color_stop, linear_gradient, point, prelude::*, px, relative, rgb, size,
 };
 use release_channel::{AppVersion, ReleaseChannel};
 use workspace::Workspace;
@@ -169,7 +169,9 @@ impl Render for SplashView {
                             .bg(rgb(0xff7a3d))
                             .with_animation(
                                 "zenith-splash-progress",
-                                Animation::new(Duration::from_millis(1600)).repeat(),
+                                Animation::new(Duration::from_millis(1800))
+                                    .repeat()
+                                    .with_easing(bounce(ease_in_out)),
                                 |bar, delta| bar.ml(relative(delta * 0.7)),
                             ),
                     ),
