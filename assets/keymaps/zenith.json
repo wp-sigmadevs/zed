@@ -107,6 +107,10 @@
       "secondary-e": "zenith_search::RecentFiles",
       // The JetBrains keymap binds ⌘⇧N (Go to File) in this context too.
       "secondary-shift-n": "zenith_scratches::NewScratchFile",
+      // Refactor This, PhpStorm's Windows/Linux key. Its macOS key ⌃T is the editor's Transpose,
+      // and F6, ⌘F6 and ⌘⌫ are Focus Next Part, Focus Next Part and Delete to End of Line, so
+      // Move, Safe Delete and Change Signature are reached through this picker.
+      "ctrl-alt-shift-t": "zenith_refactor::RefactorThis",
     },
   },
   {

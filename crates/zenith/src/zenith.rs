@@ -52,6 +52,8 @@ pub fn init(cx: &mut App) {
     zenith_postfix::init(cx);
     #[cfg(feature = "http")]
     zenith_http::init(cx);
+    #[cfg(feature = "refactor")]
+    zenith_refactor::init(cx);
     #[cfg(feature = "external_libraries")]
     zenith_external_libraries::init(cx);
 }
