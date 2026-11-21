@@ -1,10 +1,13 @@
+use editor::Editor;
 use gpui::prelude::*;
 use gpui::{
     Action, App, Context, EventEmitter, FocusHandle, Focusable, IntoElement, ParentElement, Pixels,
     Render, SharedString, Styled, WeakEntity, Window, px,
 };
 use std::collections::HashSet;
+use std::path::PathBuf;
 use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard};
+use text::Point;
 use ui::prelude::*;
 use ui::{ButtonStyle, Color, Icon, IconName, Label, LabelCommon};
 use workspace::dock::{DockPosition, Panel, PanelEvent};
@@ -16,7 +19,7 @@ gpui::actions!(zenith_wordpress, [ToggleWpHooksPanel]);
 
 pub struct WpHooksPanel {
     focus_handle: FocusHandle,
-    index: Arc<RwLock<WordPressIndex>>,
+    pub(crate) index: Arc<RwLock<WordPressIndex>>,
     search_query: String,
     filter_kind: Option<HookKind>,
     expanded_hooks: HashSet<String>,
@@ -268,26 +271,24 @@ impl Render for WpHooksPanel {
 
                                 details = details.child(
                                     h_flex()
-                                        .id(SharedString::from(format!("def-{}-{line}", def.name)))
+                                        .id(SharedString::from(format!(
+                                            "def-{}-{}-{line}",
+                                            def.name,
+                                            def.file_path.display()
+                                        )))
                                         .p_1()
                                         .gap_1()
                                         .rounded_sm()
                                         .hover(|s| s.bg(cx.theme().colors().element_hover))
                                         .cursor_pointer()
                                         .on_click(move |_, window, cx| {
-                                            if let Some(workspace) = workspace.upgrade() {
-                                                let path = path.clone();
-                                                workspace.update(cx, |workspace, cx| {
-                                                    workspace
-                                                        .open_abs_path(
-                                                            path,
-                                                            OpenOptions::default(),
-                                                            window,
-                                                            cx,
-                                                        )
-                                                        .detach_and_log_err(cx);
-                                                });
-                                            }
+                                            open_at_line(
+                                                &workspace,
+                                                path.clone(),
+                                                line,
+                                                window,
+                                                cx,
+                                            );
                                         })
                                         .child(
                                             Label::new("[def]")
@@ -334,8 +335,9 @@ impl Render for WpHooksPanel {
                                 details = details.child(
                                     h_flex()
                                         .id(SharedString::from(format!(
-                                            "listener-{}-{line}",
-                                            listener.hook_name
+                                            "listener-{}-{}-{line}",
+                                            listener.hook_name,
+                                            listener.file_path.display()
                                         )))
                                         .p_1()
                                         .gap_1()
@@ -343,19 +345,13 @@ impl Render for WpHooksPanel {
                                         .hover(|s| s.bg(cx.theme().colors().element_hover))
                                         .cursor_pointer()
                                         .on_click(move |_, window, cx| {
-                                            if let Some(workspace) = workspace.upgrade() {
-                                                let path = path.clone();
-                                                workspace.update(cx, |workspace, cx| {
-                                                    workspace
-                                                        .open_abs_path(
-                                                            path,
-                                                            OpenOptions::default(),
-                                                            window,
-                                                            cx,
-                                                        )
-                                                        .detach_and_log_err(cx);
-                                                });
-                                            }
+                                            open_at_line(
+                                                &workspace,
+                                                path.clone(),
+                                                line,
+                                                window,
+                                                cx,
+                                            );
                                         })
                                         .child(
                                             Label::new(format!("[{}]", listener.priority))
@@ -392,6 +388,41 @@ impl Render for WpHooksPanel {
                     })),
             )
     }
+}
+
+/// Where a 1-based `line` of the index sits in the editor: column 0 of that line.
+/// The column stored in the index is a byte offset into a scan that may be stale, so it is
+/// not used.
+pub(crate) fn line_to_point(line: usize) -> Point {
+    Point::new(line.saturating_sub(1).try_into().unwrap_or(u32::MAX), 0)
+}
+
+/// Opens `path` and puts the cursor on `line` (1-based, as in the index).
+fn open_at_line(
+    workspace: &WeakEntity<Workspace>,
+    path: PathBuf,
+    line: usize,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let Some(workspace) = workspace.upgrade() else {
+        return;
+    };
+    let open = workspace.update(cx, |workspace, cx| {
+        workspace.open_abs_path(path, OpenOptions::default(), window, cx)
+    });
+    window
+        .spawn(cx, async move |cx| {
+            if let Some(editor) = open.await?.downcast::<Editor>() {
+                cx.update(|window, cx| {
+                    editor.update(cx, |editor, cx| {
+                        editor.go_to_singleton_buffer_point(line_to_point(line), window, cx)
+                    })
+                })?;
+            }
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
 }
 
 /// Dock panels need unique priorities (a debug build panics on a clash). Taken: 0 agent,
@@ -436,6 +467,14 @@ mod tests {
             this.toggle_expand("init", cx);
             assert!(!this.expanded_hooks.contains("init"));
         });
+    }
+
+    #[test]
+    fn test_index_lines_are_one_based_editor_rows_are_zero_based() {
+        assert_eq!(line_to_point(1), Point::new(0, 0));
+        assert_eq!(line_to_point(42), Point::new(41, 0));
+        // A line of 0 never occurs in the index; it must not underflow.
+        assert_eq!(line_to_point(0), Point::new(0, 0));
     }
 
     #[test]

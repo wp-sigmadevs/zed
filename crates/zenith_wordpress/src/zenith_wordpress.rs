@@ -1,4 +1,6 @@
+mod setup;
 pub mod wp_hooks_panel;
+pub use setup::{WordPressSettings, init};
 pub use wp_hooks_panel::{ToggleWpHooksPanel, WpHooksPanel};
 
 use serde::{Deserialize, Serialize};
@@ -288,6 +290,19 @@ impl WordPressIndex {
         }
         for listeners in self.listeners_by_name.values_mut() {
             listeners.retain(|l| l.file_path != file_path);
+        }
+        self.definitions_by_name.retain(|_, v| !v.is_empty());
+        self.listeners_by_name.retain(|_, v| !v.is_empty());
+    }
+
+    /// Forgets every file under `root` (a worktree that left the project).
+    pub fn remove_dir(&mut self, root: &Path) {
+        self.indexed_files.retain(|file| !file.starts_with(root));
+        for defs in self.definitions_by_name.values_mut() {
+            defs.retain(|d| !d.file_path.starts_with(root));
+        }
+        for listeners in self.listeners_by_name.values_mut() {
+            listeners.retain(|l| !l.file_path.starts_with(root));
         }
         self.definitions_by_name.retain(|_, v| !v.is_empty());
         self.listeners_by_name.retain(|_, v| !v.is_empty());

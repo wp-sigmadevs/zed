@@ -23382,7 +23382,9 @@ dependencies = [
 name = "zenith_wordpress"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "collections",
+ "editor",
  "gpui",
  "icons",
  "pretty_assertions",
@@ -23391,9 +23393,15 @@ dependencies = [
  "serde",
  "serde_json",
  "settings",
+ "tempfile",
+ "text",
+ "theme",
+ "theme_settings",
  "ui",
  "util",
  "workspace",
+ "worktree",
+ "zenith_php_tools",
 ]
 
 [[package]]
