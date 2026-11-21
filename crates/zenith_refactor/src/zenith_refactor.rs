@@ -4,7 +4,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 
+pub mod editor_actions;
 pub mod preview_modal;
+pub use editor_actions::init;
 pub use preview_modal::*;
 
 gpui::actions!(
