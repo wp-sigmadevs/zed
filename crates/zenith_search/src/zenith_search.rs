@@ -83,6 +83,14 @@ actions!(
         /// Moves Find in Files to the next search context: Anywhere, In Comments,
         /// In String Literals and the "Except" ones.
         CycleFindContext,
+        /// Turns Match Case on or off in Find in Files.
+        ToggleFindCase,
+        /// Turns Words (whole word) on or off in Find in Files.
+        ToggleFindWord,
+        /// Turns Regex on or off in Find in Files.
+        ToggleFindRegex,
+        /// Turns the file mask on or off in Find in Files.
+        ToggleFindMask,
         /// Opens the recently used file masks of Find in Files; Up or Down in the mask
         /// box does the same.
         ToggleFileMaskHistory,
@@ -1842,6 +1850,7 @@ fn symbol_badge_letter(kind: SymbolKind) -> (&'static str, BadgeColor) {
 }
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use futures::StreamExt as _;
     use gpui::{TestAppContext, VisualTestContext};
@@ -1850,6 +1859,21 @@ mod tests {
     use std::{cell::RefCell, rc::Rc};
     use util::path;
     use workspace::{AppState, MultiWorkspace};
+
+    /// Zenith's keymap read from this checkout's `assets/`. `load_asset` reads the assets of
+    /// the checkout holding the test binary's target dir, which is another worktree's when
+    /// several share one `CARGO_TARGET_DIR`, and would not see this branch's bindings.
+    fn zenith_keymap(cx: &App) -> Vec<gpui::KeyBinding> {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/keymaps/zenith.json");
+        let content = std::fs::read_to_string(path).expect("Zenith keymap file");
+        match KeymapFile::load(&content, cx) {
+            settings::KeymapFileLoadResult::Success { key_bindings }
+            | settings::KeymapFileLoadResult::SomeFailedToLoad { key_bindings, .. } => key_bindings,
+            settings::KeymapFileLoadResult::JsonParseFailure { error } => {
+                panic!("Zenith keymap does not parse: {error}")
+            }
+        }
+    }
 
     /// A folder removed on drop (the crate has no `tempfile` dependency).
     struct TempDir(std::path::PathBuf);
@@ -2712,8 +2736,7 @@ mod tests {
     async fn test_tab_keys_cycle_ready_tabs(cx: &mut TestAppContext) {
         let app_state = init_test(cx);
         cx.update(|cx| {
-            let bindings = KeymapFile::load_asset(settings::ZENITH_KEYMAP_PATH, None, cx)
-                .expect("Zenith keymap loads");
+            let bindings = zenith_keymap(cx);
             cx.bind_keys(bindings);
         });
         let project = Project::test(app_state.fs.clone(), [], cx).await;
@@ -3316,14 +3339,14 @@ mod tests {
         modal.update_in(cx, |m, window, cx| m.set_query("foo", window, cx));
         cx.run_until_parked();
         assert_eq!(rows(cx), ["a.php:1", "a.php:2", "a.php:3"]);
-        modal.update_in(cx, |m, window, cx| m.click_case_chip(window, cx));
+        cx.dispatch_action(ToggleFindCase);
         cx.run_until_parked();
         assert_eq!(rows(cx), ["a.php:2"]);
         modal.update_in(cx, |m, window, cx| m.set_query("Foo", window, cx));
         cx.run_until_parked();
         assert_eq!(rows(cx), ["a.php:1"]);
         // Off again: every case is back.
-        modal.update_in(cx, |m, window, cx| m.click_case_chip(window, cx));
+        cx.dispatch_action(ToggleFindCase);
         cx.run_until_parked();
         assert_eq!(rows(cx), ["a.php:1", "a.php:2", "a.php:3"]);
     }
@@ -3339,10 +3362,10 @@ mod tests {
         modal.update_in(cx, |m, window, cx| m.set_query("foo", window, cx));
         cx.run_until_parked();
         assert_eq!(rows(cx), ["a.php:1", "a.php:2", "a.php:3", "a.php:4"]);
-        modal.update_in(cx, |m, window, cx| m.click_word_chip(window, cx));
+        cx.dispatch_action(ToggleFindWord);
         cx.run_until_parked();
         assert_eq!(rows(cx), ["a.php:1", "a.php:3"]);
-        modal.update_in(cx, |m, window, cx| m.click_word_chip(window, cx));
+        cx.dispatch_action(ToggleFindWord);
         cx.run_until_parked();
         assert_eq!(rows(cx).len(), 4);
     }
@@ -3365,7 +3388,7 @@ mod tests {
         cx.run_until_parked();
         // Off: the query is literal text, found only where it is written out.
         assert_eq!(rows(cx), ["b.php:1"]);
-        modal.update_in(cx, |m, window, cx| m.click_regex_chip(window, cx));
+        cx.dispatch_action(ToggleFindRegex);
         cx.run_until_parked();
         // On: "fo" then more o's then a word edge; "fox" has none.
         assert_eq!(rows(cx), ["a.php:1", "a.php:2", "b.php:1"]);
@@ -3379,7 +3402,7 @@ mod tests {
         cx.run_until_parked();
         assert_eq!(rows(cx), ["a.php:2"]);
         // Off again, the same text is literal: "fo(" is not special and not found.
-        modal.update_in(cx, |m, window, cx| m.click_regex_chip(window, cx));
+        cx.dispatch_action(ToggleFindRegex);
         modal.update_in(cx, |m, window, cx| m.set_query("fo(", window, cx));
         cx.run_until_parked();
         assert!(rows(cx).is_empty());
@@ -3414,13 +3437,13 @@ mod tests {
         assert!(enabled(cx));
         assert_eq!(rows(cx), ["a.php:1"]);
         // Unticking widens the list and keeps the text.
-        modal.update_in(cx, |m, window, cx| m.click_mask_checkbox(window, cx));
+        cx.dispatch_action(ToggleFindMask);
         cx.run_until_parked();
         assert!(!enabled(cx));
         assert_eq!(modal.read_with(cx, |m, cx| m.mask_text(cx)), "*.php");
         assert_eq!(rows(cx), ["a.php:1", "b.js:1", "c.css:1"]);
         // Ticking again brings the same mask back.
-        modal.update_in(cx, |m, window, cx| m.click_mask_checkbox(window, cx));
+        cx.dispatch_action(ToggleFindMask);
         cx.run_until_parked();
         assert!(enabled(cx));
         assert_eq!(rows(cx), ["a.php:1"]);
@@ -3452,7 +3475,7 @@ mod tests {
         assert_eq!(globs(cx), ["inc/**/*.php", "inc/**/*.js"]);
         assert_eq!(rows(cx), ["a.php:1", "c.js:1"]);
         // Unticked, the whole directory is searched again, and nothing outside it.
-        modal.update_in(cx, |m, window, cx| m.click_mask_checkbox(window, cx));
+        cx.dispatch_action(ToggleFindMask);
         cx.run_until_parked();
         assert_eq!(globs(cx), ["inc"]);
         assert_eq!(rows(cx), ["a.php:1", "c.js:1", "d.css:1"]);
@@ -3794,8 +3817,7 @@ mod tests {
             settings::init(cx);
             workspace::init(AppState::test(cx), cx);
             init(cx);
-            let bindings = KeymapFile::load_asset(settings::ZENITH_KEYMAP_PATH, None, cx)
-                .expect("Zenith keymap loads");
+            let bindings = zenith_keymap(cx);
             let bound_to = |action: &dyn Action, keys: &[&str]| {
                 bindings.iter().any(|binding| {
                     binding.action().partial_eq(action)
@@ -3843,7 +3865,7 @@ mod tests {
             load(&mut base, jetbrains);
             let mut all = base.clone();
             // Same order as `load_default_keymap`.
-            load(&mut all, settings::ZENITH_KEYMAP_PATH);
+            all.extend(zenith_keymap(cx));
             load(&mut all, settings::SPECIFIC_OVERRIDES_KEYMAP_PATH);
             let (base, all) = (gpui::Keymap::new(base), gpui::Keymap::new(all));
 
@@ -3905,12 +3927,36 @@ mod tests {
                     );
                 }
             }
+            // PhpStorm's Find in Files toggles, pressed in the query box (alt-c, alt-w, alt-x,
+            // alt-m) over the JetBrains keymap; none is taken by an Editor binding.
+            let find_box = ["Workspace", "FindInFiles Picker", "Editor mode=single_line"];
+            let stack: Vec<_> = find_box
+                .iter()
+                .map(|context| gpui::KeyContext::parse(context).expect("context"))
+                .collect();
+            for (keys, action) in [
+                ("alt-c", "zenith_search::ToggleFindCase"),
+                ("alt-w", "zenith_search::ToggleFindWord"),
+                ("alt-x", "zenith_search::ToggleFindRegex"),
+                ("alt-m", "zenith_search::ToggleFindMask"),
+            ] {
+                let keystroke = gpui::Keystroke::parse_with_os(keys, os).expect("keystroke");
+                let (found, _) = all.bindings_for_input(&[keystroke], &stack);
+                assert_eq!(
+                    found
+                        .first()
+                        .map(|binding| binding.action().name().to_string())
+                        .as_deref(),
+                    Some(action),
+                    "{keys} in the Find in Files box"
+                );
+            }
             // ⌥⌘← / ⌥⌘→ are previous/next tab in Zed's own keymap; Zenith's file turns them
             // into Back / Forward, whatever the base keymap is.
             let mut zed_only = Vec::new();
             load(&mut zed_only, settings::DEFAULT_KEYMAP_PATH);
             let mut zed_with_zenith = zed_only.clone();
-            load(&mut zed_with_zenith, settings::ZENITH_KEYMAP_PATH);
+            zed_with_zenith.extend(zenith_keymap(cx));
             load(
                 &mut zed_with_zenith,
                 settings::SPECIFIC_OVERRIDES_KEYMAP_PATH,

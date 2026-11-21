@@ -36,7 +36,8 @@ use workspace::{
 };
 
 use super::{
-    CycleFindContext, CycleFindScope, ToggleFileMaskHistory, TogglePinFindPopup, mask_history,
+    CycleFindContext, CycleFindScope, ToggleFileMaskHistory, ToggleFindCase, ToggleFindMask,
+    ToggleFindRegex, ToggleFindWord, TogglePinFindPopup, mask_history,
     popup::{Frame, PopupKind},
     style::{
         FIELD_HEIGHT, FOOTER_HEIGHT, HEADER_GAP, HEADER_HEIGHT, MASK_WIDTH, PADDING, POPUP_BAND,
@@ -791,29 +792,25 @@ impl FindInFilesModal {
         self.mask_enabled = false;
     }
 
-    /// What clicking the "Aa" chip does; the chips have no action to dispatch.
-    #[cfg(test)]
-    pub(crate) fn click_case_chip(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// Match Case: the "Aa" chip and its action.
+    fn toggle_case(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.toggle(window, cx, |this| {
             this.case_sensitive = !this.case_sensitive
         });
     }
 
-    /// What clicking the "W" chip does.
-    #[cfg(test)]
-    pub(crate) fn click_word_chip(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// Words: the "W" chip and its action.
+    fn toggle_word(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.toggle(window, cx, |this| this.whole_word = !this.whole_word);
     }
 
-    /// What clicking the ".*" chip does.
-    #[cfg(test)]
-    pub(crate) fn click_regex_chip(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// Regex: the ".*" chip and its action.
+    fn toggle_regex(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.toggle(window, cx, |this| this.regex = !this.regex);
     }
 
-    /// What clicking the "File mask:" checkbox does.
-    #[cfg(test)]
-    pub(crate) fn click_mask_checkbox(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// The "File mask:" checkbox and its action.
+    fn toggle_mask(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.toggle(window, cx, |this| this.mask_enabled = !this.mask_enabled);
     }
 
@@ -902,6 +899,7 @@ impl FindInFilesModal {
             "Find in Files"
         };
         let summary = self.summary(cx);
+        let query_focus = self.query.read(cx).focus_handle(cx);
         let pinned = self.pinned;
         let pin_label = if pinned {
             "Unpin (the popup closes when focus leaves it)"
@@ -933,11 +931,14 @@ impl FindInFilesModal {
                             .label("File mask:")
                             .label_size(LabelSize::Small)
                             .label_color(Color::Default)
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.toggle(window, cx, |this| {
-                                    this.mask_enabled = !this.mask_enabled
-                                })
-                            })),
+                            .tooltip(Tooltip::for_action_title_in(
+                                "File mask on or off",
+                                &ToggleFindMask,
+                                &query_focus,
+                            ))
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.toggle_mask(window, cx)),
+                            ),
                     )
                     .child(
                         self.field(&self.mask, window, cx)
@@ -1063,13 +1064,18 @@ impl FindInFilesModal {
         window: &Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
-        let chip = |id: &'static str, label: &'static str, tip: &'static str, on: bool| {
+        let query_focus = self.query.read(cx).focus_handle(cx);
+        let chip = |id: &'static str,
+                    label: &'static str,
+                    tip: &'static str,
+                    action: &dyn gpui::Action,
+                    on: bool| {
             Button::new(id, label)
                 .size(ButtonSize::Compact)
                 .label_size(LabelSize::Small)
                 .toggle_state(on)
                 .selected_style(ButtonStyle::Tinted(TintColor::Accent))
-                .tooltip(Tooltip::text(tip))
+                .tooltip(Tooltip::for_action_title_in(tip, action, &query_focus))
                 .aria_label(tip)
         };
         let has_query = !self.query.read(cx).text(cx).is_empty();
@@ -1098,27 +1104,34 @@ impl FindInFilesModal {
                         )
                     })
                     .child(
-                        chip("zenith-find-case", "Aa", "Match Case", self.case_sensitive).on_click(
-                            cx.listener(|this, _, window, cx| {
-                                this.toggle(window, cx, |this| {
-                                    this.case_sensitive = !this.case_sensitive
-                                })
-                            }),
-                        ),
+                        chip(
+                            "zenith-find-case",
+                            "Aa",
+                            "Match Case",
+                            &ToggleFindCase,
+                            self.case_sensitive,
+                        )
+                        .on_click(cx.listener(|this, _, window, cx| this.toggle_case(window, cx))),
                     )
                     .child(
-                        chip("zenith-find-word", "W", "Words", self.whole_word).on_click(
-                            cx.listener(|this, _, window, cx| {
-                                this.toggle(window, cx, |this| this.whole_word = !this.whole_word)
-                            }),
-                        ),
+                        chip(
+                            "zenith-find-word",
+                            "W",
+                            "Words",
+                            &ToggleFindWord,
+                            self.whole_word,
+                        )
+                        .on_click(cx.listener(|this, _, window, cx| this.toggle_word(window, cx))),
                     )
                     .child(
-                        chip("zenith-find-regex", ".*", "Regex", self.regex).on_click(cx.listener(
-                            |this, _, window, cx| {
-                                this.toggle(window, cx, |this| this.regex = !this.regex)
-                            },
-                        )),
+                        chip(
+                            "zenith-find-regex",
+                            ".*",
+                            "Regex",
+                            &ToggleFindRegex,
+                            self.regex,
+                        )
+                        .on_click(cx.listener(|this, _, window, cx| this.toggle_regex(window, cx))),
                     ),
             )
             .children(self.replace.as_ref().map(|replace| {
@@ -1363,7 +1376,19 @@ impl Render for FindInFilesModal {
             .on_action(cx.listener(Self::toggle_pin))
             .on_action(cx.listener(Self::cycle_scope))
             .on_action(cx.listener(Self::cycle_context))
-            .on_action(cx.listener(Self::toggle_mask_history));
+            .on_action(cx.listener(Self::toggle_mask_history))
+            .on_action(
+                cx.listener(|this, _: &ToggleFindCase, window, cx| this.toggle_case(window, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &ToggleFindWord, window, cx| this.toggle_word(window, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &ToggleFindRegex, window, cx| this.toggle_regex(window, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &ToggleFindMask, window, cx| this.toggle_mask(window, cx)),
+            );
         self.frame.render(
             PopupKind::Find,
             root,

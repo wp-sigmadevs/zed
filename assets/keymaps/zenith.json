@@ -95,6 +95,18 @@
     },
   },
   {
+    // Find in Files toggles, as PhpStorm's Match Case, Words, Regex and File mask.
+    // The query box is an Editor inside this context; no Editor binding uses these keys on macOS
+    // or in the JetBrains keymaps (theirs are in BufferSearchBar and ProjectSearchBar).
+    "context": "FindInFiles",
+    "bindings": {
+      "alt-c": "zenith_search::ToggleFindCase",
+      "alt-w": "zenith_search::ToggleFindWord",
+      "alt-x": "zenith_search::ToggleFindRegex",
+      "alt-m": "zenith_search::ToggleFindMask",
+    },
+  },
+  {
     // Owner's WebStorm customs (zed-config keymap.json), built in.
     "context": "Editor",
     "bindings": {
