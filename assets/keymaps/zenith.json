@@ -20,6 +20,9 @@
       "secondary-shift-6": "zenith_todo::ToggleFocus",
       // Problems tool window, as in PhpStorm (⌘6).
       "secondary-6": "zenith_problems::ToggleFocus",
+      // WordPress Hooks tool window (WordPress projects only). PhpStorm has no key for it; free
+      // in the macOS, Linux and JetBrains keymaps.
+      "secondary-shift-7": "zenith_wordpress::ToggleWpHooksPanel",
       // New Scratch File, as in PhpStorm (⌘⇧N); overrides Go to File and New Window.
       "secondary-shift-n": "zenith_scratches::NewScratchFile",
       "secondary-shift-f": "zenith_search::FindInFiles",
@@ -40,6 +43,14 @@
       "shift-tab": "zenith_local_history::FocusPreviousControl",
       "alt-shift-r": "zenith_local_history::RevertToRevision",
       "alt-shift-c": "zenith_local_history::CopyRevisionText",
+    },
+  },
+  {
+    // Collapse / expand a hook in the WordPress Hooks tool window.
+    "context": "WpHooksPanel",
+    "bindings": {
+      "left": "menu::SelectParent",
+      "right": "menu::SelectChild",
     },
   },
   {

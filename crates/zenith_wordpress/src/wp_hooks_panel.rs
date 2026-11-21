@@ -2,8 +2,8 @@ use editor::Editor;
 use gpui::prelude::*;
 use gpui::{
     Action, AnyElement, App, Context, EventEmitter, FocusHandle, Focusable, IntoElement,
-    ParentElement, Pixels, Render, Role, SharedString, Styled, UniformListScrollHandle, WeakEntity,
-    Window, px, uniform_list,
+    ParentElement, Pixels, Render, Role, ScrollStrategy, SharedString, Styled,
+    UniformListScrollHandle, WeakEntity, Window, px, uniform_list,
 };
 use std::collections::HashSet;
 use std::ops::Range;
@@ -21,7 +21,13 @@ gpui::actions!(
     zenith_wordpress,
     [
         /// Toggles focus on the WordPress Hooks panel.
-        ToggleWpHooksPanel
+        ToggleWpHooksPanel,
+        /// Shows every hook in the WordPress Hooks panel.
+        FilterAllHooks,
+        /// Shows only action hooks in the WordPress Hooks panel.
+        FilterActionHooks,
+        /// Shows only filter hooks in the WordPress Hooks panel.
+        FilterFilterHooks
     ]
 );
 
@@ -61,6 +67,8 @@ pub struct WpHooksPanel {
     hooks: Vec<HookSummary>,
     /// What the list shows: the hooks passing the filter and the lines of the expanded ones.
     rows: Vec<Row>,
+    /// The keyboard-selected line of `rows`.
+    selected: Option<usize>,
     /// Hook lines in `rows`.
     shown_hooks: usize,
     scroll_handle: UniformListScrollHandle,
@@ -81,6 +89,7 @@ impl WpHooksPanel {
             workspace,
             hooks: Vec::new(),
             rows: Vec::new(),
+            selected: None,
             shown_hooks: 0,
             scroll_handle: UniformListScrollHandle::new(),
         };
@@ -135,6 +144,111 @@ impl WpHooksPanel {
                 });
             }
         }
+        self.selected = self
+            .rows
+            .len()
+            .checked_sub(1)
+            .and_then(|last| self.selected.map(|ix| ix.min(last)));
+    }
+
+    fn select(&mut self, ix: usize, cx: &mut Context<Self>) {
+        self.selected = Some(ix);
+        self.scroll_handle
+            .scroll_to_item(ix, ScrollStrategy::Nearest);
+        cx.notify();
+    }
+
+    fn select_next(&mut self, _: &menu::SelectNext, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(last) = self.rows.len().checked_sub(1) else {
+            return;
+        };
+        self.select(self.selected.map_or(0, |ix| (ix + 1).min(last)), cx);
+    }
+
+    fn select_previous(
+        &mut self,
+        _: &menu::SelectPrevious,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.rows.is_empty() {
+            return;
+        }
+        self.select(self.selected.map_or(0, |ix| ix.saturating_sub(1)), cx);
+    }
+
+    fn select_first(&mut self, _: &menu::SelectFirst, _: &mut Window, cx: &mut Context<Self>) {
+        if !self.rows.is_empty() {
+            self.select(0, cx);
+        }
+    }
+
+    fn select_last(&mut self, _: &menu::SelectLast, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(last) = self.rows.len().checked_sub(1) {
+            self.select(last, cx);
+        }
+    }
+
+    /// Collapses a hook, or moves from one of its lines to the hook.
+    fn select_parent(&mut self, _: &menu::SelectParent, _: &mut Window, cx: &mut Context<Self>) {
+        match self.selected.and_then(|ix| self.rows.get(ix)) {
+            Some(Row::Hook(hook)) => {
+                let name = self.hooks[*hook].name.clone();
+                if self.expanded_hooks.contains(&name) {
+                    self.toggle_expand(&name, cx);
+                }
+            }
+            Some(Row::Definition { hook, .. } | Row::Listener { hook, .. }) => {
+                let hook = *hook;
+                if let Some(ix) = self
+                    .rows
+                    .iter()
+                    .position(|row| matches!(row, Row::Hook(owner) if *owner == hook))
+                {
+                    self.select(ix, cx);
+                }
+            }
+            None => {}
+        }
+    }
+
+    /// Expands a collapsed hook.
+    fn select_child(&mut self, _: &menu::SelectChild, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(Row::Hook(hook)) = self.selected.and_then(|ix| self.rows.get(ix)) {
+            let name = self.hooks[*hook].name.clone();
+            if !self.expanded_hooks.contains(&name) {
+                self.toggle_expand(&name, cx);
+            }
+        }
+    }
+
+    fn confirm(&mut self, _: &menu::Confirm, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(ix) = self.selected {
+            self.activate(ix, window, cx);
+        }
+    }
+
+    /// Escape: hand the keyboard back to the editor.
+    fn cancel(&mut self, _: &menu::Cancel, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(workspace) = self.workspace.upgrade() {
+            workspace.update(cx, |workspace, cx| workspace.focus_center_pane(window, cx));
+        }
+    }
+
+    /// Enter or click: a hook expands or collapses, a definition or listener opens its file at
+    /// its line.
+    fn activate(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.select(ix, cx);
+        match self.rows.get(ix) {
+            Some(Row::Hook(hook)) => {
+                let name = self.hooks[*hook].name.clone();
+                self.toggle_expand(&name, cx);
+            }
+            Some(Row::Definition { path, line, .. } | Row::Listener { path, line, .. }) => {
+                open_at_line(&self.workspace, path.clone(), *line, window, cx);
+            }
+            None => {}
+        }
     }
 
     pub fn toggle_expand(&mut self, hook_name: &str, cx: &mut Context<Self>) {
@@ -160,12 +274,15 @@ impl WpHooksPanel {
     }
 
     fn render_row(&self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
+        let selected = self.selected == Some(ix);
         let item = |id: SharedString| {
             ListItem::new(id)
                 .spacing(ListItemSpacing::Dense)
                 .height(px(ROW_HEIGHT))
                 .rounded()
+                .toggle_state(selected)
                 .aria_role(Role::TreeItem)
+                .on_click(cx.listener(move |this, _, window, cx| this.activate(ix, window, cx)))
         };
         let location = |path: &Path, line: usize| {
             format!(
@@ -179,14 +296,17 @@ impl WpHooksPanel {
             Row::Hook(hook) => {
                 let hook = &self.hooks[*hook];
                 let expanded = self.expanded_hooks.contains(&hook.name);
-                let name = hook.name.clone();
                 item(format!("hook-header-{}", hook.name).into())
+                    // ListItem reports `toggle` as a pressed state, not as expanded, so the
+                    // state is spelled out in the label.
                     .aria_label(format!(
-                        "{}, {} listeners, {} definitions",
-                        hook.name, hook.listeners, hook.definitions
+                        "{}, {}, {} listeners, {} definitions",
+                        hook.name,
+                        if expanded { "expanded" } else { "collapsed" },
+                        hook.listeners,
+                        hook.definitions
                     ))
                     .toggle(Some(expanded))
-                    .on_click(cx.listener(move |this, _, _, cx| this.toggle_expand(&name, cx)))
                     .child(Label::new(hook.name.clone()).weight(gpui::FontWeight::MEDIUM))
                     .end_slot(
                         Label::new(format!("{}L / {}D", hook.listeners, hook.definitions))
@@ -201,16 +321,12 @@ impl WpHooksPanel {
                 path,
                 line,
             } => {
-                let (name, path, line) = (&self.hooks[*hook].name, path.clone(), *line);
-                let workspace = self.workspace.clone();
-                let text = location(&path, line);
+                let (name, line) = (&self.hooks[*hook].name, *line);
+                let text = location(path, line);
                 item(format!("def-{name}-{}-{line}-{ordinal}", path.display()).into())
                     .indent_level(1)
                     .indent_step_size(px(ITEM_INDENT))
-                    .aria_label(format!("Definition at {text}"))
-                    .on_click(move |_, window, cx| {
-                        open_at_line(&workspace, path.clone(), line, window, cx)
-                    })
+                    .aria_label(format!("Definition of {name} at {text}"))
                     .start_slot(
                         Label::new("[def]")
                             .size(LabelSize::XSmall)
@@ -227,16 +343,14 @@ impl WpHooksPanel {
                 priority,
                 callback,
             } => {
-                let (name, path, line) = (&self.hooks[*hook].name, path.clone(), *line);
-                let workspace = self.workspace.clone();
-                let text = location(&path, line);
+                let (name, line) = (&self.hooks[*hook].name, *line);
+                let text = location(path, line);
                 item(format!("listener-{name}-{}-{line}-{ordinal}", path.display()).into())
                     .indent_level(1)
                     .indent_step_size(px(ITEM_INDENT))
-                    .aria_label(format!("Listener {callback} at {text}"))
-                    .on_click(move |_, window, cx| {
-                        open_at_line(&workspace, path.clone(), line, window, cx)
-                    })
+                    .aria_label(format!(
+                        "Listener {callback} of {name}, priority {priority}, at {text}"
+                    ))
                     .start_slot(
                         Label::new(format!("[{priority}]"))
                             .size(LabelSize::XSmall)
@@ -329,17 +443,46 @@ impl Panel for WpHooksPanel {
 
 impl Render for WpHooksPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let filter_button = |id: &'static str, label: &'static str, kind: Option<HookKind>| {
-            Button::new(id, label)
-                .style(if self.filter_kind == kind {
-                    ButtonStyle::Filled
-                } else {
-                    ButtonStyle::Subtle
-                })
-                .on_click(cx.listener(move |this, _, _, cx| this.set_filter_kind(kind, cx)))
-        };
+        // `Button` defaults to `Role::Button`; the toggle state reaches assistive technology as
+        // "pressed" and the label says it in words.
+        let filter_button =
+            |id: &'static str, label: &'static str, what: &'static str, kind: Option<HookKind>| {
+                let active = self.filter_kind == kind;
+                Button::new(id, label)
+                    .style(if active {
+                        ButtonStyle::Filled
+                    } else {
+                        ButtonStyle::Subtle
+                    })
+                    .toggle_state(active)
+                    .aria_label(if active {
+                        format!("{what}, selected")
+                    } else {
+                        what.to_string()
+                    })
+                    .on_click(cx.listener(move |this, _, _, cx| this.set_filter_kind(kind, cx)))
+            };
         v_flex()
             .id("wp-hooks-panel")
+            .key_context("WpHooksPanel")
+            .track_focus(&self.focus_handle)
+            .on_action(cx.listener(Self::select_next))
+            .on_action(cx.listener(Self::select_previous))
+            .on_action(cx.listener(Self::select_first))
+            .on_action(cx.listener(Self::select_last))
+            .on_action(cx.listener(Self::select_parent))
+            .on_action(cx.listener(Self::select_child))
+            .on_action(cx.listener(Self::confirm))
+            .on_action(cx.listener(Self::cancel))
+            .on_action(
+                cx.listener(|this, _: &FilterAllHooks, _, cx| this.set_filter_kind(None, cx)),
+            )
+            .on_action(cx.listener(|this, _: &FilterActionHooks, _, cx| {
+                this.set_filter_kind(Some(HookKind::Action), cx)
+            }))
+            .on_action(cx.listener(|this, _: &FilterFilterHooks, _, cx| {
+                this.set_filter_kind(Some(HookKind::Filter), cx)
+            }))
             .size_full()
             .bg(cx.theme().colors().panel_background)
             .overflow_hidden()
@@ -371,15 +514,17 @@ impl Render for WpHooksPanel {
                     .gap_1()
                     .border_b_1()
                     .border_color(cx.theme().colors().border_variant)
-                    .child(filter_button("filter-all", "All", None))
+                    .child(filter_button("filter-all", "All", "Show all hooks", None))
                     .child(filter_button(
                         "filter-actions",
                         "Actions",
+                        "Show action hooks",
                         Some(HookKind::Action),
                     ))
                     .child(filter_button(
                         "filter-filters",
                         "Filters",
+                        "Show filter hooks",
                         Some(HookKind::Filter),
                     )),
             )
@@ -448,6 +593,7 @@ pub(crate) fn read_index<T>(index: &RwLock<T>) -> RwLockReadGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui::{Entity, TestAppContext, VisualTestContext};
 
     #[gpui::test]
     fn test_wp_hooks_panel_state(cx: &mut App) {
@@ -497,6 +643,168 @@ mod tests {
             panel.set_filter_kind(Some(HookKind::Action), cx);
             assert!(panel.rows.is_empty());
         });
+    }
+
+    struct Fixture {
+        workspace: Entity<Workspace>,
+        panel: Entity<WpHooksPanel>,
+    }
+
+    /// A workspace over `/p/p.php` (hooks `zz_alpha` and `zz_beta`) with the panel added by hand
+    /// and the keys a keymap file would give it.
+    async fn fixture(cx: &mut TestAppContext) -> (Fixture, &mut VisualTestContext) {
+        let app_state = cx.update(|cx| {
+            let app_state = workspace::AppState::test(cx);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            editor::init(cx);
+            workspace::init(app_state.clone(), cx);
+            let panel = Some("WpHooksPanel");
+            cx.bind_keys([
+                gpui::KeyBinding::new("down", menu::SelectNext, panel),
+                gpui::KeyBinding::new("up", menu::SelectPrevious, panel),
+                gpui::KeyBinding::new("right", menu::SelectChild, panel),
+                gpui::KeyBinding::new("left", menu::SelectParent, panel),
+                gpui::KeyBinding::new("enter", menu::Confirm, panel),
+                gpui::KeyBinding::new("escape", menu::Cancel, panel),
+            ]);
+            app_state
+        });
+        let source = "<?php\napply_filters('zz_alpha', 1);\nadd_filter('zz_alpha', 'cb');\ndo_action('zz_beta');\n";
+        app_state
+            .fs
+            .as_fake()
+            .insert_tree("/p", serde_json::json!({ "p.php": source }))
+            .await;
+        let project = project::Project::test(app_state.fs.clone(), ["/p".as_ref()], cx).await;
+        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace = multi_workspace.read_with(cx, |multi, _| multi.workspace().clone());
+        let index = Arc::new(RwLock::new(WordPressIndex::new()));
+        index
+            .write()
+            .unwrap()
+            .index_source(PathBuf::from("/p/p.php"), source);
+        let panel = workspace.update_in(cx, |workspace, window, cx| {
+            let weak = cx.entity().downgrade();
+            let panel = cx.new(|cx| WpHooksPanel::new(weak, index, cx));
+            workspace.add_panel(panel.clone(), window, cx);
+            panel
+        });
+        panel.update(cx, |panel, cx| panel.set_search_query("zz_".into(), cx));
+        (Fixture { workspace, panel }, cx)
+    }
+
+    fn selected(fixture: &Fixture, cx: &mut VisualTestContext) -> (Option<usize>, usize) {
+        fixture
+            .panel
+            .read_with(cx, |panel, _| (panel.selected, panel.rows.len()))
+    }
+
+    #[gpui::test]
+    async fn keyboard_selects_expands_collapses_and_opens(cx: &mut TestAppContext) {
+        let (fixture, cx) = fixture(cx).await;
+        // The toggle action puts the keyboard on the panel itself.
+        fixture.workspace.update_in(cx, |workspace, window, cx| {
+            workspace.toggle_panel_focus::<WpHooksPanel>(window, cx);
+        });
+        cx.run_until_parked();
+        let focused = |cx: &mut VisualTestContext| {
+            fixture.panel.update_in(cx, |panel, window, cx| {
+                panel.focus_handle(cx).is_focused(window)
+            })
+        };
+        assert!(focused(cx));
+
+        // Rows: zz_alpha, zz_beta.
+        assert_eq!(selected(&fixture, cx), (None, 2));
+        cx.simulate_keystrokes("down");
+        assert_eq!(selected(&fixture, cx), (Some(0), 2));
+        // Expanding adds the definition and the listener under the selected hook.
+        cx.simulate_keystrokes("right");
+        assert_eq!(selected(&fixture, cx), (Some(0), 4));
+        cx.simulate_keystrokes("down");
+        assert_eq!(selected(&fixture, cx), (Some(1), 4));
+        // Left on a line goes to its hook, left on the hook collapses it.
+        cx.simulate_keystrokes("left");
+        assert_eq!(selected(&fixture, cx), (Some(0), 4));
+        cx.simulate_keystrokes("left");
+        assert_eq!(selected(&fixture, cx), (Some(0), 2));
+        // Enter on a hook toggles it too.
+        cx.simulate_keystrokes("enter");
+        assert_eq!(selected(&fixture, cx), (Some(0), 4));
+        // Selection never leaves the list.
+        cx.simulate_keystrokes("down down down down up");
+        assert_eq!(selected(&fixture, cx), (Some(2), 4));
+
+        // Enter on the definition (line 2) opens the file with the cursor there.
+        cx.simulate_keystrokes("up");
+        assert_eq!(selected(&fixture, cx), (Some(1), 4));
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        let editor = fixture
+            .workspace
+            .read_with(cx, |workspace, cx| workspace.active_item_as::<Editor>(cx))
+            .expect("the file is open");
+        let head = editor.update(cx, |editor, cx| {
+            let snapshot = editor.display_snapshot(cx);
+            editor.selections.newest::<Point>(&snapshot).head()
+        });
+        assert_eq!(head, Point::new(1, 0));
+
+        // Escape hands the keyboard to the editor.
+        fixture.workspace.update_in(cx, |workspace, window, cx| {
+            workspace.focus_panel::<WpHooksPanel>(window, cx);
+        });
+        cx.run_until_parked();
+        assert!(focused(cx));
+        cx.simulate_keystrokes("escape");
+        assert!(!focused(cx));
+        assert!(editor.update_in(cx, |editor, window, cx| {
+            editor.focus_handle(cx).is_focused(window)
+        }));
+    }
+
+    /// The shipped Zenith keymap gives the panel its toggle key and its left/right keys.
+    #[gpui::test]
+    fn test_zenith_keymap_binds_the_panel(cx: &mut App) {
+        // The file itself, not the asset loader: a dev build reads assets from the checkout that
+        // owns the test binary, which is not this one when the target dir is shared.
+        let bindings = match settings::KeymapFile::load(
+            include_str!("../../../assets/keymaps/zenith.json"),
+            cx,
+        ) {
+            settings::KeymapFileLoadResult::Success { key_bindings }
+            | settings::KeymapFileLoadResult::SomeFailedToLoad { key_bindings, .. } => key_bindings,
+            settings::KeymapFileLoadResult::JsonParseFailure { error } => panic!("{error:#}"),
+        };
+        let bound = |action: &dyn Action, key: &str, context: &str| {
+            bindings.iter().any(|binding| {
+                binding.action().partial_eq(action)
+                    && binding.keystrokes().len() == 1
+                    && binding.keystrokes()[0].inner().key == key
+                    && binding.predicate().map(|p| p.to_string()).as_deref() == Some(context)
+            })
+        };
+        assert!(bound(&ToggleWpHooksPanel, "7", "Workspace"));
+        assert!(bound(&menu::SelectChild, "right", "WpHooksPanel"));
+        assert!(bound(&menu::SelectParent, "left", "WpHooksPanel"));
+    }
+
+    #[gpui::test]
+    async fn filter_actions_follow_the_panel(cx: &mut TestAppContext) {
+        let (fixture, cx) = fixture(cx).await;
+        fixture.workspace.update_in(cx, |workspace, window, cx| {
+            workspace.focus_panel::<WpHooksPanel>(window, cx);
+        });
+        cx.run_until_parked();
+        let filter = |cx: &mut VisualTestContext| fixture.panel.read_with(cx, |p, _| p.filter_kind);
+        cx.dispatch_action(FilterActionHooks);
+        assert_eq!(filter(cx), Some(HookKind::Action));
+        cx.dispatch_action(FilterFilterHooks);
+        assert_eq!(filter(cx), Some(HookKind::Filter));
+        cx.dispatch_action(FilterAllHooks);
+        assert_eq!(filter(cx), None);
     }
 
     #[test]

@@ -23388,6 +23388,7 @@ dependencies = [
  "editor",
  "gpui",
  "icons",
+ "menu",
  "pretty_assertions",
  "project",
  "schemars 1.0.4",
