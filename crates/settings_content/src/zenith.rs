@@ -17,6 +17,8 @@ pub struct ZenithSettingsContent {
     pub external_libraries: Option<ZenithExternalLibrariesSettingsContent>,
     /// Settings for the WordPress Hooks tool window.
     pub wordpress: Option<ZenithWordPressSettingsContent>,
+    /// Settings for the Laravel tool window.
+    pub laravel: Option<ZenithLaravelSettingsContent>,
     /// Settings for the hover card.
     pub hover_card: Option<ZenithHoverCardSettingsContent>,
 }
@@ -25,6 +27,15 @@ pub struct ZenithSettingsContent {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
 pub struct ZenithWordPressSettingsContent {
     /// Whether the WordPress Hooks tool window is offered for trusted WordPress projects.
+    ///
+    /// Default: true
+    pub enabled: Option<bool>,
+}
+
+/// Settings for the Laravel tool window.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+pub struct ZenithLaravelSettingsContent {
+    /// Whether the Laravel tool window (routes and views) is offered for trusted Laravel projects.
     ///
     /// Default: true
     pub enabled: Option<bool>,
