@@ -330,6 +330,9 @@ fn append_children_recursive(
 }
 
 #[cfg(test)]
+mod local_settings_trust_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashMap;
@@ -552,6 +555,7 @@ mod tests {
             external_libraries: Some(
                 settings::settings_content::ZenithExternalLibrariesSettingsContent {
                     enabled: Some(false),
+                    ..Default::default()
                 },
             ),
             ..Default::default()

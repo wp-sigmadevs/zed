@@ -393,6 +393,7 @@ mod tests {
                     content.zenith = Some(ZenithSettingsContent {
                         external_libraries: Some(ZenithExternalLibrariesSettingsContent {
                             enabled: Some(false),
+                            ..Default::default()
                         }),
                         ..Default::default()
                     });
