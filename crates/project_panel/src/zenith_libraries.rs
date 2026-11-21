@@ -4,8 +4,8 @@
 
 use super::*;
 use zenith_external_libraries::{
-    RowDecoration, classify, decorate, detect_libraries, is_enabled, is_section_expanded,
-    is_under_library, may_be_library_path, section_id, section_worktree, set_section_expanded,
+    RowDecoration, decorate_row, detect_libraries, is_enabled, is_under_library,
+    may_be_library_path, row_kind, section_worktree, set_section_expanded,
 };
 
 impl ProjectPanel {
@@ -69,59 +69,68 @@ impl ProjectPanel {
         }
     }
 
-    /// Library rows indent one level under the node and carry its labels.
+    /// Library rows indent one level under the node and carry its labels. Runs for every visible
+    /// row, so it bails out before touching the worktree unless the row can be a library row.
     pub(super) fn zenith_decorate(
         &self,
         entry: &Entry,
-        worktree_id: WorktreeId,
-        row: (String, Option<SharedString>, Option<SharedString>, usize),
+        filename: String,
+        icon: Option<SharedString>,
+        depth: usize,
         cx: &App,
-    ) -> (String, Option<SharedString>, Option<SharedString>, usize) {
-        let (filename, icon, chevron, depth) = row;
-        let unchanged = RowDecoration {
-            filename,
-            icon,
-            chevron,
-            depth,
+    ) -> (String, Option<SharedString>, usize) {
+        let project = self.project.read(cx);
+        let worktree = match section_worktree(entry.id) {
+            Some(worktree_id) => project.worktree_for_id(worktree_id, cx),
+            None if may_be_library_path(&entry.path) => project.worktree_for_entry(entry.id, cx),
+            None => None,
+        };
+        let kind = worktree
+            .filter(|_| is_enabled(cx))
+            .and_then(|worktree| row_kind(worktree.read(cx), entry.id, &entry.path));
+        let Some(kind) = kind else {
+            return (filename, icon, depth);
         };
         // Mirrors the upstream rule that hides the root row.
         let root_visible = !(ProjectPanelSettings::get_global(cx).hide_root
-            && self.project.read(cx).visible_worktrees(cx).count() == 1);
-        let decorated = self
-            .zenith_row_kind(entry, worktree_id, cx)
-            .map(|kind| {
-                let expanded = self
-                    .state
-                    .expanded_dir_ids
-                    .get(&worktree_id)
-                    .is_some_and(|ids| is_section_expanded(worktree_id, ids));
-                decorate(&kind, expanded, root_visible, unchanged.clone())
-            })
-            .unwrap_or(unchanged);
-        (
-            decorated.filename,
-            decorated.icon,
-            decorated.chevron,
-            decorated.depth,
-        )
+            && project.visible_worktrees(cx).count() == 1);
+        let row = decorate_row(
+            kind,
+            root_visible,
+            RowDecoration {
+                filename,
+                icon,
+                depth,
+            },
+        );
+        (row.filename, row.icon, row.depth)
     }
 
-    fn zenith_row_kind(
+    /// `settings` with drag-and-drop off for the "External Libraries" node and every row inside
+    /// a library: they are read-only, so nothing is dragged from them or dropped onto them. The
+    /// row render reads `drag_and_drop` for both the row handlers and the folded-path separators.
+    /// Runs for every visible row every frame, so ordinary rows stop at the path check.
+    pub(super) fn zenith_dnd(
         &self,
-        entry: &Entry,
-        worktree_id: WorktreeId,
+        mut settings: ProjectPanelSettings,
+        entry_id: ProjectEntryId,
+        details: &EntryDetails,
         cx: &App,
-    ) -> Option<zenith_external_libraries::RowKind> {
-        if !is_enabled(cx) {
-            return None;
+    ) -> ProjectPanelSettings {
+        if settings.drag_and_drop
+            && (section_worktree(entry_id).is_some() || may_be_library_path(&details.path))
+            && is_enabled(cx)
+        {
+            let is_library_row = self
+                .project
+                .read(cx)
+                .worktree_for_id(details.worktree_id, cx)
+                .is_some_and(|worktree| {
+                    row_kind(worktree.read(cx), entry_id, &details.path).is_some()
+                });
+            settings.drag_and_drop &= !is_library_row;
         }
-        let is_section = entry.id == section_id(worktree_id);
-        if !is_section && !may_be_library_path(&entry.path) {
-            return None;
-        }
-        let worktree = self.project.read(cx).worktree_for_id(worktree_id, cx)?;
-        let libraries = detect_libraries(&worktree.read(cx).snapshot());
-        classify(&libraries, worktree_id, entry.id, &entry.path)
+        settings
     }
 
     /// For a file or folder inside a library: the read-only menu plus Local History, Reveal,
@@ -200,6 +209,7 @@ mod tests {
         ZenithExternalLibrariesSettingsContent, ZenithSettingsContent,
     };
     use workspace::MultiWorkspace;
+    use zenith_external_libraries::section_id;
 
     async fn open_panel(
         cx: &mut TestAppContext,
@@ -410,6 +420,7 @@ mod tests {
                     content.zenith = Some(ZenithSettingsContent {
                         external_libraries: Some(ZenithExternalLibrariesSettingsContent {
                             enabled: Some(false),
+                            ..Default::default()
                         }),
                         ..Default::default()
                     });
@@ -471,5 +482,64 @@ mod tests {
         });
         assert!(library, "library files get the library menu");
         assert!(ordinary, "ordinary files keep the regular menu");
+    }
+
+    #[gpui::test]
+    async fn test_library_rows_have_no_drag_and_drop(cx: &mut TestAppContext) {
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/site", composer_tree()).await;
+        let (panel, mut cx) = open_panel(cx, fs, &["/site"]).await;
+        let cx = &mut cx;
+        let id = first_worktree_id(&panel, cx);
+        panel.update_in(cx, |panel, window, cx| {
+            panel.toggle_expanded(section_id(id), window, cx);
+        });
+        cx.run_until_parked();
+        panel.update_in(cx, |panel, window, cx| {
+            let vendor = panel
+                .project
+                .read(cx)
+                .worktrees(cx)
+                .next()
+                .unwrap()
+                .read(cx)
+                .entry_for_path(RelPath::from_unix_str("vendor").unwrap())
+                .unwrap()
+                .id;
+            panel.toggle_expanded(vendor, window, cx);
+        });
+        cx.run_until_parked();
+
+        let drag_and_drop = panel.update_in(cx, |panel, window, cx| {
+            let mut rows = Vec::new();
+            panel.for_each_visible_entry(0..200, window, cx, &mut |entry_id, details, _, _| {
+                rows.push((entry_id, details));
+            });
+            let settings = *ProjectPanelSettings::get_global(cx);
+            assert!(settings.drag_and_drop, "drag and drop is on by default");
+            rows.into_iter()
+                .map(|(entry_id, details)| {
+                    let allowed = panel.zenith_dnd(settings, entry_id, &details, cx);
+                    (details.filename, allowed.drag_and_drop)
+                })
+                .collect::<Vec<_>>()
+        });
+        let allowed = |name: &str| {
+            drag_and_drop
+                .iter()
+                .find(|(n, _)| n == name)
+                .unwrap_or_else(|| panic!("no row {name:?} in {drag_and_drop:?}"))
+                .1
+        };
+        for library_row in [
+            "External Libraries",
+            "Composer Packages (read-only)",
+            "autoload.php",
+        ] {
+            assert!(!allowed(library_row), "{library_row} must not drag or drop");
+        }
+        for ordinary_row in ["site", "src", "composer.json"] {
+            assert!(allowed(ordinary_row), "{ordinary_row} keeps drag and drop");
+        }
     }
 }

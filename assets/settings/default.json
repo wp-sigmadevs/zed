@@ -3022,6 +3022,9 @@
     "external_libraries": {
       // Move detected library folders under an "External Libraries" node.
       "enabled": true,
+      // Extra absolute library folders. Local settings, tasks and debug configs inside them
+      // (and inside vendor/, node_modules/, wp-includes/, wp-admin/) are never loaded.
+      "paths": [],
     },
     // WordPress Hooks tool window: hooks and listeners of a WordPress project.
     "wordpress": {

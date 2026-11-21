@@ -14028,6 +14028,7 @@ dependencies = [
  "which",
  "worktree",
  "zed_credentials_provider",
+ "zenith_local_settings_trust",
  "zeroize",
  "zlog",
  "ztracing",
@@ -22906,6 +22907,7 @@ version = "0.1.0"
 dependencies = [
  "gpui",
  "onboarding",
+ "zenith_external_libraries",
  "zenith_folds",
  "zenith_inspections",
  "zenith_laravel",
@@ -22944,6 +22946,7 @@ dependencies = [
  "util",
  "workspace",
  "worktree",
+ "zenith_local_settings_trust",
 ]
 
 [[package]]
@@ -23080,6 +23083,18 @@ dependencies = [
  "zed_actions",
  "zed_env_vars",
  "zstd",
+]
+
+[[package]]
+name = "zenith_local_settings_trust"
+version = "0.1.0"
+dependencies = [
+ "fs",
+ "gpui",
+ "serde_json",
+ "settings",
+ "util",
+ "worktree",
 ]
 
 [[package]]

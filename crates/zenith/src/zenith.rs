@@ -46,4 +46,6 @@ pub fn init(cx: &mut App) {
     zenith_wordpress::init(cx);
     #[cfg(feature = "laravel")]
     zenith_laravel::init(cx);
+    #[cfg(feature = "external_libraries")]
+    zenith_external_libraries::init(cx);
 }

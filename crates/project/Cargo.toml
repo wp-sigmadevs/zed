@@ -107,6 +107,7 @@ wax.workspace = true
 which.workspace = true
 worktree.workspace = true
 zed_credentials_provider.workspace = true
+zenith_local_settings_trust.workspace = true
 zeroize.workspace = true
 zlog.workspace = true
 ztracing.workspace = true

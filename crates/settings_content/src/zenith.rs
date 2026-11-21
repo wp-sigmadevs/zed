@@ -70,6 +70,11 @@ pub struct ZenithExternalLibrariesSettingsContent {
     ///
     /// Default: true
     pub enabled: Option<bool>,
+    /// Absolute folders to treat as libraries: project-local settings, tasks, debug configs
+    /// and editorconfig files inside them are never loaded. Read from user settings only.
+    ///
+    /// Default: []
+    pub paths: Option<Vec<String>>,
 }
 
 /// Settings for the Zenith welcome screen.

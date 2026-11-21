@@ -27,6 +27,7 @@ ui.workspace = true
 util.workspace = true
 worktree.workspace = true
 workspace.workspace = true
+zenith_local_settings_trust.workspace = true
 
 [dev-dependencies]
 fs = { workspace = true, features = ["test-support"] }

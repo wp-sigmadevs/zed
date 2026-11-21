@@ -6162,6 +6162,7 @@ impl ProjectPanel {
         let is_sticky = details.sticky.is_some();
         let sticky_index = details.sticky.as_ref().map(|this| this.sticky_index);
         let settings = ProjectPanelSettings::get_global(cx);
+        let settings = &self.zenith_dnd(*settings, entry_id, &details, cx);
         let show_editor = details.is_editing && !details.is_processing;
 
         let selection = SelectedEntry {
@@ -7222,8 +7223,7 @@ impl ProjectPanel {
             entry_file_name(entry, root_name).to_string()
         };
 
-        let (filename, icon, chevron, depth) =
-            self.zenith_decorate(entry, worktree_id, (filename, icon, chevron, depth), cx);
+        let (filename, icon, depth) = self.zenith_decorate(entry, filename, icon, depth, cx);
 
         let selection = SelectedEntry {
             worktree_id,
