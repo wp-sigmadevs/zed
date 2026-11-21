@@ -3027,6 +3027,10 @@
     "wordpress": {
       "enabled": true,
     },
+    // Laravel tool window: routes and views of a Laravel project.
+    "laravel": {
+      "enabled": true,
+    },
     // Hover card: one card for the diagnostic and the documentation under the pointer.
     "hover_card": {
       // Show the combined card instead of separate popovers.
