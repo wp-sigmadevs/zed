@@ -339,7 +339,7 @@ impl Editor {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let show_tooltip = !self.context_menu_visible();
-        IconButton::new("inline_code_actions", ui::IconName::BoltFilled)
+        IconButton::new("inline_code_actions", ui::IconName::ZenithLightbulb)
             .icon_size(icon_size)
             .shape(ui::IconButtonShape::Square)
             .icon_color(ui::Color::Hidden)

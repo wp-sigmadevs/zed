@@ -1,4 +1,4 @@
-The zenith_*.svg icons (alert, bot, collapse_all, columns, database, expand_all, folder,
+The zenith_*.svg icons (alert, bot, collapse_all, columns, database, expand_all, folder, lightbulb,
 git_branch, globe, history, hook, list_checks, minus, more_vertical, plus, terminal) are drawn from Lucide (https://lucide.dev), ISC licence:
 
 Copyright (c) for portions of Lucide are held by Cole Bemis 2013-2022 as part of Feather (MIT).
