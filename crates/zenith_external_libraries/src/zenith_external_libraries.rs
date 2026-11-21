@@ -164,16 +164,6 @@ pub fn is_under_library(libraries: &[DetectedLibrary], path: &RelPath) -> bool {
         .any(|library| path.starts_with(&library.path))
 }
 
-/// The detected library whose root is exactly `path`.
-pub fn library_root<'a>(
-    libraries: &'a [DetectedLibrary],
-    path: &RelPath,
-) -> Option<&'a DetectedLibrary> {
-    libraries
-        .iter()
-        .find(|library| library.path.as_ref() == path)
-}
-
 /// Could `path` be inside a library folder? Cheap pre-check before looking up manifests.
 pub fn may_be_library_path(path: &RelPath) -> bool {
     path.components()
@@ -192,30 +182,54 @@ pub enum RowKind {
     Inside,
 }
 
-pub fn classify(
-    libraries: &[DetectedLibrary],
-    worktree_id: WorktreeId,
+/// Per-row check, no detection pass: the section id, then the first path component against the
+/// library table, and only then that one table row's manifests (at most five lookups).
+pub fn row_kind(
+    snap: &WorktreeSnapshot,
     entry_id: ProjectEntryId,
     path: &RelPath,
 ) -> Option<RowKind> {
-    if entry_id == section_id(worktree_id) {
-        Some(RowKind::Section)
-    } else if let Some(library) = library_root(libraries, path) {
-        Some(RowKind::Library {
-            label: library.label.clone(),
-            icon: library.icon,
-        })
-    } else {
-        is_under_library(libraries, path).then_some(RowKind::Inside)
-    }
+    row_kind_with(snap.id(), entry_id, path, |path| {
+        let entry = snap.entry_for_path(RelPath::from_unix_str(path).ok()?)?;
+        Some((entry.id, entry.is_dir()))
+    })
 }
 
-/// The row's presentation after the library section adjusted it.
+/// [`row_kind`] over a root-relative lookup returning `(id, is_dir)`.
+fn row_kind_with(
+    worktree_id: WorktreeId,
+    entry_id: ProjectEntryId,
+    path: &RelPath,
+    lookup: impl Fn(&str) -> Option<(ProjectEntryId, bool)>,
+) -> Option<RowKind> {
+    if entry_id == section_id(worktree_id) {
+        return Some(RowKind::Section);
+    }
+    let first = path.components().next()?;
+    let &(folder, manifests, label, icon) =
+        LIBRARY_TABLE.iter().find(|(folder, ..)| *folder == first)?;
+    if !manifests.iter().any(|manifest| lookup(manifest).is_some()) {
+        return None;
+    }
+    if !lookup(folder).is_some_and(|(_, is_dir)| is_dir) {
+        return None;
+    }
+    Some(if path.as_unix_str() == folder {
+        RowKind::Library {
+            label: SharedString::from(label),
+            icon,
+        }
+    } else {
+        RowKind::Inside
+    })
+}
+
+/// The row's presentation after the library section adjusted it. The chevron is not part of it:
+/// the panel derives it from the expanded ids, which include the section's synthetic id.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RowDecoration {
     pub filename: String,
     pub icon: Option<SharedString>,
-    pub chevron: Option<SharedString>,
     pub depth: usize,
 }
 
@@ -223,29 +237,18 @@ pub struct RowDecoration {
 /// roots are labelled read-only. `root_visible` is whether the worktree root row is shown:
 /// then top-level entries are already one level deep, which is where the node's children go;
 /// with the root hidden they are one level too shallow.
-pub fn decorate(
-    kind: &RowKind,
-    section_expanded: bool,
-    root_visible: bool,
-    row: RowDecoration,
-) -> RowDecoration {
+pub fn decorate_row(kind: RowKind, root_visible: bool, row: RowDecoration) -> RowDecoration {
     let shift = usize::from(!root_visible);
     match kind {
         RowKind::Section => RowDecoration {
             filename: "External Libraries".to_string(),
             icon: Some(SharedString::from(IconName::BookCopy.path())),
-            chevron: Some(SharedString::from(if section_expanded {
-                IconName::ChevronDown.path()
-            } else {
-                IconName::ChevronRight.path()
-            })),
             depth: 0,
         },
         RowKind::Library { label, icon } => RowDecoration {
             filename: format!("{label} (read-only)"),
             icon: Some(SharedString::from(icon.path())),
             depth: row.depth + shift,
-            ..row
         },
         RowKind::Inside => RowDecoration {
             depth: row.depth + shift,
@@ -428,21 +431,71 @@ mod tests {
         assert!(!is_under_library(&[], rel("vendor")));
     }
 
+    fn kind_in(files: &[(&str, bool)], entry_id: u64, path: &str) -> Option<RowKind> {
+        let map: HashMap<&str, (ProjectEntryId, bool)> = files
+            .iter()
+            .enumerate()
+            .map(|(ix, (name, is_dir))| (*name, (eid(ix as u64 + 1), *is_dir)))
+            .collect();
+        row_kind_with(wt(1), eid(entry_id), rel(path), |path| {
+            map.get(path).copied()
+        })
+    }
+
     #[test]
-    fn test_classify_and_decorate() {
-        let libraries = detect_in(&[("composer.json", false), ("vendor", true)]);
+    fn test_row_kind_needs_manifest() {
+        let bare = [("vendor", true)];
+        assert_eq!(kind_in(&bare, 9, "vendor"), None);
+        assert_eq!(kind_in(&bare, 9, "vendor/a/b"), None);
+
+        let with = [("composer.json", false), ("vendor", true)];
+        assert_eq!(
+            kind_in(&with, 9, "vendor"),
+            Some(RowKind::Library {
+                label: "Composer Packages".into(),
+                icon: IconName::Box
+            })
+        );
+        assert_eq!(kind_in(&with, 9, "vendor/a/b"), Some(RowKind::Inside));
+
+        // Another ecosystem's manifest does not count; a file is no library folder.
+        assert_eq!(
+            kind_in(&[("package.json", false), ("vendor", true)], 9, "vendor/a"),
+            None
+        );
+        assert_eq!(
+            kind_in(
+                &[("composer.json", false), ("vendor", false)],
+                9,
+                "vendor/a"
+            ),
+            None
+        );
+        // Not a library folder name, or not at the root.
+        assert_eq!(kind_in(&with, 9, "src/main.php"), None);
+        assert_eq!(kind_in(&with, 9, "src/vendor"), None);
+        assert_eq!(kind_in(&with, 9, "vendors/x"), None);
+        // The section row needs no manifest at all.
+        assert_eq!(
+            kind_in(&[], section_id(wt(1)).to_proto(), "External Libraries"),
+            Some(RowKind::Section)
+        );
+    }
+
+    #[test]
+    fn test_decorate_row() {
         let row = RowDecoration {
             filename: "vendor".into(),
             icon: None,
-            chevron: None,
             depth: 0,
         };
-
-        let kind = classify(&libraries, wt(1), eid(2), rel("vendor")).unwrap();
+        let library = RowKind::Library {
+            label: "Composer Packages".into(),
+            icon: IconName::Box,
+        };
         // Root row shown: a library root is already at depth 1, directly under the node.
-        let root = decorate(
-            &kind,
-            false,
+        let root = decorate_row(
+            library.clone(),
             true,
             RowDecoration {
                 depth: 1,
@@ -450,57 +503,26 @@ mod tests {
             },
         );
         assert_eq!(root.filename, "Composer Packages (read-only)");
+        assert_eq!(root.icon, Some(SharedString::from(IconName::Box.path())));
         assert_eq!(root.depth, 1);
         // Root row hidden: it is moved down one level.
-        let hidden_root = decorate(&kind, false, false, row.clone());
-        assert_eq!(hidden_root.depth, 1);
+        assert_eq!(decorate_row(library, false, row.clone()).depth, 1);
 
-        let kind = classify(&libraries, wt(1), eid(9), rel("vendor/a/b")).unwrap();
-        assert_eq!(kind, RowKind::Inside);
-        let inside = decorate(
-            &kind,
-            false,
-            true,
-            RowDecoration {
-                depth: 2,
-                ..row.clone()
-            },
-        );
-        assert_eq!(inside.depth, 2);
-        let inside = decorate(
-            &kind,
-            false,
-            false,
-            RowDecoration {
-                depth: 1,
-                ..row.clone()
-            },
-        );
-        assert_eq!(inside.depth, 2);
+        for (root_visible, from, to) in [(true, 2, 2), (false, 1, 2)] {
+            let inside = decorate_row(
+                RowKind::Inside,
+                root_visible,
+                RowDecoration {
+                    depth: from,
+                    ..row.clone()
+                },
+            );
+            assert_eq!((inside.filename.as_str(), inside.depth), ("vendor", to));
+        }
 
-        let kind = classify(
-            &libraries,
-            wt(1),
-            section_id(wt(1)),
-            rel("External Libraries"),
-        )
-        .unwrap();
-        let collapsed = decorate(&kind, false, true, row.clone());
-        let expanded = decorate(&kind, true, true, row);
-        assert_eq!(collapsed.filename, "External Libraries");
-        assert_eq!(
-            collapsed.chevron,
-            Some(SharedString::from(IconName::ChevronRight.path()))
-        );
-        assert_eq!(
-            expanded.chevron,
-            Some(SharedString::from(IconName::ChevronDown.path()))
-        );
-
-        assert_eq!(
-            classify(&libraries, wt(1), eid(3), rel("src/main.rs")),
-            None
-        );
+        let section = decorate_row(RowKind::Section, true, row);
+        assert_eq!(section.filename, "External Libraries");
+        assert_eq!(section.depth, 0);
     }
 
     #[test]
@@ -580,6 +602,16 @@ mod tests {
         assert_eq!(libraries.len(), 2);
         assert_eq!(libraries[0].label, "Composer Packages");
         assert_eq!(libraries[1].label, "node_modules");
+
+        let entry = |path: &str| snapshot.entry_for_path(rel(path)).unwrap().id;
+        assert_eq!(
+            row_kind(&snapshot, entry("vendor/laravel"), rel("vendor/laravel")),
+            Some(RowKind::Inside)
+        );
+        assert_eq!(
+            row_kind(&snapshot, entry("src/main.php"), rel("src/main.php")),
+            None
+        );
 
         let all = |snapshot: &WorktreeSnapshot| -> Vec<GitEntry> {
             snapshot

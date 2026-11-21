@@ -4,8 +4,8 @@
 
 use super::*;
 use zenith_external_libraries::{
-    RowDecoration, classify, decorate, detect_libraries, is_enabled, is_section_expanded,
-    is_under_library, may_be_library_path, section_id, section_worktree, set_section_expanded,
+    RowDecoration, decorate_row, detect_libraries, is_enabled, is_under_library,
+    may_be_library_path, row_kind, section_worktree, set_section_expanded,
 };
 
 impl ProjectPanel {
@@ -69,59 +69,41 @@ impl ProjectPanel {
         }
     }
 
-    /// Library rows indent one level under the node and carry its labels.
+    /// Library rows indent one level under the node and carry its labels. Runs for every visible
+    /// row, so it bails out before touching the worktree unless the row can be a library row.
     pub(super) fn zenith_decorate(
         &self,
         entry: &Entry,
-        worktree_id: WorktreeId,
-        row: (String, Option<SharedString>, Option<SharedString>, usize),
+        filename: String,
+        icon: Option<SharedString>,
+        depth: usize,
         cx: &App,
-    ) -> (String, Option<SharedString>, Option<SharedString>, usize) {
-        let (filename, icon, chevron, depth) = row;
-        let unchanged = RowDecoration {
-            filename,
-            icon,
-            chevron,
-            depth,
+    ) -> (String, Option<SharedString>, usize) {
+        let project = self.project.read(cx);
+        let worktree = match section_worktree(entry.id) {
+            Some(worktree_id) => project.worktree_for_id(worktree_id, cx),
+            None if may_be_library_path(&entry.path) => project.worktree_for_entry(entry.id, cx),
+            None => None,
+        };
+        let kind = worktree
+            .filter(|_| is_enabled(cx))
+            .and_then(|worktree| row_kind(worktree.read(cx), entry.id, &entry.path));
+        let Some(kind) = kind else {
+            return (filename, icon, depth);
         };
         // Mirrors the upstream rule that hides the root row.
         let root_visible = !(ProjectPanelSettings::get_global(cx).hide_root
-            && self.project.read(cx).visible_worktrees(cx).count() == 1);
-        let decorated = self
-            .zenith_row_kind(entry, worktree_id, cx)
-            .map(|kind| {
-                let expanded = self
-                    .state
-                    .expanded_dir_ids
-                    .get(&worktree_id)
-                    .is_some_and(|ids| is_section_expanded(worktree_id, ids));
-                decorate(&kind, expanded, root_visible, unchanged.clone())
-            })
-            .unwrap_or(unchanged);
-        (
-            decorated.filename,
-            decorated.icon,
-            decorated.chevron,
-            decorated.depth,
-        )
-    }
-
-    fn zenith_row_kind(
-        &self,
-        entry: &Entry,
-        worktree_id: WorktreeId,
-        cx: &App,
-    ) -> Option<zenith_external_libraries::RowKind> {
-        if !is_enabled(cx) {
-            return None;
-        }
-        let is_section = entry.id == section_id(worktree_id);
-        if !is_section && !may_be_library_path(&entry.path) {
-            return None;
-        }
-        let worktree = self.project.read(cx).worktree_for_id(worktree_id, cx)?;
-        let libraries = detect_libraries(&worktree.read(cx).snapshot());
-        classify(&libraries, worktree_id, entry.id, &entry.path)
+            && project.visible_worktrees(cx).count() == 1);
+        let row = decorate_row(
+            kind,
+            root_visible,
+            RowDecoration {
+                filename,
+                icon,
+                depth,
+            },
+        );
+        (row.filename, row.icon, row.depth)
     }
 
     /// For a file or folder inside a library: the read-only menu plus Local History, Reveal,
@@ -200,6 +182,7 @@ mod tests {
         ZenithExternalLibrariesSettingsContent, ZenithSettingsContent,
     };
     use workspace::MultiWorkspace;
+    use zenith_external_libraries::section_id;
 
     async fn open_panel(
         cx: &mut TestAppContext,
