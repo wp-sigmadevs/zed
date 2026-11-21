@@ -28,6 +28,10 @@ gpui::actions!(
     ]
 );
 
+/// Who a row is: a route's (name, file, line), a view's (dot name, file, 0). Two files can give
+/// the same name, so the name alone does not tell rows apart.
+type RowKey = (String, PathBuf, usize);
+
 /// Every row of the list has this height, which is what lets `uniform_list` draw only what is
 /// on screen.
 const ROW_HEIGHT: f32 = 26.;
@@ -111,23 +115,37 @@ impl LaravelPanel {
         cx.notify();
     }
 
-    /// Who the selected line is (a route's name, a view's dot name), so the selection can follow
-    /// it when `rows` changes.
-    fn selected_key(&self) -> Option<String> {
+    /// Who the selected line is, so the selection can follow it when `rows` changes.
+    fn selected_key(&self) -> Option<RowKey> {
         let ix = *self.rows.get(self.selected?)?;
-        Some(self.key_at(ix).to_string())
+        Some(match self.active_tab {
+            LaravelPanelTab::Routes => {
+                let route = &self.routes[ix];
+                (route.name.clone(), route.file_path.clone(), route.line)
+            }
+            LaravelPanelTab::Views => {
+                let view = &self.views[ix];
+                (view.dot_name.clone(), view.file_path.clone(), 0)
+            }
+        })
     }
 
-    fn key_at(&self, ix: usize) -> &str {
+    fn is_key(&self, ix: usize, key: &RowKey) -> bool {
         match self.active_tab {
-            LaravelPanelTab::Routes => &self.routes[ix].name,
-            LaravelPanelTab::Views => &self.views[ix].dot_name,
+            LaravelPanelTab::Routes => {
+                let route = &self.routes[ix];
+                (&route.name, &route.file_path, route.line) == (&key.0, &key.1, key.2)
+            }
+            LaravelPanelTab::Views => {
+                let view = &self.views[ix];
+                (&view.dot_name, &view.file_path, 0) == (&key.0, &key.1, key.2)
+            }
         }
     }
 
     /// Rebuilds `rows`, then selects `selected` again: its own line, else (it is gone) the old
     /// position kept within the list.
-    fn build_rows(&mut self, selected: Option<String>) {
+    fn build_rows(&mut self, selected: Option<RowKey>) {
         let query = self.search_query.to_lowercase();
         let contains = |text: &str| query.is_empty() || text.to_lowercase().contains(&query);
         self.rows = match self.active_tab {
@@ -152,7 +170,7 @@ impl LaravelPanel {
         };
         let previous = self.selected;
         self.selected = selected
-            .and_then(|key| self.rows.iter().position(|&ix| self.key_at(ix) == key))
+            .and_then(|key| self.rows.iter().position(|&ix| self.is_key(ix, &key)))
             .or_else(|| {
                 let last = self.rows.len().checked_sub(1)?;
                 previous.map(|ix| ix.min(last))
@@ -238,31 +256,67 @@ impl LaravelPanel {
         }
     }
 
+    /// A row's element id: the file (and line) keep it unique when two files share a name.
+    fn row_id(&self, ix: usize) -> SharedString {
+        let row = self.rows[ix];
+        match self.active_tab {
+            LaravelPanelTab::Routes => {
+                let route = &self.routes[row];
+                format!(
+                    "route-{}-{}-{}",
+                    route.name,
+                    route.file_path.display(),
+                    route.line
+                )
+            }
+            LaravelPanelTab::Views => {
+                let view = &self.views[row];
+                format!("view-{}-{}", view.dot_name, view.file_path.display())
+            }
+        }
+        .into()
+    }
+
+    /// What assistive technology reads for a row.
+    fn row_label(&self, ix: usize) -> String {
+        let row = self.rows[ix];
+        match self.active_tab {
+            LaravelPanelTab::Routes => {
+                let route = &self.routes[row];
+                format!(
+                    "Route {} {}, name {}, at {}:{}",
+                    route.method,
+                    route.uri,
+                    route.name,
+                    file_name(&route.file_path),
+                    route.line
+                )
+            }
+            LaravelPanelTab::Views => {
+                let view = &self.views[row];
+                format!("View {}, {}", view.dot_name, file_name(&view.file_path))
+            }
+        }
+    }
+
     fn render_row(&self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
         let row = self.rows[ix];
+        let selected = self.selected == Some(ix);
         let item = |id: SharedString| {
             ListItem::new(id)
                 .spacing(ListItemSpacing::Dense)
                 .height(px(ROW_HEIGHT))
                 .rounded()
-                .toggle_state(self.selected == Some(ix))
+                .toggle_state(selected)
                 .aria_role(Role::ListItem)
                 .on_click(cx.listener(move |this, _, window, cx| this.activate(ix, window, cx)))
-        };
-        let location = |path: &Path| {
-            path.file_name()
-                .map(|f| f.to_string_lossy().into_owned())
-                .unwrap_or_default()
         };
         match self.active_tab {
             LaravelPanelTab::Routes => {
                 let route = &self.routes[row];
-                let place = format!("{}:{}", location(&route.file_path), route.line);
-                item(format!("route-{}", route.name).into())
-                    .aria_label(format!(
-                        "Route {} {}, name {}, at {place}",
-                        route.method, route.uri, route.name
-                    ))
+                let place = format!("{}:{}", file_name(&route.file_path), route.line);
+                item(self.row_id(ix))
+                    .aria_label(self.row_label(ix))
                     .start_slot(
                         // The method is spelled out; the colour only adds to it.
                         Label::new(route.method.clone())
@@ -294,12 +348,8 @@ impl LaravelPanel {
             }
             LaravelPanelTab::Views => {
                 let view = &self.views[row];
-                item(format!("view-{}", view.dot_name).into())
-                    .aria_label(format!(
-                        "View {}, {}",
-                        view.dot_name,
-                        location(&view.file_path)
-                    ))
+                item(self.row_id(ix))
+                    .aria_label(self.row_label(ix))
                     .start_slot(
                         Icon::new(IconName::FileCode)
                             .size(IconSize::Small)
@@ -315,6 +365,12 @@ impl LaravelPanel {
             }
         }
     }
+}
+
+fn file_name(path: &Path) -> String {
+    path.file_name()
+        .map(|f| f.to_string_lossy().into_owned())
+        .unwrap_or_default()
 }
 
 /// Where a 1-based `line` of the index sits in the editor: column 0 of that line.
@@ -547,8 +603,9 @@ mod tests {
         index
     }
 
+    /// The name of the selected route or view.
     fn selected_key(panel: &LaravelPanel) -> Option<String> {
-        panel.selected_key()
+        panel.selected_key().map(|key| key.0)
     }
 
     #[gpui::test]
@@ -580,11 +637,11 @@ mod tests {
         // A new route shows up only once the panel is told the index changed.
         index.write().unwrap().index_route_file(
             PathBuf::from("/p/routes/api.php"),
-            &WEB.replace("b.two", "a.one"),
+            &WEB.replace("b.two", "a.one").replace("d.four", "a.two"),
         );
         panel.read_with(cx, |panel, _| assert_eq!(panel.rows.len(), 2));
         panel.update(cx, |panel, cx| panel.index_changed(cx));
-        panel.read_with(cx, |panel, _| assert_eq!(panel.rows.len(), 3));
+        panel.read_with(cx, |panel, _| assert_eq!(panel.rows.len(), 4));
 
         panel.update(cx, |panel, cx| {
             panel.set_search_query("D.F".into(), cx);
@@ -672,6 +729,55 @@ mod tests {
         panel.update(cx, |panel, cx| {
             panel.set_tab(LaravelPanelTab::Routes, cx);
             assert_eq!(panel.selected, None);
+        });
+    }
+
+    #[gpui::test]
+    fn test_duplicate_names_are_listed_and_selected_by_file_and_line(cx: &mut App) {
+        let index = index_with(&[
+            ("/p/routes/web.php", WEB),
+            ("/p/routes/web2.php", WEB),
+            ("/p/routes/web3.php", WEB),
+        ]);
+        let base = Path::new("/p/resources/views");
+        for dir in ["a", "b"] {
+            index
+                .write()
+                .unwrap()
+                .index_view_path(&base.join(dir), &base.join(dir).join("home.blade.php"));
+        }
+        let panel = cx.new(|cx| LaravelPanel::new(WeakEntity::new_invalid(), index.clone(), cx));
+        panel.update(cx, |panel, _| {
+            // b.two x3, d.four x3, each with its own file; ids and labels tell them apart.
+            assert_eq!(panel.rows.len(), 6);
+            let ids: std::collections::HashSet<_> = (0..6).map(|ix| panel.row_id(ix)).collect();
+            assert_eq!(ids.len(), 6);
+            // Select the second copy of b.two; a copy arriving above it must not take the
+            // selection over.
+            panel.selected = Some(1);
+            assert_eq!(
+                panel.selected_key().unwrap().1,
+                Path::new("/p/routes/web2.php")
+            );
+        });
+        index
+            .write()
+            .unwrap()
+            .index_route_file(PathBuf::from("/p/routes/web1.php"), WEB);
+        panel.update(cx, |panel, cx| panel.index_changed(cx));
+        panel.update(cx, |panel, _| {
+            assert_eq!(panel.rows.len(), 8);
+            assert_eq!(panel.selected, Some(2));
+            assert_eq!(
+                panel.selected_key().unwrap().1,
+                Path::new("/p/routes/web2.php")
+            );
+        });
+        // The views tab lists both copies of home, and ids stay unique.
+        panel.update(cx, |panel, cx| {
+            panel.set_tab(LaravelPanelTab::Views, cx);
+            assert_eq!(panel.rows.len(), 2);
+            assert_ne!(panel.row_id(0), panel.row_id(1));
         });
     }
 

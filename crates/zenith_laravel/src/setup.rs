@@ -414,6 +414,14 @@ fn indexable_files(snapshot: &Snapshot, caps: Caps) -> Vec<(PathBuf, bool)> {
     .collect()
 }
 
+/// The batch as a list, removals first, so the room they free is there for the additions of the
+/// same batch.
+fn removals_first(batch: HashMap<PathBuf, bool>) -> Vec<(PathBuf, bool)> {
+    let mut batch: Vec<_> = batch.into_iter().collect();
+    batch.sort_by_key(|(_, live)| *live);
+    batch
+}
+
 /// Indexes (`true`) or forgets (`false`) each file. A route file is read, bounded, refusing pipes
 /// and devices (a project can plant `web.php -> /dev/zero`); one that cannot be read or is over
 /// the size cap leaves the index. A view is a path only, nothing is read. A file outside `roots`
@@ -441,10 +449,7 @@ fn apply_changes(
             })
             .collect()
     };
-    // Removals first, so the room they free is there for the additions of the same batch.
-    let mut batch: Vec<_> = batch.into_iter().collect();
-    batch.sort_by_key(|(_, live)| *live);
-    for (path, live) in batch {
+    for (path, live) in removals_first(batch) {
         let Some(slot) = roots.iter().position(|root| path.starts_with(root)) else {
             continue;
         };
@@ -781,6 +786,19 @@ mod tests {
         assert!(read_index(&index).contains_file(&route_e));
         assert!(read_index(&index).contains_file(&view_e));
         assert_eq!(counts(&index), (2, 2));
+    }
+
+    #[test]
+    fn test_removals_come_before_additions() {
+        // A HashMap lists in no fixed order; 64 mixed entries put an addition first unless sorted.
+        let batch: HashMap<PathBuf, bool> = (0..64)
+            .map(|n| (PathBuf::from(format!("/p/routes/{n}.php")), n % 2 == 0))
+            .collect();
+        let ordered = removals_first(batch);
+        assert_eq!(ordered.len(), 64);
+        let first_addition = ordered.iter().position(|(_, live)| *live).unwrap();
+        assert_eq!(first_addition, 32);
+        assert!(ordered[first_addition..].iter().all(|(_, live)| *live));
     }
 
     fn laravel_tree() -> Value {

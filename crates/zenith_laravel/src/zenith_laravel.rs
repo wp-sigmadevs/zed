@@ -4,7 +4,7 @@ pub use laravel_panel::{LaravelPanel, LaravelPanelTab, ShowRoutes, ShowViews, To
 pub use setup::{LaravelSettings, init};
 
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -41,17 +41,47 @@ pub struct EnvDefinition {
     pub example_value: Option<String>,
 }
 
+/// A line longer than this is not looked at by the route parser.
+/// ponytail: a route is a short line. Raise it if a generated route file is cut off.
+const MAX_ROUTE_LINE_BYTES: usize = 4 * 1024;
+
+/// A route whose name, uri or action is longer than this is left out.
+/// ponytail: real names and uris are a few dozen bytes. Raise it if a route goes missing.
+const MAX_ROUTE_FIELD_BYTES: usize = 512;
+
+/// Most routes taken from one file; the rest of it is not read.
+/// ponytail: a big app has a few hundred routes per file. Raise it for a generated route file.
+const MAX_ROUTES_PER_FILE: usize = 5_000;
+
+/// Most routes held by the index; a file that would take it past this is left out entirely.
+/// ponytail: a flat ceiling (about 100k routes fit in tens of MiB), like the WordPress hook cap;
+/// evict the oldest file instead only if real trees reach it.
+pub const MAX_INDEXED_ROUTES: usize = 100_000;
+
+/// The index keeps what each file gave it. A name two files share lives on in the other when one
+/// goes; the lookups and listings are worked out from the files, so they can never disagree
+/// with them.
 #[derive(Default)]
 pub struct LaravelIndex {
-    views: HashMap<String, ViewDefinition>,
-    components: HashMap<String, ViewDefinition>,
-    routes: HashMap<String, RouteDefinition>,
+    /// Views by file. A file in here counts toward the view cap.
+    views: HashMap<PathBuf, ViewDefinition>,
+    /// Named routes by route file. A route file that was read is in here even when it has no
+    /// named route (an empty list). What the route-file cap counts.
+    routes: HashMap<PathBuf, Vec<RouteDefinition>>,
     configs: HashMap<String, ConfigDefinition>,
     env_vars: HashMap<String, EnvDefinition>,
-    /// Files whose views are in `views`, and route files that were read (even one with no named
-    /// route). What the caps count.
-    view_files: HashSet<PathBuf>,
-    route_files: HashSet<PathBuf>,
+}
+
+/// The tag a component view answers to: `components.forms.input` is `x-forms-input`.
+fn component_tag(view: &ViewDefinition) -> Option<String> {
+    if !view.is_component {
+        return None;
+    }
+    let name = view
+        .dot_name
+        .strip_prefix("components.")
+        .unwrap_or(&view.dot_name);
+    Some(format!("x-{}", name.replace('.', "-")))
 }
 
 impl LaravelIndex {
@@ -83,134 +113,134 @@ impl LaravelIndex {
         let is_component = stem.starts_with("components/") || stem.starts_with("components.");
 
         let definition = ViewDefinition {
-            dot_name: dot_name.clone(),
+            dot_name,
             file_path: file_path.to_path_buf(),
             is_blade,
             is_component,
         };
 
-        if is_component {
-            let component_name = stem
-                .strip_prefix("components/")
-                .or_else(|| stem.strip_prefix("components."))
-                .unwrap_or(stem)
-                .replace('/', ".");
-            let tag_name = format!("x-{}", component_name.replace('.', "-"));
-            self.components.insert(tag_name, definition.clone());
-        }
-
-        self.views.insert(dot_name, definition);
-        self.view_files.insert(file_path.to_path_buf());
+        self.views.insert(file_path.to_path_buf(), definition);
     }
 
+    // ponytail: the lookups and completions below scan every file, fine at the 20k-view and
+    // 100k-route caps; add a name index (rebuilt per change) if completion gets slow.
+
+    /// The view of that name; of several files, the first by path.
     pub fn find_view(&self, dot_name: &str) -> Option<&ViewDefinition> {
-        self.views.get(dot_name)
+        self.views
+            .values()
+            .filter(|view| view.dot_name == dot_name)
+            .min_by(|a, b| a.file_path.cmp(&b.file_path))
     }
 
     pub fn view_completions(&self, prefix: &str) -> Vec<String> {
-        let mut matches: Vec<String> = self
-            .views
-            .keys()
-            .filter(|k| k.starts_with(prefix))
-            .cloned()
-            .collect();
-        matches.sort();
-        matches
+        sorted_unique(
+            self.views
+                .values()
+                .map(|view| &view.dot_name)
+                .filter(|name| name.starts_with(prefix))
+                .cloned(),
+        )
     }
 
+    /// The component of that tag; of several files, the first by path.
     pub fn find_component(&self, tag_name: &str) -> Option<&ViewDefinition> {
-        self.components.get(tag_name)
+        self.views
+            .values()
+            .filter(|view| component_tag(view).as_deref() == Some(tag_name))
+            .min_by(|a, b| a.file_path.cmp(&b.file_path))
     }
 
     pub fn component_completions(&self, prefix: &str) -> Vec<String> {
-        let mut matches: Vec<String> = self
-            .components
-            .keys()
-            .filter(|k| k.starts_with(prefix))
-            .cloned()
-            .collect();
-        matches.sort();
-        matches
+        sorted_unique(
+            self.views
+                .values()
+                .filter_map(component_tag)
+                .filter(|tag| tag.starts_with(prefix)),
+        )
     }
 
+    /// Replaces a file's routes with a fresh read of it. A file that would take the index past
+    /// [`MAX_INDEXED_ROUTES`] is left out entirely.
     pub fn index_route_file(&mut self, file_path: PathBuf, content: &str) {
-        self.remove_routes_for_file(&file_path);
-        let parsed_routes = parse_route_file(&file_path, content);
-        for route in parsed_routes {
-            self.routes.insert(route.name.clone(), route);
+        let parsed = parse_route_file(&file_path, content);
+        let others: usize = self
+            .routes
+            .iter()
+            .filter(|(path, _)| **path != file_path)
+            .map(|(_, routes)| routes.len())
+            .sum();
+        if others + parsed.len() > MAX_INDEXED_ROUTES {
+            self.routes.remove(&file_path);
+        } else {
+            self.routes.insert(file_path, parsed);
         }
-        self.route_files.insert(file_path);
     }
 
-    /// Every named route, by name.
+    /// Every named route, duplicates included, by name then file then line.
     pub fn routes_sorted(&self) -> Vec<RouteDefinition> {
-        let mut routes: Vec<_> = self.routes.values().cloned().collect();
-        routes.sort_by(|a, b| a.name.cmp(&b.name));
+        let mut routes: Vec<_> = self.routes.values().flatten().cloned().collect();
+        routes.sort_by(|a, b| route_order(a).cmp(&route_order(b)));
         routes
     }
 
-    /// Every view, by dot name.
+    /// Every view, duplicates included, by dot name then file.
     pub fn views_sorted(&self) -> Vec<ViewDefinition> {
         let mut views: Vec<_> = self.views.values().cloned().collect();
-        views.sort_by(|a, b| a.dot_name.cmp(&b.dot_name));
+        views.sort_by(|a, b| (&a.dot_name, &a.file_path).cmp(&(&b.dot_name, &b.file_path)));
         views
     }
 
     pub fn contains_file(&self, file_path: &Path) -> bool {
-        self.view_files.contains(file_path) || self.route_files.contains(file_path)
+        self.views.contains_key(file_path) || self.routes.contains_key(file_path)
     }
 
     /// How many view files lie under `root`.
     pub fn view_count_under(&self, root: &Path) -> usize {
-        self.view_files
-            .iter()
+        self.views
+            .keys()
             .filter(|file| file.starts_with(root))
             .count()
     }
 
     /// How many route files lie under `root`.
     pub fn route_file_count_under(&self, root: &Path) -> usize {
-        self.route_files
-            .iter()
+        self.routes
+            .keys()
             .filter(|file| file.starts_with(root))
             .count()
     }
 
     /// Forgets the views and routes of a file that was deleted or can no longer be read.
     pub fn remove_file(&mut self, file_path: &Path) {
-        if self.contains_file(file_path) {
-            self.forget(|path| path == file_path);
-        }
+        self.views.remove(file_path);
+        self.routes.remove(file_path);
     }
 
     /// Forgets every file under `root` (a worktree that left the project).
     pub fn remove_dir(&mut self, root: &Path) {
-        self.forget(|path| path.starts_with(root));
+        self.views.retain(|file, _| !file.starts_with(root));
+        self.routes.retain(|file, _| !file.starts_with(root));
     }
 
-    // ponytail: scans every entry per removal, fine at the 20k-view cap; key entries by file if
-    // bulk deletes get slow.
-    fn forget(&mut self, gone: impl Fn(&Path) -> bool) {
-        self.view_files.retain(|file| !gone(file));
-        self.route_files.retain(|file| !gone(file));
-        self.views.retain(|_, view| !gone(&view.file_path));
-        self.components.retain(|_, view| !gone(&view.file_path));
-        self.routes.retain(|_, route| !gone(&route.file_path));
-    }
-
+    /// The route of that name; of several files, the first by path then line.
     pub fn find_route(&self, name: &str) -> Option<&RouteDefinition> {
-        self.routes.get(name)
+        self.routes
+            .values()
+            .flatten()
+            .filter(|route| route.name == name)
+            .min_by(|a, b| route_order(a).1.cmp(&route_order(b).1))
     }
 
     pub fn route_completions(&self, prefix: &str) -> Vec<String> {
-        let mut matches: Vec<String> = self
-            .routes
-            .keys()
-            .filter(|k| k.starts_with(prefix))
-            .cloned()
-            .collect();
-        matches.sort();
-        matches
+        sorted_unique(
+            self.routes
+                .values()
+                .flatten()
+                .map(|route| &route.name)
+                .filter(|name| name.starts_with(prefix))
+                .cloned(),
+        )
     }
 
     pub fn index_config_file(&mut self, config_name: &str, file_path: PathBuf, content: &str) {
@@ -259,10 +289,6 @@ impl LaravelIndex {
         matches
     }
 
-    fn remove_routes_for_file(&mut self, file_path: &Path) {
-        self.routes.retain(|_, v| v.file_path != file_path);
-    }
-
     fn remove_configs_for_file(&mut self, file_path: &Path) {
         self.configs.retain(|_, v| v.file_path != file_path);
     }
@@ -272,12 +298,33 @@ impl LaravelIndex {
     }
 }
 
+fn sorted_unique(names: impl Iterator<Item = String>) -> Vec<String> {
+    let mut names: Vec<String> = names.collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// How routes order: by name, then where they are.
+fn route_order(route: &RouteDefinition) -> (&str, (&Path, usize)) {
+    (&route.name, (&route.file_path, route.line))
+}
+
+/// Named routes of one file, within the ceilings above: at most [`MAX_ROUTES_PER_FILE`], none
+/// from a line over [`MAX_ROUTE_LINE_BYTES`], none with a name, uri or action over
+/// [`MAX_ROUTE_FIELD_BYTES`].
 pub fn parse_route_file(file_path: &Path, content: &str) -> Vec<RouteDefinition> {
     let mut routes = Vec::new();
 
     let methods = ["get", "post", "put", "patch", "delete", "any", "match"];
 
     for (line_index, line) in content.lines().enumerate() {
+        if routes.len() >= MAX_ROUTES_PER_FILE {
+            break;
+        }
+        if line.len() > MAX_ROUTE_LINE_BYTES {
+            continue;
+        }
         let trimmed = line.trim();
         if trimmed.starts_with("//") || trimmed.starts_with('#') {
             continue;
@@ -324,6 +371,10 @@ pub fn parse_route_file(file_path: &Path, content: &str) -> Vec<RouteDefinition>
         if let Some(name_pos) = line.find(name_marker) {
             let after_name = &line[name_pos + name_marker.len()..];
             if let Some((name, _)) = extract_string_literal(after_name) {
+                let too_long = |text: &str| text.len() > MAX_ROUTE_FIELD_BYTES;
+                if too_long(&name) || too_long(&uri) || action.as_deref().is_some_and(too_long) {
+                    continue;
+                }
                 routes.push(RouteDefinition {
                     name,
                     method,
@@ -625,6 +676,116 @@ DB_HOST=127.0.0.1
         let routes: Vec<_> = index.routes_sorted().into_iter().map(|r| r.name).collect();
         assert_eq!(views, ["alpha", "mid", "zed"]);
         assert_eq!(routes, ["a", "b", "c", "k", "m", "q", "x", "z"]);
+    }
+
+    #[test]
+    fn test_a_name_two_files_share_survives_one_of_them_going() {
+        let mut index = LaravelIndex::new();
+        let (web, api) = (
+            PathBuf::from("/a/routes/web.php"),
+            PathBuf::from("/a/routes/api.php"),
+        );
+        index.index_route_file(web.clone(), "Route::get('/', 'H@i')->name('home');\n");
+        index.index_route_file(
+            api.clone(),
+            "\n\nRoute::get('/api', 'H@i')->name('home');\n",
+        );
+        assert_eq!(index.routes_sorted().len(), 2);
+        assert_eq!(index.route_completions(""), ["home"]);
+
+        // The first by path answers, whichever file was read last.
+        assert_eq!(index.find_route("home").unwrap().file_path, api);
+        index.remove_file(&api);
+        let left = index.find_route("home").expect("web.php still defines it");
+        assert_eq!((&left.file_path, left.line), (&web, 1));
+        assert_eq!(index.routes_sorted().len(), 1);
+
+        let base = Path::new("/a/resources/views");
+        let (one, two) = (base.join("home.blade.php"), base.join("home.php"));
+        let card = base.join("components/card.blade.php");
+        let card_two = Path::new("/b/resources/views/components/card.blade.php");
+        index.index_view_path(base, &one);
+        index.index_view_path(base, &two);
+        index.index_view_path(base, &card);
+        index.index_view_path(Path::new("/b/resources/views"), card_two);
+        assert_eq!(index.views_sorted().len(), 4);
+        assert_eq!(index.find_view("home").unwrap().file_path, one);
+        assert_eq!(index.find_component("x-card").unwrap().file_path, card);
+        assert_eq!(index.component_completions("x-"), ["x-card"]);
+
+        index.remove_file(&one);
+        index.remove_file(&card);
+        assert_eq!(index.find_view("home").unwrap().file_path, two);
+        assert_eq!(index.find_component("x-card").unwrap().file_path, card_two);
+        // The counts follow the files held.
+        assert_eq!(index.view_count_under(Path::new("/")), 2);
+        assert_eq!(index.route_file_count_under(Path::new("/")), 1);
+        assert!(index.contains_file(&two) && !index.contains_file(&one));
+    }
+
+    fn route_lines(count: usize) -> String {
+        (0..count)
+            .map(|n| format!("Route::get('/r{n}')->name('n{n}');\n"))
+            .collect()
+    }
+
+    #[test]
+    fn test_one_file_yields_at_most_the_per_file_cap() {
+        let routes = parse_route_file(
+            Path::new("/a/routes/web.php"),
+            &route_lines(3 * MAX_ROUTES_PER_FILE),
+        );
+        assert_eq!(routes.len(), MAX_ROUTES_PER_FILE);
+    }
+
+    #[test]
+    fn test_overlong_lines_and_fields_are_skipped() {
+        let file = Path::new("/a/routes/web.php");
+        let long = "x".repeat(1024 * 1024);
+        let huge_line = format!("Route::get('/{long}')->name('big');\n");
+        assert!(parse_route_file(file, &huge_line).is_empty());
+
+        // A well-formed route followed by padding: only the line cap rules it out.
+        let padded = format!("Route::get('/a')->name('a'); // {long}\n");
+        assert!(parse_route_file(file, &padded).is_empty());
+
+        let wide = "y".repeat(MAX_ROUTE_FIELD_BYTES + 1);
+        let fits = "z".repeat(MAX_ROUTE_FIELD_BYTES);
+        let source = format!(
+            "Route::get('/{wide}')->name('uri');\n\
+             Route::get('/u')->name('{wide}');\n\
+             Route::get('/a', '{wide}')->name('act');\n\
+             Route::get('/{}')->name('{fits}');\n\
+             Route::get('/ok')->name('ok');\n",
+            &fits[1..]
+        );
+        let names: Vec<_> = parse_route_file(file, &source)
+            .into_iter()
+            .map(|r| r.name)
+            .collect();
+        assert_eq!(names, [fits, "ok".to_string()]);
+    }
+
+    #[test]
+    fn test_a_file_past_the_total_cap_is_left_out_entirely() {
+        let mut index = LaravelIndex::new();
+        let full = route_lines(MAX_ROUTES_PER_FILE);
+        for n in 0..MAX_INDEXED_ROUTES / MAX_ROUTES_PER_FILE {
+            index.index_route_file(PathBuf::from(format!("/a/routes/f{n}.php")), &full);
+        }
+        assert_eq!(index.routes_sorted().len(), MAX_INDEXED_ROUTES);
+
+        let over = PathBuf::from("/a/routes/over.php");
+        index.index_route_file(over.clone(), "Route::get('/x')->name('x');\n");
+        assert!(!index.contains_file(&over));
+        assert_eq!(index.routes_sorted().len(), MAX_INDEXED_ROUTES);
+
+        // A file already held may be re-read at the same size: its own routes are not counted
+        // twice.
+        let held = PathBuf::from("/a/routes/f0.php");
+        index.index_route_file(held.clone(), &full);
+        assert!(index.contains_file(&held));
+        assert_eq!(index.routes_sorted().len(), MAX_INDEXED_ROUTES);
     }
 
     #[test]
