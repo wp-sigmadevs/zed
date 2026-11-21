@@ -22907,6 +22907,7 @@ version = "0.1.0"
 dependencies = [
  "gpui",
  "onboarding",
+ "zenith_external_libraries",
  "zenith_folds",
  "zenith_inspections",
  "zenith_local_history",
@@ -22943,6 +22944,7 @@ dependencies = [
  "util",
  "workspace",
  "worktree",
+ "zenith_local_settings_trust",
 ]
 
 [[package]]

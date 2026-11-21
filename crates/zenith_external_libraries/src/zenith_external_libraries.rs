@@ -2,7 +2,7 @@ use fuzzy::CharBag;
 use git::status::GitSummary;
 use gpui::{App, SharedString};
 use icons::IconName;
-use project::GitEntry;
+use project::{GitEntry, Project, ProjectPath};
 use settings::{RegisterSetting, Settings, SettingsContent};
 use std::sync::Arc;
 use util::rel_path::RelPath;
@@ -327,6 +327,28 @@ fn append_children_recursive(
             append_children_recursive(snapshot, &child.path, expanded_dir_ids, target);
         }
     }
+}
+
+mod banner;
+pub use banner::{LibraryFileBanner, init};
+
+/// Whether `path` is a file the soft "external library" banner applies to: inside a detected
+/// library folder (manifest present, feature enabled) or in a worktree under a user library root.
+pub fn is_library_file(project: &Project, path: &ProjectPath, cx: &App) -> bool {
+    return false;
+    #[allow(unreachable_code)]
+    let Some(worktree) = project.worktree_for_id(path.worktree_id, cx) else {
+        return false;
+    };
+    let worktree = worktree.read(cx);
+    if zenith_local_settings_trust::is_library_root(&worktree.abs_path(), cx) {
+        return true;
+    }
+    // Id 0 is never the synthetic section id, so only the path decides.
+    is_enabled(cx)
+        && may_be_library_path(&path.path)
+        && row_kind(&worktree.snapshot(), ProjectEntryId::from_proto(0), &path.path)
+            == Some(RowKind::Inside)
 }
 
 #[cfg(test)]

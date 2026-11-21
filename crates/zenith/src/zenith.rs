@@ -42,4 +42,6 @@ pub fn init(cx: &mut App) {
     zenith_scratches::init(cx);
     #[cfg(feature = "local_history")]
     zenith_local_history::init(cx);
+    #[cfg(feature = "external_libraries")]
+    zenith_external_libraries::init(cx);
 }
