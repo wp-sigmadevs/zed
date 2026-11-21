@@ -19,6 +19,8 @@ pub struct ZenithSettingsContent {
     pub wordpress: Option<ZenithWordPressSettingsContent>,
     /// Settings for the Laravel tool window.
     pub laravel: Option<ZenithLaravelSettingsContent>,
+    /// Settings for the Next.js tool window.
+    pub nextjs: Option<ZenithNextJsSettingsContent>,
     /// Settings for the hover card.
     pub hover_card: Option<ZenithHoverCardSettingsContent>,
 }
@@ -36,6 +38,15 @@ pub struct ZenithWordPressSettingsContent {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
 pub struct ZenithLaravelSettingsContent {
     /// Whether the Laravel tool window (routes and views) is offered for trusted Laravel projects.
+    ///
+    /// Default: true
+    pub enabled: Option<bool>,
+}
+
+/// Settings for the Next.js tool window.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+pub struct ZenithNextJsSettingsContent {
+    /// Whether the Next.js tool window (App Router routes) is offered for trusted Next.js projects.
     ///
     /// Default: true
     pub enabled: Option<bool>,
