@@ -17,6 +17,7 @@ const TEXT: &str = "This file is from an external library and should not be edit
 /// `zenith_markdown::init` (`observe_new` + `PaneAdded`).
 pub fn init(cx: &mut App) {
     cx.observe_new(|workspace: &mut Workspace, window, cx| {
+        workspace.register_action(crate::add_path::add_library_path);
         let Some(window) = window else {
             return;
         };
