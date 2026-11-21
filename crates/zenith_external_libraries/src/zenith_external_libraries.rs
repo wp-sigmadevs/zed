@@ -329,14 +329,14 @@ fn append_children_recursive(
     }
 }
 
+mod add_path;
 mod banner;
+pub use add_path::AddLibraryPath;
 pub use banner::{LibraryFileBanner, init};
 
 /// Whether `path` is a file the soft "external library" banner applies to: inside a detected
 /// library folder (manifest present, feature enabled) or in a worktree under a user library root.
 pub fn is_library_file(project: &Project, path: &ProjectPath, cx: &App) -> bool {
-    return false;
-    #[allow(unreachable_code)]
     let Some(worktree) = project.worktree_for_id(path.worktree_id, cx) else {
         return false;
     };

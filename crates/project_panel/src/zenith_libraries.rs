@@ -48,7 +48,9 @@ impl ProjectPanel {
         }
         let project = self.project.read(cx);
         let mut changed = false;
-        for visible in &mut self.state.visible_entries {
+        // One "External Libraries" node for the whole panel: it goes under the last worktree
+        // that has libraries. Libraries of earlier worktrees stay in their own trees.
+        for visible in self.state.visible_entries.iter_mut().rev() {
             let Some(worktree) = project.worktree_for_id(visible.worktree_id, cx) else {
                 continue;
             };
@@ -61,12 +63,87 @@ impl ProjectPanel {
             if zenith_external_libraries::apply(&snapshot, expanded_dir_ids, &mut visible.entries) {
                 visible.index = OnceCell::new();
                 changed = true;
+                break;
             }
         }
         if changed {
             // The widest-item index was computed before rows were moved.
             self.state.max_width_item_index = None;
         }
+    }
+
+    /// Whether the worktree of `entry_id` is the one hosting the node: no later visible worktree
+    /// has libraries. Only asked for rows already known to be library rows.
+    fn zenith_hosts_node(&self, entry_id: &ProjectEntryId, cx: &App) -> bool {
+        let project = self.project.read(cx);
+        let Some(worktree_id) = project.worktree_id_for_entry(*entry_id, cx) else {
+            return false;
+        };
+        self.state
+            .visible_entries
+            .iter()
+            .skip_while(|visible| visible.worktree_id != worktree_id)
+            .skip(1)
+            .all(|visible| {
+                project
+                    .worktree_for_id(visible.worktree_id, cx)
+                    .is_none_or(|worktree| {
+                        detect_libraries(&worktree.read(cx).snapshot()).is_empty()
+                    })
+            })
+    }
+
+    /// Context menu of the "External Libraries" row (a synthetic entry, so the regular menu has
+    /// nothing for it): Add Library Path…. Does nothing for any other row.
+    pub(super) fn zenith_section_menu(
+        &mut self,
+        placement: ContextMenuPlacement,
+        entry_id: ProjectEntryId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(worktree_id) = section_worktree(entry_id) else {
+            return;
+        };
+        self.selection = Some(SelectedEntry {
+            worktree_id,
+            entry_id,
+        });
+        let focus = self.focus_handle.clone();
+        let context_menu = ContextMenu::build(window, cx, |menu, _, _| {
+            menu.context(focus).action(
+                "Add Library Path…",
+                Box::new(zenith_external_libraries::AddLibraryPath),
+            )
+        });
+        let (position, anchor) = match placement {
+            ContextMenuPlacement::AtMouse(mouse_position) => (mouse_position, None),
+            ContextMenuPlacement::AtEntry => match self.scroll_selection_into_view() {
+                Some(entry_bounds) => {
+                    let (position, anchor) =
+                        Self::context_menu_placement_for_entry(entry_bounds, window, cx);
+                    let offset = if anchor.is_bottom() {
+                        -CONTEXT_MENU_KEYBOARD_OFFSET
+                    } else {
+                        CONTEXT_MENU_KEYBOARD_OFFSET
+                    };
+                    (position + offset, Some(anchor))
+                }
+                None => (window.mouse_position(), None),
+            },
+        };
+        window.focus(&context_menu.focus_handle(cx), cx);
+        let subscription = cx.subscribe(&context_menu, |this, _, _: &DismissEvent, cx| {
+            this.context_menu.take();
+            cx.notify();
+        });
+        self.context_menu = Some(DeployedContextMenu {
+            menu: context_menu,
+            position,
+            anchor,
+            _subscription: subscription,
+        });
+        cx.notify();
     }
 
     /// Library rows indent one level under the node and carry its labels. Runs for every visible
@@ -91,6 +168,10 @@ impl ProjectPanel {
         let Some(kind) = kind else {
             return (filename, icon, depth);
         };
+        // Rows of a worktree that does not host the node are still in its own tree.
+        if section_worktree(entry.id).is_none() && !self.zenith_hosts_node(&entry.id, cx) {
+            return (filename, icon, depth);
+        }
         // Mirrors the upstream rule that hides the root row.
         let root_visible = !(ProjectPanelSettings::get_global(cx).hide_root
             && project.visible_worktrees(cx).count() == 1);
