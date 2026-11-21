@@ -73,7 +73,8 @@ pub fn parse_http_file(content: &str) -> Vec<HttpRequest> {
     let mut requests = Vec::new();
     let normalized = content.replace("\r\n", "\n");
     let chunks: Vec<&str> = normalized.split("\n###").collect();
-    let mut current_line = 1;
+    // Byte offset of the current chunk in `normalized`, to find the line its text starts on.
+    let mut offset = 0;
 
     for (chunk_idx, chunk) in chunks.iter().enumerate() {
         let (first_line_name, remaining_chunk) = if chunk_idx == 0 {
@@ -86,17 +87,24 @@ pub fn parse_http_file(content: &str) -> Vec<HttpRequest> {
             split_name_and_rest(chunk)
         };
 
-        if let Some(mut req) = parse_single_chunk(remaining_chunk, current_line) {
+        // The 1-based line a chunk's text starts on; the name line is taken off the rest.
+        let chunk_line = 1 + normalized
+            .get(..offset)
+            .map_or(0, |before| before.matches('\n').count());
+        let rest_line = if chunk_idx == 0 && !chunk.starts_with("###") {
+            chunk_line
+        } else {
+            chunk_line + 1
+        };
+
+        if let Some(mut req) = parse_single_chunk(remaining_chunk, rest_line) {
             if req.name.is_none() {
                 req.name = first_line_name;
             }
             requests.push(req);
         }
 
-        current_line += chunk.lines().count();
-        if chunk_idx > 0 {
-            current_line += 1;
-        }
+        offset += chunk.len() + "\n###".len();
     }
 
     requests

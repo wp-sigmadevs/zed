@@ -149,6 +149,26 @@
     },
   },
   {
+    // Postfix completion, Surround With and Live Templates (⌘⌥⇧X / ⌘⌥⇧T / ⌘⌥⇧J). PhpStorm's own keys
+    // (⌘⌥T, ⌘J) are taken here by Close Other Tabs and the bottom dock; these three are unbound
+    // in the macOS, Linux and Windows keymaps.
+    "context": "Editor && mode == full",
+    "bindings": {
+      "secondary-alt-shift-x": "zenith_postfix::ExpandPostfix",
+      "secondary-alt-shift-t": "zenith_postfix::SurroundWith",
+      "secondary-alt-shift-j": "zenith_postfix::LiveTemplates",
+    },
+  },
+  {
+    // Run the request under the cursor in a .http file. Same depth as the editor's own ⌃Enter
+    // (inline assist / new line), loaded later, so it wins. Run All and Select Environment
+    // are command palette only.
+    "context": "Editor && mode == full && extension == http",
+    "bindings": {
+      "ctrl-enter": "zenith_http::RunRequest",
+    },
+  },
+  {
     // Owner's WebStorm customs (zed-config keymap.json), built in.
     "context": "Editor",
     "bindings": {

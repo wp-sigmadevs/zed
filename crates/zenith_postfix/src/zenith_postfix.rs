@@ -1,4 +1,6 @@
+mod choice_picker;
 mod editor_actions;
+pub mod live_templates;
 pub use editor_actions::init;
 
 use std::path::Path;

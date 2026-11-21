@@ -1,3 +1,4 @@
+mod choice_picker;
 pub mod editor_actions;
 pub mod environment;
 pub mod history;
