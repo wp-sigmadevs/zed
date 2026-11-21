@@ -641,4 +641,59 @@ mod tests {
             assert!(allowed(ordinary_row), "{ordinary_row} keeps drag and drop");
         }
     }
+
+    fn set_library_paths(cx: &mut TestAppContext, paths: &[&str]) {
+        cx.update(|cx| {
+            cx.update_global::<SettingsStore, _>(|store, cx| {
+                store.update_user_settings(cx, |content| {
+                    content.zenith = Some(ZenithSettingsContent {
+                        external_libraries: Some(ZenithExternalLibrariesSettingsContent {
+                            paths: Some(paths.iter().map(ToString::to_string).collect()),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    });
+                });
+            });
+        });
+    }
+
+    #[gpui::test]
+    async fn test_library_path_worktree_is_wrapped_not_a_root(cx: &mut TestAppContext) {
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/site", json!({ "src": { "main.php": "" } }))
+            .await;
+        fs.insert_tree("/wpcore", json!({ "wp-includes": { "plugin.php": "" } }))
+            .await;
+        init_test(cx);
+        set_library_paths(cx, &["/wpcore"]);
+        let (panel, mut cx) = open_panel_inited(cx, fs, &["/site", "/wpcore"]).await;
+        let cx = &mut cx;
+
+        let names = names(&panel, cx);
+        assert!(names.contains(&"site".to_string()), "{names:?}");
+        assert!(
+            !names.contains(&"wpcore".to_string()),
+            "a library path is not a project root: {names:?}"
+        );
+        assert_eq!(
+            names.iter().filter(|n| *n == "External Libraries").count(),
+            1,
+            "{names:?}"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_each_worktree_keeps_its_own_libraries_node(cx: &mut TestAppContext) {
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/one", composer_tree()).await;
+        fs.insert_tree("/two", composer_tree()).await;
+        let (panel, mut cx) = open_panel(cx, fs, &["/one", "/two"]).await;
+        let names = names(&panel, &mut cx);
+        assert_eq!(
+            names.iter().filter(|n| *n == "External Libraries").count(),
+            2,
+            "{names:?}"
+        );
+    }
 }
