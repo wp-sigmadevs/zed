@@ -106,6 +106,33 @@ impl ProjectPanel {
         (row.filename, row.icon, row.depth)
     }
 
+    /// `settings` with drag-and-drop off for the "External Libraries" node and every row inside
+    /// a library: they are read-only, so nothing is dragged from them or dropped onto them. The
+    /// row render reads `drag_and_drop` for both the row handlers and the folded-path separators.
+    /// Runs for every visible row every frame, so ordinary rows stop at the path check.
+    pub(super) fn zenith_dnd(
+        &self,
+        mut settings: ProjectPanelSettings,
+        entry_id: ProjectEntryId,
+        details: &EntryDetails,
+        cx: &App,
+    ) -> ProjectPanelSettings {
+        if settings.drag_and_drop
+            && (section_worktree(entry_id).is_some() || may_be_library_path(&details.path))
+            && is_enabled(cx)
+        {
+            let is_library_row = self
+                .project
+                .read(cx)
+                .worktree_for_id(details.worktree_id, cx)
+                .is_some_and(|worktree| {
+                    row_kind(worktree.read(cx), entry_id, &details.path).is_some()
+                });
+            settings.drag_and_drop &= !is_library_row;
+        }
+        settings
+    }
+
     /// For a file or folder inside a library: the read-only menu plus Local History, Reveal,
     /// Copy Path and Copy Relative Path, in place of `menu`. Other entries keep `menu`.
     pub(super) fn zenith_menu(
@@ -455,5 +482,64 @@ mod tests {
         });
         assert!(library, "library files get the library menu");
         assert!(ordinary, "ordinary files keep the regular menu");
+    }
+
+    #[gpui::test]
+    async fn test_library_rows_have_no_drag_and_drop(cx: &mut TestAppContext) {
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/site", composer_tree()).await;
+        let (panel, mut cx) = open_panel(cx, fs, &["/site"]).await;
+        let cx = &mut cx;
+        let id = first_worktree_id(&panel, cx);
+        panel.update_in(cx, |panel, window, cx| {
+            panel.toggle_expanded(section_id(id), window, cx);
+        });
+        cx.run_until_parked();
+        panel.update_in(cx, |panel, window, cx| {
+            let vendor = panel
+                .project
+                .read(cx)
+                .worktrees(cx)
+                .next()
+                .unwrap()
+                .read(cx)
+                .entry_for_path(RelPath::from_unix_str("vendor").unwrap())
+                .unwrap()
+                .id;
+            panel.toggle_expanded(vendor, window, cx);
+        });
+        cx.run_until_parked();
+
+        let drag_and_drop = panel.update_in(cx, |panel, window, cx| {
+            let mut rows = Vec::new();
+            panel.for_each_visible_entry(0..200, window, cx, &mut |entry_id, details, _, _| {
+                rows.push((entry_id, details));
+            });
+            let settings = *ProjectPanelSettings::get_global(cx);
+            assert!(settings.drag_and_drop, "drag and drop is on by default");
+            rows.into_iter()
+                .map(|(entry_id, details)| {
+                    let allowed = panel.zenith_dnd(settings, entry_id, &details, cx);
+                    (details.filename, allowed.drag_and_drop)
+                })
+                .collect::<Vec<_>>()
+        });
+        let allowed = |name: &str| {
+            drag_and_drop
+                .iter()
+                .find(|(n, _)| n == name)
+                .unwrap_or_else(|| panic!("no row {name:?} in {drag_and_drop:?}"))
+                .1
+        };
+        for library_row in [
+            "External Libraries",
+            "Composer Packages (read-only)",
+            "autoload.php",
+        ] {
+            assert!(!allowed(library_row), "{library_row} must not drag or drop");
+        }
+        for ordinary_row in ["site", "src", "composer.json"] {
+            assert!(allowed(ordinary_row), "{ordinary_row} keeps drag and drop");
+        }
     }
 }
