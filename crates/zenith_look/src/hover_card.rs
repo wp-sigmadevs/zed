@@ -16,10 +16,10 @@ use editor::{
         },
     },
 };
-use gpui::{AnyElement, App, Focusable as _, Pixels, Size, WeakEntity, Window};
+use gpui::{AnyElement, App, Focusable as _, Pixels, Role, SharedString, Size, WeakEntity, Window};
 use markdown::{CodeBlockRenderer, CopyButtonVisibility, MarkdownElement, WrapButtonVisibility};
 use theme::ActiveTheme as _;
-use ui::{CopyButton, Divider, ElevationIndex, Tooltip, prelude::*};
+use ui::{CopyButton, Divider, ElevationIndex, KeyBinding, Tooltip, prelude::*};
 
 pub fn init(cx: &mut App) {
     set_hover_card_renderer(render, cx);
@@ -27,14 +27,23 @@ pub fn init(cx: &mut App) {
 
 /// `phpcs: Sniff.Code: message`; the source and the code are left out when the
 /// language server sent none.
-pub(crate) fn diagnostic_text(diagnostic: &HoverCardDiagnostic) -> String {
+pub(crate) fn diagnostic_text(diagnostic: &HoverCardDiagnostic) -> SharedString {
     let mut text = String::new();
     for part in [&diagnostic.source, &diagnostic.code].into_iter().flatten() {
         text.push_str(part);
         text.push_str(": ");
     }
     text.push_str(&diagnostic.message);
-    text
+    text.into()
+}
+
+fn severity_name(severity: HoverCardSeverity) -> &'static str {
+    match severity {
+        HoverCardSeverity::Error => "Error",
+        HoverCardSeverity::Warning => "Warning",
+        HoverCardSeverity::Info => "Info",
+        HoverCardSeverity::Hint => "Hint",
+    }
 }
 
 fn severity_icon(severity: HoverCardSeverity) -> (IconName, Color) {
@@ -52,7 +61,12 @@ fn render(
     window: &mut Window,
     cx: &mut App,
 ) -> Option<AnyElement> {
-    let colors = cx.theme().colors().clone();
+    let colors = cx.theme().colors();
+    let (surface, border, code_background) = (
+        colors.surface_background,
+        colors.border_variant,
+        colors.editor_background,
+    );
     let has_docs = !parts.docs.is_empty();
     let HoverCardParts {
         diagnostic,
@@ -65,9 +79,9 @@ fn render(
         .max_w(max_size.width.min(window.rem_size() * 40.))
         .max_h(max_size.height)
         .overflow_hidden()
-        .bg(colors.surface_background)
+        .bg(surface)
         .border_1()
-        .border_color(colors.border_variant)
+        .border_color(border)
         .rounded_lg()
         .shadow(ElevationIndex::ElevatedSurface.shadow(cx))
         .when_some(diagnostic, |card, diagnostic| {
@@ -76,13 +90,14 @@ fn render(
         });
 
     let mut style = hover_markdown_style(window, cx);
-    style.code_block = style.code_block.bg(colors.editor_background);
-    let docs = docs.into_iter().enumerate().map(|(index, doc)| {
+    style.code_block = style.code_block.bg(code_background);
+    let docs_handle = scroll_handle.clone();
+    let docs = docs.into_iter().map(|doc| {
         let editor = editor.clone();
         MarkdownElement::new(doc.markdown, style.clone())
-            // Only the first doc's handle is the card's scroll handle.
-            .when(index == 0, |element| {
-                element.scroll_handle(doc.scroll_handle.clone())
+            // The docs container scrolls, so every doc follows its handle.
+            .when_some(docs_handle.clone(), |element, handle| {
+                element.scroll_handle(handle)
             })
             .code_block_renderer(CodeBlockRenderer::Default {
                 copy_button_visibility: CopyButtonVisibility::Hidden,
@@ -135,6 +150,11 @@ fn render_diagnostic(
                         .child(
                             div()
                                 .id("zenith-hover-diagnostic")
+                                .role(Role::Group)
+                                .aria_label(format!(
+                                    "{}: {text}",
+                                    severity_name(diagnostic.severity)
+                                ))
                                 .min_w_0()
                                 .max_h(max_size.height * 0.5)
                                 .overflow_y_scroll()
@@ -152,6 +172,7 @@ fn render_diagnostic(
                     Button::new("zenith-hover-quick-fixes", "Show Quick Fixes")
                         .style(ButtonStyle::Subtle)
                         .label_size(LabelSize::Small)
+                        .key_binding(KeyBinding::for_action(&ToggleCodeActions::default(), cx))
                         .tooltip(Tooltip::for_action_title(
                             "Show Quick Fixes",
                             &ToggleCodeActions::default(),

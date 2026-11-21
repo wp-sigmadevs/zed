@@ -45,9 +45,6 @@ pub struct HoverCardDiagnostic {
     pub message: SharedString,
     /// Where the diagnostic starts; the card is anchored here.
     pub range_start: Anchor,
-    /// Upstream's rendering of the diagnostic (links, code description), for a
-    /// renderer that prefers it to `message`. Links: `open_diagnostic_link`.
-    pub markdown: Entity<Markdown>,
     pub scroll_handle: ScrollHandle,
 }
 
@@ -95,23 +92,6 @@ pub fn open_doc_link(
     open_markdown_url(workspace, link, window, cx);
 }
 
-/// Opens a link clicked in a diagnostic's markdown, through the installed
-/// diagnostic renderer as upstream's diagnostic popover does.
-pub fn open_diagnostic_link(
-    editor: &WeakEntity<Editor>,
-    link: SharedString,
-    window: &mut Window,
-    cx: &mut App,
-) {
-    if let Some(renderer) = GlobalDiagnosticRenderer::global(cx) {
-        editor
-            .update(cx, |editor, cx| {
-                renderer.as_ref().open_link(editor, link, window, cx);
-            })
-            .ok();
-    }
-}
-
 fn diagnostic_parts(popover: &DiagnosticPopover) -> HoverCardDiagnostic {
     let diagnostic = &popover.local_diagnostic.diagnostic;
     HoverCardDiagnostic {
@@ -128,7 +108,6 @@ fn diagnostic_parts(popover: &DiagnosticPopover) -> HoverCardDiagnostic {
         }),
         message: diagnostic.message.as_shared_string().clone(),
         range_start: popover.local_diagnostic.range.start,
-        markdown: popover.markdown.clone(),
         scroll_handle: popover.scroll_handle.clone(),
     }
 }

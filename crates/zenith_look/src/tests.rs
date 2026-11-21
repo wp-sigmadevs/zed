@@ -293,23 +293,21 @@ mod hover_card_tests {
         assert_ne!(diagnostic, docs);
     }
 
-    #[gpui::test]
-    fn test_diagnostic_text_source_first(cx: &mut gpui::TestAppContext) {
-        let text = |source: Option<&str>, code: Option<&str>, cx: &mut gpui::TestAppContext| {
-            let markdown = cx.new(|cx| Markdown::new("m".into(), None, None, cx));
+    #[test]
+    fn test_diagnostic_text_source_first() {
+        let text = |source: Option<&str>, code: Option<&str>| {
             diagnostic_text(&HoverCardDiagnostic {
                 severity: HoverCardSeverity::Error,
                 source: source.map(|s| s.to_string().into()),
                 code: code.map(|c| c.to_string().into()),
                 message: "message".into(),
                 range_start: Anchor::Min,
-                markdown,
                 scroll_handle: ScrollHandle::new(),
             })
         };
-        assert_eq!(text(Some("phpcs"), Some("Sniff.Code"), cx), "phpcs: Sniff.Code: message");
-        assert_eq!(text(None, Some("Sniff.Code"), cx), "Sniff.Code: message");
-        assert_eq!(text(Some("phpcs"), None, cx), "phpcs: message");
-        assert_eq!(text(None, None, cx), "message");
+        assert_eq!(text(Some("phpcs"), Some("Sniff.Code")), "phpcs: Sniff.Code: message");
+        assert_eq!(text(None, Some("Sniff.Code")), "Sniff.Code: message");
+        assert_eq!(text(Some("phpcs"), None), "phpcs: message");
+        assert_eq!(text(None, None), "message");
     }
 }
