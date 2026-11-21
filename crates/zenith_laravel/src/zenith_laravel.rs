@@ -1,5 +1,7 @@
 pub mod laravel_panel;
-pub use laravel_panel::{LaravelPanel, LaravelPanelTab, ToggleLaravelPanel};
+mod setup;
+pub use laravel_panel::{LaravelPanel, LaravelPanelTab, ShowRoutes, ShowViews, ToggleLaravelPanel};
+pub use setup::{LaravelSettings, init};
 
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -46,7 +48,10 @@ pub struct LaravelIndex {
     routes: HashMap<String, RouteDefinition>,
     configs: HashMap<String, ConfigDefinition>,
     env_vars: HashMap<String, EnvDefinition>,
-    indexed_files: HashSet<PathBuf>,
+    /// Files whose views are in `views`, and route files that were read (even one with no named
+    /// route). What the caps count.
+    view_files: HashSet<PathBuf>,
+    route_files: HashSet<PathBuf>,
 }
 
 impl LaravelIndex {
@@ -95,7 +100,7 @@ impl LaravelIndex {
         }
 
         self.views.insert(dot_name, definition);
-        self.indexed_files.insert(file_path.to_path_buf());
+        self.view_files.insert(file_path.to_path_buf());
     }
 
     pub fn find_view(&self, dot_name: &str) -> Option<&ViewDefinition> {
@@ -134,7 +139,63 @@ impl LaravelIndex {
         for route in parsed_routes {
             self.routes.insert(route.name.clone(), route);
         }
-        self.indexed_files.insert(file_path);
+        self.route_files.insert(file_path);
+    }
+
+    /// Every named route, by name.
+    pub fn routes_sorted(&self) -> Vec<RouteDefinition> {
+        let mut routes: Vec<_> = self.routes.values().cloned().collect();
+        routes.sort_by(|a, b| a.name.cmp(&b.name));
+        routes
+    }
+
+    /// Every view, by dot name.
+    pub fn views_sorted(&self) -> Vec<ViewDefinition> {
+        let mut views: Vec<_> = self.views.values().cloned().collect();
+        views.sort_by(|a, b| a.dot_name.cmp(&b.dot_name));
+        views
+    }
+
+    pub fn contains_file(&self, file_path: &Path) -> bool {
+        self.view_files.contains(file_path) || self.route_files.contains(file_path)
+    }
+
+    /// How many view files lie under `root`.
+    pub fn view_count_under(&self, root: &Path) -> usize {
+        self.view_files
+            .iter()
+            .filter(|file| file.starts_with(root))
+            .count()
+    }
+
+    /// How many route files lie under `root`.
+    pub fn route_file_count_under(&self, root: &Path) -> usize {
+        self.route_files
+            .iter()
+            .filter(|file| file.starts_with(root))
+            .count()
+    }
+
+    /// Forgets the views and routes of a file that was deleted or can no longer be read.
+    pub fn remove_file(&mut self, file_path: &Path) {
+        if self.contains_file(file_path) {
+            self.forget(|path| path == file_path);
+        }
+    }
+
+    /// Forgets every file under `root` (a worktree that left the project).
+    pub fn remove_dir(&mut self, root: &Path) {
+        self.forget(|path| path.starts_with(root));
+    }
+
+    // ponytail: scans every entry per removal, fine at the 20k-view cap; key entries by file if
+    // bulk deletes get slow.
+    fn forget(&mut self, gone: impl Fn(&Path) -> bool) {
+        self.view_files.retain(|file| !gone(file));
+        self.route_files.retain(|file| !gone(file));
+        self.views.retain(|_, view| !gone(&view.file_path));
+        self.components.retain(|_, view| !gone(&view.file_path));
+        self.routes.retain(|_, route| !gone(&route.file_path));
     }
 
     pub fn find_route(&self, name: &str) -> Option<&RouteDefinition> {
@@ -158,7 +219,6 @@ impl LaravelIndex {
         for config in keys {
             self.configs.insert(config.key.clone(), config);
         }
-        self.indexed_files.insert(file_path);
     }
 
     pub fn find_config(&self, key: &str) -> Option<&ConfigDefinition> {
@@ -182,7 +242,6 @@ impl LaravelIndex {
         for var in vars {
             self.env_vars.insert(var.key.clone(), var);
         }
-        self.indexed_files.insert(file_path);
     }
 
     pub fn find_env(&self, key: &str) -> Option<&EnvDefinition> {
@@ -399,30 +458,8 @@ fn extract_string_literal(input: &str) -> Option<(String, &str)> {
 /// A manifest is small; only this much of one is read.
 const MANIFEST_MAX_BYTES: u64 = 1024 * 1024;
 
-/// Up to `max` bytes of a regular file, symlinks followed. `None` for a device, pipe, folder or
-/// unreadable path: a project can plant `composer.json -> /dev/zero`, and an unbounded read of
-/// it never ends. The check is on the opened handle, and the open is non-blocking (a plain open
-/// of a pipe with no writer blocks). Same logic as `zenith_php_tools::read_regular`.
-fn read_regular(path: &Path, max: u64) -> Option<Vec<u8>> {
-    use std::io::Read as _;
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.custom_flags(libc::O_NONBLOCK);
-    }
-    let file = options.open(path).ok()?;
-    if !file.metadata().ok()?.is_file() {
-        return None;
-    }
-    let mut bytes = Vec::new();
-    file.take(max).read_to_end(&mut bytes).ok()?;
-    Some(bytes)
-}
-
 fn manifest_contains(path: &Path, needle: &str) -> bool {
-    read_regular(path, MANIFEST_MAX_BYTES)
+    zenith_php_tools::read_regular(path, MANIFEST_MAX_BYTES)
         .is_some_and(|bytes| String::from_utf8_lossy(&bytes).contains(needle))
 }
 
@@ -531,6 +568,63 @@ DB_HOST=127.0.0.1
 
         let completions = index.env_completions("APP_");
         assert_eq!(completions, vec!["APP_ENV", "APP_KEY", "APP_NAME"]);
+    }
+
+    #[test]
+    fn test_removing_a_file_removes_what_it_gave_the_index() {
+        let mut index = LaravelIndex::new();
+        let base = Path::new("/app/resources/views");
+        let card = base.join("components/card.blade.php");
+        index.index_view_path(base, &card);
+        index.index_view_path(base, &base.join("home.blade.php"));
+        let web = PathBuf::from("/app/routes/web.php");
+        index.index_route_file(
+            web.clone(),
+            "<?php\nRoute::get('/', 'H@i')->name('home');\n",
+        );
+        assert_eq!(
+            (
+                index.view_count_under(Path::new("/app")),
+                index.route_file_count_under(Path::new("/app"))
+            ),
+            (2, 1)
+        );
+
+        index.remove_file(&card);
+        assert!(index.find_view("components.card").is_none());
+        assert!(index.find_component("x-card").is_none());
+        assert!(!index.contains_file(&card));
+        assert!(index.find_view("home").is_some());
+
+        index.remove_file(&web);
+        assert!(index.find_route("home").is_none());
+        assert!(!index.contains_file(&web));
+
+        index.remove_dir(Path::new("/app"));
+        assert!(index.views_sorted().is_empty());
+        assert_eq!(index.view_count_under(Path::new("/app")), 0);
+    }
+
+    #[test]
+    fn test_routes_and_views_come_back_sorted() {
+        let mut index = LaravelIndex::new();
+        let base = Path::new("/a/resources/views");
+        for name in ["zed", "alpha", "mid"] {
+            index.index_view_path(base, &base.join(format!("{name}.blade.php")));
+        }
+        let source: String = ["q", "z", "c", "a", "m", "x", "b", "k"]
+            .iter()
+            .map(|n| format!("Route::get('/{n}', 'C@m')->name('{n}');\n"))
+            .collect();
+        index.index_route_file(PathBuf::from("/a/routes/web.php"), &source);
+        let views: Vec<_> = index
+            .views_sorted()
+            .into_iter()
+            .map(|v| v.dot_name)
+            .collect();
+        let routes: Vec<_> = index.routes_sorted().into_iter().map(|r| r.name).collect();
+        assert_eq!(views, ["alpha", "mid", "zed"]);
+        assert_eq!(routes, ["a", "b", "c", "k", "m", "q", "x", "z"]);
     }
 
     #[test]

@@ -13,22 +13,33 @@ path = "src/zenith_laravel.rs"
 doctest = false
 
 [dependencies]
+anyhow.workspace = true
 collections.workspace = true
+editor.workspace = true
 gpui.workspace = true
 icons.workspace = true
+menu.workspace = true
+project.workspace = true
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 settings.workspace = true
+text.workspace = true
 ui.workspace = true
 util.workspace = true
 workspace.workspace = true
+worktree.workspace = true
+zenith_php_tools.workspace = true
 
-[target.'cfg(unix)'.dependencies]
+[target.'cfg(unix)'.dev-dependencies]
 libc.workspace = true
 
 [dev-dependencies]
+editor = { workspace = true, features = ["test-support"] }
 gpui = { workspace = true, features = ["test-support"] }
+project = { workspace = true, features = ["test-support"] }
 workspace = { workspace = true, features = ["test-support"] }
 pretty_assertions.workspace = true
 tempfile.workspace = true
+theme.workspace = true
+theme_settings.workspace = true

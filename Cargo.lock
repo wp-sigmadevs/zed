@@ -23017,19 +23017,28 @@ dependencies = [
 name = "zenith_laravel"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "collections",
+ "editor",
  "gpui",
  "icons",
  "libc",
+ "menu",
  "pretty_assertions",
+ "project",
  "schemars 1.0.4",
  "serde",
  "serde_json",
  "settings",
  "tempfile",
+ "text",
+ "theme",
+ "theme_settings",
  "ui",
  "util",
  "workspace",
+ "worktree",
+ "zenith_php_tools",
 ]
 
 [[package]]
