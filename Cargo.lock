@@ -23110,6 +23110,7 @@ dependencies = [
 name = "zenith_look"
 version = "0.1.0"
 dependencies = [
+ "agent_settings",
  "anyhow",
  "assets",
  "editor",
@@ -23120,6 +23121,7 @@ dependencies = [
  "lsp",
  "markdown",
  "paths",
+ "project",
  "release_channel",
  "semver",
  "serde_json",
@@ -23131,6 +23133,7 @@ dependencies = [
  "ui",
  "util",
  "workspace",
+ "zed_actions",
 ]
 
 [[package]]
