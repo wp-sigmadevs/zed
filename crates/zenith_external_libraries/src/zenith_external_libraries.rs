@@ -317,17 +317,26 @@ pub fn is_library_worktree(abs: &std::path::Path, cx: &App) -> bool {
     zenith_local_settings_trust::is_library_root(abs, cx)
 }
 
-/// Rewrites the visible entries of a user-added library worktree: the whole tree moves under
-/// its own "External Libraries" row, shown only while that row is expanded.
+/// Rewrites the visible entries of a user-added library worktree. `joined` is the state of the
+/// "External Libraries" node of the group just before it, if that group has one: the tree then
+/// shows as another child of that single node (its root row stays, shown only while the node is
+/// expanded). With `None` the tree moves under its own node, shown only while that is expanded.
 pub fn apply_library_worktree(
     worktree_id: WorktreeId,
     expanded_dir_ids: &[ProjectEntryId],
     entries: &mut Vec<GitEntry>,
+    joined: Option<bool>,
 ) {
-    let tree = std::mem::take(entries);
-    entries.push(create_external_libraries_root_entry(worktree_id));
-    if is_section_expanded(worktree_id, expanded_dir_ids) {
-        entries.extend(tree);
+    match joined {
+        Some(true) => {}
+        Some(false) => entries.clear(),
+        None => {
+            let tree = std::mem::take(entries);
+            entries.push(create_external_libraries_root_entry(worktree_id));
+            if is_section_expanded(worktree_id, expanded_dir_ids) {
+                entries.extend(tree);
+            }
+        }
     }
 }
 

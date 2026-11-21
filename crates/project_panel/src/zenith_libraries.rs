@@ -5,8 +5,8 @@
 use super::*;
 use zenith_external_libraries::{
     RowDecoration, apply_library_worktree, decorate_row, detect_libraries, is_enabled,
-    is_library_worktree, is_under_library, may_be_library_path, row_kind, section_worktree,
-    set_section_expanded,
+    is_library_worktree, is_section_expanded, is_under_library, may_be_library_path, row_kind,
+    section_worktree, set_section_expanded,
 };
 
 impl ProjectPanel {
@@ -50,6 +50,8 @@ impl ProjectPanel {
         }
         let project = self.project.read(cx);
         let mut changed = false;
+        // Expanded state of the "External Libraries" node of the previous group, if it has one.
+        let mut node: Option<bool> = None;
         for visible in self.state.visible_entries.iter_mut() {
             let Some(worktree) = project.worktree_for_id(visible.worktree_id, cx) else {
                 continue;
@@ -61,7 +63,15 @@ impl ProjectPanel {
                 .get(&visible.worktree_id)
                 .map_or(&[][..], Vec::as_slice);
             if is_library_worktree(&worktree.abs_path(), cx) {
-                apply_library_worktree(visible.worktree_id, expanded_dir_ids, &mut visible.entries);
+                apply_library_worktree(
+                    visible.worktree_id,
+                    expanded_dir_ids,
+                    &mut visible.entries,
+                    node,
+                );
+                // A library worktree that joined a node is controlled by it; otherwise it owns one.
+                node = node
+                    .or_else(|| Some(is_section_expanded(visible.worktree_id, expanded_dir_ids)));
                 visible.index = OnceCell::new();
                 changed = true;
             } else if zenith_external_libraries::apply(
@@ -71,6 +81,9 @@ impl ProjectPanel {
             ) {
                 visible.index = OnceCell::new();
                 changed = true;
+                node = Some(is_section_expanded(visible.worktree_id, expanded_dir_ids));
+            } else {
+                node = None;
             }
         }
         if changed {
