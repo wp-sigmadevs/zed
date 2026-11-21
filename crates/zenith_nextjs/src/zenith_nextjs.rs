@@ -1,9 +1,15 @@
 pub mod nextjs_panel;
-pub use nextjs_panel::{NextJsPanel, ToggleNextJsPanel};
+mod setup;
+pub use nextjs_panel::{
+    NextFilter, NextJsFilter, NextJsPanel, PreviousFilter, ShowAllRoutes, ShowPages,
+    ShowRouteHandlers, ToggleNextJsPanel,
+};
+pub use setup::{NextJsSettings, init};
 
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use zenith_php_tools::read_regular;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum AppRouterKind {
@@ -40,10 +46,57 @@ pub struct RscDiagnostic {
     pub message: String,
 }
 
+/// The App Router special files, by file name: `page`, `layout`, `loading`, `error`, `route`,
+/// `not-found` or `template` with a js, jsx, ts, tsx or mjs extension. `page.test.tsx` and
+/// `layout.css` are not special files.
+fn kind_of_file_name(name: &str) -> Option<AppRouterKind> {
+    let (stem, extension) = name.rsplit_once('.')?;
+    if !matches!(extension, "js" | "jsx" | "ts" | "tsx" | "mjs") {
+        return None;
+    }
+    Some(match stem {
+        "page" => AppRouterKind::Page,
+        "layout" => AppRouterKind::Layout,
+        "loading" => AppRouterKind::Loading,
+        "error" => AppRouterKind::Error,
+        "route" => AppRouterKind::RouteHandler,
+        "not-found" => AppRouterKind::NotFound,
+        "template" => AppRouterKind::Template,
+        _ => return None,
+    })
+}
+
+/// What the index takes from a path under a worktree root (unix separators): the app dir it
+/// lies under (`app` or `src/app`) and its kind. Only special files below an app dir count, and
+/// nothing below `node_modules/`, `.next/` or `vendor/`.
+pub(crate) fn classify(rel: &str) -> Option<(&'static str, AppRouterKind)> {
+    let app_dir = ["app", "src/app"].into_iter().find(|dir| {
+        rel.strip_prefix(dir)
+            .is_some_and(|rest| rest.starts_with('/'))
+    })?;
+    if rel
+        .split('/')
+        .any(|part| matches!(part, "node_modules" | ".next" | "vendor"))
+    {
+        return None;
+    }
+    let kind = kind_of_file_name(rel.rsplit('/').next()?)?;
+    Some((app_dir, kind))
+}
+
+/// Lines longer than this are not looked at for HTTP methods: a minified or hostile file is one
+/// huge line.
+/// ponytail: a handler declaration is a short line. Raise it if a generated one is missed.
+const MAX_METHOD_LINE_BYTES: usize = 4 * 1024;
+
+const HTTP_METHODS: [&str; 7] = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"];
+
+/// The App Router routes of the project, one per special file. The file is the key, so one file
+/// is added or forgotten in one step, and two files that give the same URL (`app/` and
+/// `src/app/`, or a page and its layout) are both kept.
 #[derive(Default)]
 pub struct NextJsIndex {
-    routes_by_path: HashMap<String, Vec<AppRoute>>,
-    files_indexed: HashSet<PathBuf>,
+    routes: HashMap<PathBuf, AppRoute>,
 }
 
 impl NextJsIndex {
@@ -58,82 +111,89 @@ impl NextJsIndex {
             || manifest_contains(&root_path.join("package.json"), "\"next\"")
     }
 
-    pub fn index_app_file(&mut self, app_root: &Path, file_path: &Path, content: &str) {
-        let Ok(relative) = file_path.strip_prefix(app_root) else {
-            return;
-        };
-
-        let file_name = relative
-            .file_name()
-            .map(|f| f.to_string_lossy())
-            .unwrap_or_default();
-
-        let kind = if file_name.starts_with("page.") {
-            AppRouterKind::Page
-        } else if file_name.starts_with("layout.") {
-            AppRouterKind::Layout
-        } else if file_name.starts_with("loading.") {
-            AppRouterKind::Loading
-        } else if file_name.starts_with("error.") {
-            AppRouterKind::Error
-        } else if file_name.starts_with("route.") {
-            AppRouterKind::RouteHandler
-        } else if file_name.starts_with("not-found.") {
-            AppRouterKind::NotFound
-        } else if file_name.starts_with("template.") {
-            AppRouterKind::Template
-        } else {
-            return;
-        };
-
+    /// The route of `file_path` (below `app_root`), or `None` when it is not a special file.
+    /// Parses `content` (read for a route handler only); needs no lock, so callers do it before
+    /// taking one.
+    pub fn route_for(app_root: &Path, file_path: &Path, content: &str) -> Option<AppRoute> {
+        let relative = file_path.strip_prefix(app_root).ok()?;
+        let kind = kind_of_file_name(&relative.file_name()?.to_string_lossy())?;
         let parent_dir = relative.parent().unwrap_or(Path::new(""));
         let (url_path, is_dynamic, dynamic_params) = calculate_route_path(parent_dir);
-
         let http_methods = if kind == AppRouterKind::RouteHandler {
             extract_http_methods(content)
         } else {
             Vec::new()
         };
-
-        let route = AppRoute {
-            url_path: url_path.clone(),
+        Some(AppRoute {
+            url_path,
             kind,
             file_path: file_path.to_path_buf(),
             is_dynamic,
             dynamic_params,
             http_methods,
-        };
+        })
+    }
 
-        self.remove_file(file_path);
-        self.routes_by_path.entry(url_path).or_default().push(route);
-        self.files_indexed.insert(file_path.to_path_buf());
+    pub fn index_app_file(&mut self, app_root: &Path, file_path: &Path, content: &str) {
+        if let Some(route) = Self::route_for(app_root, file_path, content) {
+            self.insert(route);
+        }
+    }
+
+    pub fn insert(&mut self, route: AppRoute) {
+        self.routes.insert(route.file_path.clone(), route);
     }
 
     pub fn remove_file(&mut self, file_path: &Path) {
-        if !self.files_indexed.remove(file_path) {
-            return;
-        }
-        for routes in self.routes_by_path.values_mut() {
-            routes.retain(|r| r.file_path != file_path);
-        }
-        self.routes_by_path.retain(|_, v| !v.is_empty());
+        self.routes.remove(file_path);
+    }
+
+    /// Forgets every file under `root`.
+    pub fn remove_dir(&mut self, root: &Path) {
+        self.routes.retain(|path, _| !path.starts_with(root));
+    }
+
+    pub fn contains_file(&self, file_path: &Path) -> bool {
+        self.routes.contains_key(file_path)
+    }
+
+    pub fn route_count(&self) -> usize {
+        self.routes.len()
+    }
+
+    pub fn route_count_under(&self, root: &Path) -> usize {
+        self.routes
+            .keys()
+            .filter(|path| path.starts_with(root))
+            .count()
+    }
+
+    /// Every route, by URL and then by file.
+    pub fn routes_sorted(&self) -> Vec<AppRoute> {
+        let mut routes: Vec<AppRoute> = self.routes.values().cloned().collect();
+        routes.sort_by(|a, b| (&a.url_path, &a.file_path).cmp(&(&b.url_path, &b.file_path)));
+        routes
     }
 
     pub fn find_routes_for_path(&self, url_path: &str) -> Vec<&AppRoute> {
-        self.routes_by_path
-            .get(url_path)
-            .map(|v| v.iter().collect())
-            .unwrap_or_default()
+        let mut routes: Vec<&AppRoute> = self
+            .routes
+            .values()
+            .filter(|route| route.url_path == url_path)
+            .collect();
+        routes.sort_by(|a, b| a.file_path.cmp(&b.file_path));
+        routes
     }
 
     pub fn route_completions(&self, prefix: &str) -> Vec<String> {
         let mut matches: Vec<String> = self
-            .routes_by_path
-            .keys()
-            .filter(|k| k.starts_with(prefix))
-            .cloned()
+            .routes
+            .values()
+            .filter(|route| route.url_path.starts_with(prefix))
+            .map(|route| route.url_path.clone())
             .collect();
         matches.sort();
+        matches.dedup();
         matches
     }
 
@@ -187,33 +247,31 @@ pub fn calculate_route_path(relative_dir: &Path) -> (String, bool, Vec<String>) 
     (url_path, is_dynamic, dynamic_params)
 }
 
+/// The HTTP verbs a route handler exports (`export async function GET`, `export const POST =`),
+/// each once, in the order found. Lines over [`MAX_METHOD_LINE_BYTES`] are skipped.
 pub fn extract_http_methods(content: &str) -> Vec<String> {
-    let methods = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"];
-    let mut found = Vec::new();
-
+    let mut found: Vec<&str> = Vec::new();
     for line in content.lines() {
+        if line.len() > MAX_METHOD_LINE_BYTES {
+            continue;
+        }
         let trimmed = line.trim();
         if !trimmed.starts_with("export") {
             continue;
         }
-
-        for &method in &methods {
-            let func_pattern = format!("function {method}");
-            let const_pattern = format!("const {method} =");
-            let async_pattern = format!("async function {method}");
-
-            if trimmed.contains(&func_pattern)
-                || trimmed.contains(&const_pattern)
-                || trimmed.contains(&async_pattern)
+        for method in HTTP_METHODS {
+            if !found.contains(&method)
+                && (trimmed.contains(&format!("function {method}"))
+                    || trimmed.contains(&format!("const {method} =")))
             {
-                if !found.contains(&method.to_string()) {
-                    found.push(method.to_string());
-                }
+                found.push(method);
             }
         }
+        if found.len() == HTTP_METHODS.len() {
+            break;
+        }
     }
-
-    found
+    found.into_iter().map(String::from).collect()
 }
 
 pub fn detect_component_boundary(content: &str) -> ComponentBoundary {
@@ -305,28 +363,6 @@ pub fn analyze_component_safety(file_path: &Path, content: &str) -> Vec<RscDiagn
 
 /// A manifest is small; only this much of one is read.
 const MANIFEST_MAX_BYTES: u64 = 1024 * 1024;
-
-/// Up to `max` bytes of a regular file, symlinks followed. `None` for a device, pipe, folder or
-/// unreadable path: a project can plant `composer.json -> /dev/zero`, and an unbounded read of
-/// it never ends. The check is on the opened handle, and the open is non-blocking (a plain open
-/// of a pipe with no writer blocks). Same logic as `zenith_php_tools::read_regular`.
-fn read_regular(path: &Path, max: u64) -> Option<Vec<u8>> {
-    use std::io::Read as _;
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.custom_flags(libc::O_NONBLOCK);
-    }
-    let file = options.open(path).ok()?;
-    if !file.metadata().ok()?.is_file() {
-        return None;
-    }
-    let mut bytes = Vec::new();
-    file.take(max).read_to_end(&mut bytes).ok()?;
-    Some(bytes)
-}
 
 fn manifest_contains(path: &Path, needle: &str) -> bool {
     read_regular(path, MANIFEST_MAX_BYTES)
@@ -448,5 +484,109 @@ export default function UserProfile() {
             std::ffi::CString::new(dir.path().join("package.json").to_str().unwrap()).unwrap();
         assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
         assert!(!NextJsIndex::is_nextjs_project(dir.path()));
+    }
+
+    #[test]
+    fn test_only_app_router_files_below_an_app_dir_are_classified() {
+        for (yes, dir, kind) in [
+            ("app/page.tsx", "app", AppRouterKind::Page),
+            ("app/(shop)/cart/page.jsx", "app", AppRouterKind::Page),
+            (
+                "src/app/blog/[slug]/layout.js",
+                "src/app",
+                AppRouterKind::Layout,
+            ),
+            ("app/loading.ts", "app", AppRouterKind::Loading),
+            ("app/error.tsx", "app", AppRouterKind::Error),
+            ("app/api/x/route.mjs", "app", AppRouterKind::RouteHandler),
+            ("src/app/not-found.tsx", "src/app", AppRouterKind::NotFound),
+            ("app/a/template.js", "app", AppRouterKind::Template),
+        ] {
+            assert_eq!(classify(yes), Some((dir, kind)), "{yes}");
+        }
+        for no in [
+            "page.tsx",
+            "pages/index.tsx",
+            "app",
+            "app/",
+            "application/page.tsx",
+            "lib/app/page.tsx",
+            "src/lib/app/page.tsx",
+            "app/page.css",
+            "app/page.md",
+            "app/page.d.ts",
+            "app/page.test.tsx",
+            "app/layout.tsx.bak",
+            "app/route.php",
+            "app/components/Button.tsx",
+            "app/node_modules/pkg/page.tsx",
+            "app/.next/page.tsx",
+            "app/vendor/x/page.tsx",
+            "node_modules/next/app/page.tsx",
+            ".next/app/page.tsx",
+        ] {
+            assert_eq!(classify(no), None, "{no}");
+        }
+    }
+
+    #[test]
+    fn test_a_file_that_is_no_app_router_file_gets_no_route() {
+        let mut index = NextJsIndex::new();
+        let root = Path::new("/p/app");
+        index.index_app_file(root, Path::new("/p/app/page.test.tsx"), "");
+        index.index_app_file(root, Path::new("/p/app/Button.tsx"), "");
+        index.index_app_file(root, Path::new("/elsewhere/page.tsx"), "");
+        assert_eq!(index.route_count(), 0);
+    }
+
+    #[test]
+    fn test_http_methods_skip_long_lines_and_repeat_nothing() {
+        let long = format!(
+            "export async function GET() {{ /* {} */ }}",
+            "x".repeat(MAX_METHOD_LINE_BYTES)
+        );
+        let content = format!("{long}\nexport async function POST() {{}}\n");
+        assert_eq!(extract_http_methods(&content), ["POST"]);
+
+        let twice = "export async function GET() {}\nexport const GET = () => {};\nexport function GET() {}\n";
+        assert_eq!(extract_http_methods(twice), ["GET"]);
+
+        let all = HTTP_METHODS
+            .iter()
+            .chain(HTTP_METHODS.iter())
+            .map(|method| format!("export async function {method}() {{}}\n"))
+            .collect::<String>();
+        assert_eq!(extract_http_methods(&all), HTTP_METHODS);
+    }
+
+    #[test]
+    fn test_files_with_one_url_are_all_kept_and_leave_one_by_one() {
+        let mut index = NextJsIndex::new();
+        let files = [
+            ("/p/app", "/p/app/about/page.tsx"),
+            ("/p/src/app", "/p/src/app/about/page.tsx"),
+            ("/p/app", "/p/app/about/layout.tsx"),
+        ];
+        for (root, file) in files {
+            index.index_app_file(Path::new(root), Path::new(file), "");
+        }
+        assert_eq!(index.find_routes_for_path("/about").len(), 3);
+        assert_eq!(index.route_completions("/"), ["/about"]);
+
+        index.remove_file(Path::new("/p/app/about/page.tsx"));
+        let left: Vec<_> = index
+            .find_routes_for_path("/about")
+            .into_iter()
+            .map(|route| route.file_path.clone())
+            .collect();
+        assert_eq!(
+            left,
+            [
+                PathBuf::from("/p/app/about/layout.tsx"),
+                PathBuf::from("/p/src/app/about/page.tsx")
+            ]
+        );
+        index.remove_dir(Path::new("/p/src"));
+        assert_eq!(index.route_count(), 1);
     }
 }
