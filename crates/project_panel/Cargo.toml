@@ -45,6 +45,7 @@ language.workspace = true
 markdown.workspace = true
 markdown_preview.workspace = true
 zed_actions.workspace = true
+zenith_external_libraries.workspace = true
 telemetry.workspace = true
 notifications.workspace = true
 fs.workspace = true

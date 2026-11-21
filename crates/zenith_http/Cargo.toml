@@ -1,0 +1,38 @@
+[package]
+name = "zenith_http"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/zenith_http.rs"
+doctest = false
+
+[dependencies]
+anyhow.workspace = true
+collections.workspace = true
+futures.workspace = true
+gpui.workspace = true
+http.workspace = true
+http_client.workspace = true
+icons.workspace = true
+log.workspace = true
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+settings.workspace = true
+ui.workspace = true
+util.workspace = true
+uuid = { workspace = true, features = ["v4"] }
+workspace.workspace = true
+
+[dev-dependencies]
+http_client = { workspace = true, features = ["test-support"] }
+gpui = { workspace = true, features = ["test-support"] }
+workspace = { workspace = true, features = ["test-support"] }
+pretty_assertions.workspace = true
+tempfile.workspace = true

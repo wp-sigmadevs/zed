@@ -14120,6 +14120,7 @@ dependencies = [
  "workspace",
  "worktree",
  "zed_actions",
+ "zenith_external_libraries",
 ]
 
 [[package]]
@@ -22922,6 +22923,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "zenith_external_libraries"
+version = "0.1.0"
+dependencies = [
+ "collections",
+ "fs",
+ "fuzzy",
+ "git",
+ "gpui",
+ "icons",
+ "pretty_assertions",
+ "project",
+ "schemars 1.0.4",
+ "serde",
+ "serde_json",
+ "settings",
+ "ui",
+ "util",
+ "workspace",
+ "worktree",
+]
+
+[[package]]
 name = "zenith_folds"
 version = "0.1.0"
 dependencies = [
@@ -22934,6 +22957,30 @@ dependencies = [
  "serde_json",
  "tree-sitter-typescript",
  "util",
+ "workspace",
+]
+
+[[package]]
+name = "zenith_http"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "collections",
+ "futures 0.3.34",
+ "gpui",
+ "http 1.3.1",
+ "http_client",
+ "icons",
+ "log",
+ "pretty_assertions",
+ "schemars 1.0.4",
+ "serde",
+ "serde_json",
+ "settings",
+ "tempfile",
+ "ui",
+ "util",
+ "uuid",
  "workspace",
 ]
 
@@ -22963,6 +23010,25 @@ dependencies = [
  "workspace",
  "zed_actions",
  "zenith_php_tools",
+]
+
+[[package]]
+name = "zenith_laravel"
+version = "0.1.0"
+dependencies = [
+ "collections",
+ "gpui",
+ "icons",
+ "libc",
+ "pretty_assertions",
+ "schemars 1.0.4",
+ "serde",
+ "serde_json",
+ "settings",
+ "tempfile",
+ "ui",
+ "util",
+ "workspace",
 ]
 
 [[package]]
@@ -23043,6 +23109,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "zenith_nextjs"
+version = "0.1.0"
+dependencies = [
+ "collections",
+ "gpui",
+ "icons",
+ "libc",
+ "pretty_assertions",
+ "schemars 1.0.4",
+ "serde",
+ "serde_json",
+ "settings",
+ "tempfile",
+ "ui",
+ "util",
+ "workspace",
+]
+
+[[package]]
 name = "zenith_php_tools"
 version = "0.1.0"
 dependencies = [
@@ -23057,6 +23142,24 @@ dependencies = [
  "tempfile",
  "theme",
  "theme_settings",
+ "ui",
+ "util",
+ "workspace",
+]
+
+[[package]]
+name = "zenith_postfix"
+version = "0.1.0"
+dependencies = [
+ "collections",
+ "gpui",
+ "icons",
+ "log",
+ "pretty_assertions",
+ "schemars 1.0.4",
+ "serde",
+ "serde_json",
+ "settings",
  "ui",
  "util",
  "workspace",
@@ -23093,6 +23196,32 @@ dependencies = [
  "theme",
  "theme_settings",
  "ui",
+ "workspace",
+]
+
+[[package]]
+name = "zenith_refactor"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "collections",
+ "fs",
+ "gpui",
+ "icons",
+ "log",
+ "menu",
+ "pretty_assertions",
+ "project",
+ "regex",
+ "schemars 1.0.4",
+ "serde",
+ "serde_json",
+ "settings",
+ "tempfile",
+ "theme",
+ "theme_settings",
+ "ui",
+ "util",
  "workspace",
 ]
 
@@ -23247,6 +23376,24 @@ dependencies = [
  "util",
  "workspace",
  "zed_actions",
+]
+
+[[package]]
+name = "zenith_wordpress"
+version = "0.1.0"
+dependencies = [
+ "collections",
+ "gpui",
+ "icons",
+ "pretty_assertions",
+ "project",
+ "schemars 1.0.4",
+ "serde",
+ "serde_json",
+ "settings",
+ "ui",
+ "util",
+ "workspace",
 ]
 
 [[package]]

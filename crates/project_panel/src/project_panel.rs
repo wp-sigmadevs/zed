@@ -1,6 +1,7 @@
 pub mod project_panel_settings;
 mod undo;
 mod utils;
+mod zenith_libraries;
 
 use anyhow::{Context as _, Result};
 use client::{ErrorCode, ErrorExt};
@@ -1357,6 +1358,7 @@ impl ProjectPanel {
                     }
                 })
             });
+            let context_menu = self.zenith_menu(worktree_id, entry_id, context_menu, window, cx);
 
             let (position, anchor) = match placement {
                 ContextMenuPlacement::AtMouse(mouse_position) => (mouse_position, None),
@@ -1529,6 +1531,7 @@ impl ProjectPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.zenith_section(None, Some(true), window, cx);
         if let Some((worktree, entry)) = self.selected_entry(cx) {
             if let Some(folded_ancestors) = self.state.ancestors.get_mut(&entry.id)
                 && folded_ancestors.current_ancestor_depth > 0
@@ -1570,6 +1573,7 @@ impl ProjectPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.zenith_section(None, Some(false), window, cx);
         let Some((worktree, entry)) = self.selected_entry_handle(cx) else {
             return;
         };
@@ -1813,6 +1817,7 @@ impl ProjectPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.zenith_section(Some(entry_id), None, window, cx);
         if let Some(worktree_id) = self.project.read(cx).worktree_id_for_entry(entry_id, cx)
             && let Some(expanded_dir_ids) = self.state.expanded_dir_ids.get_mut(&worktree_id)
         {
@@ -2096,6 +2101,7 @@ impl ProjectPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.zenith_section(None, None, window, cx);
         if let Some((_, entry)) = self.selected_entry(cx) {
             if entry.is_file() {
                 if split_direction.is_some() {
@@ -4927,6 +4933,7 @@ impl ProjectPanel {
                 .await;
             this.update_in(cx, |this, window, cx| {
                 this.state = new_state;
+                this.zenith_libraries(cx);
                 if let Some((worktree_id, entry_id)) = new_selected_entry {
                     this.selection = Some(SelectedEntry {
                         worktree_id,
@@ -7214,6 +7221,9 @@ impl ProjectPanel {
         } else {
             entry_file_name(entry, root_name).to_string()
         };
+
+        let (filename, icon, chevron, depth) =
+            self.zenith_decorate(entry, worktree_id, (filename, icon, chevron, depth), cx);
 
         let selection = SelectedEntry {
             worktree_id,
