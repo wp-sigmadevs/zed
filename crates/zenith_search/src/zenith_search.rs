@@ -35,7 +35,9 @@ use std::{
 };
 mod find_in_files;
 mod popup;
+mod style;
 use popup::{Frame, PopupKind};
+use style::{POPUP_BAND, POPUP_FOOTER};
 use text::Point;
 use ui::{HighlightedLabel, ListItem, ListItemSpacing, TintColor, prelude::*};
 use util::{
@@ -73,6 +75,13 @@ actions!(
         FindInFiles,
         /// PhpStorm's Replace in Files popup (⌘⇧R).
         ReplaceInFiles,
+        /// Pins the Find in Files popup: it stays open when focus leaves it.
+        TogglePinFindPopup,
+        /// Moves Find in Files to the next scope tab: In Project, Module, Directory, Scope.
+        CycleFindScope,
+        /// Moves Find in Files to the next search context: Anywhere, In Comments,
+        /// In String Literals and the "Except" ones.
+        CycleFindContext,
         /// Moves to the next Search Everywhere tab.
         NextTab,
         /// Moves to the previous Search Everywhere tab.
@@ -244,10 +253,6 @@ fn tool_window_color(name: &str) -> Color {
 
 /// Recent Files' left column of tool windows, in rems.
 const TOOL_WINDOWS_WIDTH: f32 = 12.;
-
-/// PhpStorm's popup palette: a lighter title band and footer over the list.
-const POPUP_BAND: u32 = 0x393b40;
-const POPUP_FOOTER: u32 = 0x303236;
 
 fn tool_windows(workspace: &Workspace, window: &Window, cx: &App) -> Vec<ToolWindow> {
     [
@@ -3055,6 +3060,186 @@ mod tests {
         modal.update_in(cx, |m, window, cx| m.set_mask("*.php", window, cx));
         cx.run_until_parked();
         assert_eq!(modal.read_with(cx, |m, _| m.hit_labels()), ["a.php:1"]);
+    }
+
+    #[gpui::test]
+    async fn test_find_in_files_funnel_filters_hits_by_context(cx: &mut TestAppContext) {
+        use find_in_files::SearchContext::*;
+        let (_, modal, cx) = open_find_in_files(
+            serde_json::json!({
+                "a.php": "$code = needle();\n// needle in a comment\necho \"needle in a string\";\nneedle(); // needle\n",
+            }),
+            cx,
+        )
+        .await;
+        modal.update_in(cx, |m, window, cx| m.set_query("needle", window, cx));
+        cx.run_until_parked();
+        let rows = |cx: &mut VisualTestContext| modal.read_with(cx, |m, _| m.hit_labels());
+        let summary = |cx: &mut VisualTestContext| modal.read_with(cx, |m, cx| m.summary_text(cx));
+        assert_eq!(rows(cx), ["a.php:1", "a.php:2", "a.php:3", "a.php:4"]);
+        for (context, expected, matches) in [
+            (
+                InComments,
+                vec!["a.php:2", "a.php:4"],
+                "2 matches in 1 file",
+            ),
+            (InStringLiterals, vec!["a.php:3"], "1 match in 1 file"),
+            (
+                ExceptComments,
+                vec!["a.php:1", "a.php:3", "a.php:4"],
+                "3 matches in 1 file",
+            ),
+            (
+                ExceptStringLiterals,
+                vec!["a.php:1", "a.php:2", "a.php:4"],
+                "4 matches in 1 file",
+            ),
+            (
+                ExceptCommentsAndStringLiterals,
+                vec!["a.php:1", "a.php:4"],
+                "2 matches in 1 file",
+            ),
+            (
+                Anywhere,
+                vec!["a.php:1", "a.php:2", "a.php:3", "a.php:4"],
+                "5 matches in 1 file",
+            ),
+        ] {
+            modal.update_in(cx, |m, window, cx| m.pick_context(context, window, cx));
+            cx.run_until_parked();
+            assert_eq!(rows(cx), expected, "{context:?}");
+            assert_eq!(summary(cx), matches, "{context:?}");
+        }
+        // The keyboard path walks the same menu: Anywhere, then In Comments.
+        cx.dispatch_action(CycleFindContext);
+        cx.run_until_parked();
+        assert_eq!(modal.read_with(cx, |m, _| m.context()), InComments);
+        assert_eq!(rows(cx), ["a.php:2", "a.php:4"]);
+        // The funnel and the pin are on screen.
+        assert!(cx.debug_bounds("zenith-popup-header").is_some());
+    }
+
+    #[gpui::test]
+    async fn test_find_in_files_pin_keeps_the_popup_open_when_focus_leaves(
+        cx: &mut TestAppContext,
+    ) {
+        let (workspace, modal, cx) =
+            open_find_in_files(serde_json::json!({ "a.php": "needle\n" }), cx).await;
+        let is_open = |cx: &mut VisualTestContext| {
+            workspace.read_with(cx, |w, cx| {
+                w.active_modal::<find_in_files::FindInFilesModal>(cx)
+                    .is_some()
+            })
+        };
+        let none = gpui::Modifiers::none();
+        let outside = gpui::point(px(4.), px(4.));
+        assert!(!modal.read_with(cx, |m, _| m.is_pinned()));
+        // Pinned: a click outside and moving focus away leave it open.
+        cx.dispatch_action(TogglePinFindPopup);
+        assert!(modal.read_with(cx, |m, _| m.is_pinned()));
+        cx.simulate_mouse_down(outside, gpui::MouseButton::Left, none);
+        cx.simulate_mouse_up(outside, gpui::MouseButton::Left, none);
+        cx.run_until_parked();
+        assert!(is_open(cx));
+        let editor_focus = workspace.read_with(cx, |w, cx| gpui::Focusable::focus_handle(w, cx));
+        cx.update(|window, cx| window.focus(&editor_focus, cx));
+        cx.run_until_parked();
+        assert!(is_open(cx));
+        // Esc still closes it.
+        cx.update(|window, cx| {
+            window.focus(&gpui::Focusable::focus_handle(modal.read(cx), cx), cx)
+        });
+        cx.dispatch_action(menu::Cancel);
+        cx.run_until_parked();
+        assert!(!is_open(cx));
+        // Not pinned: a click outside dismisses.
+        workspace.update_in(cx, |workspace, window, cx| {
+            find_in_files::FindInFilesModal::open(workspace, false, window, cx)
+        });
+        cx.run_until_parked();
+        assert!(is_open(cx));
+        cx.simulate_mouse_down(outside, gpui::MouseButton::Left, none);
+        cx.simulate_mouse_up(outside, gpui::MouseButton::Left, none);
+        cx.run_until_parked();
+        assert!(!is_open(cx));
+    }
+
+    #[gpui::test]
+    async fn test_find_in_files_scope_tabs_set_the_include_globs(cx: &mut TestAppContext) {
+        use find_in_files::Scope;
+        let app_state = init_test(cx);
+        for root in ["a", "b"] {
+            app_state
+                .fs
+                .as_fake()
+                .insert_tree(
+                    format!("/root/{root}"),
+                    serde_json::json!({ "x.php": "needle\n", "y.js": "needle\n" }),
+                )
+                .await;
+        }
+        let project = Project::test(
+            app_state.fs.clone(),
+            [path!("/root/a").as_ref(), path!("/root/b").as_ref()],
+            cx,
+        )
+        .await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        // The active file lives in the second worktree, and is the only open one.
+        workspace
+            .update_in(cx, |workspace, window, cx| {
+                workspace.open_abs_path(
+                    path!("/root/b/x.php").into(),
+                    workspace::OpenOptions::default(),
+                    window,
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+        workspace.update_in(cx, |workspace, window, cx| {
+            find_in_files::FindInFilesModal::open(workspace, false, window, cx)
+        });
+        cx.run_until_parked();
+        let modal = workspace.update(cx, |workspace, cx| {
+            workspace
+                .active_modal::<find_in_files::FindInFilesModal>(cx)
+                .expect("open")
+        });
+        modal.update_in(cx, |m, window, cx| m.set_query("needle", window, cx));
+        cx.run_until_parked();
+        let rows = |cx: &mut VisualTestContext| modal.read_with(cx, |m, _| m.hit_labels());
+        let globs = |cx: &mut VisualTestContext| modal.read_with(cx, |m, cx| m.globs(cx));
+        assert_eq!(rows(cx).len(), 4, "In Project: every file");
+        assert!(globs(cx).is_empty());
+        // Module: the active file's worktree, its name in the globs.
+        modal.update_in(cx, |m, window, cx| m.pick_scope(Scope::Module, window, cx));
+        cx.run_until_parked();
+        assert_eq!(globs(cx), ["b"]);
+        assert_eq!(rows(cx), ["x.php:1", "y.js:1"]);
+        modal.update_in(cx, |m, window, cx| m.set_mask("*.php", window, cx));
+        cx.run_until_parked();
+        assert_eq!(globs(cx), ["b/**/*.php"]);
+        assert_eq!(rows(cx), ["x.php:1"]);
+        modal.update_in(cx, |m, window, cx| m.set_mask("", window, cx));
+        // Directory: the existing field.
+        modal.update_in(cx, |m, window, cx| m.set_directory("a", window, cx));
+        cx.run_until_parked();
+        assert_eq!(globs(cx), ["a"]);
+        // Scope (Open Files): only the tabs that were open.
+        modal.update_in(cx, |m, window, cx| {
+            m.pick_scope(Scope::OpenFiles, window, cx)
+        });
+        cx.run_until_parked();
+        assert!(globs(cx).is_empty());
+        assert_eq!(rows(cx), ["x.php:1"]);
+        // The keyboard path cycles Scope back to In Project.
+        cx.dispatch_action(CycleFindScope);
+        cx.run_until_parked();
+        assert_eq!(modal.read_with(cx, |m, _| m.scope()), Scope::Project);
+        assert_eq!(rows(cx).len(), 4);
     }
 
     #[gpui::test]

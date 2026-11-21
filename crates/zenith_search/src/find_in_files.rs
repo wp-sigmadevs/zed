@@ -13,9 +13,9 @@ use std::{
 use editor::{Editor, EditorEvent, SelectionEffects, scroll::Autoscroll};
 use gpui::{
     App, ClickEvent, Context, DismissEvent, Div, Entity, EventEmitter, FocusHandle, Focusable,
-    HighlightStyle, IntoElement, ParentElement, Render, ScrollStrategy, SharedString, Styled,
+    HighlightStyle, IntoElement, ParentElement, Render, Role, ScrollStrategy, SharedString, Styled,
     StyledText, Subscription, Task, UniformListScrollHandle, WeakEntity, Window, div, prelude::*,
-    px, rems, uniform_list,
+    px, uniform_list,
 };
 use picker::{MatchLocation, PreviewBackend, PreviewLayout, PreviewUpdate};
 use project::{
@@ -25,30 +25,120 @@ use project::{
 use settings::SeedQuerySetting;
 use text::{Point, ToOffset as _, ToPoint as _};
 use ui::{
-    Button, ButtonSize, ButtonStyle, Checkbox, IconButton, Label, ScrollAxes, Scrollbars,
-    TintColor, Tooltip, WithScrollbar, prelude::*,
+    Button, ButtonSize, ButtonStyle, Checkbox, ContextMenu, IconButton, IconPosition, Label,
+    PopoverMenu, ScrollAxes, Scrollbars, TintColor, Tooltip, WithScrollbar, prelude::*,
 };
 use util::paths::PathMatcher;
-use workspace::{ModalView, Workspace, pane::DeploySearch, searchable::SearchableItem};
+use workspace::{
+    DismissDecision, ModalView, Workspace, pane::DeploySearch, searchable::SearchableItem,
+};
 
 use super::{
-    POPUP_BAND, POPUP_FOOTER,
+    CycleFindContext, CycleFindScope, TogglePinFindPopup,
     popup::{Frame, PopupKind},
+    style::{
+        FIELD_HEIGHT, FOOTER_HEIGHT, HEADER_GAP, HEADER_HEIGHT, MASK_WIDTH, PADDING, POPUP_BAND,
+        POPUP_FOOTER, PREVIEW_HEIGHT, ROW_HEIGHT, SEARCH_BOX_HEIGHT, VISIBLE_ROWS,
+    },
 };
 
 /// More hits than this say "refine the query", not "scroll".
 const MAX_HITS: usize = 300;
-const ROW_HEIGHT: f32 = 26.;
-/// The list shows this many rows; more scroll.
-const VISIBLE_ROWS: f32 = 7.;
-/// About nine lines of the preview's code.
-const PREVIEW_HEIGHT: f32 = 210.;
 
-/// Where the search looks.
+/// Where the search looks: PhpStorm's In Project | Module | Directory | Scope tabs.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Scope {
     Project,
+    /// The worktree of the file that was active when the popup opened.
+    Module,
     Directory,
+    /// PhpStorm's named scopes; "Open Files" is the one this popup offers.
+    OpenFiles,
+}
+
+impl Scope {
+    const ALL: [Self; 4] = [
+        Self::Project,
+        Self::Module,
+        Self::Directory,
+        Self::OpenFiles,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Project => "In Project",
+            Self::Module => "Module",
+            Self::Directory => "Directory",
+            Self::OpenFiles => "Scope",
+        }
+    }
+
+    fn id(self) -> &'static str {
+        match self {
+            Self::Project => "zenith-find-in-project",
+            Self::Module => "zenith-find-in-module",
+            Self::Directory => "zenith-find-in-directory",
+            Self::OpenFiles => "zenith-find-in-scope",
+        }
+    }
+}
+
+/// What a match sits in, by the line heuristic of [`span_at`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Span {
+    Code,
+    Comment,
+    String,
+}
+
+/// Which matches count, from PhpStorm's funnel menu.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub(crate) enum SearchContext {
+    #[default]
+    Anywhere,
+    InComments,
+    InStringLiterals,
+    ExceptComments,
+    ExceptStringLiterals,
+    ExceptCommentsAndStringLiterals,
+}
+
+impl SearchContext {
+    const ALL: [Self; 6] = [
+        Self::Anywhere,
+        Self::InComments,
+        Self::InStringLiterals,
+        Self::ExceptComments,
+        Self::ExceptStringLiterals,
+        Self::ExceptCommentsAndStringLiterals,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Anywhere => "Anywhere",
+            Self::InComments => "In Comments",
+            Self::InStringLiterals => "In String Literals",
+            Self::ExceptComments => "Except Comments",
+            Self::ExceptStringLiterals => "Except String Literals",
+            Self::ExceptCommentsAndStringLiterals => "Except Comments and String Literals",
+        }
+    }
+
+    fn allows(self, span: Span) -> bool {
+        match self {
+            Self::Anywhere => true,
+            Self::InComments => span == Span::Comment,
+            Self::InStringLiterals => span == Span::String,
+            Self::ExceptComments => span != Span::Comment,
+            Self::ExceptStringLiterals => span != Span::String,
+            Self::ExceptCommentsAndStringLiterals => span == Span::Code,
+        }
+    }
+
+    fn next(self) -> Self {
+        let ix = Self::ALL.iter().position(|c| *c == self).unwrap_or(0);
+        Self::ALL[(ix + 1) % Self::ALL.len()]
+    }
 }
 
 pub struct FindInFilesModal {
@@ -72,6 +162,17 @@ pub struct FindInFilesModal {
     /// The file mask only narrows the search while its box is ticked.
     mask_enabled: bool,
     scope: Scope,
+    /// The funnel: which kinds of match are listed.
+    context: SearchContext,
+    /// Pinned, the popup stays open when focus leaves it or the pointer clicks outside.
+    pinned: bool,
+    /// Set when the popup is closed on purpose (Esc, opening a hit), which pinning
+    /// does not hold back.
+    closing: bool,
+    /// The worktree the Module tab searches: that of the file active at open.
+    module_root: Option<String>,
+    /// The tabs open at that moment: what the Scope tab searches.
+    open_buffers: Vec<Entity<language::Buffer>>,
     /// Enter sends the results to a project search tab instead of opening one hit.
     open_in_tab: bool,
     search: Task<()>,
@@ -82,7 +183,11 @@ pub struct FindInFilesModal {
     _subscriptions: Vec<Subscription>,
 }
 
-impl ModalView for FindInFilesModal {}
+impl ModalView for FindInFilesModal {
+    fn on_before_dismiss(&mut self, _: &mut Window, _: &mut Context<Self>) -> DismissDecision {
+        DismissDecision::Dismiss(!self.pinned || self.closing)
+    }
+}
 impl EventEmitter<DismissEvent> for FindInFilesModal {}
 
 impl Focusable for FindInFilesModal {
@@ -103,6 +208,15 @@ impl FindInFilesModal {
             .unwrap_or_else(|| workspace.focus_handle(cx));
         let workspace_handle = cx.entity().downgrade();
         let project = workspace.project().clone();
+        // Opening again closes it, as for every modal, pinned or not.
+        if let Some(open) = workspace.active_modal::<Self>(cx) {
+            open.update(cx, |open, _| open.closing = true);
+        }
+        let module_root = module_root(workspace, cx);
+        let open_buffers: Vec<_> = workspace
+            .items_of_type::<Editor>(cx)
+            .filter_map(|editor| editor.read(cx).buffer().read(cx).as_singleton())
+            .collect();
         // The selection, else the word at the caret, like PhpStorm's Find in Files.
         let seed = workspace
             .active_item_as::<Editor>(cx)
@@ -119,7 +233,7 @@ impl FindInFilesModal {
             .filter(|text| !text.contains('\n'))
             .unwrap_or_default();
         workspace.toggle_modal(window, cx, move |window, cx| {
-            Self::new(
+            let mut modal = Self::new(
                 workspace_handle,
                 project,
                 replace,
@@ -127,7 +241,10 @@ impl FindInFilesModal {
                 seed,
                 window,
                 cx,
-            )
+            );
+            modal.module_root = module_root;
+            modal.open_buffers = open_buffers;
+            modal
         });
     }
 
@@ -195,6 +312,11 @@ impl FindInFilesModal {
             regex: false,
             mask_enabled: false,
             scope: Scope::Project,
+            context: SearchContext::default(),
+            pinned: false,
+            closing: false,
+            module_root: None,
+            open_buffers: Vec::new(),
             open_in_tab: false,
             search: Task::ready(()),
             frame: Frame::default(),
@@ -204,8 +326,16 @@ impl FindInFilesModal {
         }
     }
 
-    /// The include globs: the mask when it is ticked, inside the directory when that
-    /// scope is picked.
+    /// The Module tab's worktree name, when it has to be in the globs: with one
+    /// worktree the module is the whole project.
+    fn module_prefix(&self, cx: &App) -> Option<&str> {
+        let root = self.module_root.as_deref()?;
+        (self.scope == Scope::Module && self.project.read(cx).visible_worktrees(cx).count() > 1)
+            .then_some(root)
+    }
+
+    /// The include globs: the mask when it is ticked, inside the directory or
+    /// module when that scope is picked.
     fn include_globs(&self, cx: &App) -> Vec<String> {
         let mask = if self.mask_enabled {
             self.mask.read(cx).text(cx)
@@ -221,9 +351,22 @@ impl FindInFilesModal {
                 .collect();
             relative_directory(&self.directory.read(cx).text(cx), &roots)
         } else {
-            String::new()
+            // ponytail: the name goes in as a glob, so a worktree named with glob
+            // characters ([ ] { } * ?) matches nothing; escape it if that shows up.
+            self.module_prefix(cx).unwrap_or_default().to_string()
         };
         include_globs(&mask, &directory)
+    }
+
+    /// With several worktrees the Module tab matches globs against paths that start
+    /// with the worktree's name, as the project search tab does.
+    fn match_full_paths(&self, cx: &App) -> bool {
+        self.module_prefix(cx).is_some()
+    }
+
+    /// The Scope tab searches the tabs that were open, nothing else.
+    fn scope_buffers(&self) -> Option<Vec<Entity<language::Buffer>>> {
+        (self.scope == Scope::OpenFiles).then(|| self.open_buffers.clone())
     }
 
     /// Searches again with the current query, options and scope.
@@ -231,6 +374,9 @@ impl FindInFilesModal {
         let query = self.query.read(cx).text(cx);
         let path_style = self.project.read(cx).path_style(cx);
         let globs = self.include_globs(cx);
+        let full_paths = self.match_full_paths(cx);
+        let buffers = self.scope_buffers();
+        let context = self.context;
         // The hits of the previous query stay until the new ones arrive.
         self.search = Task::ready(());
         let built = (!query.trim().is_empty())
@@ -246,8 +392,8 @@ impl FindInFilesModal {
                         false,
                         include,
                         PathMatcher::default(),
-                        false,
-                        None,
+                        full_paths,
+                        buffers,
                     )
                 } else {
                     SearchQuery::text(
@@ -257,8 +403,8 @@ impl FindInFilesModal {
                         false,
                         include,
                         PathMatcher::default(),
-                        false,
-                        None,
+                        full_paths,
+                        buffers,
                     )
                 }
                 // An unfinished regex is not an error worth showing while typing.
@@ -279,7 +425,7 @@ impl FindInFilesModal {
                 let SearchResult::Buffer { buffer, ranges } = result else {
                     continue;
                 };
-                let found = cx.update(|_, cx| Hit::from_buffer(&buffer, &ranges, cx));
+                let found = cx.update(|_, cx| Hit::from_buffer(&buffer, &ranges, context, cx));
                 let Ok(found) = found else { return };
                 hits.extend(found);
                 if hits.len() >= MAX_HITS {
@@ -380,7 +526,43 @@ impl FindInFilesModal {
     }
 
     fn cancel(&mut self, _: &menu::Cancel, _: &mut Window, cx: &mut Context<Self>) {
+        self.close(cx);
+    }
+
+    /// Closes the popup even when it is pinned.
+    fn close(&mut self, cx: &mut Context<Self>) {
+        self.closing = true;
         cx.emit(DismissEvent);
+    }
+
+    fn toggle_pin(&mut self, _: &TogglePinFindPopup, _: &mut Window, cx: &mut Context<Self>) {
+        self.pinned = !self.pinned;
+        cx.notify();
+    }
+
+    fn cycle_scope(&mut self, _: &CycleFindScope, window: &mut Window, cx: &mut Context<Self>) {
+        let usable = |scope: &Scope| *scope != Scope::Module || self.module_root.is_some();
+        let tabs: Vec<Scope> = Scope::ALL.into_iter().filter(usable).collect();
+        let ix = tabs
+            .iter()
+            .position(|scope| *scope == self.scope)
+            .unwrap_or(0);
+        self.set_scope(tabs[(ix + 1) % tabs.len()], window, cx);
+    }
+
+    fn set_scope(&mut self, scope: Scope, window: &mut Window, cx: &mut Context<Self>) {
+        self.toggle(window, cx, |this| this.scope = scope);
+        if scope == Scope::Directory {
+            window.focus(&self.directory.read(cx).focus_handle(cx), cx);
+        }
+    }
+
+    fn cycle_context(&mut self, _: &CycleFindContext, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_context(self.context.next(), window, cx);
+    }
+
+    fn set_context(&mut self, context: SearchContext, window: &mut Window, cx: &mut Context<Self>) {
+        self.toggle(window, cx, |this| this.context = context);
     }
 
     fn secondary_confirm(
@@ -421,6 +603,7 @@ impl FindInFilesModal {
             return;
         };
         let workspace = self.workspace.clone();
+        self.closing = true;
         cx.spawn_in(window, async move |_, cx| {
             let open = workspace.update_in(cx, |workspace, window, cx| {
                 workspace.open_path(hit.project_path.clone(), None, true, window, cx)
@@ -466,7 +649,7 @@ impl FindInFilesModal {
             ..Default::default()
         };
         let focus = self.previous_focus.clone();
-        cx.emit(DismissEvent);
+        self.close(cx);
         window.focus(&focus, cx);
         window.dispatch_action(Box::new(action), cx);
     }
@@ -537,6 +720,41 @@ impl FindInFilesModal {
     }
 
     #[cfg(test)]
+    pub(crate) fn pick_scope(&mut self, scope: Scope, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_scope(scope, window, cx);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pick_context(
+        &mut self,
+        context: SearchContext,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_context(context, window, cx);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn scope(&self) -> Scope {
+        self.scope
+    }
+
+    #[cfg(test)]
+    pub(crate) fn context(&self) -> SearchContext {
+        self.context
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_pinned(&self) -> bool {
+        self.pinned
+    }
+
+    #[cfg(test)]
+    pub(crate) fn globs(&self, cx: &App) -> Vec<String> {
+        self.include_globs(cx)
+    }
+
+    #[cfg(test)]
     pub(crate) fn match_count(&self) -> usize {
         self.hits.len()
     }
@@ -571,7 +789,7 @@ impl FindInFilesModal {
         let colors = cx.theme().colors();
         let focused = editor.read(cx).focus_handle(cx).is_focused(window);
         h_flex()
-            .h(px(30.))
+            .h(FIELD_HEIGHT)
             .px_2()
             .gap_1p5()
             .rounded_md()
@@ -591,16 +809,22 @@ impl FindInFilesModal {
             "Find in Files"
         };
         let summary = self.summary(cx);
+        let pinned = self.pinned;
+        let pin_label = if pinned {
+            "Unpin (the popup closes when focus leaves it)"
+        } else {
+            "Pin (keep the popup open when focus leaves it)"
+        };
         let header = h_flex()
             .debug_selector(|| "zenith-popup-header".into())
-            .h_11()
-            .px_4()
-            .gap_3()
+            .h(HEADER_HEIGHT)
+            .px(PADDING)
+            .gap(HEADER_GAP)
             .justify_between()
             .bg(gpui::rgb(POPUP_BAND))
             .child(
                 h_flex()
-                    .gap_3()
+                    .gap(HEADER_GAP)
                     .child(Label::new(title).weight(gpui::FontWeight::SEMIBOLD))
                     .child(
                         Label::new(summary)
@@ -624,14 +848,73 @@ impl FindInFilesModal {
                     )
                     .child(
                         self.field(&self.mask, window, cx)
-                            .w(rems(10.))
+                            .w(MASK_WIDTH)
                             .child(div().flex_1().child(self.mask.clone())),
+                    )
+                    .child(self.render_context_menu(cx))
+                    .child(
+                        IconButton::new(
+                            "zenith-find-pin",
+                            if pinned {
+                                IconName::Pin
+                            } else {
+                                IconName::Unpin
+                            },
+                        )
+                        .icon_size(IconSize::Small)
+                        .toggle_state(pinned)
+                        .selected_style(ButtonStyle::Tinted(TintColor::Accent))
+                        .tooltip(Tooltip::text(pin_label))
+                        .aria_label(pin_label)
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.toggle_pin(&TogglePinFindPopup, window, cx)
+                        })),
                     ),
             );
         header
     }
 
-    fn render_search_box(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+    /// The funnel: which kinds of match to list, as PhpStorm's menu.
+    fn render_context_menu(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let modal = cx.entity().downgrade();
+        let current = self.context;
+        let label = format!("Search context: {}", current.label());
+        PopoverMenu::new("zenith-find-context-menu")
+            .trigger(
+                IconButton::new("zenith-find-context", IconName::Filter)
+                    .icon_size(IconSize::Small)
+                    .toggle_state(current != SearchContext::Anywhere)
+                    .selected_style(ButtonStyle::Tinted(TintColor::Accent))
+                    .tooltip(Tooltip::text(label.clone()))
+                    .aria_label(label),
+            )
+            .menu(move |window, cx| {
+                let modal = modal.clone();
+                Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                    for context in SearchContext::ALL {
+                        let modal = modal.clone();
+                        menu = menu.toggleable_entry(
+                            context.label(),
+                            context == current,
+                            IconPosition::Start,
+                            None,
+                            move |window, cx| {
+                                modal
+                                    .update(cx, |modal, cx| modal.set_context(context, window, cx))
+                                    .ok();
+                            },
+                        );
+                    }
+                    menu
+                }))
+            })
+    }
+
+    fn render_search_box(
+        &self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
         let chip = |id: &'static str, label: &'static str, tip: &'static str, on: bool| {
             Button::new(id, label)
                 .size(ButtonSize::Compact)
@@ -647,7 +930,7 @@ impl FindInFilesModal {
             .child(
                 self.field(&self.query, window, cx)
                     .debug_selector(|| "zenith-find-query".into())
-                    .h(px(36.))
+                    .h(SEARCH_BOX_HEIGHT)
                     .child(
                         Icon::new(IconName::MagnifyingGlass)
                             .size(IconSize::Small)
@@ -692,42 +975,43 @@ impl FindInFilesModal {
             )
             .children(self.replace.as_ref().map(|replace| {
                 self.field(replace, window, cx)
-                    .h(px(36.))
+                    .h(SEARCH_BOX_HEIGHT)
                     .child(div().flex_1().child(replace.clone()))
             }))
     }
 
     fn render_scope(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement + use<> {
-        let segment = |id: &'static str, label: &'static str, scope: Scope| {
-            Button::new(id, label)
+        let tab = |scope: Scope| {
+            Button::new(scope.id(), scope.label())
                 .label_size(LabelSize::Small)
                 .style(ButtonStyle::Subtle)
                 .toggle_state(self.scope == scope)
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    this.toggle(window, cx, |this| this.scope = scope);
-                    if scope == Scope::Directory {
-                        window.focus(&this.directory.read(cx).focus_handle(cx), cx);
-                    }
-                }))
+                .disabled(scope == Scope::Module && self.module_root.is_none())
+                .aria_role(Role::Tab)
+                .aria_label(scope.label())
+                .on_click(cx.listener(move |this, _, window, cx| this.set_scope(scope, window, cx)))
         };
         h_flex()
             .gap_2()
-            .child(segment(
-                "zenith-find-in-project",
-                "In Project",
-                Scope::Project,
-            ))
-            .child(segment(
-                "zenith-find-in-directory",
-                "Directory",
-                Scope::Directory,
-            ))
+            .children(Scope::ALL.map(tab))
             .when(self.scope == Scope::Directory, |this| {
                 this.child(
                     self.field(&self.directory, window, cx)
                         .debug_selector(|| "zenith-find-directory".into())
                         .flex_1()
                         .child(div().flex_1().child(self.directory.clone())),
+                )
+            })
+            .when(self.scope == Scope::OpenFiles, |this| {
+                this.child(
+                    h_flex()
+                        .debug_selector(|| "zenith-find-scope-name".into())
+                        .h(FIELD_HEIGHT)
+                        .px_2()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(cx.theme().colors().border)
+                        .child(Label::new("Open Files").size(LabelSize::Small)),
                 )
             })
     }
@@ -857,8 +1141,8 @@ impl FindInFilesModal {
     fn render_footer(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         h_flex()
             .debug_selector(|| "zenith-popup-footer".into())
-            .h_12()
-            .px_4()
+            .h(FOOTER_HEIGHT)
+            .px(PADDING)
             .gap_2()
             .justify_between()
             .bg(gpui::rgb(POPUP_FOOTER))
@@ -932,7 +1216,10 @@ impl Render for FindInFilesModal {
             .on_action(cx.listener(Self::confirm))
             .on_action(cx.listener(Self::secondary_confirm))
             .on_action(cx.listener(Self::cancel))
-            .on_action(cx.listener(Self::focus_next_field));
+            .on_action(cx.listener(Self::focus_next_field))
+            .on_action(cx.listener(Self::toggle_pin))
+            .on_action(cx.listener(Self::cycle_scope))
+            .on_action(cx.listener(Self::cycle_context));
         self.frame.render(
             PopupKind::Find,
             root,
@@ -965,6 +1252,7 @@ impl Hit {
     fn from_buffer(
         buffer: &Entity<language::Buffer>,
         ranges: &[Range<text::Anchor>],
+        context: SearchContext,
         cx: &App,
     ) -> Vec<Hit> {
         let buffer_entity = buffer;
@@ -1005,6 +1293,11 @@ impl Hit {
             };
             let matched = (start.column as usize).saturating_sub(lead)
                 ..(column_end as usize).saturating_sub(lead).max(1);
+            if context != SearchContext::Anywhere
+                && !context.allows(span_at(&text[lead..], matched.start))
+            {
+                continue;
+            }
             // Several matches on one line make one row.
             if let Some(last) = hits.last_mut()
                 && last.point.row == start.row
@@ -1081,6 +1374,61 @@ fn relative_directory(input: &str, roots: &[PathBuf]) -> String {
         .to_string()
 }
 
+/// The name of the worktree the Module tab searches: that of the active file, else
+/// the first one.
+fn module_root(workspace: &Workspace, cx: &App) -> Option<String> {
+    let project = workspace.project().read(cx);
+    let worktree = workspace
+        .active_item(cx)
+        .and_then(|item| item.project_path(cx))
+        .and_then(|path| project.worktree_for_id(path.worktree_id, cx))
+        .or_else(|| project.visible_worktrees(cx).next())?;
+    Some(worktree.read(cx).root_name_str().to_string())
+}
+
+/// What the byte `at` of `line` sits in: a line comment, a block comment or a
+/// quoted string, found by scanning the line from its start.
+// ponytail: one line at a time, `//`, `/* */` and quotes only, so a string or block
+// comment opened on an earlier line reads as code and a lone apostrophe opens a
+// string. Real spans need the syntax tree.
+fn span_at(line: &str, at: usize) -> Span {
+    if is_comment_line(line) {
+        return Span::Comment;
+    }
+    let mut quote: Option<char> = None;
+    let mut skip_to = 0;
+    let mut chars = line.char_indices().peekable();
+    while let Some((ix, c)) = chars.next() {
+        if ix > at {
+            break;
+        }
+        if ix < skip_to {
+            continue;
+        }
+        match quote {
+            Some(_) if c == '\\' => {
+                chars.next();
+            }
+            Some(open) if c == open => quote = None,
+            Some(_) => {}
+            None => match (c, chars.peek().map(|&(_, next)| next)) {
+                ('"' | '\'' | '`', _) => quote = Some(c),
+                ('/', Some('/')) => return Span::Comment,
+                ('/', Some('*')) => match line[ix + 2..].find("*/") {
+                    Some(end) if ix + 2 + end + 2 <= at => skip_to = ix + 2 + end + 2,
+                    _ => return Span::Comment,
+                },
+                _ => {}
+            },
+        }
+    }
+    if quote.is_some() {
+        Span::String
+    } else {
+        Span::Code
+    }
+}
+
 /// Whether the line looks like a comment, which the list dims.
 // ponytail: language-agnostic prefixes only; real comment spans would need the syntax tree.
 fn is_comment_line(line: &str) -> bool {
@@ -1143,6 +1491,50 @@ mod tests {
         assert!(is_comment_line("/** Docs */"));
         assert!(!is_comment_line("public $services = [];"));
         assert!(!is_comment_line("*ptr = 1;"));
+    }
+
+    #[test]
+    fn test_span_at_tells_code_comments_and_strings_apart() {
+        let line = r#"echo "a // b"; $x = 'it\'s'; /* c */ run(); // tail"#;
+        let at = |needle: &str| span_at(line, line.find(needle).unwrap());
+        assert_eq!(at("echo"), Span::Code);
+        // A `//` inside quotes is text, not a comment.
+        assert_eq!(at("a //"), Span::String);
+        assert_eq!(at("b\""), Span::String);
+        assert_eq!(at("s'"), Span::String, "an escaped quote stays inside");
+        assert_eq!(at(" c "), Span::Comment);
+        assert_eq!(at("run"), Span::Code, "after a closed block comment");
+        assert_eq!(at("tail"), Span::Comment);
+        assert_eq!(span_at("* @param $services", 3), Span::Comment);
+        assert_eq!(span_at("", 0), Span::Code);
+    }
+
+    #[test]
+    fn test_search_context_admits_the_right_spans() {
+        use Span::{Code, Comment, String};
+        let admitted =
+            |context: SearchContext| [Code, Comment, String].map(|span| context.allows(span));
+        assert_eq!(admitted(SearchContext::Anywhere), [true, true, true]);
+        assert_eq!(admitted(SearchContext::InComments), [false, true, false]);
+        assert_eq!(
+            admitted(SearchContext::InStringLiterals),
+            [false, false, true]
+        );
+        assert_eq!(admitted(SearchContext::ExceptComments), [true, false, true]);
+        assert_eq!(
+            admitted(SearchContext::ExceptStringLiterals),
+            [true, true, false]
+        );
+        assert_eq!(
+            admitted(SearchContext::ExceptCommentsAndStringLiterals),
+            [true, false, false]
+        );
+        // The cycle visits every context once and comes back.
+        let mut context = SearchContext::Anywhere;
+        for _ in SearchContext::ALL {
+            context = context.next();
+        }
+        assert_eq!(context, SearchContext::Anywhere);
     }
 
     #[test]
