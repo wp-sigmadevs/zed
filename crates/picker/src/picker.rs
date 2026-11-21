@@ -141,6 +141,9 @@ pub struct Picker<D: PickerDelegate> {
     show_scrollbar: bool,
     /// How the picker is presented, which controls its chrome and behavior.
     presentation: Presentation,
+    /// Zenith: the exact size an embedding popup gives its picker (see
+    /// [`Picker::set_embedded_size`]); `None` keeps the picker's own sizing.
+    embedded_size: Option<(Pixels, Option<Pixels>)>,
     /// Bounds tracking for the picker container (for aside positioning)
     picker_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     /// Bounds tracking for items (for aside positioning) - maps item index to bounds
@@ -639,6 +642,7 @@ impl<D: PickerDelegate> Picker<D> {
             presentation: Presentation::Modal {
                 resizable: has_preview,
             },
+            embedded_size: None,
             picker_bounds: Rc::new(Cell::new(None)),
             item_bounds: Rc::new(RefCell::new(HashMap::default())),
             size_bounds,
@@ -753,6 +757,15 @@ impl<D: PickerDelegate> Picker<D> {
     pub fn embedded(mut self) -> Self {
         self.presentation = Presentation::Embedded;
         self
+    }
+
+    /// Zenith: sizes an embedded picker to its container. The width replaces the
+    /// picker's own; a height makes the results fill it instead of shrinking to fit.
+    pub fn set_embedded_size(&mut self, width: Pixels, height: Option<Pixels>, cx: &mut Context<Self>) {
+        if self.embedded_size != Some((width, height)) {
+            self.embedded_size = Some((width, height));
+            cx.notify();
+        }
     }
 
     /// Presents the picker as a popover surface: it draws its own elevated

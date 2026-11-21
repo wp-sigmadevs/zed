@@ -34,6 +34,8 @@ use std::{
     time::Duration,
 };
 mod find_in_files;
+mod popup;
+use popup::{Frame, PopupKind};
 use text::Point;
 use ui::{HighlightedLabel, ListItem, ListItemSpacing, TintColor, prelude::*};
 use util::{
@@ -211,21 +213,8 @@ pub struct SearchEverywhere {
     tool_windows: Vec<ToolWindow>,
     /// Switcher: the modifiers held when it opened; releasing them opens the pick.
     init_modifiers: Option<gpui::Modifiers>,
-    /// How far the popup has been dragged from where the modal layer put it.
-    offset: gpui::Point<Pixels>,
-    /// Last pointer position of the drag in progress.
-    drag_last: Option<gpui::Point<Pixels>>,
-}
-
-/// Dragging the header moves the popup, as in PhpStorm.
-struct DragPopup;
-
-struct NoDragPreview;
-
-impl Render for NoDragPreview {
-    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        div()
-    }
+    /// The card: dragging the header moves it, the corner grip resizes it.
+    frame: Frame,
 }
 
 struct ToolWindow {
@@ -252,6 +241,9 @@ fn tool_window_color(name: &str) -> Color {
     };
     Color::Custom(gpui::rgb(hue).into())
 }
+
+/// Recent Files' left column of tool windows, in rems.
+const TOOL_WINDOWS_WIDTH: f32 = 12.;
 
 /// PhpStorm's popup palette: a lighter title band and footer over the list.
 const POPUP_BAND: u32 = 0x393b40;
@@ -392,23 +384,8 @@ impl SearchEverywhere {
             picker,
             tool_windows: Vec::new(),
             init_modifiers: None,
-            offset: gpui::Point::default(),
-            drag_last: None,
+            frame: Frame::default(),
         }
-    }
-
-    /// Moves the popup with the pointer, keeping it within reach of the window.
-    fn drag_to(&mut self, position: gpui::Point<Pixels>, window: &Window, cx: &mut Context<Self>) {
-        if let Some(last) = self.drag_last {
-            let viewport = window.viewport_size();
-            let offset = self.offset + (position - last);
-            self.offset = gpui::point(
-                offset.x.clamp(-viewport.width / 2., viewport.width / 2.),
-                offset.y.clamp(-viewport.height / 4., viewport.height / 2.),
-            );
-            cx.notify();
-        }
-        self.drag_last = Some(position);
     }
 
     fn switch_tab(&mut self, tab: Tab, window: &mut Window, cx: &mut Context<Self>) {
@@ -434,7 +411,7 @@ impl SearchEverywhere {
 }
 
 impl Render for SearchEverywhere {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let current_tab = self.picker.read(cx).delegate.tab;
         let border = cx.theme().colors().border_variant;
         let header =
@@ -467,6 +444,21 @@ impl Render for SearchEverywhere {
                     })
                     .into_any_element(),
             };
+        let kind = if current_tab == Tab::Recent {
+            PopupKind::Recent
+        } else {
+            PopupKind::Search
+        };
+        // The list and its footer fill the card, beside the tool-window column in Recent Files.
+        let (width, height) = self.frame.size(kind, window, cx);
+        let inner = width - popup::BORDER;
+        let picker_width = if current_tab == Tab::Recent {
+            inner - rems(TOOL_WINDOWS_WIDTH).to_pixels(window.rem_size())
+        } else {
+            inner
+        };
+        self.picker
+            .update(cx, |picker, cx| picker.set_embedded_size(picker_width, height, cx));
         let body = if current_tab == Tab::Recent {
             h_flex()
                 .items_start()
@@ -476,40 +468,15 @@ impl Render for SearchEverywhere {
         } else {
             self.picker.clone().into_any_element()
         };
-        let header = div()
-            .id("zenith-popup-drag")
-            .debug_selector(|| "zenith-popup-drag".into())
-            .cursor_grab()
-            .on_mouse_down(
-                gpui::MouseButton::Left,
-                cx.listener(|this, _, _, _| this.drag_last = None),
-            )
-            .on_drag(DragPopup, |_, _, _, cx| cx.new(|_| NoDragPreview))
-            .child(header);
-        v_flex()
+        let root = v_flex()
             .key_context("SearchEverywhere")
-            .relative()
-            .left(self.offset.x)
-            .top(self.offset.y)
-            .on_drag_move::<DragPopup>(cx.listener(
-                |this, event: &gpui::DragMoveEvent<DragPopup>, window, cx| {
-                    this.drag_to(event.event.position, window, cx)
-                },
-            ))
             .on_modifiers_changed(cx.listener(Self::modifiers_changed))
             .on_action(cx.listener(|this, _: &NextTab, window, cx| this.cycle_tab(1, window, cx)))
             .on_action(
                 cx.listener(|this, _: &PreviousTab, window, cx| this.cycle_tab(-1, window, cx)),
-            )
-            .w(if current_tab == Tab::Recent {
-                rems(48.)
-            } else {
-                rems(38.)
-            })
-            .elevation_3(cx)
-            .overflow_hidden()
-            .child(header)
-            .child(body)
+            );
+        self.frame
+            .render(kind, root, header, body, |this: &mut Self| &mut this.frame, window, cx)
     }
 }
 
@@ -688,7 +655,7 @@ impl SearchEverywhere {
     fn render_tool_windows(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         v_flex()
             .debug_selector(|| "zenith-tool-windows".into())
-            .w(rems(12.))
+            .w(rems(TOOL_WINDOWS_WIDTH))
             .flex_none()
             .py_1()
             .border_r_1()
@@ -3117,7 +3084,7 @@ mod tests {
                 .expect("open")
         });
         assert_eq!(
-            modal.read_with(cx, |modal, _| modal.offset),
+            modal.read_with(cx, |modal, _| modal.frame.offset),
             gpui::Point::default()
         );
         let none = gpui::Modifiers::none();
@@ -3127,7 +3094,7 @@ mod tests {
             cx.simulate_mouse_move(start + delta, gpui::MouseButton::Left, none);
         }
         cx.simulate_mouse_up(start, gpui::MouseButton::Left, none);
-        let offset = modal.read_with(cx, |modal, _| modal.offset);
+        let offset = modal.read_with(cx, |modal, _| modal.frame.offset);
         assert!(offset.x > px(0.) && offset.y > px(0.), "{offset:?}");
     }
 
@@ -3148,6 +3115,191 @@ mod tests {
         assert!(cx.debug_bounds("zenith-search-filter").is_none());
         open_on(Tab::All, &workspace, cx);
         assert!(cx.debug_bounds("zenith-search-filter").is_some());
+    }
+
+
+    /// A workspace with `src/main.rs` and `src/lib.rs` already opened.
+    async fn workspace_with_recent_files(
+        cx: &mut TestAppContext,
+    ) -> (Entity<Workspace>, &mut VisualTestContext) {
+        let app_state = init_test(cx);
+        app_state
+            .fs
+            .as_fake()
+            .insert_tree(
+                path!("/root"),
+                json!({ "src": { "main.rs": "", "lib.rs": "" } }),
+            )
+            .await;
+        let project = Project::test(app_state.fs.clone(), [path!("/root").as_ref()], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        cx.run_until_parked();
+        let worktree_id = workspace.read_with(cx, |workspace, cx| {
+            workspace.project().read(cx).worktrees(cx).next().unwrap().read(cx).id()
+        });
+        for file in ["src/main.rs", "src/lib.rs"] {
+            workspace
+                .update_in(cx, |workspace, window, cx| {
+                    let path = ProjectPath {
+                        worktree_id,
+                        path: RelPath::from_unix_str(file).unwrap().into(),
+                    };
+                    workspace.open_path(path, None, true, window, cx)
+                })
+                .await
+                .unwrap();
+        }
+        (workspace, cx)
+    }
+
+    fn width_of(cx: &mut VisualTestContext, selector: &'static str) -> Pixels {
+        cx.debug_bounds(selector)
+            .unwrap_or_else(|| panic!("{selector} was not painted"))
+            .size
+            .width
+    }
+
+    #[gpui::test]
+    async fn test_list_and_footer_span_the_whole_popup(cx: &mut TestAppContext) {
+        let (workspace, cx) = workspace_with_recent_files(cx).await;
+        for tab in [Tab::All, Tab::Files, Tab::Recent] {
+            open_on(tab, &workspace, cx);
+            if tab != Tab::Recent {
+                cx.simulate_input("main");
+                cx.run_until_parked();
+            }
+            let card = width_of(cx, "zenith-popup-drag");
+            let footer = cx.debug_bounds("zenith-popup-footer").expect("footer");
+            let left = cx
+                .debug_bounds("zenith-tool-windows")
+                .map_or(Pixels::ZERO, |tools| tools.size.width);
+            assert_eq!(footer.size.width + left, card, "{tab:?}: dead strip at the right");
+            workspace.update_in(cx, |w, window, cx| w.hide_modal(window, cx));
+        }
+        // Find in Files owns its list, so check its rows and footer too.
+        workspace.update_in(cx, |workspace, window, cx| {
+            find_in_files::FindInFilesModal::open(workspace, false, window, cx)
+        });
+        cx.run_until_parked();
+        let modal = workspace.update(cx, |workspace, cx| {
+            workspace
+                .active_modal::<find_in_files::FindInFilesModal>(cx)
+                .expect("open")
+        });
+        modal.update_in(cx, |m, window, cx| m.set_query("fn", window, cx));
+        cx.run_until_parked();
+        let card = width_of(cx, "zenith-popup-drag");
+        assert_eq!(width_of(cx, "zenith-popup-footer"), card);
+        assert_eq!(width_of(cx, "zenith-find-preview"), card);
+    }
+
+    /// Drags the bottom-right grip by `by`.
+    fn drag_grip(cx: &mut VisualTestContext, by: gpui::Point<Pixels>) {
+        let start = cx
+            .debug_bounds("zenith-popup-resize")
+            .expect("the corner is a resize grip")
+            .center();
+        let none = gpui::Modifiers::none();
+        cx.simulate_mouse_down(start, gpui::MouseButton::Left, none);
+        for step in 1..=4 {
+            cx.simulate_mouse_move(start + by * (step as f32 / 4.), gpui::MouseButton::Left, none);
+        }
+        cx.simulate_mouse_up(start + by, gpui::MouseButton::Left, none);
+        cx.run_until_parked();
+    }
+
+    /// Resizes the open Search Everywhere by a pointer move that may leave the window.
+    fn resize_by(
+        workspace: &Entity<Workspace>,
+        by: gpui::Point<Pixels>,
+        cx: &mut VisualTestContext,
+    ) {
+        let modal = workspace.update(cx, |workspace, cx| {
+            workspace.active_modal::<SearchEverywhere>(cx).expect("open")
+        });
+        let grip = cx.debug_bounds("zenith-popup-resize").unwrap().center();
+        modal.update_in(cx, |modal, window, cx| {
+            modal.frame.resize_to(PopupKind::Search, grip, window, cx);
+            modal.frame.resize_to(PopupKind::Search, grip + by, window, cx);
+            // Mouse-up forgets the drag.
+            modal.frame.resize_to(PopupKind::Search, grip + by, window, cx);
+            cx.notify();
+        });
+        cx.run_until_parked();
+    }
+
+    fn card_size(cx: &mut VisualTestContext) -> gpui::Size<Pixels> {
+        let bounds = cx.debug_bounds("zenith-popup-drag").expect("header");
+        let resize = cx.debug_bounds("zenith-popup-resize").expect("grip");
+        // The grip sits in the card's bottom-right corner.
+        gpui::size(bounds.size.width, resize.bottom() - bounds.top())
+    }
+
+    #[gpui::test]
+    async fn test_corner_grip_resizes_within_limits_and_is_remembered(cx: &mut TestAppContext) {
+        let (workspace, cx) = workspace_with_recent_files(cx).await;
+        open_on(Tab::Files, &workspace, cx);
+        let before = card_size(cx);
+        drag_grip(cx, gpui::point(px(120.), px(80.)));
+        let after = card_size(cx);
+        assert_eq!(after.width - before.width, px(120.));
+        assert_eq!(after.height - before.height, px(80.));
+        // Too far: held inside the window.
+        resize_by(&workspace, gpui::point(px(5000.), px(5000.)), cx);
+        let window = cx.update(|window, _| window.viewport_size());
+        let huge = card_size(cx);
+        assert!(huge.width <= window.width * 0.95 + px(0.5), "{huge:?} in {window:?}");
+        assert!(huge.height < window.height, "{huge:?} in {window:?}");
+        // Too small: held above the minimum, still usable.
+        resize_by(&workspace, gpui::point(px(-9000.), px(-9000.)), cx);
+        let tiny = card_size(cx);
+        let rem = cx.update(|window, _| window.rem_size());
+        assert!(tiny.width >= rem * 28. - popup::BORDER - px(0.5), "{tiny:?}");
+        assert!(tiny.height >= px(120.), "{tiny:?}");
+        // The list and its footer still fill the resized card.
+        cx.simulate_input("main");
+        cx.run_until_parked();
+        let card = width_of(cx, "zenith-popup-drag");
+        assert_eq!(width_of(cx, "zenith-popup-footer"), card);
+        // The size outlives the popup, for the session.
+        drag_grip(cx, gpui::point(px(60.), px(0.)));
+        let sized = card_size(cx);
+        workspace.update_in(cx, |w, window, cx| w.hide_modal(window, cx));
+        open_on(Tab::Files, &workspace, cx);
+        assert_eq!(card_size(cx), sized);
+        // Recent Files keeps a size of its own.
+        open_on(Tab::Recent, &workspace, cx);
+        assert_ne!(card_size(cx).width, sized.width);
+    }
+
+    #[gpui::test]
+    async fn test_find_in_files_resizes_and_keeps_list_and_footer_full_width(
+        cx: &mut TestAppContext,
+    ) {
+        let (_, modal, cx) =
+            open_find_in_files(serde_json::json!({ "a.php": "add_action();\n" }), cx).await;
+        modal.update_in(cx, |m, window, cx| m.set_query("add_action", window, cx));
+        cx.run_until_parked();
+        let before = card_size(cx);
+        drag_grip(cx, gpui::point(px(100.), px(60.)));
+        let after = card_size(cx);
+        assert_eq!(after.width - before.width, px(100.));
+        assert_eq!(after.height - before.height, px(60.));
+        assert_eq!(width_of(cx, "zenith-popup-footer"), after.width);
+        assert_eq!(width_of(cx, "zenith-find-hit-0"), after.width);
+        // The extra height goes to the result list.
+        let footer = cx.debug_bounds("zenith-popup-footer").unwrap();
+        assert_eq!(footer.bottom(), cx.debug_bounds("zenith-popup-resize").unwrap().bottom());
+        // Shrinking stops where the query fields, the preview and the footer still fit.
+        let grip = cx.debug_bounds("zenith-popup-resize").unwrap().center();
+        modal.update_in(cx, |m, window, cx| {
+            m.resize_between(grip, grip - gpui::point(px(9000.), px(9000.)), window, cx)
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("zenith-find-preview").is_some());
+        assert!(card_size(cx).height >= px(440.));
     }
 
     // zenith.json binds actions from sibling crates this test binary doesn't link.

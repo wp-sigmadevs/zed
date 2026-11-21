@@ -176,6 +176,9 @@ impl<D: PickerDelegate> Picker<D> {
                     window,
                 )
             })
+            .when_some(self.embedded_size, |this, (width, height)| {
+                this.w(width).when_some(height, |this, height| this.h(height))
+            })
             .child(
                 canvas(
                     move |bounds, _window, _cx| {
@@ -229,7 +232,8 @@ impl<D: PickerDelegate> Picker<D> {
                         .when_some(
                             self.shape.results_max_height(
                                 &self.size_bounds,
-                                self.fill_height(),
+                                self.fill_height()
+                                    || self.embedded_size.is_some_and(|(_, height)| height.is_some()),
                                 window,
                             ),
                             |this, max_height| this.max_h(max_height),
