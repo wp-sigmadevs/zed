@@ -80,6 +80,9 @@
     "context": "!AcpThread > Editor && mode == full",
     "bindings": {
       "secondary-shift-e": "zenith_search::RecentLocations",
+      // Show Usages popup (⌘⌥F7), as in PhpStorm; the JetBrains keymap's own binding
+      // for these keys opens the usages in a tab, which the popup's button still does.
+      "secondary-alt-f7": "zenith_search::ShowUsages",
     },
   },
   {

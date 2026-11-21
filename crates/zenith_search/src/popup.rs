@@ -23,6 +23,8 @@ pub(crate) enum PopupKind {
     Recent,
     /// Find in Files and Replace in Files.
     Find,
+    /// The Usages popup.
+    Usages,
 }
 
 impl PopupKind {
@@ -31,6 +33,7 @@ impl PopupKind {
             Self::Search => rems(38.),
             Self::Recent => rems(48.),
             Self::Find => rems(44.),
+            Self::Usages => rems(40.),
         }
     }
 
@@ -39,6 +42,7 @@ impl PopupKind {
             Self::Search => rems(28.),
             Self::Recent => rems(34.),
             Self::Find => rems(36.),
+            Self::Usages => rems(30.),
         }
     }
 
@@ -49,6 +53,8 @@ impl PopupKind {
             Self::Search | Self::Recent => px(120.),
             // The query fields, three result rows, the preview and the footer.
             Self::Find => px(440.),
+            // Three rows and the footer.
+            Self::Usages => px(160.),
         }
     }
 }

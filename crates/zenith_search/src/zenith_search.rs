@@ -37,6 +37,7 @@ mod find_in_files;
 mod mask_history;
 mod popup;
 mod style;
+mod usages;
 use popup::{Frame, PopupKind};
 use style::{POPUP_BAND, POPUP_FOOTER};
 use text::Point;
@@ -91,6 +92,10 @@ actions!(
         ToggleFindRegex,
         /// Turns the file mask on or off in Find in Files.
         ToggleFindMask,
+        /// Lists the usages of the symbol at the cursor in a popup (PhpStorm's Show Usages).
+        ShowUsages,
+        /// Opens every usage the Usages popup lists in a new tab.
+        OpenUsagesInTab,
         /// Opens the recently used file masks of Find in Files; Up or Down in the mask
         /// box does the same.
         ToggleFileMaskHistory,
@@ -121,6 +126,7 @@ pub fn init(cx: &mut App) {
         workspace.register_action(|workspace, _: &ReplaceInFiles, window, cx| {
             find_in_files::FindInFilesModal::open(workspace, true, window, cx)
         });
+        
         workspace.register_action(|workspace, _: &GoToClass, window, cx| {
             SearchEverywhere::open(workspace, Tab::Classes, window, cx)
         });
@@ -1863,7 +1869,7 @@ mod tests {
     /// Zenith's keymap read from this checkout's `assets/`. `load_asset` reads the assets of
     /// the checkout holding the test binary's target dir, which is another worktree's when
     /// several share one `CARGO_TARGET_DIR`, and would not see this branch's bindings.
-    fn zenith_keymap(cx: &App) -> Vec<gpui::KeyBinding> {
+    pub(crate) fn zenith_keymap(cx: &App) -> Vec<gpui::KeyBinding> {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/keymaps/zenith.json");
         let content = std::fs::read_to_string(path).expect("Zenith keymap file");
         match KeymapFile::load(&content, cx) {
@@ -3908,6 +3914,16 @@ mod tests {
             assert_eq!(
                 resolve(&base, "shift-e", &editor).as_deref(),
                 Some("pane::RevealInProjectPanel")
+            );
+
+            // ⌘⌥F7 is Show Usages here; the JetBrains keymap binds it to the references tab.
+            assert_eq!(
+                resolve(&base, "alt-f7", &editor).as_deref(),
+                Some("editor::FindAllReferences")
+            );
+            assert_eq!(
+                resolve(&all, "alt-f7", &editor).as_deref(),
+                Some("zenith_search::ShowUsages")
             );
 
             // ⌘⇧F / ⌘⇧R open PhpStorm's popups, not the project search tab.

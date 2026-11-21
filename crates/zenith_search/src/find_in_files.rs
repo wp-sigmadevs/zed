@@ -624,26 +624,8 @@ impl FindInFilesModal {
             return;
         };
         self.remember_mask(cx);
-        let workspace = self.workspace.clone();
         self.closing = true;
-        cx.spawn_in(window, async move |_, cx| {
-            let open = workspace.update_in(cx, |workspace, window, cx| {
-                workspace.open_path(hit.project_path.clone(), None, true, window, cx)
-            })?;
-            let item = open.await?;
-            if let Some(editor) = item.downcast::<Editor>() {
-                editor.update_in(cx, |editor, window, cx| {
-                    editor.change_selections(
-                        SelectionEffects::scroll(Autoscroll::center()).unfold(),
-                        window,
-                        cx,
-                        |selections| selections.select_ranges([hit.point..hit.point]),
-                    );
-                })?;
-            }
-            anyhow::Ok(())
-        })
-        .detach_and_log_err(cx);
+        open_hit(self.workspace.clone(), hit, window, cx).detach_and_log_err(cx);
         cx.emit(DismissEvent);
     }
 
@@ -1404,35 +1386,35 @@ impl Render for FindInFilesModal {
 /// One matching line.
 #[derive(Clone)]
 pub struct Hit {
-    buffer: Entity<language::Buffer>,
+    pub(super) buffer: Entity<language::Buffer>,
     /// The first match, for the preview.
-    anchors: Range<text::Anchor>,
-    offsets: Range<usize>,
-    project_path: ProjectPath,
-    file_name: SharedString,
-    directory: SharedString,
-    point: Point,
+    pub(super) anchors: Range<text::Anchor>,
+    pub(super) offsets: Range<usize>,
+    pub(super) project_path: ProjectPath,
+    pub(super) file_name: SharedString,
+    pub(super) directory: SharedString,
+    pub(super) point: Point,
     /// The line with leading space removed, and the byte ranges that matched in it.
-    line: String,
-    matches: Vec<Range<usize>>,
+    pub(super) line: String,
+    pub(super) matches: Vec<Range<usize>>,
     /// The syntax colours of `line`, found once with the hit and turned into styles
     /// with the current theme when the row is drawn.
-    syntax: Vec<(Range<usize>, HighlightId)>,
+    pub(super) syntax: Vec<(Range<usize>, HighlightId)>,
 }
 
 /// What one buffer's hits are built from. Made on the main thread, which owns the
 /// buffer; [`HitSource::hits`] then runs anywhere.
-struct HitSource {
-    buffer: Entity<language::Buffer>,
-    snapshot: BufferSnapshot,
-    project_path: ProjectPath,
-    file_name: SharedString,
-    directory: SharedString,
+pub(super) struct HitSource {
+    pub(super) buffer: Entity<language::Buffer>,
+    pub(super) snapshot: BufferSnapshot,
+    pub(super) project_path: ProjectPath,
+    pub(super) file_name: SharedString,
+    pub(super) directory: SharedString,
 }
 
 impl HitSource {
     /// `None` for a buffer without a file, which has no path to list.
-    fn new(buffer: &Entity<language::Buffer>, cx: &App) -> Option<Self> {
+    pub(super) fn new(buffer: &Entity<language::Buffer>, cx: &App) -> Option<Self> {
         let snapshot_source = buffer.read(cx);
         let file = snapshot_source.file()?;
         Some(Self {
@@ -1457,7 +1439,7 @@ impl HitSource {
         })
     }
 
-    fn hits(&self, ranges: &[Range<text::Anchor>], context: SearchContext) -> Vec<Hit> {
+    pub(super) fn hits(&self, ranges: &[Range<text::Anchor>], context: SearchContext) -> Vec<Hit> {
         let snapshot = &self.snapshot;
         let mut hits: Vec<Hit> = Vec::new();
         for range in ranges {
@@ -1504,6 +1486,32 @@ impl HitSource {
     }
 }
 
+/// Opens the hit's file and puts the cursor on its first match.
+pub(super) fn open_hit<T: 'static>(
+    workspace: WeakEntity<Workspace>,
+    hit: Hit,
+    window: &mut Window,
+    cx: &mut Context<T>,
+) -> Task<anyhow::Result<()>> {
+    cx.spawn_in(window, async move |_, cx| {
+        let open = workspace.update_in(cx, |workspace, window, cx| {
+            workspace.open_path(hit.project_path.clone(), None, true, window, cx)
+        })?;
+        let item = open.await?;
+        if let Some(editor) = item.downcast::<Editor>() {
+            editor.update_in(cx, |editor, window, cx| {
+                editor.change_selections(
+                    SelectionEffects::scroll(Autoscroll::center()).unfold(),
+                    window,
+                    cx,
+                    |selections| selections.select_ranges([hit.point..hit.point]),
+                );
+            })?;
+        }
+        anyhow::Ok(())
+    })
+}
+
 /// The syntax colours along a line, past its `lead` bytes of leading space.
 fn line_syntax(
     snapshot: &BufferSnapshot,
@@ -1545,7 +1553,7 @@ fn runs_after_lead<Id>(
 
 /// What a row's text is drawn with: the syntax colours with the matches in a chip on
 /// top, all cut back to character boundaries of `line`.
-fn row_highlights(
+pub(super) fn row_highlights(
     line: &str,
     syntax: impl IntoIterator<Item = (Range<usize>, HighlightStyle)>,
     matches: &[Range<usize>],
@@ -1670,7 +1678,7 @@ fn span_at(line: &str, at: usize) -> Span {
 
 /// Whether the line looks like a comment, which the list dims.
 // ponytail: language-agnostic prefixes only; real comment spans would need the syntax tree.
-fn is_comment_line(line: &str) -> bool {
+pub(super) fn is_comment_line(line: &str) -> bool {
     let line = line.trim_start();
     ["//", "/*", "*/", "* ", "<!--"]
         .iter()
