@@ -15,6 +15,18 @@ pub struct ZenithSettingsContent {
     pub local_history: Option<ZenithLocalHistorySettingsContent>,
     /// Settings for the External Libraries project panel section.
     pub external_libraries: Option<ZenithExternalLibrariesSettingsContent>,
+    /// Settings for the hover card.
+    pub hover_card: Option<ZenithHoverCardSettingsContent>,
+}
+
+/// Settings for the hover card.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+pub struct ZenithHoverCardSettingsContent {
+    /// Whether hovering shows one card holding the diagnostic and the
+    /// documentation, instead of separate popovers.
+    ///
+    /// Default: true
+    pub enabled: Option<bool>,
 }
 
 /// Settings for the External Libraries project panel section.
