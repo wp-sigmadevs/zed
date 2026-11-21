@@ -17,12 +17,24 @@ pub struct ZenithSettingsContent {
     pub external_libraries: Option<ZenithExternalLibrariesSettingsContent>,
     /// Settings for the WordPress Hooks tool window.
     pub wordpress: Option<ZenithWordPressSettingsContent>,
+    /// Settings for the hover card.
+    pub hover_card: Option<ZenithHoverCardSettingsContent>,
 }
 
 /// Settings for the WordPress Hooks tool window.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
 pub struct ZenithWordPressSettingsContent {
     /// Whether the WordPress Hooks tool window is offered for trusted WordPress projects.
+    ///
+    /// Default: true
+    pub enabled: Option<bool>,
+}
+
+/// Settings for the hover card.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+pub struct ZenithHoverCardSettingsContent {
+    /// Whether hovering shows one card holding the diagnostic and the
+    /// documentation, instead of separate popovers.
     ///
     /// Default: true
     pub enabled: Option<bool>,

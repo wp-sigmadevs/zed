@@ -1385,6 +1385,9 @@ impl HoverState {
             return None;
         }
 
+        if let Some(card) = zenith_card::render(self, max_size, window, cx) {
+            return Some((point, vec![card]));
+        }
         let mut elements = Vec::new();
 
         if let Some(diagnostic_popover) = self.diagnostic_popover.as_ref() {
@@ -4712,3 +4715,4 @@ mod tests {
             .collect()
     }
 }
+pub mod zenith_card;
