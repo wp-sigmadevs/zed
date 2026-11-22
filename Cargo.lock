@@ -14197,6 +14197,7 @@ dependencies = [
  "worktree",
  "zed_actions",
  "zenith_external_libraries",
+ "zenith_scratches",
 ]
 
 [[package]]
@@ -23487,6 +23488,7 @@ dependencies = [
  "ui",
  "util",
  "workspace",
+ "worktree",
 ]
 
 [[package]]
