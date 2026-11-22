@@ -338,7 +338,7 @@ async fn test_a_file_without_checkpoint_is_reported_and_left_alone(cx: &mut Test
         .await
         .expect("revert");
     let bin = open(&setup, "/dir/wp-config.php", cx).await;
-    assert_eq!(outcome.missing, [bin.clone()]);
+    assert_eq!(outcome.missing, std::slice::from_ref(&bin));
     assert!(outcome.failed.is_empty());
     assert_eq!(bin.read_with(cx, |buffer, _| buffer.text()), "edited\n");
 }
@@ -390,7 +390,7 @@ async fn test_subagent_threads_are_not_tracked(cx: &mut TestAppContext) {
         .thread
         .read_with(cx, |thread, _| thread.session_id().clone());
     let project = setup.project.clone();
-    let connection = setup.connection.clone();
+    let connection = setup.connection;
     let _subagent = cx.update(|cx| {
         let action_log = cx.new(|_| ActionLog::new(project.clone()));
         cx.new(|cx| {

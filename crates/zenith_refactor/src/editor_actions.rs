@@ -224,7 +224,7 @@ fn move_class(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<W
             let (plan_source, plan_root) = (source.clone(), root.clone());
             plan_and_preview(
                 workspace,
-                source.clone(),
+                source,
                 "Failed to plan Move Class",
                 window,
                 cx,
@@ -289,7 +289,7 @@ fn safe_delete(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<
             let plan_path = path.clone();
             plan_and_preview(
                 workspace,
-                path.clone(),
+                path,
                 "Failed to plan Safe Delete",
                 window,
                 cx,
@@ -331,7 +331,7 @@ fn change_signature(workspace: &mut Workspace, window: &mut Window, cx: &mut Con
             let function = function.clone();
             plan_and_preview(
                 workspace,
-                path.clone(),
+                path,
                 "Failed to plan Change Signature",
                 window,
                 cx,
