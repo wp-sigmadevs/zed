@@ -61,4 +61,6 @@ pub fn init(cx: &mut App) {
     zenith_agent_review::init(cx);
     #[cfg(feature = "navbar")]
     zenith_navbar::init(cx);
+    #[cfg(feature = "deploy")]
+    zenith_deploy::init(cx);
 }

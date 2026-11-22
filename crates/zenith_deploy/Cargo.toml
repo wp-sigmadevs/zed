@@ -1,0 +1,35 @@
+[package]
+name = "zenith_deploy"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/zenith_deploy.rs"
+doctest = false
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+futures-rustls.workspace = true
+gpui.workspace = true
+http_client_tls.workspace = true
+log.workspace = true
+paths.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+settings.workspace = true
+smol.workspace = true
+suppaftp.workspace = true
+tempfile.workspace = true
+util.workspace = true
+uuid = { workspace = true, features = ["v4"] }
+
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }
+settings = { workspace = true, features = ["test-support"] }

@@ -44,6 +44,21 @@ pub struct ZenithSettingsContent {
     pub agent_review: Option<ZenithAgentReviewSettingsContent>,
     /// Settings for scratch files.
     pub scratches: Option<ZenithScratchesSettingsContent>,
+    /// Settings for Deployment (Remote Host tool window).
+    pub deploy: Option<ZenithDeploySettingsContent>,
+}
+
+/// Settings for Deployment. Upload on save is a per-server option, never a setting.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+pub struct ZenithDeploySettingsContent {
+    /// Whether the Remote Host tool window and Deployment actions are offered. Read at startup.
+    ///
+    /// Default: true
+    pub enabled: Option<bool>,
+    /// Where the Remote Host tool window docks.
+    ///
+    /// Default: right
+    pub dock: Option<crate::DockPosition>,
 }
 
 /// Settings for agent review.
