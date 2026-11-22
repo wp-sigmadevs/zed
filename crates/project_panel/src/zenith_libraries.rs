@@ -654,4 +654,264 @@ mod tests {
             assert!(allowed(ordinary_row), "{ordinary_row} keeps drag and drop");
         }
     }
+
+    fn set_library_paths(cx: &mut TestAppContext, paths: &[&str]) {
+        cx.update(|cx| {
+            cx.update_global::<SettingsStore, _>(|store, cx| {
+                store.update_user_settings(cx, |content| {
+                    content.zenith = Some(ZenithSettingsContent {
+                        external_libraries: Some(ZenithExternalLibrariesSettingsContent {
+                            paths: Some(paths.iter().map(ToString::to_string).collect()),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    });
+                });
+            });
+        });
+    }
+
+    /// Opens `roots` with `/libs/acme` (holding `lib/Acme.php`) added last as a library path.
+    async fn open_with_library(
+        cx: &mut TestAppContext,
+        fs: Arc<FakeFs>,
+        roots: &[&str],
+    ) -> (Entity<ProjectPanel>, VisualTestContext) {
+        fs.insert_tree("/libs/acme", json!({ "lib": { "Acme.php": "" } }))
+            .await;
+        init_test(cx);
+        set_library_paths(cx, &["/libs/acme"]);
+        let roots: Vec<&str> = roots.iter().copied().chain(["/libs/acme"]).collect();
+        open_panel_inited(cx, fs, &roots).await
+    }
+
+    fn worktree_id_of(
+        panel: &Entity<ProjectPanel>,
+        abs_path: &str,
+        cx: &mut VisualTestContext,
+    ) -> WorktreeId {
+        panel.read_with(cx, |panel, cx| {
+            panel
+                .project
+                .read(cx)
+                .worktrees(cx)
+                .find(|worktree| &*worktree.read(cx).abs_path() == Path::new(abs_path))
+                .unwrap_or_else(|| panic!("no worktree at {abs_path}"))
+                .read(cx)
+                .id()
+        })
+    }
+
+    fn toggle_section(panel: &Entity<ProjectPanel>, id: WorktreeId, cx: &mut VisualTestContext) {
+        panel.update_in(cx, |panel, window, cx| {
+            panel.toggle_expanded(section_id(id), window, cx)
+        });
+        cx.run_until_parked();
+    }
+
+    fn count(names: &[String], name: &str) -> usize {
+        names.iter().filter(|n| *n == name).count()
+    }
+
+    #[gpui::test]
+    async fn test_library_worktree_joins_the_preceding_node(cx: &mut TestAppContext) {
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/site", composer_tree()).await;
+        let (panel, mut cx) = open_with_library(cx, fs, &["/site"]).await;
+        let cx = &mut cx;
+
+        let collapsed = names(&panel, cx);
+        assert_eq!(count(&collapsed, "External Libraries"), 1, "{collapsed:?}");
+        for hidden in ["acme", "acme (read-only)", "lib"] {
+            assert!(
+                !collapsed.iter().any(|n| n == hidden),
+                "{hidden} stays hidden while the node is collapsed: {collapsed:?}"
+            );
+        }
+
+        let site = worktree_id_of(&panel, "/site", cx);
+        toggle_section(&panel, site, cx);
+        let expanded = rows(&panel, cx);
+        let position = |name: &str| {
+            expanded
+                .iter()
+                .position(|(n, _)| n == name)
+                .unwrap_or_else(|| panic!("no row {name:?} in {expanded:?}"))
+        };
+        let node = position("External Libraries");
+        let composer = position("Composer Packages (read-only)");
+        let library = position("acme (read-only)");
+        assert!(node < composer && composer < library, "{expanded:?}");
+        assert_eq!(expanded[node].1, 0);
+        assert_eq!(expanded[library].1, 1, "a sibling of the Composer packages");
+        assert_eq!(expanded[position("lib")].1, 2);
+        assert_eq!(
+            count(&names(&panel, cx), "External Libraries"),
+            1,
+            "still one node once expanded"
+        );
+
+        toggle_section(&panel, site, cx);
+        let collapsed_again = names(&panel, cx);
+        assert!(
+            !collapsed_again.iter().any(|n| n == "acme (read-only)"),
+            "collapsing the node hides the joined library: {collapsed_again:?}"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_library_worktree_without_a_preceding_node_gets_its_own(cx: &mut TestAppContext) {
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/site", json!({ "src": { "main.php": "" } }))
+            .await;
+        let (panel, mut cx) = open_with_library(cx, fs, &["/site"]).await;
+        let cx = &mut cx;
+
+        let collapsed = names(&panel, cx);
+        assert_eq!(count(&collapsed, "External Libraries"), 1, "{collapsed:?}");
+        assert!(
+            !collapsed.iter().any(|n| n.starts_with("acme")),
+            "a library path is not a project root: {collapsed:?}"
+        );
+
+        let acme = worktree_id_of(&panel, "/libs/acme", cx);
+        toggle_section(&panel, acme, cx);
+        let expanded = rows(&panel, cx);
+        let depth_of = |name: &str| expanded.iter().find(|(n, _)| n == name).map(|(_, d)| *d);
+        assert_eq!(depth_of("External Libraries"), Some(0), "{expanded:?}");
+        assert_eq!(depth_of("acme (read-only)"), Some(1), "{expanded:?}");
+        assert_eq!(depth_of("lib"), Some(2), "{expanded:?}");
+    }
+
+    #[gpui::test]
+    async fn test_library_worktree_leaves_other_project_nodes_alone(cx: &mut TestAppContext) {
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/one", composer_tree()).await;
+        fs.insert_tree("/two", composer_tree()).await;
+        let (panel, mut cx) = open_with_library(cx, fs, &["/one", "/two"]).await;
+        let cx = &mut cx;
+
+        let collapsed = names(&panel, cx);
+        assert_eq!(
+            count(&collapsed, "External Libraries"),
+            2,
+            "each project worktree keeps its node, the library adds none: {collapsed:?}"
+        );
+
+        let one = worktree_id_of(&panel, "/one", cx);
+        toggle_section(&panel, one, cx);
+        let first_open = names(&panel, cx);
+        assert_eq!(count(&first_open, "Composer Packages (read-only)"), 1);
+        assert!(
+            !first_open.iter().any(|n| n == "acme (read-only)"),
+            "the library joins the node right before it, not /one's: {first_open:?}"
+        );
+        toggle_section(&panel, one, cx);
+
+        let two = worktree_id_of(&panel, "/two", cx);
+        toggle_section(&panel, two, cx);
+        let second_open = names(&panel, cx);
+        assert_eq!(count(&second_open, "Composer Packages (read-only)"), 1);
+        assert_eq!(
+            count(&second_open, "acme (read-only)"),
+            1,
+            "{second_open:?}"
+        );
+        assert_eq!(count(&second_open, "External Libraries"), 2);
+    }
+
+    #[gpui::test]
+    async fn test_removing_the_library_worktree_removes_its_rows(cx: &mut TestAppContext) {
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/site", composer_tree()).await;
+        let (panel, mut cx) = open_with_library(cx, fs, &["/site"]).await;
+        let cx = &mut cx;
+        let site = worktree_id_of(&panel, "/site", cx);
+        toggle_section(&panel, site, cx);
+        assert_eq!(count(&names(&panel, cx), "acme (read-only)"), 1);
+
+        let acme = worktree_id_of(&panel, "/libs/acme", cx);
+        let project = panel.read_with(cx, |panel, _| panel.project.clone());
+        project.update(cx, |project, cx| project.remove_worktree(acme, cx));
+        cx.run_until_parked();
+
+        let after = names(&panel, cx);
+        assert!(
+            !after
+                .iter()
+                .any(|n| n == "acme (read-only)" || n == "lib" || n == "Acme.php"),
+            "{after:?}"
+        );
+        assert_eq!(count(&after, "External Libraries"), 1, "{after:?}");
+        assert_eq!(
+            count(&after, "Composer Packages (read-only)"),
+            1,
+            "the project's own node stays expanded: {after:?}"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_library_worktree_rows_are_read_only(cx: &mut TestAppContext) {
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/site", composer_tree()).await;
+        let (panel, mut cx) = open_with_library(cx, fs, &["/site"]).await;
+        let cx = &mut cx;
+        let site = worktree_id_of(&panel, "/site", cx);
+        let acme = worktree_id_of(&panel, "/libs/acme", cx);
+        toggle_section(&panel, site, cx);
+
+        let drag_and_drop = panel.update_in(cx, |panel, window, cx| {
+            let mut rows = Vec::new();
+            panel.for_each_visible_entry(0..200, window, cx, &mut |entry_id, details, _, _| {
+                rows.push((entry_id, details));
+            });
+            let settings = *ProjectPanelSettings::get_global(cx);
+            assert!(settings.drag_and_drop, "drag and drop is on by default");
+            rows.into_iter()
+                .map(|(entry_id, details)| {
+                    let allowed = panel.zenith_dnd(settings, entry_id, &details, cx);
+                    (details.filename, allowed.drag_and_drop)
+                })
+                .collect::<Vec<_>>()
+        });
+        let allowed = |name: &str| {
+            drag_and_drop
+                .iter()
+                .find(|(n, _)| n == name)
+                .unwrap_or_else(|| panic!("no row {name:?} in {drag_and_drop:?}"))
+                .1
+        };
+        for library_row in ["acme (read-only)", "lib"] {
+            assert!(!allowed(library_row), "{library_row} must not drag or drop");
+        }
+        for ordinary_row in ["site", "src"] {
+            assert!(allowed(ordinary_row), "{ordinary_row} keeps drag and drop");
+        }
+
+        let (library_file, source) = panel.read_with(cx, |panel, cx| {
+            let find = |worktree_id: WorktreeId, path: &str| {
+                panel
+                    .project
+                    .read(cx)
+                    .worktree_for_id(worktree_id, cx)
+                    .unwrap()
+                    .read(cx)
+                    .entry_for_path(RelPath::from_unix_str(path).unwrap())
+                    .unwrap()
+                    .id
+            };
+            (find(acme, "lib/Acme.php"), find(site, "src/main.php"))
+        });
+        let (library, ordinary) = panel.update_in(cx, |panel, window, cx| {
+            let original = ContextMenu::build(window, cx, |menu, _, _| menu);
+            let replaced = panel.zenith_menu(acme, library_file, original.clone(), window, cx);
+            let kept = panel.zenith_menu(site, source, original.clone(), window, cx);
+            (replaced != original, kept == original)
+        });
+        assert!(
+            library,
+            "library worktree files get the read-only library menu"
+        );
+        assert!(ordinary, "project files keep the regular menu");
+    }
 }
