@@ -1745,9 +1745,8 @@ pub enum DapBinary {
     Custom(String),
 }
 
-/// Zenith: loads a directory's project settings from `.zenith/settings.json` and the
-/// legacy `.zed/settings.json`. A single file is returned verbatim; when both exist
-/// they are merged with `.zenith` keys winning. `Ok(None)` when neither exists.
+/// Zenith: loads a directory's project settings from `.zenith/settings.json`, or the
+/// legacy `.zed/settings.json` when there is no `.zenith` file. `Ok(None)` when neither exists.
 async fn load_merged_local_settings(
     fs: &dyn Fs,
     dir_abs_path: &std::path::Path,
@@ -1760,17 +1759,10 @@ async fn load_merged_local_settings(
             Ok(None)
         }
     };
-    let zenith = load(local_settings_file_relative_path()).await?;
-    let legacy = load(legacy_local_settings_file_relative_path()).await?;
-    match (zenith, legacy) {
-        (Some(zenith), Some(legacy)) => {
-            let mut merged: serde_json::Value =
-                parse_json_with_comments(&legacy).context("parsing legacy .zed/settings.json")?;
-            let zenith: serde_json::Value =
-                parse_json_with_comments(&zenith).context("parsing .zenith/settings.json")?;
-            util::merge_json_value_into(zenith, &mut merged);
-            Ok(Some(serde_json::to_string(&merged)?))
-        }
-        (zenith, legacy) => Ok(zenith.or(legacy)),
+    // Zenith: `.zenith` replaces `.zed` entirely, so editing one app's project settings never
+    // changes the other's; `.zed` is read only where a project has no `.zenith` file.
+    if let Some(zenith) = load(local_settings_file_relative_path()).await? {
+        return Ok(Some(zenith));
     }
+    load(legacy_local_settings_file_relative_path()).await
 }

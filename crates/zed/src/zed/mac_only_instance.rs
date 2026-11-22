@@ -27,11 +27,13 @@ fn address() -> SocketAddr {
     // 44338, 44438, and 44538 for the preview, stable, and nightly channels,
     // respectively. User 502 will use ports 44339, 44439, and 44539 for the preview,
     // stable, and nightly channels, respectively.
+    // Zenith: 4000 above upstream's 43737 so Zenith and stock Zed never share a port.
+    let base = 47737;
     let port = match *release_channel::RELEASE_CHANNEL {
-        ReleaseChannel::Dev => 43737,
-        ReleaseChannel::Preview => 43737 + USER_BLOCK,
-        ReleaseChannel::Stable => 43737 + (2 * USER_BLOCK),
-        ReleaseChannel::Nightly => 43737 + (3 * USER_BLOCK),
+        ReleaseChannel::Dev => base,
+        ReleaseChannel::Preview => base + USER_BLOCK,
+        ReleaseChannel::Stable => base + (2 * USER_BLOCK),
+        ReleaseChannel::Nightly => base + (3 * USER_BLOCK),
     };
     let uid = getuid().as_raw();
     // Ensure that the user ID is not too large to avoid overflow when

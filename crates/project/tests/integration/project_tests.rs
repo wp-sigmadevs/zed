@@ -1194,9 +1194,9 @@ async fn test_zenith_and_legacy_zed_project_settings(cx: &mut gpui::TestAppConte
     cx.update(|cx| {
         let a = LanguageSettings::for_buffer(&buffer_a.read(cx), cx);
         assert_eq!(a.tab_size.get(), 4, ".zenith wins over .zed");
-        assert_eq!(
+        assert_ne!(
             a.preferred_line_length, 64,
-            ".zed keys not in .zenith still apply"
+            ".zed is ignored where .zenith exists"
         );
         let b = LanguageSettings::for_buffer(&buffer_b.read(cx), cx);
         assert_eq!(b.tab_size.get(), 2, ".zenith alone is read");

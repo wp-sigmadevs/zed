@@ -1,5 +1,5 @@
-//! Points PHPantom (built from `main`, plan 42) at the user's library roots through its
-//! GLOBAL `.phpantom.toml`, and at the Zenith-built binary through
+//! Points PHPantom (built from `main`, plan 42) at the user's library roots through a
+//! Zenith-only `.phpantom.toml` (`XDG_CONFIG_HOME` set in `lsp.phpantom.binary.env`), and at the Zenith-built binary through
 //! `lsp.phpantom.binary.path`. Stub packages are not written: PHPantom discovers
 //! Composer-installed ones per project, and a global path would let any opened repo poison it. Everything here is additive and idempotent: user content in
 //! the file is never overwritten or reordered, and only entries Zenith added itself (recorded
@@ -23,6 +23,32 @@ static SYNC_LOCK: Mutex<()> = Mutex::new(());
 /// built from `main` and symlinked as `current`.
 fn binary_path(home: &Path) -> PathBuf {
     home.join(".local/share/zenith/tools/phpantom/current/phpantom_lsp")
+}
+
+/// `XDG_CONFIG_HOME` Zenith gives its own PHPantom, so stock Zed's PHPantom (which reads
+/// `~/.config/phpantom_lsp`) never sees Zenith's library list, and the other way round.
+fn own_config_home(home: &Path) -> PathBuf {
+    home.join(".local/share/zenith/tools/phpantom/config")
+}
+
+/// Writes Zenith's own `.phpantom.toml` (a file only Zenith owns) when its content changes.
+fn write_own_config(home: &Path, include: &[String]) -> Result<(), String> {
+    let config = config_file(home, Some(own_config_home(home)));
+    let mut doc = DocumentMut::new();
+    let mut indexing = Table::new();
+    indexing.insert(
+        "include",
+        Item::Value(include.iter().collect::<Array>().into()),
+    );
+    doc.insert("indexing", Item::Table(indexing));
+    let text = doc.to_string();
+    if std::fs::read_to_string(&config).ok().as_deref() == Some(text.as_str()) {
+        return Ok(());
+    }
+    if let Some(dir) = config.parent() {
+        std::fs::create_dir_all(dir).map_err(|error| format!("{}: {error}", dir.display()))?;
+    }
+    write_atomic(&config, &text)
 }
 
 /// Entries Zenith added to the config file: `{"include": [...]}`. Older versions also
@@ -242,15 +268,19 @@ pub(crate) fn sync(project: &Entity<Project>, cx: &mut App) {
             include.push(path.clone());
         }
     }
-    let binary_unset = user
+    let user_binary = user
         .content
         .project
         .lsp
         .0
         .get("phpantom")
-        .and_then(|lsp| lsp.binary.as_ref())
+        .and_then(|lsp| lsp.binary.as_ref());
+    let binary_unset = user_binary
         .and_then(|binary| binary.path.as_ref())
         .is_none();
+    let env_unset = user_binary
+        .and_then(|binary| binary.env.as_ref())
+        .is_none_or(|env| !env.contains_key("XDG_CONFIG_HOME"));
     let fs = project.read(cx).fs().clone();
     let home = crate::home_dir();
     let xdg = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from);
@@ -258,15 +288,19 @@ pub(crate) fn sync(project: &Entity<Project>, cx: &mut App) {
         let binary = binary_path(&home);
         let set_binary = cx
             .background_spawn(async move {
-                if let Err(error) = sync_config(&home, xdg, &include) {
+                // Take back what older Zenith versions added to the global (shared) file.
+                if let Err(error) = sync_config(&home, xdg, &[]) {
                     log::warn!("phpantom config: {error}");
                 }
-                binary_unset
-                    .then(|| binary.is_file().then(|| binary.display().to_string()))
-                    .flatten()
+                if let Err(error) = write_own_config(&home, &include) {
+                    log::warn!("phpantom config: {error}");
+                }
+                let own = own_config_home(&home).display().to_string();
+                ((binary_unset || env_unset) && binary.is_file())
+                    .then(|| (binary.display().to_string(), own))
             })
             .await;
-        if let Some(path) = set_binary {
+        if let Some((path, own)) = set_binary {
             cx.update(|cx| {
                 settings::update_settings_file(fs, cx, move |content, _| {
                     let lsp = content.project.lsp.0.entry("phpantom".into()).or_default();
@@ -274,6 +308,11 @@ pub(crate) fn sync(project: &Entity<Project>, cx: &mut App) {
                     if binary.path.is_none() {
                         binary.path = Some(path);
                     }
+                    binary
+                        .env
+                        .get_or_insert_default()
+                        .entry("XDG_CONFIG_HOME".into())
+                        .or_insert(own);
                 });
             });
         }
@@ -283,7 +322,22 @@ pub(crate) fn sync(project: &Entity<Project>, cx: &mut App) {
 
 #[cfg(all(test, unix))]
 mod tests {
-    use super::{config_file, sync_config};
+    use super::{config_file, own_config_home, sync_config, write_own_config};
+
+    #[test]
+    fn test_own_config_is_separate_from_the_global_one() {
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path();
+        write_own_config(home, &["/libs/wp".into()]).unwrap();
+        let own = config_file(home, Some(own_config_home(home)));
+        assert!(own.starts_with(home.join(".local/share/zenith")));
+        let text = std::fs::read_to_string(&own).unwrap();
+        assert!(text.contains("include = [\"/libs/wp\"]"), "{text}");
+        assert!(
+            !config_file(home, None).exists(),
+            "the global file is not created"
+        );
+    }
 
     #[test]
     fn test_sync_keeps_user_entries_prunes_its_own_and_follows_symlinks() {
