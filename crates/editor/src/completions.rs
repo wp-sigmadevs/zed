@@ -1602,3 +1602,10 @@ pub(crate) fn snippet_candidate_suffixes<'a>(
             }
         })
 }
+
+// Zenith: lets a zenith crate wrap the provider an editor has instead of replacing it.
+impl Editor {
+    pub fn zenith_completion_provider(&self) -> Option<Rc<dyn CompletionProvider>> {
+        self.completion_provider.clone()
+    }
+}

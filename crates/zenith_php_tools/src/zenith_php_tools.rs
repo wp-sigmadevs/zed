@@ -3,6 +3,9 @@
 //! downloads or runs a tool.
 
 mod phpantom;
+mod string_completions;
+
+pub use string_completions::{StringCompletionSource, add_string_completions};
 
 use http_client::HttpClient;
 use std::{
