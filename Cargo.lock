@@ -22927,6 +22927,7 @@ dependencies = [
  "zenith_search",
  "zenith_splash",
  "zenith_templates",
+ "zenith_title_bar",
  "zenith_todo",
  "zenith_welcome",
  "zenith_wordpress",
@@ -23438,10 +23439,14 @@ dependencies = [
 name = "zenith_title_bar"
 version = "0.1.0"
 dependencies = [
+ "db",
  "gpui",
  "project",
+ "serde_json",
  "task",
+ "tasks_ui",
  "ui",
+ "util",
  "workspace",
  "zed_actions",
  "zenith_search",
