@@ -3,6 +3,10 @@
 //! into this module; all panel-state access for the feature lives here.
 
 use super::*;
+
+#[cfg_attr(not(feature = "scratches"), path = "zenith_libraries/scratches_off.rs")]
+mod scratches_node;
+use scratches_node::scratch_node_menu;
 use zenith_external_libraries::{
     RowDecoration, RowKind, create_external_libraries_root_entry, decorate_row, detect_libraries,
     is_enabled, is_library_worktree, is_section_expanded, is_under_library, may_be_library_path,
@@ -41,12 +45,19 @@ impl ProjectPanel {
         }
     }
 
+    /// Appends the nodes after the project roots: "External Libraries", then "Scratches and
+    /// Consoles". Runs on the freshly derived state, before the panel repaints.
+    pub(super) fn zenith_libraries(&mut self, cx: &mut Context<Self>) {
+        self.zenith_external_libraries(cx);
+        self.zenith_scratch_rows(cx);
+    }
+
     /// Moves every library row below all project roots, under one "External Libraries" node:
     /// each worktree's library folders and every user-added library worktree. The rows keep
     /// their worktree's group (several groups may share a worktree id), the node row heads the
     /// first one and its expansion is that worktree's. Runs on the freshly derived state, before
     /// the panel repaints.
-    pub(super) fn zenith_libraries(&mut self, cx: &mut Context<Self>) {
+    fn zenith_external_libraries(&mut self, cx: &mut Context<Self>) {
         if !is_enabled(cx) {
             return;
         }
@@ -160,8 +171,13 @@ impl ProjectPanel {
             entry_id,
         });
         let focus = self.focus_handle.clone();
+        let is_scratch = self.zenith_is_scratch(worktree_id, cx);
         let context_menu = ContextMenu::build(window, cx, |menu, _, _| {
-            menu.context(focus).action(
+            let menu = menu.context(focus);
+            if is_scratch {
+                return scratch_node_menu(menu);
+            }
+            menu.action(
                 "Add Library Path…",
                 Box::new(zenith_external_libraries::AddLibraryPath),
             )
@@ -207,6 +223,11 @@ impl ProjectPanel {
         depth: usize,
         cx: &App,
     ) -> (String, Option<SharedString>, usize) {
+        if let Some(row) =
+            self.zenith_scratch_decorate(entry, worktree_id, &filename, &icon, depth, cx)
+        {
+            return row;
+        }
         // A user-added library worktree sits one level under its node, root row labelled.
         if section_worktree(entry.id).is_none() && self.zenith_library_worktree(worktree_id, cx) {
             return if entry.path.is_empty() {
@@ -258,6 +279,9 @@ impl ProjectPanel {
         details: &EntryDetails,
         cx: &App,
     ) -> ProjectPanelSettings {
+        if settings.drag_and_drop && self.zenith_is_scratch(details.worktree_id, cx) {
+            settings.drag_and_drop = false;
+        }
         if settings.drag_and_drop && is_enabled(cx) {
             let is_library_row = self.zenith_library_worktree(details.worktree_id, cx)
                 || ((section_worktree(entry_id).is_some() || may_be_library_path(&details.path))
@@ -283,6 +307,9 @@ impl ProjectPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Entity<ContextMenu> {
+        if let Some(scratch_menu) = self.zenith_scratch_menu(worktree_id, entry_id, window, cx) {
+            return scratch_menu;
+        }
         if !is_enabled(cx) {
             return menu;
         }

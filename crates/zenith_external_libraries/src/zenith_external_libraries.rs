@@ -315,7 +315,8 @@ pub fn is_library_worktree(abs: &std::path::Path, cx: &App) -> bool {
     zenith_local_settings_trust::is_library_root(abs, cx)
 }
 
-fn append_children_recursive(
+/// Appends `parent_path`'s children to `target`, descending into the expanded folders.
+pub fn append_children_recursive(
     snapshot: &WorktreeSnapshot,
     parent_path: &RelPath,
     expanded_dir_ids: &[ProjectEntryId],
