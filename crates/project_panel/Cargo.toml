@@ -20,6 +20,7 @@ doctest = false
 # Zenith: off, the panel has no External Libraries node (the workspace dependency has no defaults).
 default = ["external_libraries"]
 external_libraries = ["dep:zenith_external_libraries"]
+scratches = ["external_libraries", "dep:zenith_scratches"]
 
 [dependencies]
 anyhow.workspace = true
@@ -51,6 +52,7 @@ markdown.workspace = true
 markdown_preview.workspace = true
 zed_actions.workspace = true
 zenith_external_libraries = { workspace = true, optional = true }
+zenith_scratches = { workspace = true, optional = true }
 telemetry.workspace = true
 notifications.workspace = true
 fs.workspace = true
