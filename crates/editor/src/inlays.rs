@@ -206,3 +206,23 @@ impl Editor {
             .collect()
     }
 }
+
+// Zenith: lets a zenith crate draw inlay hints as elements (PhpStorm's small pills).
+pub type InlayHintRenderFn =
+    fn(gpui::SharedString, &mut crate::ChunkRendererContext) -> gpui::AnyElement;
+static HINT_RENDERER: OnceLock<InlayHintRenderFn> = OnceLock::new();
+pub fn set_inlay_hint_renderer(render: InlayHintRenderFn) {
+    HINT_RENDERER.set(render).ok();
+}
+pub(crate) fn zenith_hint_renderer(id: InlayId, text: &str) -> Option<crate::ChunkRenderer> {
+    let render = *HINT_RENDERER
+        .get()
+        .filter(|_| matches!(id, InlayId::Hint(_)))?;
+    let text = gpui::SharedString::from(text.to_string());
+    Some(crate::ChunkRenderer {
+        id: crate::display_map::ChunkRendererId::Inlay(id),
+        render: std::sync::Arc::new(move |cx| render(text.clone(), cx)),
+        constrain_width: false,
+        measured_width: None,
+    })
+}

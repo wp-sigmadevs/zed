@@ -1374,6 +1374,7 @@ impl Editor {
             return;
         };
         let should_show = inlay_hints.should_show();
+        let zenith_keep = cx.try_global::<InlayHintFilter>().map(|filter| filter.0);
         let Some(buffer_snapshot) = self
             .buffer
             .read(cx)
@@ -1518,7 +1519,9 @@ impl Editor {
             // Hidden kinds must not claim a dedup slot, or they could suppress a visible
             // identical hint from another server.
             .filter(|(_, _, hint, _)| {
-                should_show && inlay_hints.allowed_hint_kinds.contains(&hint.kind)
+                should_show
+                    && inlay_hints.allowed_hint_kinds.contains(&hint.kind)
+                    && zenith_keep.is_none_or(|keep| keep(hint, &buffer_snapshot))
             })
             // Deduplicate identical hints from different servers by (offset, text),
             // independently of the anchor bias.
@@ -7421,4 +7424,12 @@ let c = 3;"#
         });
         cx.executor().run_until_parked();
     }
+}
+
+// Zenith: lets a zenith crate hide some hints (PhpStorm names only literal arguments).
+pub type InlayHintFilterFn = fn(&InlayHint, &BufferSnapshot) -> bool;
+struct InlayHintFilter(InlayHintFilterFn);
+impl gpui::Global for InlayHintFilter {}
+pub fn set_inlay_hint_filter(keep: InlayHintFilterFn, cx: &mut App) {
+    cx.set_global(InlayHintFilter(keep));
 }
