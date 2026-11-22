@@ -44,6 +44,19 @@ pub struct ZenithSettingsContent {
     pub agent_review: Option<ZenithAgentReviewSettingsContent>,
     /// Settings for scratch files.
     pub scratches: Option<ZenithScratchesSettingsContent>,
+    /// Settings for PHP tools.
+    pub php_tools: Option<ZenithPhpToolsSettingsContent>,
+}
+
+/// Settings for PHP tools.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+pub struct ZenithPhpToolsSettingsContent {
+    /// Absolute path of the PHP command line interpreter that tools and inspections run,
+    /// tried before every PHP found on this machine. Read from user settings only: a
+    /// binary chosen by a project would run its code.
+    ///
+    /// Default: null
+    pub php_binary: Option<String>,
 }
 
 /// Settings for agent review.
