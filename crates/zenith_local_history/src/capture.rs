@@ -571,7 +571,7 @@ fn capture_external(
     let Some(worktree) = project.worktree_for_id(worktree_id, cx) else {
         return;
     };
-    let paths: Vec<_> = changes
+    let mut paths: Vec<_> = changes
         .iter()
         // Never `Loaded`: that is the initial scan, not a change.
         .filter(|(path, _, change)| {
@@ -583,9 +583,15 @@ fn capture_external(
                 .entry_for_path(path)
                 .is_some_and(|entry| entry.is_file())
         })
-        .take(MAX_EXTERNAL_PER_UPDATE)
         .map(|(path, _, _)| path.clone())
         .collect();
+    if paths.len() > MAX_EXTERNAL_PER_UPDATE {
+        log::info!(
+            "local history: {} external changes in one update, recording the first {MAX_EXTERNAL_PER_UPDATE}",
+            paths.len()
+        );
+        paths.truncate(MAX_EXTERNAL_PER_UPDATE);
+    }
     let mut now_jobs = Vec::new();
     let mut later = Vec::new();
     for path in paths {

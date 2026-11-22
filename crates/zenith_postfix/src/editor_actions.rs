@@ -159,21 +159,32 @@ fn replace_with_cursor(
     cx: &mut Context<Editor>,
 ) {
     let text = replacement.replace('\n', &format!("\n{indent}"));
-    let before_cursor = cursor_offset
-        .and_then(|offset| replacement.get(..offset))
-        .map(|head| head.replace('\n', &format!("\n{indent}")));
-    editor.edit([(range.clone(), text.as_str())], cx);
-    if let Some(head) = before_cursor {
-        let lines = head.matches('\n').count() as u32;
-        let column = match head.rfind('\n') {
-            Some(newline) => head.len() - newline - 1,
-            None => range.start.column as usize + head.len(),
-        };
-        let target = Point::new(range.start.row + lines, column as u32);
+    let target = cursor_target(range.start, replacement, cursor_offset, indent);
+    editor.edit([(range, text.as_str())], cx);
+    if let Some(target) = target {
         editor.change_selections(Default::default(), window, cx, |selections| {
             selections.select_ranges([target..target])
         });
     }
+}
+
+/// Where the cursor lands after `replacement` (re-indented with `indent`) is inserted at
+/// `start`, `cursor_offset` bytes into the unindented replacement.
+fn cursor_target(
+    start: Point,
+    replacement: &str,
+    cursor_offset: Option<usize>,
+    indent: &str,
+) -> Option<Point> {
+    let head = replacement
+        .get(..cursor_offset?)?
+        .replace('\n', &format!("\n{indent}"));
+    let lines = head.matches('\n').count() as u32;
+    let column = match head.rfind('\n') {
+        Some(newline) => head.len() - newline - 1,
+        None => start.column as usize + head.len(),
+    };
+    Some(Point::new(start.row + lines, column as u32))
 }
 
 /// Wraps the lines the selection touches in a block of `kind`.
@@ -295,4 +306,34 @@ fn expand_template(
         window,
         cx,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cursor_target;
+    use language::Point;
+
+    #[test]
+    fn test_cursor_target_follows_indented_lines() {
+        let start = Point::new(3, 4);
+        assert_eq!(
+            cursor_target(start, "if ($x) {\n    \n}", Some(14), "    "),
+            Some(Point::new(4, 8))
+        );
+        assert_eq!(
+            cursor_target(start, "echo $x;", Some(5), "    "),
+            Some(Point::new(3, 9))
+        );
+        assert_eq!(cursor_target(start, "abc", None, ""), None);
+        assert_eq!(
+            cursor_target(start, "é", Some(1), ""),
+            None,
+            "not a char boundary"
+        );
+        assert_eq!(
+            cursor_target(start, "abc", Some(9), ""),
+            None,
+            "past the end"
+        );
+    }
 }
