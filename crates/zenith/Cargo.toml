@@ -24,7 +24,7 @@ look = ["dep:zenith_look"]
 todo = ["dep:zenith_todo"]
 splash = ["dep:zenith_splash"]
 markdown = ["dep:zenith_markdown"]
-external_libraries = ["dep:zenith_external_libraries"]
+external_libraries = ["dep:zenith_external_libraries", "project_panel/external_libraries"]
 problems = ["dep:zenith_problems"]
 folds = ["dep:zenith_folds"]
 templates = ["dep:zenith_templates"]
@@ -42,6 +42,7 @@ navbar = ["dep:zenith_navbar"]
 [dependencies]
 gpui.workspace = true
 onboarding.workspace = true
+project_panel.workspace = true
 zenith_agent_review = { workspace = true, optional = true }
 zenith_folds = { workspace = true, optional = true }
 zenith_inspections = { workspace = true, optional = true }

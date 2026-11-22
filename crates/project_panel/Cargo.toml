@@ -16,6 +16,11 @@ harness = false
 path = "src/project_panel.rs"
 doctest = false
 
+[features]
+# Zenith: off, the panel has no External Libraries node (the workspace dependency has no defaults).
+default = ["external_libraries"]
+external_libraries = ["dep:zenith_external_libraries"]
+
 [dependencies]
 anyhow.workspace = true
 collections.workspace = true
@@ -45,7 +50,7 @@ language.workspace = true
 markdown.workspace = true
 markdown_preview.workspace = true
 zed_actions.workspace = true
-zenith_external_libraries.workspace = true
+zenith_external_libraries = { workspace = true, optional = true }
 telemetry.workspace = true
 notifications.workspace = true
 fs.workspace = true
