@@ -42,6 +42,11 @@ impl ProjectsDelegate {
     }
 
     #[cfg(test)]
+    pub fn info(&self, root: &std::path::Path) -> Option<&ProjectInfo> {
+        self.info.get(root)
+    }
+
+    #[cfg(test)]
     pub fn matched_paths(&self) -> Vec<String> {
         self.matches.iter().map(|m| m.string.to_string()).collect()
     }
@@ -64,6 +69,14 @@ fn project_name(project: &RecentWorkspace) -> String {
         .map(|name| name.to_string_lossy().into_owned())
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// Where opened projects go, per the `default_open_behavior` setting.
+pub(crate) fn open_mode(cx: &App) -> OpenMode {
+    match WorkspaceSettings::get_global(cx).default_open_behavior {
+        settings::DefaultOpenBehavior::ExistingWindow => OpenMode::Activate,
+        settings::DefaultOpenBehavior::NewWindow => OpenMode::NewWindow,
+    }
 }
 
 /// "just now", "5m ago", "2h ago", "yesterday", "3d ago", or the date.
@@ -153,10 +166,7 @@ impl PickerDelegate for ProjectsDelegate {
             return;
         }
         let paths = project.paths.paths().to_vec();
-        let open_mode = match WorkspaceSettings::get_global(cx).default_open_behavior {
-            settings::DefaultOpenBehavior::ExistingWindow => OpenMode::Activate,
-            settings::DefaultOpenBehavior::NewWindow => OpenMode::NewWindow,
-        };
+        let open_mode = open_mode(cx);
         self.workspace
             .update(cx, |workspace, cx| {
                 workspace

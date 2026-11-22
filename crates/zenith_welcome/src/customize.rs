@@ -67,26 +67,28 @@ fn render_agents(cx: &mut App) -> impl IntoElement {
         .child(more)
 }
 
-/// Upstream's keymap picker with Zed's default keymap labelled as Zenith's own; no telemetry.
+/// Upstream's keymap picker; JetBrains is the fork default (`base_keymap` in
+/// default.json), upstream's own keymap is labelled "Zenith"; no telemetry.
+const KEYMAPS: [(&str, IconName, BaseKeymap); 8] = [
+    (
+        "JetBrains (default)",
+        IconName::EditorJetBrains,
+        BaseKeymap::JetBrains,
+    ),
+    ("Zenith", IconName::Zenith, BaseKeymap::Zed),
+    ("VS Code", IconName::EditorVsCode, BaseKeymap::VSCode),
+    (
+        "Sublime Text",
+        IconName::EditorSublime,
+        BaseKeymap::SublimeText,
+    ),
+    ("Atom", IconName::EditorAtom, BaseKeymap::Atom),
+    ("Emacs", IconName::EditorEmacs, BaseKeymap::Emacs),
+    ("Cursor", IconName::EditorCursor, BaseKeymap::Cursor),
+    ("TextMate", IconName::Keyboard, BaseKeymap::TextMate),
+];
+
 fn render_base_keymap_section(tab_index: &mut isize, cx: &mut App) -> impl IntoElement {
-    const KEYMAPS: [(&str, IconName, BaseKeymap); 8] = [
-        ("Zenith (default)", IconName::Zenith, BaseKeymap::Zed),
-        ("VS Code", IconName::EditorVsCode, BaseKeymap::VSCode),
-        (
-            "JetBrains",
-            IconName::EditorJetBrains,
-            BaseKeymap::JetBrains,
-        ),
-        (
-            "Sublime Text",
-            IconName::EditorSublime,
-            BaseKeymap::SublimeText,
-        ),
-        ("Atom", IconName::EditorAtom, BaseKeymap::Atom),
-        ("Emacs", IconName::EditorEmacs, BaseKeymap::Emacs),
-        ("Cursor", IconName::EditorCursor, BaseKeymap::Cursor),
-        ("TextMate", IconName::Keyboard, BaseKeymap::TextMate),
-    ];
     let current = *BaseKeymap::get_global(cx);
     let button = |index: usize| {
         let (label, icon, keymap) = KEYMAPS[index];
@@ -125,5 +127,21 @@ mod tests {
             &["claude-acp", "codex-acp"],
             "upstream reordered FEATURED_AGENT_IDS; update PRIMARY_AGENTS",
         );
+    }
+
+    #[test]
+    fn default_keymap_label_matches_default_settings() {
+        let defaults: serde_json::Value =
+            settings::parse_json_with_comments(&settings::default_settings())
+                .expect("default settings parse");
+        let default: BaseKeymap =
+            serde_json::from_value(defaults["base_keymap"].clone()).expect("base_keymap parses");
+        let labelled: Vec<_> = KEYMAPS
+            .iter()
+            .filter(|(label, _, _)| label.ends_with("(default)"))
+            .map(|(_, _, keymap)| *keymap)
+            .collect();
+        assert_eq!(labelled, vec![default]);
+        assert!(KEYMAPS.iter().all(|(label, _, _)| !label.contains("Zed")));
     }
 }

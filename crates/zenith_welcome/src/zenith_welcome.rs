@@ -22,7 +22,7 @@ use workspace::{
 };
 use zed_actions::OpenOnboarding;
 
-pub use view::{Page, ZenithWelcome};
+pub use view::{FinishSetup, NewProject, Page, ZenithWelcome};
 
 #[derive(Debug, Clone, Copy, RegisterSetting)]
 pub struct ZenithWelcomeSettings {
@@ -68,8 +68,11 @@ fn welcome_override(
     cx: &mut App,
 ) -> Option<AnyView> {
     ZenithWelcomeSettings::get_global(cx).enabled.then(|| {
-        cx.new(|cx| ZenithWelcome::new(workspace, focus_handle, window, cx))
-            .into()
+        let view = cx.new(|cx| ZenithWelcome::new(workspace, focus_handle, window, cx));
+        // WelcomePage keeps the view private; tests reach it through this.
+        #[cfg(test)]
+        cx.set_global(tests::LastWelcome(view.downgrade()));
+        view.into()
     })
 }
 
@@ -120,10 +123,11 @@ pub fn show_onboarding_view(app_state: Arc<AppState>, cx: &mut App) -> Task<anyh
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fs::FakeFs;
-    use gpui::{BorrowAppContext as _, Entity, TestAppContext, VisualTestContext};
+    use fs::{FakeFs, Fs as _};
+    use gpui::{BorrowAppContext as _, Entity, Focusable as _, TestAppContext, VisualTestContext};
     use project::Project;
     use settings::SettingsStore;
+    use std::path::{Path, PathBuf};
     use workspace::MultiWorkspace;
 
     fn init_test(cx: &mut TestAppContext) {
@@ -217,8 +221,57 @@ mod tests {
         });
     }
 
+    /// The welcome view most recently built by `welcome_override`.
+    pub(crate) struct LastWelcome(pub(crate) gpui::WeakEntity<ZenithWelcome>);
+    impl gpui::Global for LastWelcome {}
+
+    fn last_welcome(cx: &mut VisualTestContext) -> Entity<ZenithWelcome> {
+        cx.update(|_, cx| cx.global::<LastWelcome>().0.upgrade())
+            .expect("welcome view alive")
+    }
+
+    fn recent(id: i64, path: &str) -> workspace::RecentWorkspace {
+        workspace::RecentWorkspace {
+            workspace_id: workspace::WorkspaceId::from_i64(id),
+            location: workspace::SerializedWorkspaceLocation::Local,
+            paths: workspace::PathList::new(&[path]),
+            identity_paths: workspace::PathList::new(&[path]),
+            path_style: None,
+            timestamp: chrono::Utc::now(),
+        }
+    }
+
+    /// Whether any window has a project rooted at `root`.
+    fn project_open(root: &str, cx: &mut VisualTestContext) -> bool {
+        cx.update(|_, cx| {
+            cx.windows()
+                .into_iter()
+                .filter_map(|window| window.downcast::<MultiWorkspace>())
+                .any(|window| {
+                    window.read(cx).is_ok_and(|multi| {
+                        multi.workspaces().any(|workspace| {
+                            workspace
+                                .read(cx)
+                                .project()
+                                .read(cx)
+                                .visible_worktrees(cx)
+                                .any(|tree| tree.read(cx).abs_path().as_ref() == Path::new(root))
+                        })
+                    })
+                })
+        })
+    }
+
     async fn workspace(cx: &mut TestAppContext) -> (Entity<Workspace>, &mut VisualTestContext) {
-        let project = Project::test(FakeFs::new(cx.executor()), None, cx).await;
+        let fs = FakeFs::new(cx.executor());
+        workspace_on(fs, cx).await
+    }
+
+    async fn workspace_on(
+        fs: Arc<FakeFs>,
+        cx: &mut TestAppContext,
+    ) -> (Entity<Workspace>, &mut VisualTestContext) {
+        let project = Project::test(fs, None, cx).await;
         let (multi, cx) =
             cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
         let workspace = multi.read_with(cx, |multi, _| multi.workspace().clone());
@@ -339,7 +392,6 @@ mod tests {
 
     #[gpui::test]
     async fn projects_picker_filters(cx: &mut TestAppContext) {
-        use workspace::{PathList, RecentWorkspace, SerializedWorkspaceLocation, WorkspaceId};
         init_test(cx);
         let (workspace, cx) = workspace(cx).await;
         let weak = workspace.downgrade();
@@ -352,14 +404,6 @@ mod tests {
         // Let the initial (empty) DB load finish before seeding.
         cx.run_until_parked();
         let picker = view.read_with(cx, |view, _| view.projects().clone());
-        let recent = |id, path: &str| RecentWorkspace {
-            workspace_id: WorkspaceId::from_i64(id),
-            location: SerializedWorkspaceLocation::Local,
-            paths: PathList::new(&[path]),
-            identity_paths: PathList::new(&[path]),
-            path_style: None,
-            timestamp: chrono::Utc::now(),
-        };
         picker.update_in(cx, |picker, window, cx| {
             picker.delegate.set_projects(vec![
                 recent(1, "/code/laravel-crm"),
@@ -415,5 +459,173 @@ mod tests {
                 view::PageRequest(None)
             ));
         });
+    }
+
+    #[gpui::test]
+    async fn enter_opens_project(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/code/crm", serde_json::json!({ "artisan": "" }))
+            .await;
+        let (workspace, cx) = workspace_on(fs, cx).await;
+        cx.update(|_, cx| {
+            cx.bind_keys([gpui::KeyBinding::new(
+                "enter",
+                menu::Confirm,
+                Some("Picker"),
+            )])
+        });
+        cx.dispatch_action(OpenOnboarding);
+        cx.run_until_parked();
+        let view = last_welcome(cx);
+        cx.update(|_, cx| view::request_page(workspace.entity_id(), Page::Projects, cx));
+        cx.run_until_parked();
+        assert_eq!(view.read_with(cx, |view, _| view.page()), Page::Projects);
+
+        let picker = view.read_with(cx, |view, _| view.projects().clone());
+        picker.update_in(cx, |picker, window, cx| {
+            picker.delegate.set_projects(vec![recent(1, "/code/crm")]);
+            picker.refresh(window, cx);
+            picker.focus_handle(cx).focus(window, cx);
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(!project_open("/code/crm", cx));
+
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert!(project_open("/code/crm", cx));
+    }
+
+    #[gpui::test]
+    async fn new_project_creates_folder_and_opens_it(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/code", serde_json::json!({})).await;
+        let (_workspace, cx) = workspace_on(fs.clone(), cx).await;
+        cx.dispatch_action(OpenOnboarding);
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+
+        // Through the welcome view's key context, as the button does.
+        cx.dispatch_action(NewProject);
+        cx.run_until_parked();
+        assert!(cx.did_prompt_for_new_path());
+        cx.simulate_new_path_selection(|_| Some(PathBuf::from("/code/new-app")));
+        cx.run_until_parked();
+
+        assert!(fs.is_dir(Path::new("/code/new-app")).await);
+        assert!(project_open("/code/new-app", cx));
+    }
+
+    #[gpui::test]
+    async fn finish_setup_returns_to_projects(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (_workspace, cx) = workspace(cx).await;
+        cx.dispatch_action(OpenOnboarding);
+        cx.run_until_parked();
+        let view = last_welcome(cx);
+        assert_eq!(view.read_with(cx, |view, _| view.page()), Page::Customize);
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+
+        cx.dispatch_action(FinishSetup);
+        cx.run_until_parked();
+        assert_eq!(view.read_with(cx, |view, _| view.page()), Page::Projects);
+    }
+
+    #[gpui::test]
+    async fn detect_cache_hit_skips_rescan(cx: &mut TestAppContext) {
+        use detect::{Framework, ProjectInfo};
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            "/code",
+            serde_json::json!({
+                "crm": { "artisan": "" },
+                "api": { "package.json": "{}" },
+            }),
+        )
+        .await;
+        let (workspace, cx) = workspace_on(fs.clone(), cx).await;
+        // A stale entry that a rescan would replace with Laravel.
+        let cached = ProjectInfo {
+            framework: Some(Framework::WordPress),
+            branch: None,
+        };
+        cx.update(|_, cx| {
+            cx.set_global(view::DetectCache(
+                [(PathBuf::from("/code/crm"), cached.clone())]
+                    .into_iter()
+                    .collect(),
+            ))
+        });
+        let weak = workspace.downgrade();
+        let view = cx.update(|window, cx| {
+            let focus = cx.focus_handle();
+            welcome_override(weak, focus, window, cx)
+                .and_then(|v| v.downcast::<ZenithWelcome>().ok())
+                .expect("zenith view")
+        });
+        cx.run_until_parked();
+        let picker = view.read_with(cx, |view, _| view.projects().downgrade());
+        let fs: Arc<dyn fs::Fs> = fs;
+        cx.update(|window, cx| {
+            window.spawn(cx, async move |cx| {
+                view::show_projects(
+                    fs,
+                    vec![recent(1, "/code/crm"), recent(2, "/code/api")],
+                    picker,
+                    cx,
+                )
+                .await
+            })
+        })
+        .await;
+        cx.run_until_parked();
+
+        let picker = view.read_with(cx, |view, _| view.projects().clone());
+        picker.read_with(cx, |picker, _| {
+            assert_eq!(picker.delegate.info(Path::new("/code/crm")), Some(&cached));
+            assert_eq!(
+                picker
+                    .delegate
+                    .info(Path::new("/code/api"))
+                    .and_then(|info| info.framework),
+                Some(Framework::Node),
+            );
+        });
+        cx.update(|_, cx| {
+            let cache = &cx.global::<view::DetectCache>().0;
+            assert_eq!(cache.get(Path::new("/code/crm")), Some(&cached));
+            assert!(cache.contains_key(Path::new("/code/api")));
+        });
+    }
+
+    /// Plan 32 req. 4: none of upstream onboarding's telemetry toggles or events.
+    #[test]
+    fn no_telemetry_ids() {
+        // Built with concat! so this test's own source doesn't match.
+        let needles = [
+            concat!("onboarding-", "telemetry"),
+            concat!("render_", "telemetry_section"),
+            concat!("Telemetry", "Settings"),
+            concat!("telemetry", "::event"),
+            concat!("Help improve ", "Z"),
+            concat!("Help fix ", "Z"),
+        ];
+        let sources = [
+            ("zenith_welcome.rs", include_str!("zenith_welcome.rs")),
+            ("view.rs", include_str!("view.rs")),
+            ("customize.rs", include_str!("customize.rs")),
+            ("plugins.rs", include_str!("plugins.rs")),
+            ("projects.rs", include_str!("projects.rs")),
+            ("learn.rs", include_str!("learn.rs")),
+            ("detect.rs", include_str!("detect.rs")),
+        ];
+        for (file, source) in sources {
+            for needle in needles {
+                assert!(!source.contains(needle), "{file} contains {needle:?}");
+            }
+        }
     }
 }
