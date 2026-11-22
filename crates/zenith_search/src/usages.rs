@@ -649,7 +649,11 @@ mod tests {
         cx: &mut TestAppContext,
     ) -> EditorLspTestContext {
         // Before the workspace exists, so it gets the action handlers.
-        cx.update(crate::init);
+        cx.update(|cx| {
+            let store = settings::SettingsStore::test(cx);
+            cx.set_global(store);
+            crate::init(cx);
+        });
         let mut cx = EditorLspTestContext::new_rust(
             lsp::ServerCapabilities {
                 references_provider: Some(lsp::OneOf::Left(true)),
@@ -815,7 +819,11 @@ mod tests {
         places: Vec<(u32, u32, u32)>,
         cx: &mut TestAppContext,
     ) -> EditorLspTestContext {
-        cx.update(crate::init);
+        cx.update(|cx| {
+            let store = settings::SettingsStore::test(cx);
+            cx.set_global(store);
+            crate::init(cx);
+        });
         let mut cx = EditorLspTestContext::new_rust(
             lsp::ServerCapabilities {
                 code_lens_provider: Some(lsp::CodeLensOptions {
