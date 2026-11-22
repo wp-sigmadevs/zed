@@ -44,7 +44,7 @@ async fn setup(cx: &mut TestAppContext) -> Setup {
     let fs = FakeFs::new(cx.executor());
     fs.insert_tree(
         "/dir",
-        json!({ "a.txt": "base\n", "b.txt": "b base\n", "bin.txt": "x\0y\n" }),
+        json!({ "a.txt": "base\n", "b.txt": "b base\n", "wp-config.php": "secret\n" }),
     )
     .await;
     let project = Project::test(fs.clone(), [Path::new("/dir")], cx).await;
@@ -327,8 +327,8 @@ async fn test_revert_is_refused_while_the_agent_runs(cx: &mut TestAppContext) {
 #[gpui::test]
 async fn test_a_file_without_checkpoint_is_reported_and_left_alone(cx: &mut TestAppContext) {
     let setup = setup(cx).await;
-    // Local history keeps no binary text, so the checkpoint is refused up front.
-    run_turn_writing(&setup, "/dir/bin.txt", "z\0\n", cx).await;
+    // Local history never stores secret files, so the checkpoint is refused up front.
+    run_turn_writing(&setup, "/dir/wp-config.php", "edited\n", cx).await;
     let files = turn_files(&setup, 1, cx);
     assert_eq!(files.len(), 1);
     assert!(!files[0].checkpointed && !files[0].created);
@@ -337,10 +337,10 @@ async fn test_a_file_without_checkpoint_is_reported_and_left_alone(cx: &mut Test
         .update(|cx| revert_turn(&setup.thread, 1, cx))
         .await
         .expect("revert");
-    let bin = open(&setup, "/dir/bin.txt", cx).await;
+    let bin = open(&setup, "/dir/wp-config.php", cx).await;
     assert_eq!(outcome.missing, [bin.clone()]);
     assert!(outcome.failed.is_empty());
-    assert_eq!(bin.read_with(cx, |buffer, _| buffer.text()), "z\0\n");
+    assert_eq!(bin.read_with(cx, |buffer, _| buffer.text()), "edited\n");
 }
 
 #[gpui::test]

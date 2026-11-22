@@ -435,15 +435,13 @@ impl AgentReviewPanel {
             return;
         };
         if running {
-            window
-                .prompt(
-                    PromptLevel::Info,
-                    "The agent is still working",
-                    Some(REVERT_WHILE_RUNNING),
-                    &["OK"],
-                    cx,
-                )
-                .detach();
+            let _ = window.prompt(
+                PromptLevel::Info,
+                "The agent is still working",
+                Some(REVERT_WHILE_RUNNING),
+                &["OK"],
+                cx,
+            );
             return;
         }
         self.revert(thread, turn, window, cx);
