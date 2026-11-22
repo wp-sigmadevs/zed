@@ -114,7 +114,8 @@ impl UsagesModal {
                 Some(locations) => {
                     modal.search = cx.spawn_in(window, async move |this, cx| {
                         let result = locations.await;
-                        this.update(cx, |this: &mut Self, cx| this.show(result, cx)).ok();
+                        this.update(cx, |this: &mut Self, cx| this.show(result, cx))
+                            .ok();
                     });
                 }
                 // No symbol at the cursor, so nothing to look up.
@@ -444,7 +445,7 @@ fn usage_rows(locations: Vec<Location>, cx: &App) -> (Vec<Hit>, bool) {
 /// Cuts `rows` to `max`; true when something was cut.
 fn cap<T>(rows: &mut Vec<T>, max: usize) -> bool {
     let capped = rows.len() > max;
-    let _ = max;
+    rows.truncate(max);
     capped
 }
 
@@ -483,7 +484,10 @@ mod tests {
             .iter()
             .map(|&(row, start, end)| lsp::Location {
                 uri: uri.clone(),
-                range: lsp::Range::new(lsp::Position::new(row, start), lsp::Position::new(row, end)),
+                range: lsp::Range::new(
+                    lsp::Position::new(row, start),
+                    lsp::Position::new(row, end),
+                ),
             })
             .collect()
     }
