@@ -1,18 +1,33 @@
 //! The project panel's "+" popup (plan 20): pick a file type, type a name, and the
-//! file is created in the selected directory with that type's starter content.
-//! File and Directory hand over to the project panel's own inline name editor.
+//! file is created in the selected directory from that type's template
+//! (`template.rs`; built-ins plus `~/.config/zenith/templates/` and, in a trusted
+//! project, `.zenith/templates/`). "PHP Class" opens its own dialog
+//! (`php_class.rs`). File and Directory hand over to the project panel's own
+//! inline name editor.
+
+mod php_class;
+pub mod psr4;
+pub mod template;
 
 use command_palette_hooks::CommandPaletteFilter;
+use editor::Editor;
 use file_icons::FileIcons;
 use fuzzy_nucleo::{StringMatch, StringMatchCandidate, StringMatchOptions, match_strings};
 use gpui::{
     Action, App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, SharedString,
     Task, WeakEntity, Window, actions, rems,
 };
+pub use php_class::{NewPhpClassDialog, PhpClassSpec, PhpKind};
 use picker::{Picker, PickerDelegate};
-use project::{Project, ProjectPath};
+use project::{Project, ProjectPath, WorktreeId, trusted_worktrees::TrustedWorktrees};
 use project_panel::{NewDirectory, NewFile, ProjectPanel};
-use std::{path::Path, sync::Arc};
+use std::{
+    future::Future,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
+use template::{Rendered, Template};
+use text::Point;
 use ui::{HighlightedLabel, ListItem, ListItemSpacing, prelude::*};
 use util::rel_path::RelPath;
 use workspace::{ModalView, Workspace, notifications::NotifyTaskExt as _};
@@ -22,7 +37,10 @@ actions!(
     [
         /// Opens the New popup: pick a file type and name, and it is created in the
         /// directory selected in the project panel.
-        NewFromTemplate
+        NewFromTemplate,
+        /// Opens the New PHP Class dialog for the directory selected in the project
+        /// panel: class, interface, trait or enum, namespaced from composer.json.
+        NewPhpClass
     ]
 );
 
@@ -31,11 +49,14 @@ pub fn init(cx: &mut App) {
         workspace.register_action(|workspace, _: &NewFromTemplate, window, cx| {
             NewPopup::open(workspace, window, cx)
         });
+        workspace.register_action(|workspace, _: &NewPhpClass, window, cx| {
+            NewPhpClassDialog::open(workspace, window, cx)
+        });
     })
     .detach();
 }
 
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone)]
 enum Kind {
     /// `project_panel::NewFile`
     File,
@@ -45,97 +66,71 @@ enum Kind {
     AgentSession,
     /// `zenith_scratches::NewScratchFile`, looked up by name: no crate dependency.
     Scratch,
-    /// A named file with starter content.
-    Template {
-        extension: &'static str,
-        content: &'static str,
-    },
+    /// [`NewPhpClass`]
+    PhpClass,
+    /// A named file rendered from a template.
+    Template(Arc<Template>),
 }
 
+#[derive(Clone)]
 struct Entry {
-    label: &'static str,
+    label: SharedString,
     kind: Kind,
     /// A file name the icon theme can match, for the row's icon.
-    icon_sample: &'static str,
+    icon_sample: SharedString,
 }
 
-const HTML: &str = "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n    <meta charset=\"UTF-8\">\n    \
-<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">\n    \
-<title>Document</title>\n</head>\n<body>\n\n</body>\n</html>\n";
-
-const fn template(extension: &'static str, content: &'static str) -> Kind {
-    Kind::Template { extension, content }
-}
-
-/// PhpStorm's order. Left out until they exist: PHP Class and its
-/// siblings, HTTP Request, Data Source, PHP Test and the framework generators.
-const ENTRIES: &[Entry] = &[
-    Entry {
-        label: "New Scratch File",
-        kind: Kind::Scratch,
-        icon_sample: "",
-    },
-    Entry {
-        label: "PHP File",
-        kind: template("php", "<?php\n\n"),
-        icon_sample: "x.php",
-    },
-    Entry {
-        label: "File",
-        kind: Kind::File,
-        icon_sample: "x",
-    },
-    Entry {
-        label: "Directory",
-        kind: Kind::Directory,
-        icon_sample: "",
-    },
-    Entry {
-        label: "Agent Session",
-        kind: Kind::AgentSession,
-        icon_sample: "",
-    },
-    Entry {
-        label: "JavaScript File",
-        kind: template("js", ""),
-        icon_sample: "x.js",
-    },
-    Entry {
-        label: "TypeScript File",
-        kind: template("ts", ""),
-        icon_sample: "x.ts",
-    },
-    Entry {
-        label: "HTML File",
-        kind: template("html", HTML),
-        icon_sample: "x.html",
-    },
-    Entry {
-        label: "Stylesheet",
-        kind: template("css", ""),
-        icon_sample: "x.css",
-    },
-    Entry {
-        label: "SCSS File",
-        kind: template("scss", ""),
-        icon_sample: "x.scss",
-    },
-    Entry {
-        label: "Less File",
-        kind: template("less", ""),
-        icon_sample: "x.less",
-    },
-    Entry {
-        label: "JSON File",
-        kind: template("json", "{}\n"),
-        icon_sample: "x.json",
-    },
-    Entry {
-        label: "Markdown File",
-        kind: template("md", ""),
-        icon_sample: "x.md",
-    },
+/// Rendered by the PHP Class dialog, not listed as rows.
+const PHP_KINDS: [&str; 4] = ["php-class", "php-interface", "php-trait", "php-enum"];
+/// Built-in rows after Agent Session, in PhpStorm's order.
+const LATER_BUILTINS: [&str; 8] = [
+    "javascript",
+    "typescript",
+    "html",
+    "stylesheet",
+    "scss",
+    "less",
+    "json",
+    "markdown",
 ];
+
+/// PhpStorm's order, then templates with new ids from the user's and the
+/// project's folders. Rows whose action is not in this build are left out.
+fn entries(templates: &[Template], agent: bool, scratch: bool) -> Vec<Entry> {
+    let fixed = |label: &'static str, kind: Kind, icon_sample: &'static str| Entry {
+        label: label.into(),
+        kind,
+        icon_sample: icon_sample.into(),
+    };
+    let row = |template: &Template| Entry {
+        label: template.name.clone().into(),
+        icon_sample: format!("x.{}", template.extension).into(),
+        kind: Kind::Template(Arc::new(template.clone())),
+    };
+    let by_id = |id: &str| templates.iter().find(|template| template.id == id).map(row);
+    let mut entries = Vec::new();
+    if scratch {
+        entries.push(fixed("New Scratch File", Kind::Scratch, ""));
+    }
+    entries.extend(by_id("php-file"));
+    entries.push(fixed("PHP Class", Kind::PhpClass, "x.php"));
+    entries.push(fixed("File", Kind::File, "x"));
+    entries.push(fixed("Directory", Kind::Directory, ""));
+    if agent {
+        entries.push(fixed("Agent Session", Kind::AgentSession, ""));
+    }
+    entries.extend(LATER_BUILTINS.into_iter().filter_map(|id| by_id(id)));
+    entries.extend(
+        templates
+            .iter()
+            .filter(|template| {
+                let id = template.id.as_str();
+                id != "php-file" && !PHP_KINDS.contains(&id) && !LATER_BUILTINS.contains(&id)
+            })
+            .map(row),
+    );
+    entries
+}
 
 fn agent_session_action(cx: &App) -> Option<Box<dyn Action>> {
     cx.build_action("agent::NewThread", None).ok()
@@ -145,18 +140,6 @@ fn agent_session_action(cx: &App) -> Option<Box<dyn Action>> {
 fn scratch_action(cx: &App) -> Option<Box<dyn Action>> {
     cx.build_action("zenith_scratches::NewScratchFile", None)
         .ok()
-}
-
-/// Entries whose action exists in this build.
-fn visible_entries(agent: bool, scratch: bool) -> Vec<&'static Entry> {
-    ENTRIES
-        .iter()
-        .filter(|entry| match entry.kind {
-            Kind::AgentSession => agent,
-            Kind::Scratch => scratch,
-            _ => true,
-        })
-        .collect()
 }
 
 /// The directory a new file goes in: the selected directory, the parent of a
@@ -179,6 +162,42 @@ fn target_dir(project: &Project, selected: Option<ProjectPath>, cx: &App) -> Opt
         worktree_id: worktree.read(cx).id(),
         path: RelPath::empty_arc(),
     })
+}
+
+/// [`target_dir`] for the project panel's selection.
+fn selected_target_dir(workspace: &Workspace, cx: &App) -> Option<ProjectPath> {
+    let selected = workspace
+        .panel::<ProjectPanel>(cx)
+        .and_then(|panel| panel.read(cx).selected_entry_project_path(cx));
+    target_dir(workspace.project().read(cx), selected, cx)
+}
+
+/// `<worktree>/.zenith/templates`, only for a local worktree the user trusts:
+/// its templates are the project's content, written into new files.
+fn project_templates_dir(
+    project: &Entity<Project>,
+    worktree_id: WorktreeId,
+    cx: &mut App,
+) -> Option<PathBuf> {
+    if !project.read(cx).is_local() {
+        return None;
+    }
+    if let Some(store) = TrustedWorktrees::try_get_global(cx) {
+        let worktree_store = project.read(cx).worktree_store();
+        if !store.update(cx, |store, cx| {
+            store.can_trust(&worktree_store, worktree_id, cx)
+        }) {
+            return None;
+        }
+    }
+    let worktree = project.read(cx).worktree_for_id(worktree_id, cx)?;
+    Some(
+        worktree
+            .read(cx)
+            .abs_path()
+            .join(".zenith")
+            .join("templates"),
+    )
 }
 
 /// Turns what was typed into the path to create, or says why it can't be.
@@ -242,8 +261,90 @@ fn resolve(
     })
 }
 
+/// The file name without the template's extension: `${NAME}`.
+fn name_stem<'a>(file_name: &'a str, extension: &str) -> &'a str {
+    let cut = file_name.len().saturating_sub(extension.len() + 1);
+    match (file_name.get(..cut), file_name.get(cut..)) {
+        (Some(stem), Some(suffix))
+            if !stem.is_empty() && suffix.eq_ignore_ascii_case(&format!(".{extension}")) =>
+        {
+            stem
+        }
+        _ => file_name,
+    }
+}
+
+/// Where `${CURSOR}` was, as a buffer point (columns are bytes).
+fn point_at(text: &str, offset: usize) -> Point {
+    let before = text.get(..offset).unwrap_or(text);
+    let line_start = before.rfind('\n').map_or(0, |at| at + 1);
+    Point::new(
+        before.matches('\n').count() as u32,
+        (before.len() - line_start) as u32,
+    )
+}
+
+/// Renders `content`, writes it to `target` (never over an existing file) and
+/// opens it with the cursor at `${CURSOR}`. Errors show as a workspace notification.
+fn create_file(
+    workspace: WeakEntity<Workspace>,
+    project: &Entity<Project>,
+    target: ProjectPath,
+    content: impl Future<Output = anyhow::Result<Rendered>> + 'static,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let (abs_path, fs, worktree) = {
+        let project = project.read(cx);
+        let abs_path = project
+            .is_local()
+            .then(|| project.absolute_path(&target, cx))
+            .flatten();
+        let Some(worktree) = project.worktree_for_id(target.worktree_id, cx) else {
+            return;
+        };
+        (abs_path, project.fs().clone(), worktree)
+    };
+    let task: Task<anyhow::Result<()>> = window.spawn(cx, {
+        let workspace = workspace.clone();
+        async move |cx| {
+            let Rendered { text, cursor } = content.await?;
+            // The worktree snapshot misses excluded and unscanned ignored folders
+            // (`vendor/`), and `create_entry` overwrites: ask the disk too.
+            if let Some(abs_path) = abs_path
+                && fs.metadata(&abs_path).await?.is_some()
+            {
+                anyhow::bail!("{} already exists", abs_path.display());
+            }
+            let path = target.path.clone();
+            let bytes = text.as_bytes().to_vec();
+            worktree
+                .update(cx, |worktree, cx| {
+                    worktree.create_entry(path, false, Some(bytes), cx)
+                })
+                .await?;
+            let item = workspace
+                .update_in(cx, |workspace, window, cx| {
+                    workspace.open_path(target, None, true, window, cx)
+                })?
+                .await?;
+            if let (Some(offset), Some(editor)) = (cursor, item.downcast::<Editor>()) {
+                let point = point_at(&text, offset);
+                cx.update(|window, cx| {
+                    editor.update(cx, |editor, cx| {
+                        editor.go_to_singleton_buffer_point(point, window, cx)
+                    })
+                })?;
+            }
+            Ok(())
+        }
+    });
+    task.detach_and_notify_err(workspace, window, cx);
+}
+
 pub struct NewPopup {
     picker: Entity<Picker<NewDelegate>>,
+    _load_templates: Task<()>,
 }
 
 impl ModalView for NewPopup {}
@@ -266,31 +367,46 @@ impl Render for NewPopup {
 impl NewPopup {
     fn open(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
         let project = workspace.project().clone();
-        let selected = workspace
-            .panel::<ProjectPanel>(cx)
-            .and_then(|panel| panel.read(cx).selected_entry_project_path(cx));
-        let Some(dir) = target_dir(project.read(cx), selected, cx) else {
+        let Some(dir) = selected_target_dir(workspace, cx) else {
             return;
         };
+        let project_templates = project_templates_dir(&project, dir.worktree_id, cx);
+        let fs = project.read(cx).fs().clone();
         let workspace_handle = cx.entity().downgrade();
         workspace.toggle_modal(window, cx, move |window, cx| {
-            let ai = agent_session_action(cx).is_some_and(|action| {
+            let agent = agent_session_action(cx).is_some_and(|action| {
                 !CommandPaletteFilter::try_global(cx).is_some_and(|f| f.is_hidden(&*action))
             });
-            let entries = visible_entries(ai, scratch_action(cx).is_some());
+            let scratch = scratch_action(cx).is_some();
             let delegate = NewDelegate::new(
                 cx.entity().downgrade(),
                 workspace_handle,
                 project,
                 dir,
-                entries,
+                entries(&template::builtin(), agent, scratch),
             );
             let picker = cx.new(|cx| {
                 Picker::uniform_list(delegate, window, cx)
                     .initial_width(rems(20.))
                     .show_scrollbar(false)
             });
-            NewPopup { picker }
+            // The user's and the project's templates come from disk: rows for them
+            // appear once read.
+            let load = cx.spawn_in(window, async move |popup, cx| {
+                let templates = template::load_all(fs, project_templates).await;
+                popup
+                    .update_in(cx, |popup, window, cx| {
+                        popup.picker.update(cx, |picker, cx| {
+                            picker.delegate.entries = entries(&templates, agent, scratch);
+                            picker.refresh(window, cx);
+                        })
+                    })
+                    .ok();
+            });
+            NewPopup {
+                picker,
+                _load_templates: load,
+            }
         });
     }
 }
@@ -300,12 +416,15 @@ pub struct NewDelegate {
     workspace: WeakEntity<Workspace>,
     project: Entity<Project>,
     dir: ProjectPath,
-    entries: Vec<&'static Entry>,
+    entries: Vec<Entry>,
     matches: Vec<StringMatch>,
     selected: usize,
-    /// Set once a typed entry is chosen: the query is then the file's name.
-    naming: Option<&'static Entry>,
+    /// Set once a template is chosen: the query is then the file's name, then
+    /// one answer per prompt of the template.
+    naming: Option<(Entry, Arc<Template>)>,
     name: String,
+    answers: Vec<String>,
+    answer: String,
 }
 
 impl NewDelegate {
@@ -314,7 +433,7 @@ impl NewDelegate {
         workspace: WeakEntity<Workspace>,
         project: Entity<Project>,
         dir: ProjectPath,
-        entries: Vec<&'static Entry>,
+        entries: Vec<Entry>,
     ) -> Self {
         let matches = all_matches(&entries);
         Self {
@@ -327,6 +446,8 @@ impl NewDelegate {
             selected: 0,
             naming: None,
             name: String::new(),
+            answers: Vec::new(),
+            answer: String::new(),
         }
     }
 
@@ -360,55 +481,76 @@ impl NewDelegate {
         });
     }
 
+    /// The prompt being answered, when past the name.
+    fn current_prompt(&self) -> Option<&template::Prompt> {
+        let (_, template) = self.naming.as_ref()?;
+        template.prompts.get(self.answers.len().checked_sub(1)?)
+    }
+
     fn create(
         &mut self,
-        extension: &'static str,
-        content: &'static str,
+        template: Arc<Template>,
         window: &mut Window,
         cx: &mut Context<Picker<Self>>,
     ) {
-        let Ok(target) = resolve(self.project.read(cx), &self.dir, &self.name, extension, cx)
-        else {
+        let Ok(target) = resolve(
+            self.project.read(cx),
+            &self.dir,
+            &self.name,
+            &template.extension,
+            cx,
+        ) else {
             return;
         };
-        let project = self.project.clone();
-        let workspace = self.workspace.clone();
-        let abs_path = project
-            .read(cx)
-            .is_local()
-            .then(|| project.read(cx).absolute_path(&target, cx))
-            .flatten();
-        let fs = project.read(cx).fs().clone();
-        let Some(worktree) = project.read(cx).worktree_for_id(target.worktree_id, cx) else {
-            return;
+        let stem = name_stem(
+            target.path.file_name().unwrap_or_default(),
+            &template.extension,
+        )
+        .to_string();
+        let answers = template
+            .prompts
+            .iter()
+            .map(|prompt| prompt.name.clone())
+            .zip(self.answers.iter().skip(1).cloned())
+            .collect::<Vec<_>>();
+        let fs = self.project.read(cx).fs().clone();
+        let (root, abs_dir) = {
+            let project = self.project.read(cx);
+            let root = project
+                .worktree_for_id(target.worktree_id, cx)
+                .map(|worktree| worktree.read(cx).abs_path());
+            let abs_dir = project
+                .is_local()
+                .then(|| project.absolute_path(&target, cx))
+                .flatten()
+                .and_then(|path| path.parent().map(Path::to_path_buf));
+            (root, abs_dir)
+        };
+        let content = async move {
+            let namespace = match (template.body.contains("${NAMESPACE}"), root, abs_dir) {
+                (true, Some(root), Some(abs_dir)) => {
+                    psr4::resolve(fs.as_ref(), &root, &abs_dir).await
+                }
+                _ => None,
+            };
+            let mut variables =
+                template::standard_variables(&stem, namespace.as_deref().unwrap_or_default());
+            variables.extend(answers);
+            anyhow::Ok(template::render(&template.body, &variables))
         };
         self.dismiss(cx);
-        let task: Task<anyhow::Result<()>> = window.spawn(cx, async move |cx| {
-            // The worktree snapshot misses excluded and unscanned ignored folders
-            // (`vendor/`), and `create_entry` overwrites: ask the disk too.
-            if let Some(abs_path) = abs_path
-                && fs.metadata(&abs_path).await?.is_some()
-            {
-                anyhow::bail!("{} already exists", abs_path.display());
-            }
-            let path = target.path.clone();
-            worktree
-                .update(cx, |worktree, cx| {
-                    worktree.create_entry(path, false, Some(content.as_bytes().to_vec()), cx)
-                })
-                .await?;
-            workspace
-                .update_in(cx, |workspace, window, cx| {
-                    workspace.open_path(target, None, true, window, cx)
-                })?
-                .await?;
-            Ok(())
-        });
-        task.detach_and_notify_err(self.workspace.clone(), window, cx);
+        create_file(
+            self.workspace.clone(),
+            &self.project,
+            target,
+            content,
+            window,
+            cx,
+        );
     }
 }
 
-fn all_matches(entries: &[&Entry]) -> Vec<StringMatch> {
+fn all_matches(entries: &[Entry]) -> Vec<StringMatch> {
     entries
         .iter()
         .enumerate()
@@ -416,7 +558,7 @@ fn all_matches(entries: &[&Entry]) -> Vec<StringMatch> {
             candidate_id,
             score: 0.,
             positions: Vec::new(),
-            string: entry.label.into(),
+            string: entry.label.clone(),
         })
         .collect()
 }
@@ -424,14 +566,14 @@ fn all_matches(entries: &[&Entry]) -> Vec<StringMatch> {
 fn entry_icon(entry: &Entry, cx: &App) -> Icon {
     let (themed, fallback) = match entry.kind {
         Kind::File => (
-            FileIcons::get_icon(Path::new(entry.icon_sample), cx),
+            FileIcons::get_icon(Path::new(entry.icon_sample.as_ref()), cx),
             IconName::File,
         ),
         Kind::Directory => (None, IconName::Folder),
         Kind::AgentSession => (None, IconName::Thread),
         Kind::Scratch => (None, IconName::FileCode),
-        Kind::Template { .. } => (
-            FileIcons::get_icon(Path::new(entry.icon_sample), cx),
+        Kind::PhpClass | Kind::Template(_) => (
+            FileIcons::get_icon(Path::new(entry.icon_sample.as_ref()), cx),
             IconName::FileCode,
         ),
     };
@@ -450,9 +592,10 @@ impl PickerDelegate for NewDelegate {
     }
 
     fn placeholder_text(&self, _: &mut Window, _: &mut App) -> Arc<str> {
-        match self.naming {
-            Some(entry) => format!("New {} name", entry.label).into(),
-            None => "Search file type".into(),
+        match (&self.naming, self.current_prompt()) {
+            (_, Some(prompt)) => prompt.label().into(),
+            (Some((entry, _)), None) => format!("New {} name", entry.label).into(),
+            (None, None) => "Search file type".into(),
         }
     }
 
@@ -480,7 +623,11 @@ impl PickerDelegate for NewDelegate {
     ) -> Task<()> {
         self.selected = 0;
         if self.naming.is_some() {
-            self.name = query;
+            if self.answers.is_empty() {
+                self.name = query;
+            } else {
+                self.answer = query;
+            }
             return Task::ready(());
         }
         let query = query.trim();
@@ -491,7 +638,7 @@ impl PickerDelegate for NewDelegate {
                 .entries
                 .iter()
                 .enumerate()
-                .map(|(ix, entry)| StringMatchCandidate::new(ix, entry.label))
+                .map(|(ix, entry)| StringMatchCandidate::new(ix, entry.label.clone()))
                 .collect::<Vec<_>>();
             match_strings(&candidates, query, StringMatchOptions::default())
         };
@@ -499,9 +646,38 @@ impl PickerDelegate for NewDelegate {
     }
 
     fn confirm(&mut self, _: bool, window: &mut Window, cx: &mut Context<Picker<Self>>) {
-        if let Some(entry) = self.naming {
-            if let Kind::Template { extension, content } = entry.kind {
-                self.create(extension, content, window, cx);
+        if let Some((_, template)) = self.naming.clone() {
+            // `answers[0]` is the name, then one per prompt.
+            if self.answers.is_empty() {
+                if resolve(
+                    self.project.read(cx),
+                    &self.dir,
+                    &self.name,
+                    &template.extension,
+                    cx,
+                )
+                .is_err()
+                {
+                    return;
+                }
+                self.answers.push(self.name.clone());
+            } else {
+                self.answers.push(std::mem::take(&mut self.answer));
+            }
+            let next_default = template
+                .prompts
+                .get(self.answers.len() - 1)
+                .map(|prompt| prompt.default.clone());
+            match next_default {
+                Some(default) => {
+                    self.answer = default.clone();
+                    cx.defer_in(window, move |picker, window, cx| {
+                        picker.set_query(&default, window, cx);
+                        picker.refresh_placeholder(window, cx);
+                    });
+                    cx.notify();
+                }
+                None => self.create(template, window, cx),
             }
             return;
         }
@@ -509,18 +685,20 @@ impl PickerDelegate for NewDelegate {
             .matches
             .get(self.selected)
             .and_then(|found| self.entries.get(found.candidate_id))
-            .copied()
+            .cloned()
         else {
             return;
         };
-        match entry.kind {
+        match entry.kind.clone() {
             Kind::File => self.hand_over(Some(Box::new(NewFile)), true, window, cx),
             Kind::Directory => self.hand_over(Some(Box::new(NewDirectory)), true, window, cx),
             Kind::AgentSession => self.hand_over(agent_session_action(cx), true, window, cx),
             Kind::Scratch => self.hand_over(scratch_action(cx), false, window, cx),
-            Kind::Template { .. } => {
-                self.naming = Some(entry);
+            Kind::PhpClass => self.hand_over(Some(Box::new(NewPhpClass)), false, window, cx),
+            Kind::Template(template) => {
+                self.naming = Some((entry, template));
                 self.name.clear();
+                self.answers.clear();
                 self.selected = 0;
                 cx.defer_in(window, |picker, window, cx| {
                     picker.set_query("", window, cx);
@@ -550,17 +728,21 @@ impl PickerDelegate for NewDelegate {
             .inset(true)
             .spacing(ListItemSpacing::Sparse)
             .toggle_state(selected);
-        if let Some(entry) = self.naming {
-            let Kind::Template { extension, .. } = entry.kind else {
-                return None;
-            };
-            let project = self.project.read(cx);
-            let (text, color) = match resolve(project, &self.dir, &self.name, extension, cx) {
-                Ok(path) => (
-                    path.path.display(project.path_style(cx)).into_owned(),
+        if let Some((entry, template)) = &self.naming {
+            let (text, color) = if let Some(prompt) = self.current_prompt() {
+                (
+                    format!("{}: {}", prompt.label(), self.answer),
                     Color::Default,
-                ),
-                Err(message) => (message.to_string(), Color::Muted),
+                )
+            } else {
+                let project = self.project.read(cx);
+                match resolve(project, &self.dir, &self.name, &template.extension, cx) {
+                    Ok(path) => (
+                        path.path.display(project.path_style(cx)).into_owned(),
+                        Color::Default,
+                    ),
+                    Err(message) => (message.to_string(), Color::Muted),
+                }
             };
             return Some(
                 item.start_slot(entry_icon(entry, cx))
@@ -571,7 +753,10 @@ impl PickerDelegate for NewDelegate {
         let entry = self.entries.get(found.candidate_id)?;
         Some(
             item.start_slot(entry_icon(entry, cx))
-                .child(HighlightedLabel::new(entry.label, found.positions.clone())),
+                .child(HighlightedLabel::new(
+                    entry.label.clone(),
+                    found.positions.clone(),
+                )),
         )
     }
 }
@@ -642,7 +827,8 @@ mod tests {
             .insert_tree(
                 path!("/root"),
                 json!({
-                    "src": { "a.txt": "a", "Foo.php": "keep me" },
+                    "src": { "a.txt": "a", "Foo.php": "keep me", "Models": {} },
+                    "composer.json": r#"{"autoload":{"psr-4":{"App\\": "src/"}}}"#,
                     "vendor": { "autoload.php": "do not touch" },
                     ".gitignore": "vendor/\n",
                 }),
@@ -731,16 +917,21 @@ mod tests {
         let (setup, cx) = setup(cx).await;
         let picker = open(&setup, cx);
         picker.read_with(cx, |picker, _| {
-            assert_eq!(picker.delegate.entries[0].label, "New Scratch File");
-            assert_eq!(picker.delegate.entries[1].label, "PHP File");
-            assert_eq!(picker.delegate.matches.len(), ENTRIES.len() - 1); // no agent crate here
+            assert_eq!(&*picker.delegate.entries[0].label, "New Scratch File");
+            assert_eq!(&*picker.delegate.entries[1].label, "PHP File");
+            assert_eq!(&*picker.delegate.entries[2].label, "PHP Class");
+            // No agent crate here.
+            assert_eq!(
+                picker.delegate.matches.len(),
+                entries(&template::builtin(), false, true).len()
+            );
         });
         cx.simulate_input("ts");
         cx.run_until_parked();
         picker.read_with(cx, |picker, _| {
             let first = &picker.delegate.matches[0];
             assert_eq!(
-                picker.delegate.entries[first.candidate_id].label,
+                &*picker.delegate.entries[first.candidate_id].label,
                 "TypeScript File"
             );
         });
@@ -902,15 +1093,18 @@ mod tests {
     #[test]
     fn test_scratch_row_is_hidden_when_its_action_is_not_built() {
         let labels = |agent, scratch| {
-            visible_entries(agent, scratch)
+            entries(&template::builtin(), agent, scratch)
                 .iter()
-                .map(|entry| entry.label)
+                .map(|entry| entry.label.to_string())
                 .collect::<Vec<_>>()
         };
-        assert!(labels(true, true).contains(&"New Scratch File"));
-        assert!(!labels(true, false).contains(&"New Scratch File"));
-        assert!(!labels(false, true).contains(&"Agent Session"));
-        assert!(labels(false, true).contains(&"PHP File"));
+        let has = |labels: Vec<String>, label: &str| labels.iter().any(|known| known == label);
+        assert!(has(labels(true, true), "New Scratch File"));
+        assert!(!has(labels(true, false), "New Scratch File"));
+        assert!(!has(labels(false, true), "Agent Session"));
+        assert!(has(labels(false, true), "PHP File"));
+        // The four PHP kinds are the dialog's, not rows.
+        assert!(!has(labels(true, true), "PHP Interface"));
     }
 
     #[gpui::test]
@@ -924,5 +1118,149 @@ mod tests {
             panel.focus_handle(cx).contains_focused(window, cx)
         });
         assert!(focused, "the panel takes focus for its inline name editor");
+    }
+
+    fn cursor(setup: &Setup, cx: &mut VisualTestContext) -> Point {
+        let editor = setup
+            .workspace
+            .read_with(cx, |workspace, cx| workspace.active_item_as::<Editor>(cx))
+            .expect("a file is open");
+        editor.update(cx, |editor, cx| {
+            let snapshot = editor.display_snapshot(cx);
+            editor.selections.newest::<Point>(&snapshot).head()
+        })
+    }
+
+    fn dialog_open(setup: &Setup, cx: &mut VisualTestContext) -> bool {
+        setup.workspace.read_with(cx, |workspace, cx| {
+            workspace.active_modal::<NewPhpClassDialog>(cx).is_some()
+        })
+    }
+
+    #[gpui::test]
+    async fn test_new_php_class_uses_psr4_and_places_the_cursor(cx: &mut TestAppContext) {
+        let (setup, cx) = setup(cx).await;
+        select(&setup, "src/Models", cx);
+        cx.dispatch_action(NewPhpClass);
+        cx.run_until_parked();
+        assert!(dialog_open(&setup, cx));
+        cx.simulate_input("User");
+        cx.run_until_parked();
+        confirm(cx);
+        let expected = "<?php\n\nnamespace App\\Models;\n\nclass User\n{\n    \n}\n";
+        assert_eq!(
+            read(&setup, path!("/root/src/Models/User.php"))
+                .await
+                .as_deref(),
+            Some(expected)
+        );
+        assert!(!dialog_open(&setup, cx));
+        assert_eq!(cursor(&setup, cx), Point::new(6, 4));
+    }
+
+    #[gpui::test]
+    async fn test_new_php_class_refuses_bad_and_existing_names(cx: &mut TestAppContext) {
+        let (setup, cx) = setup(cx).await;
+        select(&setup, "src", cx);
+        cx.dispatch_action(NewPhpClass);
+        cx.run_until_parked();
+        cx.simulate_input("Foo");
+        cx.run_until_parked();
+        confirm(cx);
+        assert!(dialog_open(&setup, cx), "refused: stays open");
+        assert_eq!(
+            read(&setup, path!("/root/src/Foo.php")).await.as_deref(),
+            Some("keep me")
+        );
+        cx.dispatch_action(menu::Cancel);
+        cx.run_until_parked();
+        assert!(!dialog_open(&setup, cx));
+        cx.dispatch_action(NewPhpClass);
+        cx.run_until_parked();
+        cx.simulate_input("class");
+        cx.run_until_parked();
+        confirm(cx);
+        assert!(read(&setup, path!("/root/src/class.php")).await.is_none());
+    }
+
+    #[gpui::test]
+    async fn test_php_class_row_opens_the_dialog(cx: &mut TestAppContext) {
+        let (setup, cx) = setup(cx).await;
+        open(&setup, cx);
+        cx.simulate_input("PHP Class");
+        cx.run_until_parked();
+        confirm(cx);
+        assert!(dialog_open(&setup, cx));
+    }
+
+    #[gpui::test]
+    async fn test_user_and_project_templates_with_a_prompt(cx: &mut TestAppContext) {
+        let (setup, cx) = setup(cx).await;
+        setup
+            .fs
+            .as_fake()
+            .insert_tree(
+                template::user_dir(),
+                json!({
+                    "wp-plugin": {
+                        "manifest.json": r#"{"name":"WP Plugin Main File","extension":"php",
+                            "variables":[{"name":"TEXT_DOMAIN","label":"Text domain","default":"my-plugin"}]}"#,
+                        "template.php": "<?php\n// ${NAME} ${TEXT_DOMAIN}\n${CURSOR}",
+                    }
+                }),
+            )
+            .await;
+        setup
+            .fs
+            .as_fake()
+            .insert_tree(
+                path!("/root/.zenith/templates"),
+                json!({
+                    "json": {
+                        "manifest.json": r#"{"name":"Project JSON","extension":"json"}"#,
+                        "template.json": "[]\n",
+                    }
+                }),
+            )
+            .await;
+        let picker = open(&setup, cx);
+        picker.read_with(cx, |picker, _| {
+            let labels = picker
+                .delegate
+                .entries
+                .iter()
+                .map(|entry| entry.label.to_string())
+                .collect::<Vec<_>>();
+            assert!(labels.contains(&"Project JSON".to_string()), "{labels:?}");
+            assert!(!labels.contains(&"JSON File".to_string()), "{labels:?}");
+            assert_eq!(
+                labels.last().map(String::as_str),
+                Some("WP Plugin Main File")
+            );
+        });
+        cx.simulate_input("WP Plugin");
+        cx.run_until_parked();
+        confirm(cx);
+        cx.simulate_input("plugin");
+        cx.run_until_parked();
+        confirm(cx);
+        // The prompt starts with its default; accept it.
+        confirm(cx);
+        assert_eq!(
+            read(&setup, path!("/root/plugin.php")).await.as_deref(),
+            Some("<?php\n// plugin my-plugin\n")
+        );
+        assert_eq!(cursor(&setup, cx), Point::new(2, 0));
+    }
+
+    #[test]
+    fn test_name_stem_and_point_at() {
+        assert_eq!(name_stem("Foo.php", "php"), "Foo");
+        assert_eq!(name_stem("Foo.PHP", "php"), "Foo");
+        assert_eq!(name_stem("view.blade.php", "blade.php"), "view");
+        assert_eq!(name_stem(".php", "php"), ".php");
+        assert_eq!(name_stem("é.md", "md"), "é");
+        assert_eq!(point_at("ab\ncd", 4), Point::new(1, 1));
+        assert_eq!(point_at("ab", 0), Point::new(0, 0));
     }
 }

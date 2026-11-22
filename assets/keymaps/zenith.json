@@ -216,4 +216,13 @@
       "ctrl-r": "zenith_scratches::RunScratch",
     },
   },
+  {
+    // New PHP Class dialog: Tab and Shift-Tab move between its fields instead of typing a tab
+    // into the focused one ("Editor" binds editor::Tab; this context is deeper, so it wins).
+    "context": "ZenithNewPhpClass > Editor",
+    "bindings": {
+      "tab": "zenith_templates::NextField",
+      "shift-tab": "zenith_templates::PreviousField",
+    },
+  },
 ]
