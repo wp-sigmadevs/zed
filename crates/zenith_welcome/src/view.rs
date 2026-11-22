@@ -212,7 +212,6 @@ impl ZenithWelcome {
         if id != workspace_id {
             return;
         }
-        cx.set_global(PageRequest(None));
         self.set_page(page, cx);
     }
 
@@ -371,4 +370,7 @@ pub(crate) async fn show_projects(
 
 pub(crate) fn request_page(workspace: EntityId, page: Page, cx: &mut App) {
     cx.set_global(PageRequest(Some((workspace, page))));
+    // A workspace can hold two welcome views (the tab and upstream's cached empty-pane
+    // one): all of them apply the request, then it is cleared so later views ignore it.
+    cx.defer(|cx| cx.set_global(PageRequest(None)));
 }

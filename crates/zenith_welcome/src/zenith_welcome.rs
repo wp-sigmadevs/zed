@@ -176,14 +176,15 @@ mod tests {
         }
     }
 
-    // Plan 34 step 3: errors and types show in the editor, as in PhpStorm.
+    // Plan 34 step 3: types show in the editor, as in PhpStorm. Inline diagnostics are off
+    // (`29ab1ddb12`): squiggle + hover, since noisy language servers made them unusable.
     #[gpui::test]
-    fn test_inline_diagnostics_and_inlay_hints_on_by_default(cx: &mut TestAppContext) {
+    fn test_inline_diagnostics_off_and_inlay_hints_on_by_default(cx: &mut TestAppContext) {
         use settings::Settings as _;
         init_test(cx);
         cx.update(|cx| {
             let project_settings = project::project_settings::ProjectSettings::get_global(cx);
-            assert!(project_settings.diagnostics.inline.enabled);
+            assert!(!project_settings.diagnostics.inline.enabled);
             let language_settings = language::language_settings::all_language_settings(None, cx);
             assert!(language_settings.defaults.inlay_hints.enabled);
         });
@@ -241,9 +242,10 @@ mod tests {
         }
     }
 
-    /// Whether any window has a project rooted at `root`.
+    /// Whether any window has a project rooted at `root`. Through the app context, not a
+    /// window update: that leases the current window, and `cx.windows()` skips it.
     fn project_open(root: &str, cx: &mut VisualTestContext) -> bool {
-        cx.update(|_, cx| {
+        cx.cx.update(|cx| {
             cx.windows()
                 .into_iter()
                 .filter_map(|window| window.downcast::<MultiWorkspace>())
@@ -353,6 +355,10 @@ mod tests {
             .and_then(|v| v.downcast::<ZenithWelcome>().ok())
             .expect("zenith view");
             assert_eq!(ours.read(cx).page(), Page::Customize);
+        });
+        // Cleared after every view has applied it.
+        cx.run_until_parked();
+        cx.update(|_, cx| {
             assert!(matches!(
                 cx.global::<view::PageRequest>(),
                 view::PageRequest(None)
