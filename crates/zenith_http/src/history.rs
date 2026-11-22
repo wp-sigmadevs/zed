@@ -27,7 +27,10 @@ impl HttpHistoryStore {
         }
     }
 
-    pub fn add(&mut self, request: HttpRequest, response: HttpResponse) -> String {
+    /// Records a response; credential headers are masked first, so they never sit in history.
+    pub fn add(&mut self, mut request: HttpRequest, mut response: HttpResponse) -> String {
+        mask_secret_headers(&mut request.headers);
+        mask_secret_headers(&mut response.headers);
         self.next_id += 1;
         let id = format!("hist-{}", self.next_id);
         let timestamp = response.timestamp.clone();
@@ -56,6 +59,28 @@ impl HttpHistoryStore {
     pub fn get_recent(&self, limit: usize) -> &[HttpHistoryItem] {
         let count = limit.min(self.entries.len());
         &self.entries[..count]
+    }
+}
+
+/// What a masked header value is replaced with.
+pub const MASKED_VALUE: &str = "***";
+
+/// Headers whose values history never keeps (names compared case-insensitively).
+const MASKED_HEADERS: [&str; 4] = [
+    "authorization",
+    "proxy-authorization",
+    "cookie",
+    "set-cookie",
+];
+
+fn mask_secret_headers(headers: &mut [(String, String)]) {
+    for (name, value) in headers {
+        if MASKED_HEADERS
+            .iter()
+            .any(|masked| name.eq_ignore_ascii_case(masked))
+        {
+            *value = MASKED_VALUE.to_string();
+        }
     }
 }
 
@@ -101,5 +126,45 @@ mod tests {
             .map(|entry| entry.id.as_str())
             .collect();
         assert_eq!(kept, vec!["hist-5", "hist-4"]);
+    }
+
+    #[test]
+    fn test_history_masks_credential_headers() {
+        let mut store = HttpHistoryStore::new(10);
+        let mut request = HttpRequest::new("GET", "https://api.com/me", 1);
+        request.headers = vec![
+            ("Authorization".into(), "Bearer secret".into()),
+            ("cookie".into(), "session=abc".into()),
+            ("Accept".into(), "*/*".into()),
+        ];
+        let response = HttpResponse::new(
+            200,
+            "OK",
+            vec![
+                ("SET-COOKIE".into(), "session=def".into()),
+                ("Content-Type".into(), "application/json".into()),
+            ],
+            "{}",
+            5,
+        );
+        store.add(request, response);
+        let entry = &store.entries[0];
+        assert_eq!(
+            entry.request.headers,
+            vec![
+                ("Authorization".to_string(), MASKED_VALUE.to_string()),
+                ("cookie".to_string(), MASKED_VALUE.to_string()),
+                ("Accept".to_string(), "*/*".to_string()),
+            ]
+        );
+        assert_eq!(
+            entry.response.headers,
+            vec![
+                ("SET-COOKIE".to_string(), MASKED_VALUE.to_string()),
+                ("Content-Type".to_string(), "application/json".to_string()),
+            ]
+        );
+        assert!(!entry.response.to_raw_http().contains("def"));
+        assert!(!entry.request.to_curl().contains("secret"));
     }
 }
