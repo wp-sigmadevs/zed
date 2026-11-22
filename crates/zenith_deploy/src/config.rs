@@ -95,7 +95,8 @@ pub struct ServerConfig {
     pub mappings: Vec<Mapping>,
     pub excluded_local: Vec<String>,
     pub excluded_remote: Vec<String>,
-    /// Per server, never a global setting. A server read from disk starts unconfirmed.
+    /// Per server, never a global setting. Nothing here enforces the confirmation: the M1b
+    /// prompt must set `upload_on_save_confirmed`, and the uploader must require both.
     pub upload_on_save: bool,
     pub upload_on_save_confirmed: bool,
     #[serde(skip)]
