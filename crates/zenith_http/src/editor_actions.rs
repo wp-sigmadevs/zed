@@ -345,3 +345,28 @@ fn show_results(
         HttpResponseView::new(summary, request, cx)
     });
 }
+
+#[cfg(test)]
+mod tests {
+    use super::request_for_line;
+    use crate::parser::parse_http_file;
+
+    #[test]
+    fn test_request_for_line_picks_the_request_the_cursor_belongs_to() {
+        let text = "### First\nGET https://a.test/one\n\n### Second\n# note\nPOST https://a.test/two\nContent-Type: application/json\n";
+        let requests = parse_http_file(text);
+        assert_eq!(requests.len(), 2);
+        let url = |line| request_for_line(text, &requests, line).map(|r| r.url.as_str());
+        assert_eq!(url(1), Some("https://a.test/one"), "### above the first");
+        assert_eq!(url(2), Some("https://a.test/one"));
+        assert_eq!(url(3), Some("https://a.test/one"), "blank line after it");
+        assert_eq!(url(4), Some("https://a.test/two"), "### above the second");
+        assert_eq!(
+            url(5),
+            Some("https://a.test/two"),
+            "comment above the second"
+        );
+        assert_eq!(url(7), Some("https://a.test/two"), "header line");
+        assert_eq!(url(99), Some("https://a.test/two"), "past the end");
+    }
+}
