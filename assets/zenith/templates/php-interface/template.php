@@ -1,0 +1,6 @@
+<?php
+${STRICT_TYPES}${NAMESPACE_DECLARATION}
+interface ${NAME}${EXTENDS}
+{
+    ${CURSOR}
+}
