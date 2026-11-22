@@ -344,6 +344,14 @@ impl Profile {
     fn key(self) -> &'static str {
         self.dir_name()
     }
+
+    fn name(self) -> &'static str {
+        match self {
+            Profile::WordPress => "WordPress",
+            Profile::Laravel => "Laravel",
+            Profile::Php => "PHP",
+        }
+    }
 }
 
 /// Where the last install's Composer output goes.
@@ -445,6 +453,16 @@ where
     .await
 }
 
+/// Deletes a profile's managed folder: its tools, Composer home and log. Zenith's
+/// `composer.phar` and the consent answers sit one level up and stay. A symlinked
+/// folder loses only the link, never what it points at.
+pub fn remove(home: &Path, profile: Profile) -> std::io::Result<()> {
+    match fs::remove_dir_all(managed_root(home).join(profile.dir_name())) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        result => result,
+    }
+}
+
 // ---- Composer for users who have none ----
 
 pub const COMPOSER_PHAR_URL: &str = "https://getcomposer.org/download/latest-stable/composer.phar";
@@ -510,15 +528,17 @@ pub async fn download_composer(
 
 // ---- status bar item and "PHP tools: status" ----
 
+use editor::Editor;
 use gpui::{
-    Action as _, App, AppContext as _, Context, Entity, IntoElement, Render, WeakEntity, Window,
-    actions,
+    Action as _, App, AppContext as _, Context, Entity, IntoElement, PromptLevel, Render,
+    SharedString, WeakEntity, Window, actions,
 };
 use project::{Project, WorktreeId};
 use settings::Settings as _;
 use ui::{Button, ButtonCommon as _, ButtonSize, Clickable as _, LabelSize, Tooltip, prelude::*};
+use util::ResultExt as _;
 use workspace::{
-    HideStatusItem, ItemHandle, StatusItemView, Workspace,
+    HideStatusItem, ItemHandle, OpenOptions, StatusItemView, Workspace,
     notifications::{NotificationId, simple_message_notification::MessageNotification},
 };
 
@@ -526,7 +546,15 @@ actions!(
     zenith_php_tools,
     [
         /// Shows the PHP version and where each PHP tool comes from.
-        Status
+        Status,
+        /// Installs this project type's PHP tools at the versions this release pins.
+        Update,
+        /// Deletes this project type's Zenith-managed PHP tools and installs them again.
+        Reinstall,
+        /// Deletes this project type's Zenith-managed PHP tools.
+        Remove,
+        /// Opens the last PHP tools install log, read-only.
+        ShowInstallLog
     ]
 );
 
@@ -541,6 +569,18 @@ pub fn init(cx: &mut App) {
             .update(cx, |bar, cx| bar.add_right_item(item, window, cx));
         workspace.register_action(|workspace, _: &Status, window, cx| {
             show_status(workspace, window, cx)
+        });
+        workspace.register_action(|workspace, _: &Update, window, cx| {
+            manage(workspace, Manage::Update, window, cx)
+        });
+        workspace.register_action(|workspace, _: &Reinstall, window, cx| {
+            manage(workspace, Manage::Reinstall, window, cx)
+        });
+        workspace.register_action(|workspace, _: &Remove, window, cx| {
+            manage(workspace, Manage::Remove, window, cx)
+        });
+        workspace.register_action(|workspace, _: &ShowInstallLog, window, cx| {
+            show_install_log(workspace, window, cx)
         });
     })
     .detach();
@@ -679,7 +719,7 @@ impl Render for PhpStatus {
         let Some(info) = &self.info else {
             return div().into_any_element();
         };
-        let installing = cx.try_global::<Installing>().is_some_and(|state| state.0);
+        let installing = installing(cx);
         let label = match &info.version {
             _ if installing => "Installing PHP tools…".to_string(),
             Some(version) => format!("PHP {}", short_version(version)),
@@ -710,10 +750,13 @@ struct Installing(bool);
 
 impl gpui::Global for Installing {}
 
-fn find_composer(path_dirs: &[PathBuf]) -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_default();
+fn installing(cx: &App) -> bool {
+    cx.try_global::<Installing>().is_some_and(|state| state.0)
+}
+
+/// The user's Composer, else the copy Zenith downloaded earlier; `None` means
+/// Zenith downloads one when an install starts.
+fn find_composer(home: &Path, path_dirs: &[PathBuf]) -> Option<PathBuf> {
     let mut dirs = path_dirs.to_vec();
     dirs.extend([
         home.join("Library/Application Support/Herd/bin"),
@@ -723,6 +766,7 @@ fn find_composer(path_dirs: &[PathBuf]) -> Option<PathBuf> {
     dirs.into_iter()
         .map(|dir| dir.join("composer"))
         .find(|candidate| candidate.is_file())
+        .or_else(|| Some(composer_phar(home)).filter(|phar| phar.is_file()))
 }
 
 /// Whether a worktree's tools may run, and if not, why.
@@ -839,9 +883,7 @@ fn maybe_offer(
     let Some(php) = info.php_path.clone() else {
         return;
     };
-    // None: Zenith downloads Composer itself when you click Install.
-    let composer = find_composer(&path_dirs)
-        .or_else(|| composer_phar(&home).is_file().then(|| composer_phar(&home)));
+    let composer = find_composer(&home, &path_dirs);
     if !should_offer(load_consent(&home, profile), trusted, local, has_any_tool) {
         return;
     }
@@ -869,7 +911,7 @@ fn maybe_offer(
                     let (php, composer) = (php.clone(), composer.clone());
                     weak.update(cx, |workspace, cx| {
                         save_consent(&home_dir(), profile, Consent::Yes).ok();
-                        start_install(workspace, profile, php, composer, window, cx);
+                        start_install(workspace, profile, php, composer, false, window, cx);
                     })
                     .ok();
                 }
@@ -897,6 +939,7 @@ fn start_install(
     profile: Profile,
     php: PathBuf,
     composer: Option<PathBuf>,
+    reinstall: bool,
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
@@ -911,6 +954,10 @@ fn start_install(
         let (run_php, run_composer) = (php.clone(), composer.clone());
         let result = cx
             .background_spawn(async move {
+                if reinstall {
+                    remove(&home, profile)
+                        .map_err(|error| format!("Could not remove the old tools: {error}"))?;
+                }
                 let composer = match run_composer {
                     Some(composer) => composer,
                     None => download_composer(http, &home).await?,
@@ -961,7 +1008,10 @@ fn start_install(
                                 .primary_on_click(move |window, cx| {
                                     let (php, composer) = (php.clone(), composer.clone());
                                     weak.update(cx, |workspace, cx| {
-                                        start_install(workspace, profile, php, composer, window, cx)
+                                        start_install(
+                                            workspace, profile, php, composer, reinstall, window,
+                                            cx,
+                                        )
                                     })
                                     .ok();
                                 })
@@ -974,6 +1024,184 @@ fn start_install(
         cx.update(|_, cx| cx.set_global(Installing(false))).ok();
     })
     .detach();
+}
+
+struct ToolsNotice;
+
+fn notice(workspace: &mut Workspace, text: impl Into<SharedString>, cx: &mut Context<Workspace>) {
+    let text = text.into();
+    workspace.show_notification(NotificationId::unique::<ToolsNotice>(), cx, |cx| {
+        cx.new(|cx| MessageNotification::new(text, cx))
+    });
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Manage {
+    Update,
+    Reinstall,
+    Remove,
+}
+
+/// "update", "reinstall" and "remove" for the first folder's project type. Only
+/// on request, in a trusted local project, and never while an install runs.
+fn manage(
+    workspace: &mut Workspace,
+    action: Manage,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let project = workspace.project().clone();
+    let Some((worktree_id, root)) = project
+        .read(cx)
+        .visible_worktrees(cx)
+        .next()
+        .map(|worktree| {
+            (
+                worktree.read(cx).id(),
+                worktree.read(cx).abs_path().to_path_buf(),
+            )
+        })
+    else {
+        return;
+    };
+    if !project.read(cx).is_local() {
+        return notice(
+            workspace,
+            "PHP tools are managed for local projects only.",
+            cx,
+        );
+    }
+    if !worktree_trusted(&project, worktree_id, cx) {
+        return notice(workspace, "Trust this project to manage its PHP tools.", cx);
+    }
+    if installing(cx) {
+        return notice(
+            workspace,
+            "PHP tools are being installed; try again when that ends.",
+            cx,
+        );
+    }
+    let confirm = (action == Manage::Remove).then(|| {
+        window.prompt(
+            PromptLevel::Warning,
+            "Remove Zenith's PHP tools for this project type?",
+            Some("Deletes Zenith's own copy of the tools and its install log. Your project, your Composer and your PATH are not touched."),
+            &["Remove", "Cancel"],
+            cx,
+        )
+    });
+    let home = home_dir();
+    cx.spawn_in(window, async move |workspace, cx| {
+        if let Some(confirm) = confirm
+            && !matches!(confirm.await, Ok(0))
+        {
+            return anyhow::Ok(());
+        }
+        let (profile, php, composer) = cx
+            .background_spawn({
+                let home = home.clone();
+                async move {
+                    let profile = Profile::for_project(detect_project(&root));
+                    if action == Manage::Remove {
+                        return (profile, None, None);
+                    }
+                    let (candidates, path_dirs) = environment();
+                    let php = find_php(&candidates).await.map(|(php, _)| php);
+                    (profile, php, find_composer(&home, &path_dirs))
+                }
+            })
+            .await;
+        if action == Manage::Remove {
+            let busy = workspace.update(cx, |workspace, cx| {
+                let busy = installing(cx);
+                if busy {
+                    notice(
+                        workspace,
+                        "PHP tools are being installed; nothing removed.",
+                        cx,
+                    );
+                }
+                busy
+            })?;
+            if busy {
+                return Ok(());
+            }
+            let result = cx
+                .background_spawn(async move { remove(&home, profile) })
+                .await;
+            let text = match result {
+                Ok(()) => format!("Removed Zenith's {} tools.", profile.name()),
+                Err(error) => format!(
+                    "Could not remove Zenith's {} tools: {error}",
+                    profile.name()
+                ),
+            };
+            workspace.update(cx, |workspace, cx| notice(workspace, text, cx))?;
+            return Ok(());
+        }
+        workspace.update_in(cx, |workspace, window, cx| {
+            let Some(php) = php else {
+                return notice(
+                    workspace,
+                    "PHP not found: install Herd or Homebrew PHP first.",
+                    cx,
+                );
+            };
+            if installing(cx) {
+                return notice(
+                    workspace,
+                    "PHP tools are being installed; try again when that ends.",
+                    cx,
+                );
+            }
+            // Asking for the tools is the consent the banner would have asked for.
+            save_consent(&home, profile, Consent::Yes).log_err();
+            start_install(
+                workspace,
+                profile,
+                php,
+                composer,
+                action == Manage::Reinstall,
+                window,
+                cx,
+            );
+        })?;
+        Ok(())
+    })
+    .detach_and_log_err(cx);
+}
+
+/// Opens the first folder's profile `install.log` in a read-only editor.
+fn show_install_log(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
+    let Some(root) = first_root(workspace.project(), cx) else {
+        return;
+    };
+    cx.spawn_in(window, async move |workspace, cx| {
+        let log = cx
+            .background_spawn(async move {
+                let log = install_log(&home_dir(), Profile::for_project(detect_project(&root)));
+                log.is_file().then_some(log)
+            })
+            .await;
+        let Some(log) = log else {
+            workspace.update(cx, |workspace, cx| {
+                notice(
+                    workspace,
+                    "No PHP tools install log yet for this project type.",
+                    cx,
+                )
+            })?;
+            return anyhow::Ok(());
+        };
+        let open = workspace.update_in(cx, |workspace, window, cx| {
+            workspace.open_abs_path(log, OpenOptions::default(), window, cx)
+        })?;
+        if let Some(editor) = open.await?.downcast::<Editor>() {
+            cx.update(|_, cx| editor.update(cx, |editor, _| editor.set_read_only(true)))?;
+        }
+        Ok(())
+    })
+    .detach_and_log_err(cx);
 }
 
 /// Runs one `Invocation` for real; the error is Composer's own output.
@@ -1367,6 +1595,59 @@ mod tests {
                 .as_array()
                 .is_some_and(|packages| !packages.is_empty())
         );
+    }
+
+    #[test]
+    fn test_every_profile_installs_from_its_own_lock_in_its_own_folder() {
+        let home = tempfile::tempdir().unwrap();
+        for profile in [Profile::WordPress, Profile::Laravel, Profile::Php] {
+            let cwd = std::cell::RefCell::new(None);
+            futures::executor::block_on(install(
+                home.path(),
+                profile,
+                Path::new("php"),
+                Path::new("composer"),
+                |invocation| {
+                    cwd.replace(Some(invocation.cwd));
+                    async { Ok(String::new()) }
+                },
+            ))
+            .unwrap();
+            let dir = managed_root(home.path()).join(profile.dir_name());
+            assert_eq!(cwd.into_inner(), Some(dir.clone()));
+            assert_eq!(
+                fs::read_to_string(dir.join("composer.lock")).unwrap(),
+                profile.composer_lock()
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_remove_deletes_one_profile_and_keeps_composer_and_answers() {
+        let home = tempfile::tempdir().unwrap();
+        let root = managed_root(home.path());
+        write(&root, "wordpress/vendor/bin/phpcs", "");
+        write(&root, "wordpress/install.log", "log");
+        write(&root, "laravel/vendor/bin/pint", "");
+        write(&root, "composer.phar", "phar");
+        save_consent(home.path(), Profile::WordPress, Consent::Yes).unwrap();
+
+        remove(home.path(), Profile::WordPress).unwrap();
+        assert!(!root.join("wordpress").exists());
+        assert!(root.join("laravel/vendor/bin/pint").is_file());
+        assert!(composer_phar(home.path()).is_file());
+        assert_eq!(load_consent(home.path(), Profile::WordPress), Consent::Yes);
+        // Nothing to remove is not an error.
+        remove(home.path(), Profile::WordPress).unwrap();
+
+        // A symlinked profile folder loses the link, not its target.
+        let elsewhere = tempfile::tempdir().unwrap();
+        write(elsewhere.path(), "keep.txt", "mine");
+        std::os::unix::fs::symlink(elsewhere.path(), root.join("php")).unwrap();
+        remove(home.path(), Profile::Php).unwrap();
+        assert!(!root.join("php").exists());
+        assert!(elsewhere.path().join("keep.txt").is_file());
     }
 
     #[test]
