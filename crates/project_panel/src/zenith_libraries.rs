@@ -4,9 +4,9 @@
 
 use super::*;
 use zenith_external_libraries::{
-    RowDecoration, apply_library_worktree, decorate_row, detect_libraries, is_enabled,
-    is_library_worktree, is_section_expanded, is_under_library, may_be_library_path, row_kind,
-    section_worktree, set_section_expanded,
+    RowDecoration, RowKind, create_external_libraries_root_entry, decorate_row, detect_libraries,
+    is_enabled, is_library_worktree, is_section_expanded, is_under_library, may_be_library_path,
+    row_kind, section_worktree, set_section_expanded, take_libraries,
 };
 
 impl ProjectPanel {
@@ -41,55 +41,84 @@ impl ProjectPanel {
         }
     }
 
-    /// Moves library folders out of each worktree's entries and adds the "External Libraries"
-    /// node; a user-added library worktree moves entirely under its own node. Runs on the
-    /// freshly derived state, before the panel repaints.
+    /// Moves every library row below all project roots, under one "External Libraries" node:
+    /// each worktree's library folders and every user-added library worktree. The rows keep
+    /// their worktree's group (several groups may share a worktree id), the node row heads the
+    /// first one and its expansion is that worktree's. Runs on the freshly derived state, before
+    /// the panel repaints.
     pub(super) fn zenith_libraries(&mut self, cx: &mut Context<Self>) {
         if !is_enabled(cx) {
             return;
         }
         let project = self.project.read(cx);
-        let mut changed = false;
-        // Expanded state of the "External Libraries" node of the previous group, if it has one.
-        let mut node: Option<bool> = None;
+        let mut libraries: Vec<(WorktreeId, Vec<GitEntry>)> = Vec::new();
         for visible in self.state.visible_entries.iter_mut() {
             let Some(worktree) = project.worktree_for_id(visible.worktree_id, cx) else {
                 continue;
             };
             let worktree = worktree.read(cx);
-            let expanded_dir_ids = self
-                .state
-                .expanded_dir_ids
-                .get(&visible.worktree_id)
-                .map_or(&[][..], Vec::as_slice);
-            if is_library_worktree(&worktree.abs_path(), cx) {
-                apply_library_worktree(
-                    visible.worktree_id,
-                    expanded_dir_ids,
-                    &mut visible.entries,
-                    node,
-                );
-                // A library worktree that joined a node is controlled by it; otherwise it owns one.
-                node = node
-                    .or_else(|| Some(is_section_expanded(visible.worktree_id, expanded_dir_ids)));
-                visible.index = OnceCell::new();
-                changed = true;
-            } else if zenith_external_libraries::apply(
-                &worktree.snapshot(),
-                expanded_dir_ids,
-                &mut visible.entries,
-            ) {
-                visible.index = OnceCell::new();
-                changed = true;
-                node = Some(is_section_expanded(visible.worktree_id, expanded_dir_ids));
+            let rows = if is_library_worktree(&worktree.abs_path(), cx) {
+                Some(std::mem::take(&mut visible.entries))
             } else {
-                node = None;
+                let expanded_dir_ids = self
+                    .state
+                    .expanded_dir_ids
+                    .get(&visible.worktree_id)
+                    .map_or(&[][..], Vec::as_slice);
+                take_libraries(worktree, expanded_dir_ids, &mut visible.entries)
+            };
+            if let Some(rows) = rows {
+                visible.index = OnceCell::new();
+                libraries.push((visible.worktree_id, rows));
             }
         }
-        if changed {
-            // The widest-item index was computed before rows were moved.
-            self.state.max_width_item_index = None;
+        let Some(&(owner, _)) = libraries.first() else {
+            return;
+        };
+        self.state
+            .visible_entries
+            .retain(|visible| !visible.entries.is_empty());
+        let expanded = self
+            .state
+            .expanded_dir_ids
+            .get(&owner)
+            .is_some_and(|ids| is_section_expanded(owner, ids));
+        if !expanded {
+            libraries = vec![(owner, Vec::new())];
         }
+        for (ix, (worktree_id, mut entries)) in libraries.into_iter().enumerate() {
+            if ix == 0 {
+                entries.insert(0, create_external_libraries_root_entry(owner));
+            }
+            if !entries.is_empty() {
+                self.state.visible_entries.push(VisibleEntriesForWorktree {
+                    worktree_id,
+                    entries,
+                    index: OnceCell::new(),
+                });
+            }
+        }
+        // The widest-item index was computed before rows were moved.
+        self.state.max_width_item_index = None;
+    }
+
+    /// The project name a library root of `worktree_id` is labelled with: only when more than
+    /// one project worktree has libraries, so the node tells them apart.
+    fn zenith_project_label(&self, worktree_id: WorktreeId, cx: &App) -> Option<String> {
+        let project = self.project.read(cx);
+        let with_libraries = project
+            .visible_worktrees(cx)
+            .filter(|worktree| {
+                let worktree = worktree.read(cx);
+                !is_library_worktree(&worktree.abs_path(), cx)
+                    && !detect_libraries(worktree).is_empty()
+            })
+            .count();
+        if with_libraries < 2 {
+            return None;
+        }
+        let worktree = project.worktree_for_id(worktree_id, cx)?;
+        Some(worktree.read(cx).root_name_str().to_string())
     }
 
     /// Whether `worktree_id` is a user-added library worktree (read-only, no project root).
@@ -202,12 +231,13 @@ impl ProjectPanel {
         let Some(kind) = kind else {
             return (filename, icon, depth);
         };
-        // Mirrors the upstream rule that hides the root row.
-        let root_visible = !(ProjectPanelSettings::get_global(cx).hide_root
-            && project.visible_worktrees(cx).count() == 1);
+        let project_label = match kind {
+            RowKind::Library { .. } => self.zenith_project_label(worktree_id, cx),
+            _ => None,
+        };
         let row = decorate_row(
             kind,
-            root_visible,
+            project_label.as_deref(),
             RowDecoration {
                 filename,
                 icon,
@@ -546,22 +576,50 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_expansion_is_per_worktree(cx: &mut TestAppContext) {
+    async fn test_one_node_for_all_projects(cx: &mut TestAppContext) {
         let fs = FakeFs::new(cx.executor());
         fs.insert_tree("/one", composer_tree()).await;
         fs.insert_tree("/two", composer_tree()).await;
         let (panel, mut cx) = open_panel(cx, fs, &["/one", "/two"]).await;
         let cx = &mut cx;
-        let id = first_worktree_id(&panel, cx);
+
+        let collapsed = names(&panel, cx);
+        assert_eq!(count(&collapsed, "External Libraries"), 1, "{collapsed:?}");
+        assert_eq!(
+            collapsed.last().map(String::as_str),
+            Some("External Libraries"),
+            "the node follows every project root: {collapsed:?}"
+        );
+
+        toggle_node(&panel, cx);
+        let expanded = rows(&panel, cx);
+        assert_eq!(
+            expanded[expanded.len() - 3..].to_vec(),
+            vec![
+                ("External Libraries".to_string(), 0),
+                ("Composer Packages (one)".to_string(), 1),
+                ("Composer Packages (two)".to_string(), 1),
+            ],
+            "{expanded:?}"
+        );
+
+        // Keyboard navigation walks from the node into the moved library rows.
+        let owner = first_worktree_id(&panel, cx);
+        select_section_of(&panel, owner, cx);
         panel.update_in(cx, |panel, window, cx| {
-            panel.toggle_expanded(section_id(id), window, cx)
+            panel.select_next(&SelectNext, window, cx);
+            panel.select_next(&SelectNext, window, cx);
         });
-        cx.run_until_parked();
-        let libraries = names(&panel, cx)
-            .iter()
-            .filter(|name| name.starts_with("Composer"))
-            .count();
-        assert_eq!(libraries, 1, "only the toggled worktree expands");
+        let selected = panel.update_in(cx, |panel, window, cx| {
+            let mut selected = Vec::new();
+            panel.for_each_visible_entry(0..200, window, cx, &mut |_, details, _, _| {
+                if details.is_selected {
+                    selected.push(details.filename);
+                }
+            });
+            selected
+        });
+        assert_eq!(selected, vec!["Composer Packages (two)".to_string()]);
     }
 
     #[gpui::test]
@@ -702,9 +760,16 @@ mod tests {
         })
     }
 
-    fn toggle_section(panel: &Entity<ProjectPanel>, id: WorktreeId, cx: &mut VisualTestContext) {
+    /// Toggles the "External Libraries" row, whichever worktree owns it.
+    fn toggle_node(panel: &Entity<ProjectPanel>, cx: &mut VisualTestContext) {
         panel.update_in(cx, |panel, window, cx| {
-            panel.toggle_expanded(section_id(id), window, cx)
+            let mut node = None;
+            panel.for_each_visible_entry(0..200, window, cx, &mut |entry_id, details, _, _| {
+                if details.filename == "External Libraries" {
+                    node = Some(entry_id);
+                }
+            });
+            panel.toggle_expanded(node.expect("an External Libraries row"), window, cx)
         });
         cx.run_until_parked();
     }
@@ -714,7 +779,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_library_worktree_joins_the_preceding_node(cx: &mut TestAppContext) {
+    async fn test_library_worktree_joins_the_node(cx: &mut TestAppContext) {
         let fs = FakeFs::new(cx.executor());
         fs.insert_tree("/site", composer_tree()).await;
         let (panel, mut cx) = open_with_library(cx, fs, &["/site"]).await;
@@ -729,8 +794,7 @@ mod tests {
             );
         }
 
-        let site = worktree_id_of(&panel, "/site", cx);
-        toggle_section(&panel, site, cx);
+        toggle_node(&panel, cx);
         let expanded = rows(&panel, cx);
         let position = |name: &str| {
             expanded
@@ -751,7 +815,7 @@ mod tests {
             "still one node once expanded"
         );
 
-        toggle_section(&panel, site, cx);
+        toggle_node(&panel, cx);
         let collapsed_again = names(&panel, cx);
         assert!(
             !collapsed_again.iter().any(|n| n == "acme (read-only)"),
@@ -760,40 +824,54 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_library_worktree_leaves_other_project_nodes_alone(cx: &mut TestAppContext) {
+    async fn test_library_worktree_shares_the_node_with_every_project(cx: &mut TestAppContext) {
         let fs = FakeFs::new(cx.executor());
         fs.insert_tree("/one", composer_tree()).await;
         fs.insert_tree("/two", composer_tree()).await;
-        let (panel, mut cx) = open_with_library(cx, fs, &["/one", "/two"]).await;
+        fs.insert_tree("/libs/acme", json!({ "lib": { "Acme.php": "" } }))
+            .await;
+        init_test(cx);
+        set_library_paths(cx, &["/libs/acme"]);
+        // The library path is opened first, yet its tree goes below every project root.
+        let (panel, mut cx) = open_panel_inited(cx, fs, &["/libs/acme", "/one", "/two"]).await;
         let cx = &mut cx;
 
         let collapsed = names(&panel, cx);
+        assert_eq!(count(&collapsed, "External Libraries"), 1, "{collapsed:?}");
+        assert_eq!(collapsed.first().map(String::as_str), Some("one"));
         assert_eq!(
-            count(&collapsed, "External Libraries"),
-            2,
-            "each project worktree keeps its node, the library adds none: {collapsed:?}"
+            collapsed.last().map(String::as_str),
+            Some("External Libraries")
         );
+        assert_eq!(count(&collapsed, "acme (read-only)"), 0, "{collapsed:?}");
 
-        let one = worktree_id_of(&panel, "/one", cx);
-        toggle_section(&panel, one, cx);
-        let first_open = names(&panel, cx);
-        assert_eq!(count(&first_open, "Composer Packages (read-only)"), 1);
-        assert!(
-            !first_open.iter().any(|n| n == "acme (read-only)"),
-            "the library joins the node right before it, not /one's: {first_open:?}"
-        );
-        toggle_section(&panel, one, cx);
+        toggle_node(&panel, cx);
+        let expanded = names(&panel, cx);
+        let position = |name: &str| {
+            expanded
+                .iter()
+                .position(|n| n == name)
+                .unwrap_or_else(|| panic!("no row {name:?} in {expanded:?}"))
+        };
+        assert!(position("two") < position("External Libraries"));
+        assert_eq!(count(&expanded, "External Libraries"), 1);
+        for library in [
+            "Composer Packages (one)",
+            "Composer Packages (two)",
+            "acme (read-only)",
+        ] {
+            assert!(
+                position("External Libraries") < position(library),
+                "{library} sits under the one node: {expanded:?}"
+            );
+        }
 
-        let two = worktree_id_of(&panel, "/two", cx);
-        toggle_section(&panel, two, cx);
-        let second_open = names(&panel, cx);
-        assert_eq!(count(&second_open, "Composer Packages (read-only)"), 1);
+        toggle_node(&panel, cx);
+        let collapsed_again = names(&panel, cx);
         assert_eq!(
-            count(&second_open, "acme (read-only)"),
-            1,
-            "{second_open:?}"
+            collapsed_again, collapsed,
+            "one toggle collapses every library"
         );
-        assert_eq!(count(&second_open, "External Libraries"), 2);
     }
 
     #[gpui::test]
@@ -804,7 +882,7 @@ mod tests {
         let cx = &mut cx;
         let site = worktree_id_of(&panel, "/site", cx);
         let acme = worktree_id_of(&panel, "/libs/acme", cx);
-        toggle_section(&panel, site, cx);
+        toggle_node(&panel, cx);
 
         let drag_and_drop = panel.update_in(cx, |panel, window, cx| {
             let mut rows = Vec::new();
