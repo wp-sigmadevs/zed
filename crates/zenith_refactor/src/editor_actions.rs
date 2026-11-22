@@ -253,7 +253,7 @@ fn move_class(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<W
 }
 
 /// The name in the file's `namespace X;` declaration.
-fn namespace_of(content: &str) -> Option<String> {
+pub fn namespace_of(content: &str) -> Option<String> {
     content.lines().find_map(|line| {
         let name = line.trim().strip_prefix("namespace ")?;
         let name = name.trim_end().trim_end_matches([';', '{']).trim();

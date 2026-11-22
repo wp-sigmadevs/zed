@@ -7,12 +7,16 @@ use crate::choice_picker::ChoicePicker;
 use crate::live_templates::{LiveTemplate, live_templates};
 use crate::{
     ExpandPostfix, LanguageKind, LiveTemplateContext, LiveTemplates, SurroundKind, SurroundWith,
-    expand_live_template, expand_postfix, extract_expression_and_trigger, surround_with,
+    expand_postfix, extract_expression_and_trigger, surround_with, template_to_snippet,
 };
 use editor::Editor;
 use gpui::{App, Context, Window};
-use language::Point;
+use language::{Buffer, BufferSnapshot, Point};
+use snippet::Snippet;
+use time::{OffsetDateTime, UtcOffset};
+use util::ResultExt as _;
 use workspace::Workspace;
+use zenith_refactor::editor_actions::namespace_of;
 
 const SURROUNDS: [(SurroundKind, &str); 5] = [
     (SurroundKind::TryCatch, "try / catch"),
@@ -256,7 +260,8 @@ fn abbreviation_before_cursor(editor: &Editor, cx: &mut App) -> Option<String> {
     (!word.is_empty()).then_some(word)
 }
 
-/// Inserts `template` at the cursor, replacing the abbreviation before it when `replace_word`.
+/// Inserts `template` at the cursor as a snippet (tab stops, defaults, `$END$`), replacing
+/// the abbreviation before it when `replace_word`.
 fn expand_template(
     editor: &mut Editor,
     template: &LiveTemplate,
@@ -271,47 +276,143 @@ fn expand_template(
         .selections
         .newest::<Point>(&editor.display_snapshot(cx))
         .head();
-    let snapshot = buffer.read(cx).snapshot();
-    let prefix: String = snapshot
-        .text_for_range(Point::new(cursor.row, 0)..cursor)
-        .collect();
-    let indent: String = prefix.chars().take_while(|c| c.is_whitespace()).collect();
     let start = if replace_word {
         let word = abbreviation_before_cursor(editor, cx).map_or(0, |word| word.len());
         Point::new(cursor.row, cursor.column.saturating_sub(word as u32))
     } else {
         cursor
     };
-    let class_name = buffer.read(cx).file().and_then(|file| {
-        file.full_path(cx)
-            .file_stem()
-            .map(|s| s.to_string_lossy().into_owned())
-    });
-    let ctx = LiveTemplateContext {
-        class_name,
-        ..Default::default()
+    let ctx = template_context(buffer.read(cx), start, cx);
+    let Some(snippet) = Snippet::parse(&template_to_snippet(template.body, &ctx)).log_err() else {
+        return;
     };
-    let (head, tail) = template
-        .body
-        .split_once("$END$")
-        .unwrap_or((template.body, ""));
-    let head = expand_live_template(head, &ctx);
-    let replacement = format!("{head}{}", expand_live_template(tail, &ctx));
-    replace_with_cursor(
-        editor,
-        start..cursor,
-        &replacement,
-        Some(head.len()),
-        &indent,
-        window,
-        cx,
+    let multi_buffer = editor.buffer().read(cx).snapshot(cx);
+    let range = multi_buffer.point_to_offset(start)..multi_buffer.point_to_offset(cursor);
+    editor
+        .insert_snippet(&[range], snippet, window, cx)
+        .log_err();
+}
+
+/// The built-in template variables at `position` in `buffer`.
+fn template_context(buffer: &Buffer, position: Point, cx: &App) -> LiveTemplateContext {
+    let path = buffer.file().map(|file| file.full_path(cx));
+    let snapshot = buffer.snapshot();
+    let (class_name, method_name) = enclosing_names(&snapshot, snapshot.point_to_offset(position));
+    let is_php = path
+        .as_deref()
+        .and_then(LanguageKind::from_path)
+        .is_some_and(|lang| lang.is_php());
+    let now = OffsetDateTime::now_utc()
+        .to_offset(UtcOffset::current_local_offset().unwrap_or(UtcOffset::UTC));
+    let (date, year) = date_and_year(now);
+    LiveTemplateContext {
+        file_path: path
+            .as_deref()
+            .and_then(|path| path.file_name())
+            .map(|name| name.to_string_lossy().into_owned()),
+        class_name: class_name.or_else(|| {
+            path.as_deref()
+                .and_then(|path| path.file_stem())
+                .map(|stem| stem.to_string_lossy().into_owned())
+        }),
+        method_name,
+        namespace: if is_php {
+            namespace_of(&snapshot.text())
+        } else {
+            None
+        },
+        date: Some(date),
+        year: Some(year),
+    }
+}
+
+/// Names of the innermost class-like declaration and function or method around `offset`,
+/// from the syntax tree (PHP and JS/TS node kinds).
+fn enclosing_names(snapshot: &BufferSnapshot, offset: usize) -> (Option<String>, Option<String>) {
+    let (mut class_name, mut method_name) = (None, None);
+    let mut node = snapshot.syntax_ancestor(offset..offset);
+    while let Some(current) = node {
+        let slot = match current.kind() {
+            "class_declaration"
+            | "abstract_class_declaration"
+            | "class"
+            | "interface_declaration"
+            | "trait_declaration"
+            | "enum_declaration" => Some(&mut class_name),
+            "method_declaration"
+            | "method_definition"
+            | "function_definition"
+            | "function_declaration"
+            | "generator_function_declaration" => Some(&mut method_name),
+            _ => None,
+        };
+        if let Some(slot) = slot
+            && slot.is_none()
+        {
+            *slot = current.child_by_field_name("name").map(|name| {
+                snapshot
+                    .text_for_range(name.byte_range())
+                    .collect::<String>()
+            });
+        }
+        node = current.parent();
+    }
+    (class_name, method_name)
+}
+
+/// `$DATE$` (ISO `YYYY-MM-DD`) and `$YEAR$` for `now`.
+fn date_and_year(now: OffsetDateTime) -> (String, String) {
+    let date = format!(
+        "{:04}-{:02}-{:02}",
+        now.year(),
+        u8::from(now.month()),
+        now.day()
     );
+    (date, now.year().to_string())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::cursor_target;
-    use language::Point;
+    use super::{cursor_target, date_and_year, enclosing_names};
+    use gpui::{App, AppContext as _};
+    use language::{Buffer, Language, LanguageConfig, Point};
+    use std::sync::Arc;
+    use time::macros::datetime;
+
+    #[gpui::test]
+    fn test_enclosing_names_reads_class_and_method(cx: &mut App) {
+        let typescript = Arc::new(Language::new(
+            LanguageConfig {
+                name: "TypeScript".into(),
+                ..Default::default()
+            },
+            Some(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
+        ));
+        let text = "class Invoice {\n  total() {\n    return 1;\n  }\n}\nfunction helper() {}\n";
+        cx.new(|cx| {
+            let buffer = Buffer::local(text, cx).with_language(typescript, cx);
+            let snapshot = buffer.snapshot();
+            let in_method = text.find("return").expect("fixture has a return");
+            assert_eq!(
+                enclosing_names(&snapshot, in_method),
+                (Some("Invoice".to_string()), Some("total".to_string()))
+            );
+            let in_function = text.find("{}").expect("fixture has an empty body") + 1;
+            assert_eq!(
+                enclosing_names(&snapshot, in_function),
+                (None, Some("helper".to_string()))
+            );
+            buffer
+        });
+    }
+
+    #[test]
+    fn test_date_and_year_are_zero_padded() {
+        assert_eq!(
+            date_and_year(datetime!(2026-03-07 23:59 UTC)),
+            ("2026-03-07".to_string(), "2026".to_string())
+        );
+    }
 
     #[test]
     fn test_cursor_target_follows_indented_lines() {

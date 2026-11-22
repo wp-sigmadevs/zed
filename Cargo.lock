@@ -23246,9 +23246,13 @@ dependencies = [
  "serde",
  "serde_json",
  "settings",
+ "snippet",
+ "time",
+ "tree-sitter-typescript",
  "ui",
  "util",
  "workspace",
+ "zenith_refactor",
 ]
 
 [[package]]

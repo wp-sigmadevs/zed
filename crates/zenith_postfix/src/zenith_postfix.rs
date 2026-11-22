@@ -3,16 +3,12 @@ mod editor_actions;
 pub mod live_templates;
 pub use editor_actions::init;
 
-use std::path::Path;
 use serde::{Deserialize, Serialize};
+use std::path::Path;
 
 gpui::actions!(
     zenith_postfix,
-    [
-        ExpandPostfix,
-        SurroundWith,
-        LiveTemplates,
-    ]
+    [ExpandPostfix, SurroundWith, LiveTemplates,]
 );
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -193,7 +189,11 @@ pub fn deduce_singular(plural: &str) -> String {
     let singular_clean = if let Some(stripped) = clean.strip_suffix("ies") {
         format!("{stripped}y")
     } else if let Some(stripped) = clean.strip_suffix("es") {
-        if stripped.ends_with("ch") || stripped.ends_with("sh") || stripped.ends_with('x') || stripped.ends_with('s') {
+        if stripped.ends_with("ch")
+            || stripped.ends_with("sh")
+            || stripped.ends_with('x')
+            || stripped.ends_with('s')
+        {
             stripped.to_string()
         } else {
             format!("{stripped}e")
@@ -395,8 +395,12 @@ pub fn surround_with(code: &str, kind: SurroundKind, lang: LanguageKind, indent:
             SurroundKind::Foreach => {
                 format!("{indent}foreach ($items as $item) {{\n{indented_code}\n{indent}}}")
             }
-            SurroundKind::While => format!("{indent}while ($condition) {{\n{indented_code}\n{indent}}}"),
-            SurroundKind::Function => format!("{indent}function wrapper() {{\n{indented_code}\n{indent}}}"),
+            SurroundKind::While => {
+                format!("{indent}while ($condition) {{\n{indented_code}\n{indent}}}")
+            }
+            SurroundKind::Function => {
+                format!("{indent}function wrapper() {{\n{indented_code}\n{indent}}}")
+            }
         }
     } else {
         match kind {
@@ -407,8 +411,12 @@ pub fn surround_with(code: &str, kind: SurroundKind, lang: LanguageKind, indent:
             SurroundKind::Foreach => {
                 format!("{indent}for (const item of items) {{\n{indented_code}\n{indent}}}")
             }
-            SurroundKind::While => format!("{indent}while (condition) {{\n{indented_code}\n{indent}}}"),
-            SurroundKind::Function => format!("{indent}function wrapper() {{\n{indented_code}\n{indent}}}"),
+            SurroundKind::While => {
+                format!("{indent}while (condition) {{\n{indented_code}\n{indent}}}")
+            }
+            SurroundKind::Function => {
+                format!("{indent}function wrapper() {{\n{indented_code}\n{indent}}}")
+            }
         }
     }
 }
@@ -448,6 +456,134 @@ pub fn expand_live_template(template: &str, ctx: &LiveTemplateContext) -> String
     result.replace("$END$", "").replace("$CURSOR$", "")
 }
 
+impl LiveTemplateContext {
+    /// The value of a built-in variable, or `None` when `name` is not built in or unknown here.
+    fn builtin(&self, name: &str) -> Option<&str> {
+        let value = match name {
+            "CLASS_NAME" => &self.class_name,
+            "METHOD_NAME" => &self.method_name,
+            "NAMESPACE" => &self.namespace,
+            "FILE_NAME" => &self.file_path,
+            "DATE" => &self.date,
+            "YEAR" => &self.year,
+            _ => return None,
+        };
+        value.as_deref()
+    }
+}
+
+enum TemplatePiece<'a> {
+    Text(&'a str),
+    End,
+    Variable { name: &'a str, default: &'a str },
+}
+
+/// Splits a template body into literal text, `$END$` and `$NAME$` / `$NAME=default$` variables.
+/// `$$` is a literal `$`, and any other `$` (PHP `$item`, `$_GET`) stays literal text.
+// shortcut: names must be upper case so PHP variables are never read as template variables;
+// an all-caps PHP variable directly followed by `$` or `=$` (`$A=$b`) needs `$$` to stay literal.
+fn template_pieces(template: &str) -> Vec<TemplatePiece<'_>> {
+    let mut pieces = Vec::new();
+    let mut rest = template;
+    while let Some(dollar) = rest.find('$') {
+        pieces.push(TemplatePiece::Text(&rest[..dollar]));
+        let after_dollar = &rest[dollar + 1..];
+        if let Some(after) = after_dollar.strip_prefix('$') {
+            pieces.push(TemplatePiece::Text("$"));
+            rest = after;
+            continue;
+        }
+        match parse_template_variable(after_dollar) {
+            Some((name, default, after)) => {
+                pieces.push(if name == "END" {
+                    TemplatePiece::End
+                } else {
+                    TemplatePiece::Variable { name, default }
+                });
+                rest = after;
+            }
+            None => {
+                pieces.push(TemplatePiece::Text("$"));
+                rest = after_dollar;
+            }
+        }
+    }
+    pieces.push(TemplatePiece::Text(rest));
+    pieces
+}
+
+/// Reads `NAME$` or `NAME=default$` after an opening `$`: (name, default, rest after the closing `$`).
+fn parse_template_variable(source: &str) -> Option<(&str, &str, &str)> {
+    if !source.starts_with(|c: char| c.is_ascii_uppercase()) {
+        return None;
+    }
+    let name_end = source
+        .find(|c: char| !(c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'))
+        .unwrap_or(source.len());
+    let (name, after_name) = source.split_at(name_end);
+    if let Some(rest) = after_name.strip_prefix('$') {
+        return Some((name, "", rest));
+    }
+    let after_equals = after_name.strip_prefix('=')?;
+    let (default, rest) = after_equals.split_once('$')?;
+    (!default.contains('\n')).then_some((name, default, rest))
+}
+
+/// Escapes text so the snippet parser keeps it literal (`\`, `$` and `}` are special there).
+fn push_snippet_literal(snippet: &mut String, text: &str) {
+    for character in text.chars() {
+        if matches!(character, '\\' | '$' | '}') {
+            snippet.push('\\');
+        }
+        snippet.push(character);
+    }
+}
+
+/// Converts a live template body into editor snippet syntax (`snippet::Snippet::parse`).
+/// Built-in variables known in `ctx` become plain text; every other variable becomes a tab
+/// stop, numbered by first appearance, holding its default (repeats share the stop, so they
+/// mirror); `$END$` is the final stop `$0`.
+pub fn template_to_snippet(template: &str, ctx: &LiveTemplateContext) -> String {
+    let pieces = template_pieces(template);
+    let mut stops: Vec<(&str, &str)> = Vec::new();
+    for piece in &pieces {
+        let TemplatePiece::Variable { name, default } = *piece else {
+            continue;
+        };
+        if ctx.builtin(name).is_some() {
+            continue;
+        }
+        // A repeat may carry the default the first occurrence left out.
+        if let Some(stop) = stops.iter_mut().find(|stop| stop.0 == name) {
+            if stop.1.is_empty() {
+                stop.1 = default;
+            }
+        } else {
+            stops.push((name, default));
+        }
+    }
+
+    let mut snippet = String::with_capacity(template.len());
+    for piece in pieces {
+        match piece {
+            TemplatePiece::Text(text) => push_snippet_literal(&mut snippet, text),
+            TemplatePiece::End => snippet.push_str("$0"),
+            TemplatePiece::Variable { name, .. } => {
+                if let Some(value) = ctx.builtin(name) {
+                    push_snippet_literal(&mut snippet, value);
+                } else if let Some((index, (_, default))) =
+                    stops.iter().enumerate().find(|(_, stop)| stop.0 == name)
+                {
+                    snippet.push_str(&format!("${{{}:", index + 1));
+                    push_snippet_literal(&mut snippet, default);
+                    snippet.push('}');
+                }
+            }
+        }
+    }
+    snippet
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -470,10 +606,16 @@ mod tests {
         assert_eq!(res1.replacement, "foreach ($users as $user) {\n    \n}");
 
         let res2 = expand_postfix("$categories.foreach", LanguageKind::Php).expect("expand");
-        assert_eq!(res2.replacement, "foreach ($categories as $category) {\n    \n}");
+        assert_eq!(
+            res2.replacement,
+            "foreach ($categories as $category) {\n    \n}"
+        );
 
         let res3 = expand_postfix("$this->getItems().foreach", LanguageKind::Php).expect("expand");
-        assert_eq!(res3.replacement, "foreach ($this->getItems() as $item) {\n    \n}");
+        assert_eq!(
+            res3.replacement,
+            "foreach ($this->getItems() as $item) {\n    \n}"
+        );
     }
 
     #[test]
@@ -497,9 +639,13 @@ mod tests {
         assert_eq!(await_res.replacement, "await fetchUser(id)");
 
         let forof_res = expand_postfix("orders.forof", LanguageKind::JavaScript).unwrap();
-        assert_eq!(forof_res.replacement, "for (const order of orders) {\n  \n}");
+        assert_eq!(
+            forof_res.replacement,
+            "for (const order of orders) {\n  \n}"
+        );
 
-        let const_res = expand_postfix("calculateDiscount().const", LanguageKind::TypeScript).unwrap();
+        let const_res =
+            expand_postfix("calculateDiscount().const", LanguageKind::TypeScript).unwrap();
         assert_eq!(const_res.replacement, "const item = calculateDiscount();");
     }
 
@@ -512,7 +658,12 @@ mod tests {
         assert!(surrounded_php.contains("catch (\\Throwable $e)"));
 
         let js_code = "const res = await api();";
-        let surrounded_js = surround_with(js_code, SurroundKind::TryCatch, LanguageKind::TypeScript, "  ");
+        let surrounded_js = surround_with(
+            js_code,
+            SurroundKind::TryCatch,
+            LanguageKind::TypeScript,
+            "  ",
+        );
         assert!(surrounded_js.contains("  try {"));
         assert!(surrounded_js.contains("  } catch (error) {"));
     }
@@ -534,5 +685,104 @@ mod tests {
         assert!(expanded.contains("class InvoiceCalculator"));
         assert!(expanded.contains("public function execute(): void"));
         assert!(!expanded.contains("$END$"));
+    }
+
+    fn parse(snippet: &str) -> snippet::Snippet {
+        snippet::Snippet::parse(snippet).expect("the editor's snippet parser accepts it")
+    }
+
+    #[test]
+    fn test_template_to_snippet_default_is_a_stop_and_end_is_final() {
+        let snippet = template_to_snippet(
+            "public function $NAME=handle$()\n{\n    $END$\n}",
+            &LiveTemplateContext::default(),
+        );
+        assert_eq!(snippet, "public function ${1:handle}()\n{\n    $0\n\\}");
+        let parsed = parse(&snippet);
+        assert_eq!(parsed.text, "public function handle()\n{\n    \n}");
+        assert_eq!(parsed.tabstops.len(), 2);
+        assert_eq!(parsed.tabstops[0].ranges.as_slice(), &[16..22]);
+        assert_eq!(parsed.tabstops[1].ranges.as_slice(), &[31..31]);
+    }
+
+    #[test]
+    fn test_template_to_snippet_repeated_variable_mirrors_one_stop() {
+        let snippet = template_to_snippet(
+            "$TYPE$ $NAME=item$ = new $TYPE=Foo$();",
+            &LiveTemplateContext::default(),
+        );
+        assert_eq!(snippet, "${1:Foo} ${2:item} = new ${1:Foo}();");
+        let parsed = parse(&snippet);
+        assert_eq!(parsed.text, "Foo item = new Foo();");
+        assert_eq!(parsed.tabstops[0].ranges.as_slice(), &[0..3, 15..18]);
+        assert_eq!(parsed.tabstops[1].ranges.as_slice(), &[4..8]);
+    }
+
+    #[test]
+    fn test_template_to_snippet_keeps_php_dollars_literal() {
+        let snippet = template_to_snippet(
+            "foreach ($END$ as $item) {\n    \\Log::info($_GET, $$X$$, $A);\n}",
+            &LiveTemplateContext::default(),
+        );
+        assert_eq!(
+            snippet,
+            "foreach ($0 as \\$item) {\n    \\\\Log::info(\\$_GET, \\$X\\$, \\$A);\n\\}"
+        );
+        let parsed = parse(&snippet);
+        assert_eq!(
+            parsed.text,
+            "foreach ( as $item) {\n    \\Log::info($_GET, $X$, $A);\n}"
+        );
+        assert_eq!(parsed.tabstops.len(), 1, "only the final stop");
+        assert_eq!(parsed.tabstops[0].ranges.as_slice(), &[9..9]);
+    }
+
+    #[test]
+    fn test_template_to_snippet_fills_known_builtins_and_stops_on_unknown() {
+        let ctx = LiveTemplateContext {
+            class_name: Some("Invoice$}".into()),
+            year: Some("2026".into()),
+            ..Default::default()
+        };
+        let snippet = template_to_snippet(
+            "// $YEAR$\nclass $CLASS_NAME$ { function $METHOD_NAME$() {} }",
+            &ctx,
+        );
+        assert_eq!(
+            snippet,
+            "// 2026\nclass Invoice\\$\\} { function ${1:}() {\\} \\}"
+        );
+        let parsed = parse(&snippet);
+        assert_eq!(parsed.text, "// 2026\nclass Invoice$} { function () {} }");
+        assert_eq!(parsed.tabstops[0].ranges.as_slice(), &[35..35]);
+    }
+
+    #[test]
+    fn test_builtin_live_templates_convert_to_valid_snippets() {
+        for lang in [LanguageKind::Php, LanguageKind::TypeScript] {
+            for template in live_templates::live_templates(lang) {
+                let snippet = template_to_snippet(template.body, &LiveTemplateContext::default());
+                let parsed = parse(&snippet);
+                assert!(
+                    !parsed.text.contains("$END$"),
+                    "{}: {}",
+                    template.abbreviation,
+                    parsed.text
+                );
+            }
+        }
+
+        let php_foreach = live_templates::live_templates(LanguageKind::Php)
+            .iter()
+            .find(|template| template.abbreviation == "fore")
+            .expect("PHP has a foreach template");
+        let parsed = parse(&template_to_snippet(
+            php_foreach.body,
+            &LiveTemplateContext::default(),
+        ));
+        assert_eq!(parsed.text, "foreach ($items as $item) {\n    \n}");
+        assert_eq!(parsed.tabstops.len(), 3);
+        assert_eq!(parsed.tabstops[0].ranges.as_slice(), &[10..15]);
+        assert_eq!(parsed.tabstops[1].ranges.as_slice(), &[20..24]);
     }
 }
