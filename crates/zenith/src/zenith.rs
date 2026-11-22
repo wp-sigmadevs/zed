@@ -58,4 +58,6 @@ pub fn init(cx: &mut App) {
     zenith_external_libraries::init(cx);
     #[cfg(feature = "agent_review")]
     zenith_agent_review::init(cx);
+    #[cfg(feature = "navbar")]
+    zenith_navbar::init(cx);
 }
