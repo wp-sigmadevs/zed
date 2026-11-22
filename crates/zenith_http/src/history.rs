@@ -72,23 +72,170 @@ impl HttpHistoryStore {
 /// What a masked header value is replaced with.
 pub const MASKED_VALUE: &str = "***";
 
-/// Headers whose values history never keeps (names compared case-insensitively).
-const MASKED_HEADERS: [&str; 4] = [
+/// Names whose values history never keeps: header names, JSON keys, form and query fields.
+/// Matched case-insensitively and ignoring `-` and `_`, against any name that contains one,
+/// so `X-Api-Key`, `user_password` and `Set-Cookie` are all caught.
+const SECRET_NAMES: [&str; 13] = [
+    "password",
+    "passwd",
+    "pwd",
+    "secret",
+    "token",
+    "access_token",
+    "refresh_token",
+    "api_key",
+    "apikey",
+    "client_secret",
     "authorization",
-    "proxy-authorization",
+    "private_key",
     "cookie",
-    "set-cookie",
 ];
+
+fn is_secret_name(name: &str) -> bool {
+    let normalize = |text: &str| {
+        text.chars()
+            .filter(|character| !matches!(character, '-' | '_'))
+            .flat_map(char::to_lowercase)
+            .collect::<String>()
+    };
+    let name = normalize(name);
+    SECRET_NAMES
+        .iter()
+        .any(|secret| name.contains(&normalize(secret)))
+}
 
 fn mask_secret_headers(headers: &mut [(String, String)]) {
     for (name, value) in headers {
-        if MASKED_HEADERS
-            .iter()
-            .any(|masked| name.eq_ignore_ascii_case(masked))
-        {
+        if is_secret_name(name) {
             *value = MASKED_VALUE.to_string();
         }
     }
+}
+
+fn content_type(headers: &[(String, String)]) -> Option<&str> {
+    headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+        .map(|(_, value)| value.as_str())
+}
+
+/// `body` with the values of secret fields masked, or `None` when nothing was masked (or it
+/// did not parse), so the stored body stays byte-for-byte what was sent or received.
+fn mask_secret_body(body: &str, content_type: Option<&str>) -> Option<String> {
+    let content_type = content_type.unwrap_or_default().to_ascii_lowercase();
+    if content_type.contains("x-www-form-urlencoded") {
+        return mask_secret_pairs(body);
+    }
+    if content_type.starts_with("multipart/") {
+        return mask_secret_multipart(body, &content_type);
+    }
+    // shortcut: plain text, XML and other formats are stored as is; add a format here when one
+    // starts carrying credentials in practice.
+    let mut json = serde_json::from_str::<serde_json::Value>(body).ok()?;
+    if !mask_secret_json(&mut json) {
+        return None;
+    }
+    if body.contains('\n') {
+        serde_json::to_string_pretty(&json).ok()
+    } else {
+        serde_json::to_string(&json).ok()
+    }
+}
+
+fn mask_secret_json(value: &mut serde_json::Value) -> bool {
+    let mut masked = false;
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, value) in map.iter_mut() {
+                if is_secret_name(key) && (value.is_string() || value.is_number()) {
+                    *value = MASKED_VALUE.into();
+                    masked = true;
+                } else {
+                    masked |= mask_secret_json(value);
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                masked |= mask_secret_json(item);
+            }
+        }
+        _ => {}
+    }
+    masked
+}
+
+/// Masks `name=value` pairs separated by `&`, as in a form body or a URL query.
+/// shortcut: names are compared as written, so a percent-encoded name (`api%5Fkey`) is missed.
+fn mask_secret_pairs(pairs: &str) -> Option<String> {
+    let mut masked = false;
+    let joined = pairs
+        .split('&')
+        .map(|pair| match pair.split_once('=') {
+            Some((name, _)) if is_secret_name(name) => {
+                masked = true;
+                format!("{name}={MASKED_VALUE}")
+            }
+            _ => pair.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("&");
+    masked.then_some(joined)
+}
+
+/// Masks the query of `url`, leaving its fragment and everything before the `?` untouched.
+fn mask_secret_query(url: &str) -> Option<String> {
+    let (base, rest) = url.split_once('?')?;
+    let (query, fragment) = match rest.split_once('#') {
+        Some((query, fragment)) => (query, Some(fragment)),
+        None => (rest, None),
+    };
+    let query = mask_secret_pairs(query)?;
+    Some(match fragment {
+        Some(fragment) => format!("{base}?{query}#{fragment}"),
+        None => format!("{base}?{query}"),
+    })
+}
+
+/// Masks the content of form fields with a secret name. File parts (with a `filename`, or a
+/// `< path` line standing for a file) are left alone.
+fn mask_secret_multipart(body: &str, content_type: &str) -> Option<String> {
+    let boundary = content_type
+        .split(';')
+        .find_map(|parameter| parameter.trim().strip_prefix("boundary="))?
+        .trim_matches('"');
+    // The content type was lowercased; find the boundary as written in the body.
+    let start = body.to_ascii_lowercase().find(&format!("--{boundary}"))?;
+    let delimiter = body.get(start..start + boundary.len() + 2)?;
+    let mut masked = false;
+    let parts = body
+        .split(delimiter)
+        .map(|part| {
+            let Some((head, separator, content)) =
+                ["\r\n\r\n", "\n\n"].iter().find_map(|separator| {
+                    let (head, content) = part.split_once(separator)?;
+                    Some((head, *separator, content))
+                })
+            else {
+                return part.to_string();
+            };
+            let name = head
+                .split(['\n', ';'])
+                .find_map(|parameter| parameter.trim().strip_prefix("name="))
+                .map(|name| name.trim_matches('"'));
+            let is_file = head.contains("filename=") || content.trim_start().starts_with('<');
+            match name {
+                Some(name) if is_secret_name(name) && !is_file => {
+                    masked = true;
+                    let line_end = &content[content.trim_end_matches(['\r', '\n']).len()..];
+                    format!("{head}{separator}{MASKED_VALUE}{line_end}")
+                }
+                _ => part.to_string(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(delimiter);
+    masked.then_some(parts)
 }
 
 /// One row of a project's on-disk history index: what the picker shows, without the bodies.
@@ -179,6 +326,20 @@ impl HistoryDir {
         }
         mask_secret_headers(&mut request.headers);
         mask_secret_headers(&mut response.headers);
+        if let Some(url) = mask_secret_query(&request.url) {
+            request.url = url;
+        }
+        if let Some(body) = request
+            .body
+            .as_deref()
+            .and_then(|body| mask_secret_body(body, content_type(&request.headers)))
+        {
+            request.body = Some(body);
+        }
+        // Masked before truncating: a cut-off JSON body no longer parses.
+        if let Some(body) = mask_secret_body(&response.body, content_type(&response.headers)) {
+            response.body = body;
+        }
         if !response.truncated && response.body.len() > MAX_RESPONSE_BYTES {
             let mut end = MAX_RESPONSE_BYTES;
             while !response.body.is_char_boundary(end) {
