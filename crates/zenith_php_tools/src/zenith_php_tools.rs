@@ -2,6 +2,7 @@
 //! functions over paths, so they test against temp directories; nothing here
 //! downloads or runs a tool.
 
+pub mod php_config;
 mod phpantom;
 mod string_completions;
 
@@ -266,15 +267,8 @@ pub struct PhpInfo {
 
 /// The first candidate whose `php -v` answers.
 pub async fn find_php(candidates: &[PathBuf]) -> Option<(PathBuf, String)> {
-    for candidate in candidates.iter().filter(|candidate| candidate.is_file()) {
-        let Ok(output) = util::command::new_command(candidate)
-            .arg("-v")
-            .output()
-            .await
-        else {
-            continue;
-        };
-        if let Some(version) = parse_php_version(&String::from_utf8_lossy(&output.stdout)) {
+    for candidate in candidates {
+        if let Some(version) = php_config::probe_php(candidate).await {
             return Some((candidate.clone(), version));
         }
     }
@@ -559,6 +553,7 @@ actions!(
 );
 
 pub fn init(cx: &mut App) {
+    php_config::init(cx);
     cx.observe_new(|workspace: &mut Workspace, window, cx| {
         let Some(window) = window else { return };
         let project = workspace.project().clone();
@@ -586,7 +581,7 @@ pub fn init(cx: &mut App) {
     .detach();
 }
 
-/// PHP candidates and the `PATH` directories.
+/// PHP candidates (the user's `zenith.php_tools.php_binary` first) and the `PATH` directories.
 pub fn environment() -> (Vec<PathBuf>, Vec<PathBuf>) {
     let path_dirs: Vec<PathBuf> = std::env::var_os("PATH")
         .map(|path| std::env::split_paths(&path).collect())
@@ -594,7 +589,11 @@ pub fn environment() -> (Vec<PathBuf>, Vec<PathBuf>) {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_default();
-    (php_candidates(&home, &path_dirs), path_dirs)
+    let candidates = php_config::with_override(
+        php_candidates(&home, &path_dirs),
+        php_config::php_binary_override().as_deref(),
+    );
+    (candidates, path_dirs)
 }
 
 fn first_root(project: &Entity<Project>, cx: &App) -> Option<PathBuf> {
