@@ -7,6 +7,7 @@ mod history_view;
 pub mod http_response_view;
 pub mod parser;
 pub mod response;
+pub mod upload;
 
 pub use editor_actions::init;
 pub use environment::*;
@@ -26,7 +27,13 @@ use std::time::{Duration, Instant};
 
 gpui::actions!(
     zenith_http,
-    [RunRequest, RunAllRequests, CopyAsCurl, SelectEnvironment,]
+    [
+        RunRequest,
+        RunAllRequests,
+        CopyAsCurl,
+        SelectEnvironment,
+        ImportFromCurl,
+    ]
 );
 
 /// Largest response body kept; the rest is dropped and the response says so.
@@ -44,6 +51,22 @@ pub async fn execute_request(
     env: Option<&HashMap<String, String>>,
 ) -> Result<HttpResponse> {
     let empty_env = HashMap::new();
+    let body = req
+        .body
+        .as_ref()
+        .map(|b| parser::substitute_variables(b, env.unwrap_or(&empty_env)).into_bytes());
+    execute_request_with_body(req, client, env, body).await
+}
+
+/// [`execute_request`] sending `body` in place of the request's own, e.g. one built by
+/// [`upload::request_body`] with files read in.
+pub async fn execute_request_with_body(
+    req: &HttpRequest,
+    client: Arc<dyn HttpClient>,
+    env: Option<&HashMap<String, String>>,
+    mut body: Option<Vec<u8>>,
+) -> Result<HttpResponse> {
+    let empty_env = HashMap::new();
     let env_map = env.unwrap_or(&empty_env);
 
     let mut url = Url::parse(&parser::substitute_variables(&req.url, env_map))
@@ -54,12 +77,15 @@ pub async fn execute_request(
     let mut headers: Vec<(String, String)> = req
         .headers
         .iter()
-        .map(|(k, v)| (k.clone(), parser::substitute_variables(v, env_map)))
+        .map(|(k, v)| {
+            let v = parser::substitute_variables(v, env_map);
+            if k.eq_ignore_ascii_case("authorization") {
+                (k.clone(), parser::expand_authorization(&v))
+            } else {
+                (k.clone(), v)
+            }
+        })
         .collect();
-    let mut body = req
-        .body
-        .as_ref()
-        .map(|b| parser::substitute_variables(b, env_map));
 
     let start = Instant::now();
     let mut redirects = 0;
@@ -421,6 +447,46 @@ Accept: application/json
             .unwrap();
         assert!(!exact.truncated, "a body of exactly the limit is complete");
         assert_eq!(exact.size_bytes, MAX_RESPONSE_BYTES);
+    }
+
+    #[gpui::test]
+    async fn test_basic_auth_shorthand_is_encoded_after_substitution(
+        _cx: &mut gpui::TestAppContext,
+    ) {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let http = FakeHttpClient::create({
+            let sent = sent.clone();
+            move |req| {
+                let auth = req
+                    .headers()
+                    .get("authorization")
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or_default()
+                    .to_string();
+                sent.lock().unwrap().push(auth);
+                async move {
+                    Ok(http::Response::builder()
+                        .status(200)
+                        .body(AsyncBody::default())?)
+                }
+            }
+        });
+        let env = HashMap::from([
+            ("user".to_string(), "user".to_string()),
+            ("password".to_string(), "password".to_string()),
+            ("token".to_string(), "t0k3n".to_string()),
+        ]);
+        for value in ["Basic {{user}} {{password}}", "Bearer {{token}}"] {
+            let mut req = HttpRequest::new("GET", "https://a.test/", 1);
+            req.headers = vec![("Authorization".into(), value.into())];
+            execute_request(&req, http.clone(), Some(&env))
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            *sent.lock().unwrap(),
+            vec!["Basic dXNlcjpwYXNzd29yZA==", "Bearer t0k3n"]
+        );
     }
 
     #[gpui::test]
