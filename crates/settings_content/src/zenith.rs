@@ -23,6 +23,18 @@ pub struct ZenithSettingsContent {
     pub nextjs: Option<ZenithNextJsSettingsContent>,
     /// Settings for the hover card.
     pub hover_card: Option<ZenithHoverCardSettingsContent>,
+    /// Settings for agent review.
+    pub agent_review: Option<ZenithAgentReviewSettingsContent>,
+}
+
+/// Settings for agent review.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+pub struct ZenithAgentReviewSettingsContent {
+    /// Whether each AI agent turn records local-history checkpoints of the
+    /// files it edits and its changes are offered for review.
+    ///
+    /// Default: true
+    pub enabled: Option<bool>,
 }
 
 /// Settings for the WordPress Hooks tool window.
