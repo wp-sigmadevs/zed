@@ -24,11 +24,16 @@ schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 settings.workspace = true
+snippet.workspace = true
+time.workspace = true
 ui.workspace = true
 util.workspace = true
 workspace.workspace = true
+zenith_refactor.workspace = true
 
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }
+language = { workspace = true, features = ["test-support"] }
+tree-sitter-typescript.workspace = true
 workspace = { workspace = true, features = ["test-support"] }
 pretty_assertions.workspace = true

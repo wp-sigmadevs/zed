@@ -1,5 +1,7 @@
 //! Built-in live templates: an abbreviation, a description and a body that
-//! `expand_live_template` fills in. `$END$` marks where the cursor lands.
+//! `template_to_snippet` turns into an editor snippet. `$NAME$` / `$NAME=default$`
+//! (upper-case names) are tab stops, repeats mirror, built-ins like `$CLASS_NAME$` are
+//! filled in, `$END$` is the last stop and `$$` is a literal `$`.
 
 use crate::LanguageKind;
 
@@ -13,22 +15,22 @@ const PHP: &[LiveTemplate] = &[
     LiveTemplate {
         abbreviation: "pubf",
         description: "public function",
-        body: "public function $END$()\n{\n    \n}",
+        body: "public function $NAME$($PARAMETERS$)\n{\n    $END$\n}",
     },
     LiveTemplate {
         abbreviation: "prif",
         description: "private function",
-        body: "private function $END$()\n{\n    \n}",
+        body: "private function $NAME$($PARAMETERS$)\n{\n    $END$\n}",
     },
     LiveTemplate {
         abbreviation: "ctor",
         description: "constructor",
-        body: "public function __construct($END$)\n{\n    \n}",
+        body: "public function __construct($PARAMETERS$)\n{\n    $END$\n}",
     },
     LiveTemplate {
         abbreviation: "fore",
         description: "foreach loop",
-        body: "foreach ($END$ as $item) {\n    \n}",
+        body: "foreach ($$$ITERABLE=items$ as $$$ITEM=item$) {\n    $END$\n}",
     },
     LiveTemplate {
         abbreviation: "cls",
@@ -46,17 +48,17 @@ const JS: &[LiveTemplate] = &[
     LiveTemplate {
         abbreviation: "fn",
         description: "function",
-        body: "function $END$() {\n    \n}",
+        body: "function $NAME$($PARAMETERS$) {\n    $END$\n}",
     },
     LiveTemplate {
         abbreviation: "afn",
         description: "arrow function",
-        body: "const $END$ = () => {\n    \n};",
+        body: "const $NAME$ = ($PARAMETERS$) => {\n    $END$\n};",
     },
     LiveTemplate {
         abbreviation: "fore",
         description: "for...of loop",
-        body: "for (const item of $END$) {\n    \n}",
+        body: "for (const $ITEM=item$ of $ITERABLE=items$) {\n    $END$\n}",
     },
     LiveTemplate {
         abbreviation: "cls",
