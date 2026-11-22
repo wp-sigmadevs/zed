@@ -8,6 +8,7 @@ mod tests;
 use gpui::App;
 use settings::{RegisterSetting, Settings, SettingsContent};
 
+pub use capture::{checkpoint, labeled_text};
 pub use history_view::LocalHistoryView;
 pub use store::{Revision, Store};
 

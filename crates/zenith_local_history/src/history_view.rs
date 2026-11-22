@@ -753,6 +753,7 @@ fn source_name(source: &str) -> String {
         "save" => "Saved".to_string(),
         "before-revert" => "Before revert".to_string(),
         "external" => "External change".to_string(),
+        "agent" => "Agent".to_string(),
         other => other.to_string(),
     }
 }

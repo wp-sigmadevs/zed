@@ -7,14 +7,14 @@
 //!
 //! Symlinked and external files (outside the worktree) are intentionally not recorded.
 
-use crate::{LocalHistorySettings, Revision, Store};
+use crate::{LocalHistorySettings, Revision, Store, store::is_secret_file};
 use anyhow::Result;
 use fs::Fs;
 use futures::{
     StreamExt as _,
     channel::{mpsc, oneshot},
 };
-use gpui::{App, AppContext as _, Context, Global, Task};
+use gpui::{App, AppContext as _, Context, Entity, Global, Task};
 use language::{Buffer, BufferEvent, LineEnding};
 use project::{Project, ProjectPath, buffer_store::BufferStoreEvent};
 use rope::Rope;
@@ -51,6 +51,8 @@ enum Job {
         worktree_root: String,
         rel_path: String,
         rope: Rope,
+        /// Set for a checkpoint: kept even when the text equals the latest revision.
+        label: Option<String>,
         source: &'static str,
         ts: i64,
     },
@@ -79,6 +81,13 @@ enum Job {
     Content {
         hash: String,
         reply: oneshot::Sender<Result<Option<Vec<u8>>>>,
+    },
+    /// Text of the newest revision recorded under a label.
+    Labeled {
+        worktree_root: String,
+        rel_path: String,
+        label: String,
+        reply: oneshot::Sender<Result<Option<String>>>,
     },
     /// The newest revision of each file of one worktree.
     Latest {
@@ -168,6 +177,7 @@ async fn own_store(
                 worktree_root,
                 rel_path,
                 rope,
+                label,
                 source,
                 ts,
             } => {
@@ -176,7 +186,14 @@ async fn own_store(
                     continue; // binary
                 }
                 store
-                    .record(&worktree_root, &rel_path, &bytes, None, source, ts)
+                    .record(
+                        &worktree_root,
+                        &rel_path,
+                        &bytes,
+                        label.as_deref(),
+                        source,
+                        ts,
+                    )
                     .log_err();
             }
             Job::External {
@@ -223,6 +240,16 @@ async fn own_store(
             }
             Job::Content { hash, reply } => {
                 reply.send(store.content(&hash)).ok();
+            }
+            Job::Labeled {
+                worktree_root,
+                rel_path,
+                label,
+                reply,
+            } => {
+                reply
+                    .send(labeled_text_in(store, &worktree_root, &rel_path, &label))
+                    .ok();
             }
             Job::Latest {
                 worktree_root,
@@ -350,6 +377,21 @@ pub(crate) fn list_entries(
             Entry { revision, size }
         })
         .collect())
+}
+
+fn labeled_text_in(
+    store: &Store,
+    worktree_root: &str,
+    rel_path: &str,
+    label: &str,
+) -> Result<Option<String>> {
+    let Some(revision) = store.labeled(worktree_root, rel_path, label)? else {
+        return Ok(None);
+    };
+    let Some(bytes) = store.content(&revision.blob_hash)? else {
+        return Ok(None);
+    };
+    Ok(Some(String::from_utf8(bytes)?))
 }
 
 /// Revisions of one file, newest first. Empty when no database exists yet.
@@ -640,11 +682,23 @@ pub(crate) fn capture(buffer: &gpui::Entity<Buffer>, source: &'static str, cx: &
     } else {
         buffer.as_rope().clone()
     };
+    send_record(history, file, rope, None, source, cx);
+}
+
+/// Queues `rope` as a revision of `file` if the gate allows it.
+fn send_record(
+    history: &LocalHistory,
+    file: &worktree::File,
+    rope: Rope,
+    label: Option<String>,
+    source: &'static str,
+    cx: &App,
+) -> bool {
     if !should_record(file, rope.len(), cx) {
-        return;
+        return false;
     }
     let Some(worktree_root) = root_key(&file.worktree.read(cx).abs_path()) else {
-        return;
+        return false;
     };
     history
         .jobs
@@ -652,10 +706,72 @@ pub(crate) fn capture(buffer: &gpui::Entity<Buffer>, source: &'static str, cx: &
             worktree_root,
             rel_path: file.path.as_unix_str().to_owned(),
             rope,
+            label,
             source,
             ts: now(),
         })
-        .log_err();
+        .log_err()
+        .is_some()
+}
+
+/// Records `text` as an "agent" revision of the buffer's file under `label`,
+/// even when it equals the latest revision. `false` when nothing is queued:
+/// local history is off or not started, or the file is not a local plain
+/// file, is private, ignored, excluded, a likely secret or over the size cap.
+pub fn checkpoint(buffer: &Entity<Buffer>, text: Rope, label: &str, cx: &App) -> bool {
+    let Some(history) = cx.try_global::<LocalHistory>() else {
+        return false;
+    };
+    let Some(file) = worktree::File::from_dyn(buffer.read(cx).file()) else {
+        return false;
+    };
+    // The store refuses these too, but the caller must know nothing was kept.
+    let abs_path = file
+        .worktree
+        .read(cx)
+        .abs_path()
+        .join(file.path.as_std_path());
+    if is_secret_file(&abs_path) {
+        return false;
+    }
+    send_record(history, file, text, Some(label.to_owned()), "agent", cx)
+}
+
+/// Text recorded by [`checkpoint`] under `label` for the buffer's file, newest
+/// first. `None` when there is none, no database yet, or the file's history
+/// may not be shown.
+pub fn labeled_text(
+    buffer: &Entity<Buffer>,
+    label: &str,
+    cx: &App,
+) -> Task<Result<Option<String>>> {
+    let job = worktree::File::from_dyn(buffer.read(cx).file())
+        .filter(|file| is_viewable(file, cx))
+        .and_then(|file| {
+            Some((
+                root_key(&file.worktree.read(cx).abs_path())?,
+                file.path.as_unix_str().to_owned(),
+            ))
+        });
+    let Some((worktree_root, rel_path)) = job else {
+        return Task::ready(Ok(None));
+    };
+    let (reply, receiver) = oneshot::channel();
+    let sent = send(
+        cx,
+        Job::Labeled {
+            worktree_root,
+            rel_path,
+            label: label.to_owned(),
+            reply,
+        },
+    );
+    cx.background_spawn(async move {
+        if !sent {
+            return Ok(None);
+        }
+        receiver.await.unwrap_or(Ok(None))
+    })
 }
 
 #[cfg(test)]

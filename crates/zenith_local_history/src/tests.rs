@@ -791,3 +791,69 @@ async fn test_external_changes_can_be_switched_off(cx: &mut TestAppContext) {
     );
     drop(buffer);
 }
+
+async fn open_buffer(
+    project: &gpui::Entity<Project>,
+    path: &str,
+    cx: &mut TestAppContext,
+) -> gpui::Entity<language::Buffer> {
+    project
+        .update(cx, |project, cx| project.open_local_buffer(path, cx))
+        .await
+        .expect("open buffer")
+}
+
+#[gpui::test]
+async fn test_checkpoints_are_kept_and_read_back_by_label(cx: &mut TestAppContext) {
+    let dir = history_dir();
+    start(cx, dir.path());
+    let project = project_with(json!({ "a.txt": "base" }), cx).await;
+    let buffer = open_buffer(&project, "/dir/a.txt", cx).await;
+    // Same text as the "open" baseline, twice: neither is dropped as a duplicate.
+    for label in ["agent:s:1", "agent:s:2"] {
+        assert!(cx.update(|cx| crate::checkpoint(&buffer, "base".into(), label, cx)));
+    }
+    assert!(cx.update(|cx| crate::checkpoint(&buffer, "edited".into(), "agent:s:3", cx)));
+    let revisions = revisions(cx, dir.path(), "a.txt");
+    assert_eq!(sources(&revisions), ["agent", "agent", "agent", "open"]);
+    assert_eq!(revisions[1].label.as_deref(), Some("agent:s:2"));
+
+    for (label, expected) in [
+        ("agent:s:1", Some("base")),
+        ("agent:s:3", Some("edited")),
+        ("agent:s:9", None),
+    ] {
+        let text = cx
+            .update(|cx| crate::labeled_text(&buffer, label, cx))
+            .await
+            .expect("labeled text");
+        assert_eq!(text.as_deref(), expected, "{label}");
+    }
+}
+
+#[gpui::test]
+async fn test_checkpoint_refuses_secret_private_and_disabled(cx: &mut TestAppContext) {
+    let dir = history_dir();
+    start(cx, dir.path());
+    let project = project_with(
+        json!({ ".env": "A=1", "wp-config.php": "<?php", "server.pem": "key", "ok.txt": "ok" }),
+        cx,
+    )
+    .await;
+    for name in [".env", "wp-config.php", "server.pem"] {
+        let buffer = open_buffer(&project, &format!("/dir/{name}"), cx).await;
+        assert!(
+            !cx.update(|cx| crate::checkpoint(&buffer, "x".into(), "agent:s:1", cx)),
+            "{name}"
+        );
+        assert!(revisions(cx, dir.path(), name).is_empty(), "{name}");
+    }
+    let buffer = open_buffer(&project, "/dir/ok.txt", cx).await;
+    configure(cx, |history| history.enabled = Some(false));
+    assert!(!cx.update(|cx| crate::checkpoint(&buffer, "x".into(), "agent:s:1", cx)));
+    configure(cx, |history| history.max_file_size_kb = Some(1));
+    let too_big = "x".repeat(2048);
+    assert!(!cx.update(|cx| crate::checkpoint(&buffer, too_big.into(), "agent:s:1", cx)));
+    configure(cx, |_| {});
+    assert!(cx.update(|cx| crate::checkpoint(&buffer, "x".into(), "agent:s:1", cx)));
+}

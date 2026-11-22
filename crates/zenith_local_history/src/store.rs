@@ -171,8 +171,9 @@ impl Store {
     }
 
     /// Stores `bytes` as a new revision of `rel_path`. Returns the new
-    /// revision id, or `None` when the content equals the latest revision or
-    /// the file is a likely secret (`wp-config.php`, `.env*`).
+    /// revision id, or `None` when the content equals the latest revision (an
+    /// unlabelled record only) or the file is a likely secret (`wp-config.php`,
+    /// `.env*`).
     pub fn record(
         &self,
         worktree_root: &str,
@@ -192,7 +193,9 @@ impl Store {
                  WHERE worktree_root = ? AND rel_path = ?
                  ORDER BY id DESC LIMIT 1",
             )?((worktree_root, rel_path))?;
-            if latest.as_deref() == Some(hash.as_str()) {
+            // A label is a checkpoint someone will look up by name, so it is
+            // kept even when the text did not change; the blob is still shared.
+            if label.is_none() && latest.as_deref() == Some(hash.as_str()) {
                 return Ok(None);
             }
             let blob_exists = self
@@ -228,6 +231,23 @@ impl Store {
              ORDER BY id DESC",
         )?((worktree_root, rel_path))?;
         Ok(rows.into_iter().map(revision_from_row).collect())
+    }
+
+    /// The newest revision of the file recorded under `label`.
+    pub fn labeled(
+        &self,
+        worktree_root: &str,
+        rel_path: &str,
+        label: &str,
+    ) -> Result<Option<Revision>> {
+        let row = self
+            .connection
+            .select_row_bound::<(&str, &str, &str), Row>(
+                "SELECT id, worktree_root, rel_path, blob_hash, ts, label, source
+             FROM revisions WHERE worktree_root = ? AND rel_path = ? AND label = ?
+             ORDER BY id DESC LIMIT 1",
+            )?((worktree_root, rel_path, label))?;
+        Ok(row.map(revision_from_row))
     }
 
     /// Whether any revision of the file exists.
@@ -365,6 +385,32 @@ mod tests {
         assert_eq!(revisions.len(), 3);
         assert_eq!(revisions[1].label.as_deref(), Some("L"));
         assert_eq!(revisions[0].ts, 4);
+        Ok(())
+    }
+
+    #[test]
+    fn labelled_record_equal_to_latest_is_kept() -> Result<()> {
+        let store = store("labelled_not_deduped")?;
+        assert!(store.record("/r", "a", b"one", None, "save", 1)?.is_some());
+        let first = store.record("/r", "a", b"one", Some("agent:s:1"), "agent", 2)?;
+        let second = store.record("/r", "a", b"one", Some("agent:s:2"), "agent", 3)?;
+        assert!(first.is_some() && second.is_some());
+        // The unlabelled path still dedupes against the (labelled) latest.
+        assert!(store.record("/r", "a", b"one", None, "save", 4)?.is_none());
+        assert_eq!(store.revisions("/r", "a")?.len(), 3);
+        assert_eq!(blob_count(&store)?, 1);
+
+        let labeled = store
+            .labeled("/r", "a", "agent:s:1")?
+            .ok_or_else(|| anyhow::anyhow!("no labelled revision"))?;
+        assert_eq!(Some(labeled.id), first);
+        assert_eq!(labeled.source, "agent");
+        assert_eq!(
+            store.content(&labeled.blob_hash)?.as_deref(),
+            Some(b"one".as_slice())
+        );
+        assert_eq!(store.labeled("/r", "a", "agent:s:9")?, None);
+        assert_eq!(store.labeled("/r", "b", "agent:s:1")?, None);
         Ok(())
     }
 
