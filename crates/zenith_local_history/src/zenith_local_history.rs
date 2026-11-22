@@ -66,3 +66,16 @@ pub fn init(cx: &mut App) {
         }
     });
 }
+
+/// Starts recording into `<directory>/history.db` instead of the data dir;
+/// for other crates' tests. Needs a `SettingsStore` global.
+#[cfg(any(test, feature = "test-support"))]
+pub fn start_in(directory: std::path::PathBuf, cx: &mut App) {
+    capture::start(cx, move |create| {
+        if create {
+            Store::open_in(&directory).map(Some)
+        } else {
+            Store::open_existing_in(&directory)
+        }
+    });
+}
