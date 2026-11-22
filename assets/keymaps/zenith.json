@@ -37,6 +37,8 @@
       "secondary-shift-r": "zenith_search::ReplaceInFiles",
       // Show History (local history of the file), PhpStorm has no default key for it.
       "alt-shift-h": "zenith_local_history::ShowFileHistory",
+      // Jump to Navigation Bar, as in PhpStorm (⌥Home); unbound in every base keymap.
+      "alt-home": "zenith::JumpToNavigationBar",
     },
   },
   {
@@ -189,6 +191,15 @@
       "secondary-g": "go_to_line::Toggle",
       "alt-d": ["editor::SelectNext", { "replace_newest": false }],
       "secondary-shift-i": "assistant::InlineAssist",
+    },
+  },
+  {
+    // Navigation bar popups: left / right open the neighbouring segment's popup instead of a
+    // submenu. Same depth as the base "menu" bindings, loaded later, so these win.
+    "context": "NavigationBar > menu",
+    "bindings": {
+      "left": "zenith_navbar::SelectPreviousSegment",
+      "right": "zenith_navbar::SelectNextSegment",
     },
   },
 ]
