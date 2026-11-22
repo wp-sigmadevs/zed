@@ -87,6 +87,8 @@
       "secondary-alt-z": "agent::Reject",
       "shift-alt-y": "agent::KeepAll",
       "shift-alt-z": "agent::RejectAll",
+      // Same key as Revert in the Local History tab; shadows task::Spawn (Windows/Linux) here only.
+      "shift-alt-r": "zenith_agent_review::RevertTurn",
     },
   },
   {
