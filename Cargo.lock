@@ -22907,6 +22907,7 @@ version = "0.1.0"
 dependencies = [
  "gpui",
  "onboarding",
+ "zenith_agent_review",
  "zenith_external_libraries",
  "zenith_folds",
  "zenith_http",
@@ -22928,6 +22929,33 @@ dependencies = [
  "zenith_todo",
  "zenith_welcome",
  "zenith_wordpress",
+]
+
+[[package]]
+name = "zenith_agent_review"
+version = "0.1.0"
+dependencies = [
+ "acp_thread",
+ "action_log",
+ "agent-client-protocol",
+ "agent_ui",
+ "anyhow",
+ "collections",
+ "editor",
+ "gpui",
+ "language",
+ "menu",
+ "project",
+ "remote_connection",
+ "serde_json",
+ "settings",
+ "tempfile",
+ "ui",
+ "util",
+ "watch",
+ "workspace",
+ "zenith_local_history",
+ "zenith_title_bar",
 ]
 
 [[package]]
