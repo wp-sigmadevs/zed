@@ -2987,6 +2987,8 @@
     },
     // PHP inspections: PHPCS and PHPStan findings shown as diagnostics.
     "inspections": {
+      // Run inspections and offer their actions (restart to apply).
+      "enabled": true,
       // Run PHPCS.
       "phpcs": true,
       // Run PHPStan (only in projects that have a PHPStan config).
@@ -3029,6 +3031,38 @@
       // (and inside vendor/, node_modules/, wp-includes/, wp-admin/) are never loaded.
       "paths": [],
     },
+    // New popup: create a file from a template (restart to apply).
+    "templates": {
+      "enabled": true,
+    },
+
+    // Tool window buttons in rails down each side of the window (restart to apply).
+    "rails": {
+      "enabled": true,
+    },
+
+    // Window chrome.
+    "ui": {
+      // Draw the editor, docks and bottom panel as separate rounded islands (restart to apply).
+      "islands": true,
+    },
+
+    // Title bar additions: project badge, search box, run controls, agent chip.
+    "title_bar": {
+      "enabled": true,
+    },
+
+    // Editor look: icon theme, hint pills, AI bulb actions, hover card, indent status item
+    // (restart to apply).
+    "look": {
+      "enabled": true,
+    },
+
+    // Search Everywhere, Find in Files, Show Usages and the Switcher (restart to apply).
+    "search": {
+      "enabled": true,
+    },
+
     // WordPress Hooks tool window: hooks and listeners of a WordPress project.
     "wordpress": {
       "enabled": true,
