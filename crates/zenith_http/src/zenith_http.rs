@@ -12,7 +12,7 @@ pub mod upload;
 pub use editor_actions::init;
 pub use environment::*;
 pub use history::*;
-pub use history_view::{HISTORY_LIMIT, ShowHistory};
+pub use history_view::{ClearHistory, HISTORY_LIMIT, HISTORY_MAX_BYTES, ShowHistory};
 pub use http_response_view::*;
 pub use parser::*;
 pub use response::*;

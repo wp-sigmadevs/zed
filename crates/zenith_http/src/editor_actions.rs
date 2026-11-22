@@ -341,7 +341,7 @@ fn run_requests(
         workspace
             .update_in(cx, |workspace, window, cx| match results {
                 Ok(results) => {
-                    crate::history_view::record(&results, cx);
+                    crate::history_view::record(workspace, &results, cx);
                     show_results(workspace, results, window, cx)
                 }
                 Err(error) => workspace.show_error(error, cx),
