@@ -49,6 +49,58 @@ impl HttpRequest {
         parts.push(shell_quote(&self.url));
         parts.join(" ")
     }
+
+    /// The request as `.http` file text, after a `###` separator: the request line, headers,
+    /// then a blank line and the body when there is one.
+    pub fn to_http_text(&self) -> String {
+        let mut text = format!("###\n{} {}\n", self.method, self.url);
+        for (name, value) in &self.headers {
+            text.push_str(&format!("{name}: {value}\n"));
+        }
+        if let Some(body) = &self.body {
+            text.push_str(&format!("\n{body}\n"));
+        }
+        text
+    }
+}
+
+/// JetBrains' `Authorization: Basic user password` shorthand: exactly two words after `Basic`
+/// become `Basic base64(user:password)`. Anything else (an encoded value, another scheme such
+/// as `Bearer token`) is sent as written. A password containing spaces needs the encoded form.
+pub fn expand_authorization(value: &str) -> String {
+    let mut words = value.split_whitespace();
+    match (words.next(), words.next(), words.next(), words.next()) {
+        (Some(scheme), Some(user), Some(password), None)
+            if scheme.eq_ignore_ascii_case("basic") =>
+        {
+            format!(
+                "Basic {}",
+                base64_encode(format!("{user}:{password}").as_bytes())
+            )
+        }
+        _ => value.to_string(),
+    }
+}
+
+/// Standard base64 with padding (RFC 4648), the encoding Basic auth uses.
+fn base64_encode(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let group = chunk.iter().enumerate().fold(0u32, |group, (index, byte)| {
+            group | (u32::from(*byte) << (16 - 8 * index))
+        });
+        for index in 0..4 {
+            if index <= chunk.len() {
+                out.push(char::from(
+                    ALPHABET[(group >> (18 - 6 * index)) as usize & 63],
+                ));
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
 }
 
 /// Quotes `text` as one word for POSIX sh, bash, zsh and fish alike. Inside single quotes sh
@@ -282,7 +334,7 @@ pub fn parse_curl(curl_cmd: &str) -> Result<HttpRequest, String> {
     let mut headers = Vec::new();
     let mut body = None;
 
-    let parts = shell_split(trimmed);
+    let parts = shell_split(&trimmed.replace("\r\n", "\n"));
     let mut i = 1;
 
     while i < parts.len() {
@@ -362,9 +414,14 @@ fn shell_split(input: &str) -> Vec<String> {
             in_double = true;
             started = true;
         } else if c == '\\' {
-            started = true;
-            if let Some(next) = chars.next() {
-                current.push(next);
+            match chars.next() {
+                // A line continuation, as in a curl command copied from docs or a browser.
+                Some('\n') => {}
+                Some(next) => {
+                    current.push(next);
+                    started = true;
+                }
+                None => started = true,
             }
         } else if c.is_whitespace() {
             if started {
@@ -639,5 +696,70 @@ DELETE https://api.example.com/v1/users/42
         let one = substitute_variables("{{$uuid}}", &HashMap::new());
         let two = substitute_variables("{{$uuid}}", &HashMap::new());
         assert_ne!(one, two);
+    }
+
+    #[test]
+    fn test_base64_matches_rfc_4648_vectors() {
+        for (plain, encoded) in [
+            ("", ""),
+            ("f", "Zg=="),
+            ("fo", "Zm8="),
+            ("foo", "Zm9v"),
+            ("foob", "Zm9vYg=="),
+            ("fooba", "Zm9vYmE="),
+            ("foobar", "Zm9vYmFy"),
+        ] {
+            assert_eq!(base64_encode(plain.as_bytes()), encoded, "{plain:?}");
+        }
+        assert_eq!(base64_encode(&[0xfb, 0xff]), "+/8=");
+    }
+
+    #[test]
+    fn test_basic_and_bearer_authorization() {
+        assert_eq!(
+            expand_authorization("Basic user password"),
+            "Basic dXNlcjpwYXNzd29yZA=="
+        );
+        assert_eq!(
+            expand_authorization("basic  admin   p@ss:w0rd"),
+            "Basic YWRtaW46cEBzczp3MHJk"
+        );
+        for unchanged in [
+            "Basic dXNlcjpwYXNzd29yZA==",
+            "Bearer abc.def",
+            "Basic a b c",
+            "Digest user password",
+        ] {
+            assert_eq!(expand_authorization(unchanged), unchanged);
+        }
+        let env = HashMap::from([
+            ("user".to_string(), "user".to_string()),
+            ("password".to_string(), "password".to_string()),
+            ("token".to_string(), "t0k3n".to_string()),
+        ]);
+        let basic = substitute_variables("Basic {{user}} {{password}}", &env);
+        assert_eq!(expand_authorization(&basic), "Basic dXNlcjpwYXNzd29yZA==");
+        let bearer = substitute_variables("Bearer {{token}}", &env);
+        assert_eq!(expand_authorization(&bearer), "Bearer t0k3n");
+    }
+
+    #[test]
+    fn test_curl_import_to_http_text() {
+        let curl = "curl 'https://api.example.com/v1/items?page=2' \\\r\n  -X PUT \\\n  -H 'Accept: application/json' \\\n  -H \"Authorization: Bearer abc\" \\\n  --data-raw '{\"title\":\"Zenith\"}'";
+        let request = parse_curl(curl).expect("parse curl");
+        let text = request.to_http_text();
+        assert_eq!(
+            text,
+            "###\nPUT https://api.example.com/v1/items?page=2\nAccept: application/json\nAuthorization: Bearer abc\n\n{\"title\":\"Zenith\"}\n"
+        );
+        let parsed = parse_http_file(&text);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].method, request.method);
+        assert_eq!(parsed[0].url, request.url);
+        assert_eq!(parsed[0].headers, request.headers);
+        assert_eq!(parsed[0].body, request.body);
+
+        let get = parse_curl("curl https://a.test/").expect("parse curl");
+        assert_eq!(get.to_http_text(), "###\nGET https://a.test/\n");
     }
 }

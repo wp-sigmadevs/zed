@@ -6,8 +6,9 @@
 
 use crate::choice_picker::ChoicePicker;
 use crate::{
-    CopyAsCurl, EnvironmentStore, HttpRequest, HttpResponse, HttpResponseView, RunAllRequests,
-    RunRequest, SelectEnvironment, execute_request, parse_http_file,
+    CopyAsCurl, EnvironmentStore, HttpRequest, HttpResponse, HttpResponseView, ImportFromCurl,
+    RunAllRequests, RunRequest, SelectEnvironment, execute_request_with_body, parse_curl,
+    parse_http_file, upload,
 };
 use anyhow::{Result, anyhow, bail};
 use editor::Editor;
@@ -63,6 +64,9 @@ pub fn init(cx: &mut App) {
         });
         workspace.register_action(|workspace, _: &SelectEnvironment, window, cx| {
             select_environment(workspace, window, cx);
+        });
+        workspace.register_action(|workspace, _: &ImportFromCurl, window, cx| {
+            import_from_curl(workspace, window, cx);
         });
     })
     .detach();
@@ -243,6 +247,32 @@ fn select_environment(workspace: &mut Workspace, window: &mut Window, cx: &mut C
     .detach();
 }
 
+/// Inserts the curl command on the clipboard, as a request, at the cursor of the active
+/// `.http` editor.
+fn import_from_curl(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
+    if active_http_file(workspace, cx).is_none() {
+        workspace.show_error(
+            anyhow!("Open a .http file to import a cURL command into"),
+            cx,
+        );
+        return;
+    }
+    let Some(editor) = workspace.active_item_as::<Editor>(cx) else {
+        return;
+    };
+    let clipboard = cx.read_from_clipboard().and_then(|item| item.text());
+    match clipboard.as_deref().map(parse_curl) {
+        Some(Ok(request)) => {
+            let text = request.to_http_text();
+            editor.update(cx, |editor, cx| editor.insert(&text, window, cx));
+        }
+        Some(Err(error)) => {
+            workspace.show_error(anyhow!("The clipboard is not a cURL command: {error}"), cx)
+        }
+        None => workspace.show_error(anyhow!("Copy a cURL command to the clipboard first"), cx),
+    }
+}
+
 /// Sends `requests` one after the other with the selected environment's variables. One
 /// request shows its response, several show a summary of them all.
 fn run_requests(
@@ -254,7 +284,18 @@ fn run_requests(
 ) {
     let client = cx.http_client();
     let fs = workspace.project().read(cx).fs().clone();
-    let dirs = env_dirs(workspace, file_dir, cx);
+    let dirs = env_dirs(workspace, file_dir.clone(), cx);
+    // `< file` bodies stay inside the worktree holding the .http file (its folder when none does).
+    let root = file_dir.as_ref().map(|dir| {
+        workspace
+            .project()
+            .read(cx)
+            .find_worktree(dir, cx)
+            .map_or_else(
+                || dir.clone(),
+                |(worktree, _)| worktree.read(cx).abs_path().to_path_buf(),
+            )
+    });
     let selected = selected_environment(cx);
     cx.spawn_in(window, async move |workspace, cx| {
         let results = cx
@@ -270,8 +311,26 @@ fn run_requests(
                 };
                 let mut results = Vec::new();
                 for request in requests {
-                    let response =
-                        execute_request(&request, client.clone(), Some(&variables)).await;
+                    let body = upload::request_body(
+                        &request,
+                        &variables,
+                        &fs,
+                        file_dir.as_deref(),
+                        root.as_deref(),
+                    )
+                    .await;
+                    let response = match body {
+                        Ok(body) => {
+                            execute_request_with_body(
+                                &request,
+                                client.clone(),
+                                Some(&variables),
+                                body,
+                            )
+                            .await
+                        }
+                        Err(error) => Err(error),
+                    };
                     results.push((request, response));
                 }
                 anyhow::Ok(results)
