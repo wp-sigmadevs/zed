@@ -144,6 +144,12 @@ impl RenderOnce for Tab {
                 TabCloseSide::Start => (Some(end_slot), start_slot),
             }
         };
+        // Zenith: without the start slot the icon would sit 4 px from the tab edge.
+        let left_pad = if start_slot.is_none() {
+            DynamicSpacing::Base08.px(cx)
+        } else {
+            DynamicSpacing::Base04.px(cx)
+        };
 
         self.div
             .h(Tab::container_height(cx))
@@ -174,7 +180,8 @@ impl RenderOnce for Tab {
                     .group("")
                     .relative()
                     .h(Tab::content_height(cx))
-                    .px(DynamicSpacing::Base04.px(cx))
+                    .pl(left_pad)
+                    .pr(DynamicSpacing::Base04.px(cx))
                     .gap(DynamicSpacing::Base04.rems(cx))
                     .text_color(text_color)
                     .children(start_slot)
