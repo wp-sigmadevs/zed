@@ -48,8 +48,21 @@ struct ActiveFile {
     word: String,
 }
 
-/// The active editor's file when it is a local `.php` file.
-fn active_php_file(workspace: &Workspace, cx: &mut Context<Workspace>) -> Option<ActiveFile> {
+/// The active editor's file when it is a local `.php` file; otherwise says why nothing
+/// happens, so the shortcut doesn't look broken.
+fn active_php_file(workspace: &mut Workspace, cx: &mut Context<Workspace>) -> Option<ActiveFile> {
+    let file = php_file_in(workspace, cx);
+    if file.is_none() {
+        toast(
+            workspace,
+            "Refactorings work on a PHP file saved in the project",
+            cx,
+        );
+    }
+    file
+}
+
+fn php_file_in(workspace: &Workspace, cx: &mut Context<Workspace>) -> Option<ActiveFile> {
     let editor = workspace.active_item_as::<Editor>(cx)?;
     editor.update(cx, |editor, cx| {
         let buffer = editor.buffer().read(cx).as_singleton()?;
@@ -176,6 +189,11 @@ fn move_class(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<W
         .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
         .find(|root| file.path.starts_with(root));
     let Some(root) = root else {
+        toast(
+            workspace,
+            "Move Class works on files inside a project folder",
+            cx,
+        );
         return;
     };
     let relative = file
@@ -600,3 +618,49 @@ impl Focusable for PromptModal {
 
 impl EventEmitter<DismissEvent> for PromptModal {}
 impl ModalView for PromptModal {}
+
+#[cfg(test)]
+mod tests {
+    use super::{namespace_of, parse_signature_spec, word_at};
+
+    #[test]
+    fn test_word_at_finds_the_identifier_under_the_cursor() {
+        let line = "$total = calc_tax($sub, 2);";
+        assert_eq!(word_at(line, 12), "calc_tax");
+        assert_eq!(word_at(line, 9), "calc_tax", "at the start");
+        assert_eq!(word_at(line, 17), "calc_tax", "just after the end");
+        assert_eq!(word_at(line, 8), "");
+        assert_eq!(word_at(line, 999), "");
+        assert_eq!(word_at("é_x", 1), "", "not a char boundary");
+    }
+
+    #[test]
+    fn test_namespace_of_reads_both_declaration_styles() {
+        assert_eq!(
+            namespace_of("<?php\n\nnamespace App\\Billing;\nclass A {}").as_deref(),
+            Some("App\\Billing")
+        );
+        assert_eq!(
+            namespace_of("<?php\nnamespace App {\n}").as_deref(),
+            Some("App")
+        );
+        assert_eq!(namespace_of("<?php\nclass A {}"), None);
+        assert_eq!(namespace_of("<?php\nnamespace ;"), None);
+    }
+
+    #[test]
+    fn test_parse_signature_spec() {
+        let (order, added) = parse_signature_spec(" 1, 0 , +?int $limit = 10, +$flag").unwrap();
+        assert_eq!(order, [1, 0]);
+        assert_eq!(added.len(), 2);
+        assert_eq!(added[0].type_hint.as_deref(), Some("?int"));
+        assert_eq!(added[0].name, "$limit");
+        assert_eq!(added[0].default_value.as_deref(), Some("10"));
+        assert_eq!(added[1].type_hint, None);
+        assert_eq!(added[1].default_value, None);
+
+        assert!(parse_signature_spec("").is_err());
+        assert!(parse_signature_spec("a, 1").is_err());
+        assert!(parse_signature_spec("0, +$").is_err());
+    }
+}
