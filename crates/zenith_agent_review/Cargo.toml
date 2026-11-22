@@ -1,0 +1,40 @@
+[package]
+name = "zenith_agent_review"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/zenith_agent_review.rs"
+doctest = false
+
+[dependencies]
+acp_thread.workspace = true
+action_log.workspace = true
+agent_ui.workspace = true
+anyhow.workspace = true
+collections.workspace = true
+gpui.workspace = true
+language.workspace = true
+settings.workspace = true
+util.workspace = true
+workspace.workspace = true
+zenith_local_history.workspace = true
+
+[dev-dependencies]
+acp_thread = { workspace = true, features = ["test-support"] }
+agent-client-protocol.workspace = true
+gpui = { workspace = true, features = ["test-support"] }
+project = { workspace = true, features = ["test-support"] }
+remote_connection = { workspace = true, features = ["test-support"] }
+serde_json.workspace = true
+settings = { workspace = true, features = ["test-support"] }
+tempfile.workspace = true
+util.workspace = true
+watch.workspace = true
+workspace = { workspace = true, features = ["test-support"] }
+zenith_local_history = { workspace = true, features = ["test-support"] }

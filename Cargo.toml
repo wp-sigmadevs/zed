@@ -252,6 +252,7 @@ members = [
     "crates/zed_credentials_provider",
     "crates/zed_env_vars",
     "crates/zenith",
+    "crates/zenith_agent_review",
     "crates/zenith_external_libraries",
     "crates/zenith_folds",
     "crates/zenith_http",
@@ -550,6 +551,7 @@ zed_actions = { path = "crates/zed_actions" }
 zed_credentials_provider = { path = "crates/zed_credentials_provider" }
 zed_env_vars = { path = "crates/zed_env_vars" }
 zenith = { path = "crates/zenith" }
+zenith_agent_review = { path = "crates/zenith_agent_review" }
 zenith_external_libraries = { path = "crates/zenith_external_libraries" }
 zenith_folds = { path = "crates/zenith_folds" }
 zenith_http = { path = "crates/zenith_http" }
