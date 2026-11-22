@@ -1,7 +1,9 @@
 mod choice_picker;
 pub mod editor_actions;
 pub mod environment;
+mod gutter;
 pub mod history;
+mod history_view;
 pub mod http_response_view;
 pub mod parser;
 pub mod response;
@@ -9,6 +11,7 @@ pub mod response;
 pub use editor_actions::init;
 pub use environment::*;
 pub use history::*;
+pub use history_view::{HISTORY_LIMIT, ShowHistory};
 pub use http_response_view::*;
 pub use parser::*;
 pub use response::*;

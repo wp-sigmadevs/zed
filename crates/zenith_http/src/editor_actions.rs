@@ -33,6 +33,8 @@ const PUBLIC_ENV_FILE: &str = "http-client.env.json";
 const PRIVATE_ENV_FILE: &str = "http-client.private.env.json";
 
 pub fn init(cx: &mut App) {
+    crate::gutter::init(cx);
+    crate::history_view::init(cx);
     cx.observe_new(|workspace: &mut Workspace, _, _| {
         workspace.register_action(|workspace, _: &RunRequest, window, cx| {
             let Some(file) = active_http_file(workspace, cx) else {
@@ -90,7 +92,7 @@ fn active_http_file(workspace: &Workspace, cx: &mut Context<Workspace>) -> Optio
         if !file
             .full_path(cx)
             .extension()
-            .is_some_and(|ext| ext == "http")
+            .is_some_and(|ext| ext == "http" || ext == "rest")
         {
             return None;
         }
@@ -279,7 +281,10 @@ fn run_requests(
             .await;
         workspace
             .update_in(cx, |workspace, window, cx| match results {
-                Ok(results) => show_results(workspace, results, window, cx),
+                Ok(results) => {
+                    crate::history_view::record(&results, cx);
+                    show_results(workspace, results, window, cx)
+                }
                 Err(error) => workspace.show_error(error, cx),
             })
             .log_err();
