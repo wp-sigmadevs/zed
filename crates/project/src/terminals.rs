@@ -612,10 +612,6 @@ impl Project {
         })
     }
 
-    pub fn local_terminal_handles(&self) -> &Vec<WeakEntity<terminal::Terminal>> {
-        &self.terminals.local_handles
-    }
-
     fn resolve_directory_environment(
         &self,
         shell: &str,
@@ -925,5 +921,13 @@ mod tests {
                 title_override: Some(expected_title),
             },
         );
+    }
+}
+
+// Zenith: the run widget's Stop finds the terminals of its tasks here (zenith_title_bar
+// run.rs). Upstream dropped this accessor as unused in #67200.
+impl Project {
+    pub fn local_terminal_handles(&self) -> &Vec<WeakEntity<terminal::Terminal>> {
+        &self.terminals.local_handles
     }
 }
