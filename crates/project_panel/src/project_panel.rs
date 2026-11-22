@@ -1,6 +1,7 @@
 pub mod project_panel_settings;
 mod undo;
 mod utils;
+#[cfg_attr(not(feature = "external_libraries"), path = "zenith_libraries_off.rs")]
 mod zenith_libraries;
 
 use anyhow::{Context as _, Result};

@@ -4,6 +4,7 @@
 //! the status bar's panel buttons, which then stop drawing there.
 
 use gpui::{AnyElement, App, Context, Entity, IntoElement, Render, Window};
+use settings::{RegisterSetting, Settings, SettingsContent};
 use theme::ActiveTheme as _;
 use ui::prelude::*;
 use workspace::{
@@ -11,9 +12,37 @@ use workspace::{
     dock::{DockPosition, DraggedPanelButton, PanelButtons, RailsActive},
 };
 
+/// `zenith.rails.enabled` and `zenith.ui.islands`: read once at init, so a change takes
+/// effect after a restart.
+#[derive(Clone, Copy, RegisterSetting)]
+pub struct RailsSettings {
+    pub enabled: bool,
+    pub islands: bool,
+}
+
+impl Settings for RailsSettings {
+    fn from_settings(content: &SettingsContent) -> Self {
+        let zenith = content.zenith.as_ref();
+        Self {
+            enabled: zenith
+                .and_then(|zenith| zenith.rails.as_ref()?.enabled)
+                .unwrap_or(true),
+            islands: zenith
+                .and_then(|zenith| zenith.ui.as_ref()?.islands)
+                .unwrap_or(true),
+        }
+    }
+}
+
 pub fn init(cx: &mut App) {
+    let settings = *RailsSettings::get_global(cx);
+    if settings.islands {
+        cx.set_global(IslandsActive);
+    }
+    if !settings.enabled {
+        return;
+    }
     cx.set_global(RailsActive);
-    cx.set_global(IslandsActive);
     cx.observe_new(|workspace: &mut Workspace, window, cx| {
         if window.is_none() {
             return;
@@ -149,6 +178,53 @@ mod tests {
         assert_eq!(right.size.width, workspace::RAIL_WIDTH);
         assert!(left.right() <= right.left());
         assert!(cx.debug_bounds("zenith-center-island").is_some());
+    }
+
+    fn set_zenith_settings(cx: &mut TestAppContext, zenith: settings::ZenithSettingsContent) {
+        cx.update(|cx| {
+            let mut store = settings::SettingsStore::test(cx);
+            store.update_user_settings(cx, |content| content.zenith = Some(zenith));
+            cx.set_global(store);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_rails_setting_off_draws_no_rails(cx: &mut TestAppContext) {
+        set_zenith_settings(
+            cx,
+            settings::ZenithSettingsContent {
+                rails: Some(settings::ZenithRailsSettingsContent {
+                    enabled: Some(false),
+                }),
+                ..Default::default()
+            },
+        );
+        let cx = &mut open_window(cx, true).await;
+        assert!(cx.debug_bounds("zenith-left-rail").is_none());
+        assert!(cx.debug_bounds("zenith-right-rail").is_none());
+        cx.update(|_, cx| {
+            assert!(!cx.has_global::<RailsActive>());
+            assert!(
+                cx.has_global::<IslandsActive>(),
+                "islands are their own setting"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_islands_setting_off_keeps_rails(cx: &mut TestAppContext) {
+        set_zenith_settings(
+            cx,
+            settings::ZenithSettingsContent {
+                ui: Some(settings::ZenithUiSettingsContent {
+                    islands: Some(false),
+                }),
+                ..Default::default()
+            },
+        );
+        let cx = &mut open_window(cx, true).await;
+        assert!(cx.debug_bounds("zenith-left-rail").is_some());
+        cx.update(|_, cx| assert!(!cx.has_global::<IslandsActive>()));
     }
 
     #[gpui::test]

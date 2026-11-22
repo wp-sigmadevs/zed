@@ -12,6 +12,8 @@ default-run = "zed"
 workspace = true
 
 [features]
+# Zenith: `cargo run -p zed --no-default-features --features zenith/scratches` builds only that feature.
+default = ["zenith/default"]
 tracy = ["ztracing/tracy"]
 # LEAK_BACKTRACE=1 cargo run --features zed/track-project-leak --profile release-fast
 track-project-leak = ["gpui/leak-detection"]
@@ -153,7 +155,7 @@ language_extension.workspace = true
 language_model.workspace = true
 language_models.workspace = true
 language_onboarding.workspace = true
-zenith.workspace = true
+zenith = { workspace = true, default-features = false }
 language_selector.workspace = true
 language_tools.workspace = true
 languages = { workspace = true, features = ["load-grammars"] }

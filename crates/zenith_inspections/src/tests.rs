@@ -505,6 +505,7 @@ fn test_inspection_settings_defaults_and_overrides() {
     assert_eq!(
         defaults,
         InspectionSettings {
+            enabled: true,
             phpcs: true,
             phpstan: true,
             run_on_save: true,
@@ -1046,6 +1047,7 @@ async fn test_project_php_files_cover_every_folder(cx: &mut TestAppContext) {
 async fn dispatched_inspection(
     cx: &mut TestAppContext,
     action: Box<dyn gpui::Action>,
+    enabled: bool,
 ) -> (Vec<(text::Point, String)>, bool) {
     let root = tempfile::tempdir().unwrap();
     let root = fs::canonicalize(root.keep()).unwrap();
@@ -1072,16 +1074,17 @@ async fn dispatched_inspection(
         theme_settings::init(theme::LoadThemes::JustBase, cx);
         editor::init(cx);
         workspace::init(app_state.clone(), cx);
-        init(cx);
+        // Before `init`, which reads `enabled`.
         cx.update_global::<settings::SettingsStore, _>(|store, cx| {
             store
                 .set_user_settings(
-                    &serde_json::json!({ "zenith": { "inspections": { "run_on_save": false, "phpstan": false } } })
+                    &serde_json::json!({ "zenith": { "inspections": { "enabled": enabled, "run_on_save": false, "phpstan": false } } })
                         .to_string(),
                     cx,
                 )
                 .unwrap();
         });
+        init(cx);
         cx.set_global(ToolEnvironment {
             php_candidates: vec![stub_php.clone()],
             path_dirs: Vec::new(),
@@ -1134,7 +1137,7 @@ async fn dispatched_inspection(
 #[gpui::test]
 async fn test_inspect_current_file_action(cx: &mut TestAppContext) {
     assert_eq!(
-        dispatched_inspection(cx, Box::new(InspectCurrentFile)).await,
+        dispatched_inspection(cx, Box::new(InspectCurrentFile), true).await,
         (vec![(text::Point::new(1, 0), "Missing doc comment".to_string())], true)
     );
 }
@@ -1142,8 +1145,16 @@ async fn test_inspect_current_file_action(cx: &mut TestAppContext) {
 #[gpui::test]
 async fn test_inspect_project_action(cx: &mut TestAppContext) {
     assert_eq!(
-        dispatched_inspection(cx, Box::new(InspectProject)).await,
+        dispatched_inspection(cx, Box::new(InspectProject), true).await,
         (vec![(text::Point::new(1, 0), "Missing doc comment".to_string())], true)
+    );
+}
+
+#[gpui::test]
+async fn test_inspections_off_register_no_actions(cx: &mut TestAppContext) {
+    assert_eq!(
+        dispatched_inspection(cx, Box::new(InspectCurrentFile), false).await,
+        (Vec::new(), false)
     );
 }
 

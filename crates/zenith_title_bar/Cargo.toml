@@ -22,7 +22,7 @@ tasks_ui.workspace = true
 util.workspace = true
 zed_actions.workspace = true
 workspace.workspace = true
-zenith_search.workspace = true
+settings.workspace = true
 
 [dev-dependencies]
 db = { workspace = true, features = ["test-support"] }

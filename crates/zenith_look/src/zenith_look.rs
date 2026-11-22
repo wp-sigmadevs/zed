@@ -22,7 +22,28 @@ pub use indent::{IndentIndicator, indent_label};
 pub const ICONS_PREFIX: &str = "icon_themes/archipelago-icons/";
 const THEME_FILE: &str = "icon_themes/archipelago-icons.json";
 
+/// `zenith.look.enabled`: read once at init, so a change takes effect after a restart.
+#[derive(Clone, Copy, settings::RegisterSetting)]
+pub struct LookSettings {
+    pub enabled: bool,
+}
+
+impl settings::Settings for LookSettings {
+    fn from_settings(content: &settings::SettingsContent) -> Self {
+        let look = content
+            .zenith
+            .as_ref()
+            .and_then(|zenith| zenith.look.as_ref());
+        Self {
+            enabled: look.and_then(|look| look.enabled).unwrap_or(true),
+        }
+    }
+}
+
 pub fn init(cx: &mut App) {
+    if !<LookSettings as settings::Settings>::get_global(cx).enabled {
+        return;
+    }
     bulb::init(cx);
     hints::init(cx);
     hover_card::init(cx);

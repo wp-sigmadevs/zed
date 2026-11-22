@@ -495,6 +495,8 @@ pub async fn run(
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, RegisterSetting)]
 pub struct InspectionSettings {
+    /// Read once at init, so a change takes effect after a restart.
+    pub enabled: bool,
     pub phpcs: bool,
     pub phpstan: bool,
     pub run_on_save: bool,
@@ -509,6 +511,7 @@ impl Settings for InspectionSettings {
             .and_then(|zenith| zenith.inspections.as_ref());
         let flag = |value: Option<bool>| value.unwrap_or(true);
         Self {
+            enabled: flag(inspections.and_then(|settings| settings.enabled)),
             phpcs: flag(inspections.and_then(|settings| settings.phpcs)),
             phpstan: flag(inspections.and_then(|settings| settings.phpstan)),
             run_on_save: flag(inspections.and_then(|settings| settings.run_on_save)),
@@ -1230,6 +1233,9 @@ fn fix_current_file(
 
 pub fn init(cx: &mut App) {
     InspectionSettings::register(cx);
+    if !InspectionSettings::get_global(cx).enabled {
+        return;
+    }
     cx.observe_new(|editor: &mut editor::Editor, _, _| {
         if editor.mode().is_full() && editor.project().is_some() {
             editor.add_code_action_provider(std::rc::Rc::new(SuppressProvider));

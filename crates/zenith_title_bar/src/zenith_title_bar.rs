@@ -4,14 +4,38 @@ mod run;
 
 use std::collections::HashMap;
 
-use gpui::{Action, Entity, EntityId, FontWeight, Global, Hsla};
+use gpui::{Action, AnyElement, Empty, Entity, EntityId, FontWeight, Global, Hsla};
 use project::Project;
+use settings::{RegisterSetting, Settings, SettingsContent};
 use ui::{ButtonLike, IconButton, Tooltip, Vector, VectorName, prelude::*};
 
 pub use run::{DebugSelected, RerunLast, RunConfig, RunModel, RunSelected, StopRun, init};
 
+/// `zenith.title_bar.enabled`: off, the title bar is upstream's. Read on every render.
+#[derive(Clone, Copy, RegisterSetting)]
+pub struct ZenithTitleBarSettings {
+    pub enabled: bool,
+}
+
+impl Settings for ZenithTitleBarSettings {
+    fn from_settings(content: &SettingsContent) -> Self {
+        let title_bar = content
+            .zenith
+            .as_ref()
+            .and_then(|zenith| zenith.title_bar.as_ref());
+        Self {
+            enabled: title_bar
+                .and_then(|title_bar| title_bar.enabled)
+                .unwrap_or(true),
+        }
+    }
+}
+
 /// Two-letter badge shown before the project name, e.g. "LG" for `lumen-gallery`.
 pub fn project_badge(project_name: &str, cx: &App) -> Option<impl IntoElement + use<>> {
+    if !ZenithTitleBarSettings::get_global(cx).enabled {
+        return None;
+    }
     let initials = initials(project_name)?;
     // Board: 22 px mark, then a 20 px #4a5b8c badge, radius 5, 9.5 px bold white.
     let mark = show_mark(cx).then(|| Vector::square(VectorName::ZedLogo, rems_from_px(22_f32)));
@@ -40,11 +64,18 @@ fn show_mark(cx: &App) -> bool {
 
 /// Zenith's title bar middle: search, run controls, agent chip. One element, because
 /// the upstream title bar holds its sections in a fixed-size `ArrayVec`.
-pub fn middle(project: &Entity<Project>, cx: &App) -> impl IntoElement + use<> {
+pub fn middle(project: &Entity<Project>, cx: &App) -> AnyElement {
+    if !ZenithTitleBarSettings::get_global(cx).enabled {
+        return Empty.into_any_element();
+    }
     // Board gaps: run controls 2 px apart, 8 px before the chip, 4 px before settings.
     h_flex()
         .gap(px(2.))
-        .child(search_box(Box::new(zenith_search::Toggle), cx))
+        .children(
+            cx.build_action("zenith_search::Toggle", None)
+                .ok()
+                .map(|action| search_box(action, cx)),
+        )
         .child(div().w(px(10.)))
         .child(run::run_controls(project, cx))
         .child(div().w(px(8.)))
@@ -59,6 +90,7 @@ pub fn middle(project: &Entity<Project>, cx: &App) -> impl IntoElement + use<> {
                 ))
                 .on_click(dispatch(Box::new(zed_actions::OpenSettings))),
         )
+        .into_any_element()
 }
 
 /// "Search Everywhere" box for the middle of the title bar; dispatches `action`.
@@ -282,6 +314,27 @@ mod tests {
     fn test_mark_hidden_under_rails(cx: &mut TestAppContext) {
         cx.update(|cx| cx.set_global(workspace::dock::RailsActive));
         cx.update(|cx| assert!(!show_mark(cx)));
+    }
+
+    #[gpui::test]
+    fn test_setting_off_drops_the_badge(cx: &mut TestAppContext) {
+        use gpui::BorrowAppContext as _;
+        cx.update(|cx| {
+            let store = settings::SettingsStore::test(cx);
+            cx.set_global(store);
+            assert!(super::project_badge("lumen-gallery", cx).is_some());
+            cx.update_global::<settings::SettingsStore, _>(|store, cx| {
+                store.update_user_settings(cx, |content| {
+                    content.zenith = Some(settings::ZenithSettingsContent {
+                        title_bar: Some(settings::ZenithTitleBarSettingsContent {
+                            enabled: Some(false),
+                        }),
+                        ..Default::default()
+                    });
+                });
+            });
+            assert!(super::project_badge("lumen-gallery", cx).is_none());
+        });
     }
 
     #[test]

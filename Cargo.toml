@@ -475,7 +475,7 @@ picker_preview = { path = "crates/picker_preview" }
 platform_title_bar = { path = "crates/platform_title_bar" }
 prettier = { path = "crates/prettier" }
 project = { path = "crates/project" }
-project_panel = { path = "crates/project_panel" }
+project_panel = { path = "crates/project_panel", default-features = false }
 project_symbols = { path = "crates/project_symbols" }
 project_bookmarks = { path = "crates/project_bookmarks" }
 prompt_store = { path = "crates/prompt_store" }

@@ -112,7 +112,28 @@ const SYMBOL_QUERY_DEBOUNCE: Duration = Duration::from_millis(100);
 /// Results per group on the All tab, so one source can't push the others off.
 const ALL_TAB_GROUP_LIMIT: usize = 8;
 
+/// `zenith.search.enabled`: read once at init, so a change takes effect after a restart.
+#[derive(Clone, Copy, settings::RegisterSetting)]
+pub struct SearchSettings {
+    pub enabled: bool,
+}
+
+impl settings::Settings for SearchSettings {
+    fn from_settings(content: &settings::SettingsContent) -> Self {
+        let search = content
+            .zenith
+            .as_ref()
+            .and_then(|zenith| zenith.search.as_ref());
+        Self {
+            enabled: search.and_then(|search| search.enabled).unwrap_or(true),
+        }
+    }
+}
+
 pub fn init(cx: &mut App) {
+    if !SearchSettings::get_global(cx).enabled {
+        return;
+    }
     editor::set_code_lens_locations_handler(usages::UsagesModal::open_for_code_lens);
     cx.observe_new(|workspace: &mut Workspace, _, _| {
         workspace.register_action(|workspace, _: &Toggle, window, cx| {
@@ -1974,6 +1995,38 @@ mod tests {
                 .picker
                 .clone()
         })
+    }
+
+    #[gpui::test]
+    async fn test_setting_off_registers_no_actions(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let mut store = settings::SettingsStore::test(cx);
+            store.update_user_settings(cx, |content| {
+                content.zenith = Some(settings::ZenithSettingsContent {
+                    search: Some(settings::ZenithSearchSettingsContent {
+                        enabled: Some(false),
+                    }),
+                    ..Default::default()
+                });
+            });
+            cx.set_global(store);
+        });
+        let app_state = init_test(cx);
+        let project = Project::test(app_state.fs.clone(), [], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        let editor = cx.new_window_entity(|window, cx| Editor::single_line(window, cx));
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.add_item_to_active_pane(Box::new(editor.clone()), None, true, window, cx);
+            editor.update(cx, |editor, cx| window.focus(&editor.focus_handle(cx), cx))
+        });
+
+        cx.dispatch_action(Toggle);
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, cx| {
+            assert!(workspace.active_modal::<SearchEverywhere>(cx).is_none())
+        });
     }
 
     #[gpui::test]

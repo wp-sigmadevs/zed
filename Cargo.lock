@@ -22907,6 +22907,7 @@ version = "0.1.0"
 dependencies = [
  "gpui",
  "onboarding",
+ "project_panel",
  "zenith_agent_review",
  "zenith_external_libraries",
  "zenith_folds",
@@ -23450,13 +23451,13 @@ dependencies = [
  "gpui",
  "project",
  "serde_json",
+ "settings",
  "task",
  "tasks_ui",
  "ui",
  "util",
  "workspace",
  "zed_actions",
- "zenith_search",
 ]
 
 [[package]]

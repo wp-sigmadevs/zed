@@ -15,6 +15,23 @@ pub struct ZenithSettingsContent {
     pub local_history: Option<ZenithLocalHistorySettingsContent>,
     /// Settings for the External Libraries project panel section.
     pub external_libraries: Option<ZenithExternalLibrariesSettingsContent>,
+    /// Settings for the New-from-template popup.
+    pub templates: Option<ZenithTemplatesSettingsContent>,
+
+    /// Settings for the tool window rails.
+    pub rails: Option<ZenithRailsSettingsContent>,
+
+    /// Settings for Zenith's window chrome.
+    pub ui: Option<ZenithUiSettingsContent>,
+
+    /// Settings for Zenith's title bar additions.
+    pub title_bar: Option<ZenithTitleBarSettingsContent>,
+
+    /// Settings for Zenith's editor look.
+    pub look: Option<ZenithLookSettingsContent>,
+
+    /// Settings for Search Everywhere.
+    pub search: Option<ZenithSearchSettingsContent>,
     /// Settings for the WordPress Hooks tool window.
     pub wordpress: Option<ZenithWordPressSettingsContent>,
     /// Settings for the Laravel tool window.
@@ -34,6 +51,64 @@ pub struct ZenithSettingsContent {
 pub struct ZenithAgentReviewSettingsContent {
     /// Whether each AI agent turn records local-history checkpoints of the
     /// files it edits and its changes are offered for review.
+    ///
+    /// Default: true
+    pub enabled: Option<bool>,
+}
+
+/// Settings for the New-from-template popup.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+pub struct ZenithTemplatesSettingsContent {
+    /// Whether the New popup (file templates) is offered. Takes effect after a restart.
+    ///
+    /// Default: true
+    pub enabled: Option<bool>,
+}
+
+/// Settings for the tool window rails.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+pub struct ZenithRailsSettingsContent {
+    /// Whether tool window buttons sit in rails down each side of the window instead of
+    /// the status bar. Takes effect after a restart.
+    ///
+    /// Default: true
+    pub enabled: Option<bool>,
+}
+
+/// Settings for Zenith's window chrome.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+pub struct ZenithUiSettingsContent {
+    /// Whether the editor, docks and bottom panel are drawn as separate rounded islands.
+    /// Takes effect after a restart.
+    ///
+    /// Default: true
+    pub islands: Option<bool>,
+}
+
+/// Settings for Zenith's title bar additions.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+pub struct ZenithTitleBarSettingsContent {
+    /// Whether the title bar shows the project badge, search box, run controls and agent chip.
+    ///
+    /// Default: true
+    pub enabled: Option<bool>,
+}
+
+/// Settings for Zenith's editor look.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+pub struct ZenithLookSettingsContent {
+    /// Whether Zenith's icon theme, hint pills, AI bulb actions, hover card and indent
+    /// status item are installed. Takes effect after a restart.
+    ///
+    /// Default: true
+    pub enabled: Option<bool>,
+}
+
+/// Settings for Search Everywhere.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+pub struct ZenithSearchSettingsContent {
+    /// Whether Search Everywhere, Find in Files, Show Usages and the Switcher actions are
+    /// registered. Takes effect after a restart.
     ///
     /// Default: true
     pub enabled: Option<bool>,
@@ -104,6 +179,11 @@ pub struct ZenithWelcomeSettingsContent {
 /// Settings for PHP inspections.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
 pub struct ZenithInspectionsSettingsContent {
+    /// Whether PHP inspections run and their actions are registered. Takes effect after
+    /// a restart.
+    ///
+    /// Default: true
+    pub enabled: Option<bool>,
     /// Whether PHPCS runs.
     ///
     /// Default: true
