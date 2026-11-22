@@ -342,7 +342,7 @@ impl Editor {
         IconButton::new("inline_code_actions", ui::IconName::ZenithLightbulb)
             .icon_size(icon_size)
             .shape(ui::IconButtonShape::Square)
-            .icon_color(ui::Color::Hidden)
+            .icon_color(ui::Color::Warning) // Zenith: amber bulb, as in PhpStorm
             .toggle_state(is_active)
             .when(show_tooltip, |this| {
                 this.tooltip({

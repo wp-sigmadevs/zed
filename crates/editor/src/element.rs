@@ -2084,7 +2084,7 @@ impl EditorElement {
             return None;
         }
 
-        let icon_size = ui::IconSize::XSmall;
+        let icon_size = ui::IconSize::Medium; // Zenith: PhpStorm-size bulb
         let mut button = self.editor.update(cx, |editor, cx| {
             if !editor.has_available_code_actions_for_selection() {
                 return None;
