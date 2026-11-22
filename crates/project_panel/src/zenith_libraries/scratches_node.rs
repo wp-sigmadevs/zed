@@ -98,6 +98,16 @@ impl ProjectPanel {
         let Some(root) = worktree.root_entry() else {
             return;
         };
+        // Renaming the "Scratches" row would rename the store folder itself and strand
+        // `store_dir`. Trash, delete and cut already skip worktree roots; rename does not, and
+        // `rename_impl` has no hook, so the edit it just started is dropped here (before the
+        // rebuild focuses the name editor).
+        if self.state.edit_state.as_ref().is_some_and(|edit| {
+            edit.worktree_id == worktree_id && edit.entry_id == root.id && !edit.is_new_entry()
+        }) {
+            self.state.edit_state = None;
+            self.update_visible_entries_task.focus_filename_editor = false;
+        }
         let settings = ProjectPanelSettings::get_global(cx);
         let expanded_dir_ids = self
             .state
@@ -560,6 +570,66 @@ mod tests {
         });
         opened.cx.run_until_parked();
         assert_eq!(created.get(), 1, "the first entry is New Scratch File…");
+    }
+
+    /// Rename, trash, delete and cut on the node and the "Scratches" folder row never touch the
+    /// store folder, and the store keeps its files.
+    #[gpui::test]
+    async fn test_keyboard_cannot_rename_or_remove_the_store_folder(cx: &mut TestAppContext) {
+        let mut opened = open(cx, json!({ "src": { "main.php": "" } })).await;
+        toggle(&mut opened, "Scratches and Consoles");
+        let worktree_id = scratch_worktree_id(&mut opened);
+        let root = opened.panel.read_with(&opened.cx, |panel, cx| {
+            let worktree = panel
+                .project
+                .read(cx)
+                .worktree_for_id(worktree_id, cx)
+                .unwrap();
+            worktree.read(cx).root_entry().unwrap().id
+        });
+        for entry_id in [root, section_id(worktree_id)] {
+            opened.panel.update(&mut opened.cx, |panel, _| {
+                panel.selection = Some(SelectedEntry {
+                    worktree_id,
+                    entry_id,
+                });
+            });
+            opened.panel.update_in(&mut opened.cx, |panel, window, cx| {
+                panel.rename(&Rename, window, cx)
+            });
+            opened.cx.run_until_parked();
+            let rename = opened.panel.update_in(&mut opened.cx, |panel, window, cx| {
+                assert!(
+                    panel.state.edit_state.is_none(),
+                    "no rename starts on {entry_id:?}"
+                );
+                panel
+                    .filename_editor
+                    .update(cx, |editor, cx| editor.set_text("stolen", window, cx));
+                panel.confirm_edit(true, window, cx)
+            });
+            if let Some(rename) = rename {
+                rename.await.unwrap();
+            }
+            opened.panel.update_in(&mut opened.cx, |panel, window, cx| {
+                panel.trash(&Trash { skip_prompt: true }, window, cx);
+                panel.delete(&Delete { skip_prompt: true }, window, cx);
+                panel.cut(&Cut, window, cx);
+                assert!(panel.clipboard.is_none(), "cut skips the store folder");
+            });
+            opened.cx.run_until_parked();
+            assert!(opened.fs.is_dir(&opened.store).await, "{entry_id:?}");
+            assert!(opened.fs.is_file(&opened.store.join("notes.md")).await);
+            assert!(opened.fs.is_file(&opened.store.join("rest-api.http")).await);
+            assert!(
+                !opened
+                    .fs
+                    .is_dir(&opened.store.with_file_name("stolen"))
+                    .await
+            );
+        }
+        let shown = names(&mut opened);
+        assert!(shown.contains(&"Scratches".to_string()), "{shown:?}");
     }
 
     #[gpui::test]
