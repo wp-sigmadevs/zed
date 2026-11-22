@@ -37,8 +37,9 @@ pub fn is_enabled(cx: &App) -> bool {
 const SECTION_ID_BASE: u64 = 1 << 62;
 const SECTION_ID_SPAN: u64 = 1 << 32;
 
-/// The id of the "External Libraries" row of one worktree. Each worktree has its own row, so
-/// expansion state is per worktree and never shared between windows.
+/// The id of the "External Libraries" row when `worktree_id` owns it. The panel shows one node,
+/// owned by the first worktree with libraries, so its expansion lives in that worktree's
+/// expanded ids and is never shared between windows.
 pub fn section_id(worktree_id: WorktreeId) -> ProjectEntryId {
     let offset = (worktree_id.to_usize() as u64) % SECTION_ID_SPAN;
     ProjectEntryId::from_proto(SECTION_ID_BASE + offset)
@@ -233,12 +234,11 @@ pub struct RowDecoration {
     pub depth: usize,
 }
 
-/// Renames, re-icons and indents a row: library rows sit one level under the node, library
-/// roots are labelled read-only. `root_visible` is whether the worktree root row is shown:
-/// then top-level entries are already one level deep, which is where the node's children go;
-/// with the root hidden they are one level too shallow.
-pub fn decorate_row(kind: RowKind, root_visible: bool, row: RowDecoration) -> RowDecoration {
-    let shift = usize::from(!root_visible);
+/// Renames, re-icons and indents a row: library rows sit one level under the node. A library
+/// root is labelled with `project` (its project's name, when several projects have libraries)
+/// or else read-only. Library rows are listed without their worktree root row, so the panel
+/// computes them one level too shallow.
+pub fn decorate_row(kind: RowKind, project: Option<&str>, row: RowDecoration) -> RowDecoration {
     match kind {
         RowKind::Section => RowDecoration {
             filename: "External Libraries".to_string(),
@@ -246,12 +246,12 @@ pub fn decorate_row(kind: RowKind, root_visible: bool, row: RowDecoration) -> Ro
             depth: 0,
         },
         RowKind::Library { label, icon } => RowDecoration {
-            filename: format!("{label} (read-only)"),
+            filename: format!("{label} ({})", project.unwrap_or("read-only")),
             icon: Some(SharedString::from(icon.path())),
-            depth: row.depth + shift,
+            depth: row.depth + 1,
         },
         RowKind::Inside => RowDecoration {
-            depth: row.depth + shift,
+            depth: row.depth + 1,
             ..row
         },
     }
@@ -281,63 +281,38 @@ pub fn create_external_libraries_root_entry(worktree_id: WorktreeId) -> GitEntry
     }
 }
 
-/// Rewrites a worktree's visible entries: library folders leave the main tree and, when the
-/// worktree has detected libraries, an "External Libraries" row (with the libraries below it
-/// while expanded) is appended. Returns whether anything was changed.
-pub fn apply(
+/// Moves a project worktree's library folders out of its visible `entries` and returns the rows
+/// that go under the "External Libraries" node: each library root and, while it is expanded, its
+/// contents. `None` when the worktree has no detected libraries.
+pub fn take_libraries(
     snapshot: &WorktreeSnapshot,
     expanded_dir_ids: &[ProjectEntryId],
     entries: &mut Vec<GitEntry>,
-) -> bool {
+) -> Option<Vec<GitEntry>> {
     let libraries = detect_libraries(snapshot);
     if libraries.is_empty() {
-        return false;
+        return None;
     }
     entries.retain(|entry| !is_under_library(&libraries, &entry.path));
-    entries.push(create_external_libraries_root_entry(snapshot.id()));
-    if is_section_expanded(snapshot.id(), expanded_dir_ids) {
-        for library in &libraries {
-            if let Some(entry) = snapshot.entry_for_id(library.entry_id) {
-                entries.push(GitEntry {
-                    entry: entry.clone(),
-                    git_summary: GitSummary::default(),
-                });
-                if expanded_dir_ids.binary_search(&library.entry_id).is_ok() {
-                    append_children_recursive(snapshot, &library.path, expanded_dir_ids, entries);
-                }
+    let mut rows = Vec::new();
+    for library in &libraries {
+        if let Some(entry) = snapshot.entry_for_id(library.entry_id) {
+            rows.push(GitEntry {
+                entry: entry.clone(),
+                git_summary: GitSummary::default(),
+            });
+            if expanded_dir_ids.binary_search(&library.entry_id).is_ok() {
+                append_children_recursive(snapshot, &library.path, expanded_dir_ids, &mut rows);
             }
         }
     }
-    true
+    Some(rows)
 }
 
 /// Whether `abs` is a folder the user added with "Add Library Path…" (or inside one). Its
-/// worktree is shown read-only under an "External Libraries" node, never as a project root.
+/// worktree is shown read-only under the "External Libraries" node, never as a project root.
 pub fn is_library_worktree(abs: &std::path::Path, cx: &App) -> bool {
     zenith_local_settings_trust::is_library_root(abs, cx)
-}
-
-/// Rewrites the visible entries of a user-added library worktree. `joined` is the state of the
-/// "External Libraries" node of the group just before it, if that group has one: the tree then
-/// shows as another child of that single node (its root row stays, shown only while the node is
-/// expanded). With `None` the tree moves under its own node, shown only while that is expanded.
-pub fn apply_library_worktree(
-    worktree_id: WorktreeId,
-    expanded_dir_ids: &[ProjectEntryId],
-    entries: &mut Vec<GitEntry>,
-    joined: Option<bool>,
-) {
-    match joined {
-        Some(true) => {}
-        Some(false) => entries.clear(),
-        None => {
-            let tree = std::mem::take(entries);
-            entries.push(create_external_libraries_root_entry(worktree_id));
-            if is_section_expanded(worktree_id, expanded_dir_ids) {
-                entries.extend(tree);
-            }
-        }
-    }
 }
 
 fn append_children_recursive(
@@ -550,34 +525,25 @@ mod tests {
             label: "Composer Packages".into(),
             icon: IconName::Box,
         };
-        // Root row shown: a library root is already at depth 1, directly under the node.
-        let root = decorate_row(
-            library.clone(),
-            true,
+        // Listed without its root row, a library root moves down to sit directly under the node.
+        let root = decorate_row(library.clone(), None, row.clone());
+        assert_eq!(root.filename, "Composer Packages (read-only)");
+        assert_eq!(root.icon, Some(SharedString::from(IconName::Box.path())));
+        assert_eq!(root.depth, 1);
+        let named = decorate_row(library, Some("plinth"), row.clone());
+        assert_eq!(named.filename, "Composer Packages (plinth)");
+
+        let inside = decorate_row(
+            RowKind::Inside,
+            None,
             RowDecoration {
                 depth: 1,
                 ..row.clone()
             },
         );
-        assert_eq!(root.filename, "Composer Packages (read-only)");
-        assert_eq!(root.icon, Some(SharedString::from(IconName::Box.path())));
-        assert_eq!(root.depth, 1);
-        // Root row hidden: it is moved down one level.
-        assert_eq!(decorate_row(library, false, row.clone()).depth, 1);
+        assert_eq!((inside.filename.as_str(), inside.depth), ("vendor", 2));
 
-        for (root_visible, from, to) in [(true, 2, 2), (false, 1, 2)] {
-            let inside = decorate_row(
-                RowKind::Inside,
-                root_visible,
-                RowDecoration {
-                    depth: from,
-                    ..row.clone()
-                },
-            );
-            assert_eq!((inside.filename.as_str(), inside.depth), ("vendor", to));
-        }
-
-        let section = decorate_row(RowKind::Section, true, row);
+        let section = decorate_row(RowKind::Section, Some("plinth"), row);
         assert_eq!(section.filename, "External Libraries");
         assert_eq!(section.depth, 0);
     }
@@ -687,25 +653,31 @@ mod tests {
                 .collect()
         };
 
-        // Collapsed: library folders and their children leave the tree, one section row is added.
+        // Library folders and their children leave the tree; the library roots are returned.
         let mut visible = all(&snapshot);
-        assert!(apply(&snapshot, &[], &mut visible));
-        let collapsed = paths(&visible);
+        let libraries = take_libraries(&snapshot, &[], &mut visible).unwrap();
+        let remaining = paths(&visible);
         assert!(
-            !collapsed
+            !remaining
                 .iter()
                 .any(|path| path.starts_with("vendor") || path.starts_with("node_modules"))
         );
-        assert!(collapsed.contains(&"src/main.php".to_string()));
-        assert_eq!(visible.last().unwrap().id, section_id(snapshot.id()));
+        assert!(remaining.contains(&"src/main.php".to_string()));
+        assert_eq!(paths(&libraries), vec!["vendor", "node_modules"]);
 
-        // Expanded: the section is followed by each detected library.
-        let mut expanded_ids = Vec::new();
-        set_section_expanded(snapshot.id(), &mut expanded_ids, Some(true));
+        // An expanded library root brings its children along.
+        let vendor = entry("vendor");
         let mut visible = all(&snapshot);
-        assert!(apply(&snapshot, &expanded_ids, &mut visible));
-        let tail: Vec<_> = paths(&visible).into_iter().rev().take(3).collect();
-        assert_eq!(tail, vec!["node_modules", "vendor", "External Libraries"]);
+        let libraries = take_libraries(&snapshot, &[vendor], &mut visible).unwrap();
+        assert_eq!(
+            paths(&libraries),
+            vec![
+                "vendor",
+                "vendor/autoload.php",
+                "vendor/laravel",
+                "node_modules"
+            ]
+        );
     }
 
     #[gpui::test]
@@ -746,7 +718,7 @@ mod tests {
             })
             .collect();
         let before = visible.len();
-        assert!(!apply(&snapshot, &[], &mut visible));
+        assert!(take_libraries(&snapshot, &[], &mut visible).is_none());
         assert_eq!(visible.len(), before);
     }
 }

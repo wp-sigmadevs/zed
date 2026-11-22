@@ -5584,7 +5584,9 @@ impl ProjectPanel {
     ) -> Option<(usize, usize, usize)> {
         let mut total_ix = 0;
         for (worktree_ix, visible) in self.state.visible_entries.iter().enumerate() {
-            if worktree_id != visible.worktree_id {
+            if worktree_id != visible.worktree_id
+                || !visible.entries.iter().any(|entry| entry.id == entry_id)
+            {
                 total_ix += visible.entries.len();
                 continue;
             }
