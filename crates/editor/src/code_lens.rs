@@ -1721,7 +1721,8 @@ mod tests {
         cx.update(|cx| {
             <settings::SettingsStore as gpui::UpdateGlobal>::update_global(cx, |store, cx| {
                 store.update_user_settings(cx, |settings| {
-                    settings.theme.buffer_line_height = Some(settings::BufferLineHeight::Comfortable);
+                    settings.theme.buffer_line_height =
+                        Some(settings::BufferLineHeight::Comfortable);
                 });
             });
         });
@@ -2223,7 +2224,61 @@ fn zenith_show_locations(
         return false;
     };
     let server_id = action.server_id;
-    // Same conversion as `Editor::compute_target_location` (navigation.rs), all at once.
+    let resolved = zenith_resolve_locations(&project, locations, server_id, cx);
+    let locations = locations.to_vec();
+    let title = action.lsp_action.title().to_string();
+    // Always a multibuffer tab: `navigate_to_hover_links` jumps instead when the locations
+    // fit in one excerpt, and the popup's button says "Open in Tab".
+    let open_in_tab: CodeLensOpenInTab = Box::new(
+        move |editor: &mut Editor, window: &mut Window, cx: &mut Context<Editor>| {
+            let (Some(workspace), Some(project)) = (editor.workspace(), editor.project.clone())
+            else {
+                return;
+            };
+            let resolving = zenith_resolve_locations(&project, &locations, server_id, cx);
+            cx.spawn_in(window, async move |_, cx| {
+                let mut ranges = std::collections::HashMap::<_, Vec<_>>::default();
+                for location in resolving.await? {
+                    let range = location.buffer.read_with(cx, |buffer, _| {
+                        use text::ToPoint as _;
+                        location.range.start.to_point(buffer)..location.range.end.to_point(buffer)
+                    });
+                    ranges.entry(location.buffer).or_default().push(range);
+                }
+                if ranges.is_empty() {
+                    return anyhow::Ok(());
+                }
+                workspace.update_in(cx, |workspace, window, cx| {
+                    use settings::Settings as _;
+                    let allow_preview = workspace::item::PreviewTabsSettings::get_global(cx)
+                        .enable_preview_multibuffer_from_code_navigation;
+                    Editor::open_locations_in_multibuffer(
+                        workspace,
+                        ranges,
+                        title,
+                        false,
+                        allow_preview,
+                        crate::MultibufferSelectionMode::First,
+                        window,
+                        cx,
+                    );
+                })?;
+                anyhow::Ok(())
+            })
+            .detach_and_log_err(cx);
+        },
+    );
+    show(action, resolved, open_in_tab, editor, window, cx)
+}
+
+/// Resolves LSP locations to buffer anchors. Same conversion as
+/// `Editor::compute_target_location` (navigation.rs), all at once.
+fn zenith_resolve_locations(
+    project: &gpui::Entity<project::Project>,
+    locations: &[lsp::Location],
+    server_id: lsp::LanguageServerId,
+    cx: &mut App,
+) -> Task<anyhow::Result<Vec<project::Location>>> {
     let opening = locations
         .iter()
         .map(|location| {
@@ -2233,7 +2288,7 @@ fn zenith_show_locations(
             (buffer, language::range_from_lsp(location.range))
         })
         .collect::<Vec<_>>();
-    let resolved = cx.spawn(async move |_, cx| {
+    cx.spawn(async move |cx| {
         let mut resolved = Vec::with_capacity(opening.len());
         for (buffer, range) in opening {
             let buffer = buffer.await?;
@@ -2245,19 +2300,5 @@ fn zenith_show_locations(
             resolved.push(project::Location { buffer, range });
         }
         anyhow::Ok(resolved)
-    });
-    let locations = locations.to_vec();
-    let open_in_tab: CodeLensOpenInTab = Box::new(
-        move |editor: &mut Editor, window: &mut Window, cx: &mut Context<Editor>| {
-            let nav_entry = editor.navigation_entry(editor.selections.newest_anchor().head(), cx);
-            let links = locations
-                .into_iter()
-                .map(|location| HoverLink::LspLocation(location, server_id))
-                .collect();
-            editor
-                .navigate_to_hover_links(None, links, nav_entry, false, window, cx)
-                .detach_and_log_err(cx);
-        },
-    );
-    show(action, resolved, open_in_tab, editor, window, cx)
+    })
 }
