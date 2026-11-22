@@ -65,3 +65,4 @@ zenith_wordpress = { workspace = true, optional = true }
 zenith_postfix = { workspace = true, optional = true }
 zenith_http = { workspace = true, optional = true }
 zenith_refactor = { workspace = true, optional = true }
+zenith_title_bar.workspace = true

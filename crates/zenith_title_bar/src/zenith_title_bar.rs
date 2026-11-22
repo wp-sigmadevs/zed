@@ -1,10 +1,14 @@
 //! Zenith additions to the title bar (plan 34, step 2).
 
+mod run;
+
 use std::collections::HashMap;
 
 use gpui::{Action, Entity, EntityId, FontWeight, Global, Hsla};
-use project::{Inventory, Project};
+use project::Project;
 use ui::{ButtonLike, IconButton, Tooltip, Vector, VectorName, prelude::*};
+
+pub use run::{DebugSelected, RerunLast, RunConfig, RunModel, RunSelected, StopRun, init};
 
 /// Two-letter badge shown before the project name, e.g. "LG" for `lumen-gallery`.
 pub fn project_badge(project_name: &str, cx: &App) -> Option<impl IntoElement + use<>> {
@@ -40,9 +44,9 @@ pub fn middle(project: &Entity<Project>, cx: &App) -> impl IntoElement + use<> {
     // Board gaps: run controls 2 px apart, 8 px before the chip, 4 px before settings.
     h_flex()
         .gap(px(2.))
-        .child(search_box(Box::new(zenith_search::Toggle)))
+        .child(search_box(Box::new(zenith_search::Toggle), cx))
         .child(div().w(px(10.)))
-        .child(run_controls(project, cx))
+        .child(run::run_controls(project, cx))
         .child(div().w(px(8.)))
         .child(agent_chip(project, cx))
         .child(div().w(px(4.)))
@@ -58,8 +62,10 @@ pub fn middle(project: &Entity<Project>, cx: &App) -> impl IntoElement + use<> {
 }
 
 /// "Search Everywhere" box for the middle of the title bar; dispatches `action`.
-fn search_box(action: Box<dyn gpui::Action>) -> impl IntoElement {
-    // Board: 340×28, radius 7, #31343a, 12.5 px placeholder #8c8f96, ⇧⇧ key cap.
+fn search_box(action: Box<dyn gpui::Action>, cx: &App) -> impl IntoElement + use<> {
+    // Board: 340×28, radius 7, 12.5 px placeholder, ⇧⇧ key cap; theme colours so light
+    // themes work.
+    let colors = cx.theme().colors();
     ButtonLike::new("zenith-search-everywhere")
         .style(ButtonStyle::Transparent)
         .child(
@@ -71,7 +77,7 @@ fn search_box(action: Box<dyn gpui::Action>) -> impl IntoElement {
                 .pr(px(8.))
                 .gap(px(8.))
                 .rounded(px(7.))
-                .bg(gpui::rgb(0x31343a))
+                .bg(colors.element_background)
                 .child(
                     Icon::new(IconName::MagnifyingGlass)
                         .size(IconSize::Small)
@@ -82,7 +88,7 @@ fn search_box(action: Box<dyn gpui::Action>) -> impl IntoElement {
                         .flex_1()
                         .min_w_0()
                         .text_size(px(12.5))
-                        .text_color(gpui::rgb(0x8c8f96))
+                        .text_color(colors.text_placeholder)
                         .child("Search everywhere"),
                 )
                 .child(
@@ -93,10 +99,10 @@ fn search_box(action: Box<dyn gpui::Action>) -> impl IntoElement {
                         .items_center()
                         .rounded(px(4.))
                         .border_1()
-                        .border_color(gpui::rgb(0x393b40))
-                        .bg(gpui::rgb(0x2b2d30))
+                        .border_color(colors.border_variant)
+                        .bg(colors.editor_background)
                         .text_size(px(11.))
-                        .text_color(gpui::rgb(0x8c8f96))
+                        .text_color(colors.text_placeholder)
                         .child("⇧⇧"),
                 ),
         )
@@ -105,49 +111,6 @@ fn search_box(action: Box<dyn gpui::Action>) -> impl IntoElement {
             move |_window, cx| Tooltip::for_action("Search Everywhere", action.as_ref(), cx)
         })
         .on_click(move |_, window, cx| window.dispatch_action(action.boxed_clone(), cx))
-}
-
-/// Run configuration dropdown with ▶ and 🐞, as in PhpStorm. The dropdown opens
-/// Zed's task picker; ▶ reruns the last task; 🐞 starts the debugger.
-fn run_controls(project: &Entity<Project>, cx: &App) -> impl IntoElement + use<> {
-    let label = run_label(project.read(cx).task_store().read(cx).task_inventory(), cx);
-    // Looked up by name so the title bar doesn't depend on debugger_ui; absent ⇒ no 🐞.
-    let debug = cx.build_action("debugger::Start", None).ok();
-    h_flex()
-        .gap_0p5()
-        .child(
-            Button::new("zenith-run-configuration", label)
-                .label_size(LabelSize::Small)
-                .color(Color::Muted)
-                .end_icon(
-                    Icon::new(IconName::ChevronDown)
-                        .size(IconSize::XSmall)
-                        .color(Color::Muted),
-                )
-                .tooltip(action_tooltip(
-                    "Run Configurations",
-                    Box::new(zed_actions::Spawn::modal()),
-                ))
-                .on_click(dispatch(Box::new(zed_actions::Spawn::modal()))),
-        )
-        .child(
-            IconButton::new("zenith-run", IconName::PlayFilled)
-                .icon_size(IconSize::Small)
-                .icon_color(Color::Success)
-                .tooltip(action_tooltip(
-                    "Run",
-                    Box::new(zed_actions::Rerun::default()),
-                ))
-                .on_click(dispatch(Box::new(zed_actions::Rerun::default()))),
-        )
-        .when_some(debug, |this, debug| {
-            this.child(
-                IconButton::new("zenith-debug", IconName::Debug)
-                    .icon_size(IconSize::Small)
-                    .tooltip(action_tooltip("Debug", debug.boxed_clone()))
-                    .on_click(dispatch(debug)),
-            )
-        })
 }
 
 /// Plan 34: orange marks anything an agent did; nothing else in the UI uses it.
@@ -273,14 +236,6 @@ fn agent_chip(project: &Entity<Project>, cx: &App) -> impl IntoElement + use<> {
         .on_click(dispatch(Box::new(zed_actions::assistant::ToggleFocus)))
 }
 
-/// Name of the last task run, or a prompt to pick one.
-fn run_label(inventory: Option<&Entity<Inventory>>, cx: &App) -> SharedString {
-    inventory
-        .and_then(|inventory| inventory.read(cx).last_scheduled_task(None))
-        .map(|(_, task)| task.resolved_label.into())
-        .unwrap_or_else(|| "Add Configuration…".into())
-}
-
 fn action_tooltip(
     title: &'static str,
     action: Box<dyn Action>,
@@ -312,32 +267,9 @@ fn initials(name: &str) -> Option<SharedString> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentChip, AgentCounts, agent_chip_aria_label, agent_chip_label, initials, run_label,
-        show_mark,
+        AgentChip, AgentCounts, agent_chip_aria_label, agent_chip_label, initials, show_mark,
     };
     use gpui::{EntityId, TestAppContext};
-    use project::{Inventory, TaskSourceKind};
-    use task::{TaskContext, TaskTemplate};
-
-    #[gpui::test]
-    fn test_run_label(cx: &mut TestAppContext) {
-        let inventory = cx.update(Inventory::new);
-        cx.update(|cx| {
-            assert_eq!(run_label(None, cx), "Add Configuration…");
-            assert_eq!(run_label(Some(&inventory), cx), "Add Configuration…");
-        });
-        let task = TaskTemplate {
-            label: "Build".into(),
-            command: "make".into(),
-            ..TaskTemplate::default()
-        }
-        .resolve_task("test", &TaskContext::default())
-        .expect("task resolves");
-        inventory.update(cx, |inventory, _| {
-            inventory.task_scheduled(TaskSourceKind::UserInput, task)
-        });
-        cx.update(|cx| assert_eq!(run_label(Some(&inventory), cx), "Build"));
-    }
 
     #[gpui::test]
     fn test_mark_hidden_under_islands_or_rails(cx: &mut TestAppContext) {

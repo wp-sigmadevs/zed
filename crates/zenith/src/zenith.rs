@@ -16,6 +16,7 @@ pub fn show_splash(cx: &mut App) {
 /// Must run after `onboarding::init` so Zenith's global action listeners
 /// take precedence over upstream ones.
 pub fn init(cx: &mut App) {
+    zenith_title_bar::init(cx);
     #[cfg(feature = "welcome")]
     zenith_welcome::init(cx);
     #[cfg(feature = "search")]
