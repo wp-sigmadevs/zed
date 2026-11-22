@@ -361,6 +361,36 @@ pub fn analyze_component_safety(file_path: &Path, content: &str) -> Vec<RscDiagn
     diagnostics
 }
 
+/// The route path typed so far when `line` (a line up to the cursor) ends inside a string given
+/// to an `href` attribute (`href="…"`, `href={'…'}`, `` href={`…`} ``, as on `<Link>` and `<a>`)
+/// or to `router.push(…)` / `router.replace(…)`. Only an absolute path counts: `''` or `'/…'`.
+pub fn route_path_prefix(line: &str) -> Option<&str> {
+    let quote_at = line.rfind(|character: char| matches!(character, '\'' | '"' | '`'))?;
+    let prefix = &line[quote_at + 1..];
+    if !(prefix.is_empty() || prefix.starts_with('/'))
+        || prefix
+            .chars()
+            .any(|character| character.is_whitespace() || character == '$')
+    {
+        return None;
+    }
+    let before = line[..quote_at].trim_end();
+    let before = before.strip_suffix('{').map_or(before, str::trim_end);
+    if let Some(attribute) = before.strip_suffix('=') {
+        let name = attribute
+            .trim_end()
+            .rsplit(|character: char| {
+                !(character.is_ascii_alphanumeric() || character == '_' || character == '-')
+            })
+            .next()?;
+        return (name == "href").then_some(prefix);
+    }
+    let call = before.strip_suffix('(')?;
+    let (receiver, method) = call.rsplit_once('.')?;
+    (matches!(method.trim(), "push" | "replace") && receiver.trim_end().ends_with("router"))
+        .then_some(prefix)
+}
+
 /// A manifest is small; only this much of one is read.
 const MANIFEST_MAX_BYTES: u64 = 1024 * 1024;
 
@@ -588,5 +618,38 @@ export default function UserProfile() {
         );
         index.remove_dir(Path::new("/p/src"));
         assert_eq!(index.route_count(), 1);
+    }
+
+    #[test]
+    fn test_route_path_prefix_inside_an_href_or_router_string() {
+        for (line, prefix) in [
+            ("  <Link href=\"", ""),
+            ("  <Link href=\"/bl", "/bl"),
+            ("  <a href='/about/te", "/about/te"),
+            ("  <Link href={'/api", "/api"),
+            ("  <Link href={ \"/x", "/x"),
+            ("  <Link href={`/blog/", "/blog/"),
+            ("    router.push('/dash", "/dash"),
+            ("    router.replace( \"/", "/"),
+            ("    this.router.push(`/a", "/a"),
+        ] {
+            assert_eq!(route_path_prefix(line), Some(prefix), "{line}");
+        }
+        for line in [
+            "  <Link href=\"/a\" className=\"",
+            "  <div className=\"fl",
+            "  <a data-href=\"/",
+            "  <Link href={`/blog/${slug}/",
+            "  <a href=\"https://",
+            "  <a href=\"relative",
+            "    router.prefetch('/",
+            "    history.push('/",
+            "    router.push({ pathname: '/",
+            "  const x = '/",
+            "  <Link href=\"/a b",
+            "",
+        ] {
+            assert_eq!(route_path_prefix(line), None, "{line}");
+        }
     }
 }
