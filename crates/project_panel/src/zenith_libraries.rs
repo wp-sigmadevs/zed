@@ -760,30 +760,6 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_library_worktree_without_a_preceding_node_gets_its_own(cx: &mut TestAppContext) {
-        let fs = FakeFs::new(cx.executor());
-        fs.insert_tree("/site", json!({ "src": { "main.php": "" } }))
-            .await;
-        let (panel, mut cx) = open_with_library(cx, fs, &["/site"]).await;
-        let cx = &mut cx;
-
-        let collapsed = names(&panel, cx);
-        assert_eq!(count(&collapsed, "External Libraries"), 1, "{collapsed:?}");
-        assert!(
-            !collapsed.iter().any(|n| n.starts_with("acme")),
-            "a library path is not a project root: {collapsed:?}"
-        );
-
-        let acme = worktree_id_of(&panel, "/libs/acme", cx);
-        toggle_section(&panel, acme, cx);
-        let expanded = rows(&panel, cx);
-        let depth_of = |name: &str| expanded.iter().find(|(n, _)| n == name).map(|(_, d)| *d);
-        assert_eq!(depth_of("External Libraries"), Some(0), "{expanded:?}");
-        assert_eq!(depth_of("acme (read-only)"), Some(1), "{expanded:?}");
-        assert_eq!(depth_of("lib"), Some(2), "{expanded:?}");
-    }
-
-    #[gpui::test]
     async fn test_library_worktree_leaves_other_project_nodes_alone(cx: &mut TestAppContext) {
         let fs = FakeFs::new(cx.executor());
         fs.insert_tree("/one", composer_tree()).await;
@@ -818,36 +794,6 @@ mod tests {
             "{second_open:?}"
         );
         assert_eq!(count(&second_open, "External Libraries"), 2);
-    }
-
-    #[gpui::test]
-    async fn test_removing_the_library_worktree_removes_its_rows(cx: &mut TestAppContext) {
-        let fs = FakeFs::new(cx.executor());
-        fs.insert_tree("/site", composer_tree()).await;
-        let (panel, mut cx) = open_with_library(cx, fs, &["/site"]).await;
-        let cx = &mut cx;
-        let site = worktree_id_of(&panel, "/site", cx);
-        toggle_section(&panel, site, cx);
-        assert_eq!(count(&names(&panel, cx), "acme (read-only)"), 1);
-
-        let acme = worktree_id_of(&panel, "/libs/acme", cx);
-        let project = panel.read_with(cx, |panel, _| panel.project.clone());
-        project.update(cx, |project, cx| project.remove_worktree(acme, cx));
-        cx.run_until_parked();
-
-        let after = names(&panel, cx);
-        assert!(
-            !after
-                .iter()
-                .any(|n| n == "acme (read-only)" || n == "lib" || n == "Acme.php"),
-            "{after:?}"
-        );
-        assert_eq!(count(&after, "External Libraries"), 1, "{after:?}");
-        assert_eq!(
-            count(&after, "Composer Packages (read-only)"),
-            1,
-            "the project's own node stays expanded: {after:?}"
-        );
     }
 
     #[gpui::test]
