@@ -113,6 +113,7 @@ const SYMBOL_QUERY_DEBOUNCE: Duration = Duration::from_millis(100);
 const ALL_TAB_GROUP_LIMIT: usize = 8;
 
 pub fn init(cx: &mut App) {
+    editor::set_code_lens_locations_handler(usages::UsagesModal::open_for_code_lens);
     cx.observe_new(|workspace: &mut Workspace, _, _| {
         workspace.register_action(|workspace, _: &Toggle, window, cx| {
             SearchEverywhere::open(workspace, Tab::All, window, cx)

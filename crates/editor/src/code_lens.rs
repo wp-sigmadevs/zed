@@ -196,6 +196,9 @@ fn try_show_references(
     if locations.is_empty() {
         return false;
     }
+    if zenith_show_locations(&locations, action, editor, window, cx) {
+        return true;
+    }
 
     let server_id = action.server_id;
     let nav_entry = editor.navigation_entry(editor.selections.newest_anchor().head(), cx);
@@ -1528,6 +1531,8 @@ mod tests {
     #[gpui::test]
     async fn test_code_lens_disabled_by_default(cx: &mut TestAppContext) {
         init_test(cx, |_| {});
+        // Zenith: the default is "on"; pin upstream's "off" for this test.
+        update_test_editor_settings(cx, &|settings| settings.code_lens = Some(CodeLens::Off));
 
         let mut cx = EditorLspTestContext::new_typescript(
             lsp::ServerCapabilities {
@@ -2188,4 +2193,71 @@ mod tests {
         text.push('\n');
         text
     }
+}
+
+// Zenith: lets a zenith crate show a lens's locations in its own popup (PhpStorm's Usages).
+// The handler gets the lens, its locations as buffer ranges and, for its "Open in Tab", the
+// upstream list; it returns false to leave the click to the upstream code above.
+pub type CodeLensOpenInTab = Box<dyn FnOnce(&mut Editor, &mut Window, &mut Context<Editor>)>;
+pub type CodeLensLocationsFn = fn(
+    &CodeAction,
+    Task<anyhow::Result<Vec<project::Location>>>,
+    CodeLensOpenInTab,
+    &mut Editor,
+    &mut Window,
+    &mut Context<Editor>,
+) -> bool;
+static CODE_LENS_LOCATIONS: std::sync::OnceLock<CodeLensLocationsFn> = std::sync::OnceLock::new();
+pub fn set_code_lens_locations_handler(show: CodeLensLocationsFn) {
+    CODE_LENS_LOCATIONS.set(show).ok();
+}
+
+fn zenith_show_locations(
+    locations: &[lsp::Location],
+    action: &CodeAction,
+    editor: &mut Editor,
+    window: &mut Window,
+    cx: &mut Context<Editor>,
+) -> bool {
+    let (Some(show), Some(project)) = (CODE_LENS_LOCATIONS.get(), editor.project.clone()) else {
+        return false;
+    };
+    let server_id = action.server_id;
+    // Same conversion as `Editor::compute_target_location` (navigation.rs), all at once.
+    let opening = locations
+        .iter()
+        .map(|location| {
+            let buffer = project.update(cx, |project, cx| {
+                project.open_local_buffer_via_lsp(location.uri.clone(), server_id, cx)
+            });
+            (buffer, language::range_from_lsp(location.range))
+        })
+        .collect::<Vec<_>>();
+    let resolved = cx.spawn(async move |_, cx| {
+        let mut resolved = Vec::with_capacity(opening.len());
+        for (buffer, range) in opening {
+            let buffer = buffer.await?;
+            let range = buffer.read_with(cx, |buffer, _| {
+                let start = buffer.clip_point_utf16(range.start, text::Bias::Left);
+                let end = buffer.clip_point_utf16(range.end, text::Bias::Left);
+                buffer.anchor_after(start)..buffer.anchor_before(end)
+            });
+            resolved.push(project::Location { buffer, range });
+        }
+        anyhow::Ok(resolved)
+    });
+    let locations = locations.to_vec();
+    let open_in_tab: CodeLensOpenInTab = Box::new(
+        move |editor: &mut Editor, window: &mut Window, cx: &mut Context<Editor>| {
+            let nav_entry = editor.navigation_entry(editor.selections.newest_anchor().head(), cx);
+            let links = locations
+                .into_iter()
+                .map(|location| HoverLink::LspLocation(location, server_id))
+                .collect();
+            editor
+                .navigate_to_hover_links(None, links, nav_entry, false, window, cx)
+                .detach_and_log_err(cx);
+        },
+    );
+    show(action, resolved, open_in_tab, editor, window, cx)
 }

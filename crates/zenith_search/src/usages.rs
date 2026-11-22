@@ -1,20 +1,22 @@
 //! PhpStorm's Usages popup (⌘⌥F7): the places the symbol at the cursor is used, one
 //! row per line with the code coloured, from the language server's "find all
 //! references". Enter opens a row; "Open in Tab" hands the whole result to the
-//! editor's own references tab.
+//! editor's own references tab. An "N implementations" code lens opens the same popup
+//! as PhpStorm's Choose Implementation.
 
 use std::ops::Range;
 
-use editor::{Editor, actions::FindAllReferences};
+use editor::{CodeLensOpenInTab, Editor, actions::FindAllReferences};
 use gpui::{
     App, ClickEvent, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable,
     HighlightStyle, IntoElement, ParentElement, Render, Role, ScrollStrategy, SharedString, Styled,
     StyledText, Subscription, Task, UniformListScrollHandle, WeakEntity, Window, div, prelude::*,
     px, uniform_list,
 };
-use project::Location;
+use language::CharKind;
+use project::{CodeAction, Location};
 use settings::SeedQuerySetting;
-use text::ToPoint as _;
+use text::{PointUtf16, ToOffset as _, ToPoint as _, Unclipped};
 use ui::{
     Button, ButtonSize, ButtonStyle, Label, ScrollAxes, Scrollbars, Tooltip, WithScrollbar,
     prelude::*,
@@ -36,6 +38,30 @@ use super::{
 /// More usages than this say "300+", not a longer list.
 const MAX_USAGES: usize = 300;
 
+/// What the popup lists: usages, or the implementations a lens offers to choose from.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Kind {
+    Usages,
+    Implementations,
+}
+
+impl Kind {
+    fn title(self) -> &'static str {
+        match self {
+            Kind::Usages => "Usages",
+            Kind::Implementations => "Implementations",
+        }
+    }
+
+    /// Singular and plural.
+    fn nouns(self) -> (&'static str, &'static str) {
+        match self {
+            Kind::Usages => ("usage", "usages"),
+            Kind::Implementations => ("implementation", "implementations"),
+        }
+    }
+}
+
 /// What the popup is waiting for or showing.
 #[derive(Debug, PartialEq)]
 enum State {
@@ -49,7 +75,8 @@ pub(crate) struct UsagesModal {
     /// The editor the popup was opened from: "Open in Tab" asks it for the references tab.
     editor: Entity<Editor>,
     workspace: WeakEntity<Workspace>,
-    /// The word under the cursor when the popup opened.
+    kind: Kind,
+    /// The word under the cursor (or a lens's origin) when the popup opened.
     symbol: SharedString,
     rows: Vec<Hit>,
     /// The list stopped at [`MAX_USAGES`].
@@ -60,6 +87,9 @@ pub(crate) struct UsagesModal {
     frame: Frame,
     search: Task<()>,
     _syntax_watch: Vec<Subscription>,
+    /// Set when a code lens opened the popup: "Open in Tab" lists the lens's locations
+    /// instead of asking the language server about the cursor.
+    open_lens_in_tab: Option<CodeLensOpenInTab>,
 }
 
 impl ModalView for UsagesModal {}
@@ -98,12 +128,98 @@ impl UsagesModal {
         } else {
             symbol
         };
+        Self::present(
+            workspace,
+            editor,
+            Kind::Usages,
+            symbol,
+            locations,
+            None,
+            window,
+            cx,
+        );
+    }
+
+    /// A code lens click ("3 references", "2 implementations"): lists the lens's own
+    /// locations. Returns false without a workspace, so the editor falls back to its own
+    /// list, and for a single implementation, which the editor jumps to as PhpStorm does.
+    pub(crate) fn open_for_code_lens(
+        lens: &CodeAction,
+        locations: Task<anyhow::Result<Vec<Location>>>,
+        open_in_tab: CodeLensOpenInTab,
+        editor: &mut Editor,
+        window: &mut Window,
+        cx: &mut Context<Editor>,
+    ) -> bool {
+        let Some(workspace) = editor.workspace() else {
+            return false;
+        };
+        let arguments = lens
+            .lsp_action
+            .command()
+            .and_then(|command| command.arguments.as_deref())
+            .unwrap_or_default();
+        let kind = if lens
+            .lsp_action
+            .title()
+            .to_lowercase()
+            .contains("implementation")
+        {
+            Kind::Implementations
+        } else {
+            Kind::Usages
+        };
+        if kind == Kind::Implementations
+            && arguments
+                .get(2)
+                .and_then(|locations| locations.as_array())
+                .is_some_and(|locations| locations.len() == 1)
+        {
+            return false;
+        }
+        let origin = arguments.get(1).and_then(|position| {
+            Some(PointUtf16::new(
+                u32::try_from(position.get("line")?.as_u64()?).ok()?,
+                u32::try_from(position.get("character")?.as_u64()?).ok()?,
+            ))
+        });
+        let symbol = lens_symbol(lens, origin, editor, cx);
+        let editor = cx.entity();
+        // The editor is mid-update here; open the popup once it is released.
+        window.defer(cx, move |window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                Self::present(
+                    workspace,
+                    editor,
+                    kind,
+                    symbol,
+                    Some(locations),
+                    Some(open_in_tab),
+                    window,
+                    cx,
+                )
+            });
+        });
+        true
+    }
+
+    fn present(
+        workspace: &mut Workspace,
+        editor: Entity<Editor>,
+        kind: Kind,
+        symbol: String,
+        locations: Option<Task<anyhow::Result<Vec<Location>>>>,
+        open_lens_in_tab: Option<CodeLensOpenInTab>,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) {
         let workspace_handle = cx.entity().downgrade();
         workspace.toggle_modal(window, cx, move |window, cx| {
             let mut modal = Self {
                 focus: cx.focus_handle(),
                 editor,
                 workspace: workspace_handle,
+                kind,
                 symbol: symbol.into(),
                 rows: Vec::new(),
                 capped: false,
@@ -113,6 +229,7 @@ impl UsagesModal {
                 frame: Frame::default(),
                 search: Task::ready(()),
                 _syntax_watch: Vec::new(),
+                open_lens_in_tab,
             };
             match locations {
                 Some(locations) => {
@@ -200,13 +317,17 @@ impl UsagesModal {
     }
 
     /// Closes the popup and lets the editor open its own references tab, which asks the
-    /// language server again (`Editor::find_all_references`, `navigation.rs`).
+    /// language server again (`Editor::find_all_references`, `navigation.rs`). A popup a
+    /// code lens opened lists that lens's locations instead, as the lens itself would.
     fn open_in_tab(&mut self, _: &OpenUsagesInTab, window: &mut Window, cx: &mut Context<Self>) {
         let editor = self.editor.clone();
+        let open_lens_in_tab = self.open_lens_in_tab.take();
         cx.emit(DismissEvent);
         window.defer(cx, move |window, cx| {
             editor.update(cx, |editor, cx| {
-                if let Some(task) =
+                if let Some(open) = open_lens_in_tab {
+                    open(editor, window, cx);
+                } else if let Some(task) =
                     editor.find_all_references(&FindAllReferences::default(), window, cx)
                 {
                     task.detach_and_log_err(cx);
@@ -219,8 +340,8 @@ impl UsagesModal {
     fn empty_text(&self) -> String {
         match &self.state {
             State::Searching => "Searching…".to_string(),
-            State::Done => summary(0, false),
-            State::Failed(error) => format!("Could not find usages: {error}"),
+            State::Done => summary(self.kind, 0, false),
+            State::Failed(error) => format!("Could not find {}: {error}", self.kind.nouns().1),
         }
     }
 
@@ -233,15 +354,15 @@ impl UsagesModal {
             .bg(gpui::rgb(POPUP_BAND))
             .child(
                 Label::new(if self.symbol.is_empty() {
-                    SharedString::from("Usages")
+                    SharedString::from(self.kind.title())
                 } else {
-                    format!("Usages of {}", self.symbol).into()
+                    format!("{} of {}", self.kind.title(), self.symbol).into()
                 })
                 .weight(gpui::FontWeight::SEMIBOLD),
             )
             .when(!self.rows.is_empty(), |header| {
                 header.child(
-                    Label::new(summary(self.rows.len(), self.capped))
+                    Label::new(summary(self.kind, self.rows.len(), self.capped))
                         .size(LabelSize::Small)
                         .color(Color::Muted),
                 )
@@ -257,7 +378,7 @@ impl UsagesModal {
         let list = div()
             .id("zenith-usages-list")
             .role(Role::List)
-            .aria_label("Usages")
+            .aria_label(self.kind.title())
             .relative()
             .when(sized, |list| list.flex_1().min_h_0())
             .when(!sized, |list| list.h(px(ROW_HEIGHT * VISIBLE_ROWS)));
@@ -349,6 +470,7 @@ impl UsagesModal {
     }
 
     fn render_footer(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let open_all = format!("Open all {} in a new tab", self.kind.nouns().1);
         h_flex()
             .debug_selector(|| "zenith-popup-footer".into())
             .h(FOOTER_HEIGHT)
@@ -372,9 +494,9 @@ impl UsagesModal {
                     .style(ButtonStyle::Outlined)
                     .size(ButtonSize::Compact)
                     .label_size(LabelSize::Small)
-                    .aria_label("Open all usages in a new tab")
+                    .aria_label(open_all.clone())
                     .tooltip(Tooltip::for_action_title_in(
-                        "Open all usages in a new tab",
+                        open_all,
                         &OpenUsagesInTab,
                         &self.focus,
                     ))
@@ -455,13 +577,33 @@ fn cap<T>(rows: &mut Vec<T>, max: usize) -> bool {
     capped
 }
 
+/// The word a lens is about: at its origin position (`editor.action.showReferences`'s
+/// second argument), else at the start of the lens.
+// shortcut: assumes the origin is in the lens's own buffer (PHPantom's lenses); read the
+// first argument's uri if a server points elsewhere.
+fn lens_symbol(lens: &CodeAction, origin: Option<PointUtf16>, editor: &Editor, cx: &App) -> String {
+    let Some(buffer) = editor.buffer().read(cx).buffer(lens.range.start.buffer_id) else {
+        return String::new();
+    };
+    let snapshot = buffer.read(cx).snapshot();
+    let origin = origin.map_or_else(
+        || lens.range.start.to_offset(&snapshot),
+        |origin| Unclipped(origin).to_offset(&snapshot),
+    );
+    match snapshot.surrounding_word(origin, None) {
+        (range, Some(CharKind::Word)) => snapshot.text_for_range(range).collect(),
+        _ => String::new(),
+    }
+}
+
 /// "3 usages", "300+ usages" for a capped list, "No usages found" for none.
-fn summary(count: usize, capped: bool) -> String {
+fn summary(kind: Kind, count: usize, capped: bool) -> String {
+    let (one, many) = kind.nouns();
     match (count, capped) {
-        (0, _) => "No usages found".to_string(),
-        (1, false) => "1 usage".to_string(),
-        (count, false) => format!("{count} usages"),
-        (count, true) => format!("{count}+ usages"),
+        (0, _) => format!("No {many} found"),
+        (1, false) => format!("1 {one}"),
+        (count, false) => format!("{count} {many}"),
+        (count, true) => format!("{count}+ {many}"),
     }
 }
 
@@ -469,6 +611,7 @@ fn summary(count: usize, capped: bool) -> String {
 mod tests {
     use super::*;
     use editor::test::editor_lsp_test_context::EditorLspTestContext;
+    use futures::StreamExt as _;
     use gpui::TestAppContext;
     use settings::KeymapFile;
 
@@ -597,7 +740,7 @@ mod tests {
         let modal = modal(&mut cx).expect("popup");
         let (count, capped) = read(&mut cx, &modal, |m| (m.rows.len(), m.capped));
         assert_eq!((count, capped), (MAX_USAGES, true));
-        assert_eq!(summary(count, capped), "300+ usages");
+        assert_eq!(summary(Kind::Usages, count, capped), "300+ usages");
     }
 
     #[gpui::test]
@@ -662,6 +805,175 @@ mod tests {
         assert_eq!(other_editors(&mut cx).len(), 1);
     }
 
+    /// A Rust editor whose server puts one "N {noun}" lens on `fn two`, with the
+    /// command and arguments PHPantom sends (`locations_lens_command`: origin uri,
+    /// origin position, `Location[]`). The lens shows in the code actions menu
+    /// (`"code_lens": "menu"`), so the test can pick it without a mouse; picking it runs
+    /// the same `try_handle_client_command` as a click on the inline lens.
+    async fn lens_cx(
+        noun: &'static str,
+        places: Vec<(u32, u32, u32)>,
+        cx: &mut TestAppContext,
+    ) -> EditorLspTestContext {
+        cx.update(crate::init);
+        let mut cx = EditorLspTestContext::new_rust(
+            lsp::ServerCapabilities {
+                code_lens_provider: Some(lsp::CodeLensOptions {
+                    resolve_provider: None,
+                }),
+                ..Default::default()
+            },
+            cx,
+        )
+        .await;
+        cx.update(|_, cx| {
+            <settings::SettingsStore as gpui::UpdateGlobal>::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.editor.code_lens = Some(settings::CodeLens::Menu);
+                });
+            });
+        });
+        let mut lens_requests = cx
+            .lsp
+            .set_request_handler::<lsp::request::CodeLensRequest, _, _>(move |params, _| {
+                let places = places.clone();
+                async move {
+                    let uri = params.text_document.uri;
+                    let locations = references(uri.clone(), &places);
+                    Ok(Some(vec![lsp::CodeLens {
+                        range: lsp::Range::new(lsp::Position::new(4, 0), lsp::Position::new(4, 11)),
+                        command: Some(lsp::Command {
+                            title: format!("{} {noun}", locations.len()),
+                            command: "editor.action.showReferences".to_string(),
+                            arguments: Some(vec![
+                                serde_json::json!(uri),
+                                serde_json::json!(lsp::Position::new(4, 3)),
+                                serde_json::json!(locations),
+                            ]),
+                        }),
+                        data: None,
+                    }]))
+                }
+            });
+        cx.set_state("fn one() {\n    let mut a = two();\n}\n\nfn tˇwo() {}\n\nfn three() {\n    two();\n    two();\n}");
+        cx.executor()
+            .advance_clock(std::time::Duration::from_secs(1));
+        // The cursor's code actions carry the lens only once the server has answered.
+        lens_requests.next().await;
+        cx.run_until_parked();
+        cx
+    }
+
+    /// The popup a lens opened, with its locations listed.
+    fn lens_popup(cx: &mut EditorLspTestContext) -> Entity<UsagesModal> {
+        let modal = modal(cx).expect("the lens opens the popup");
+        assert!(read(cx, &modal, |m| m.state != State::Searching));
+        modal
+    }
+
+    /// Picks the lens from the code actions menu.
+    async fn click_lens(cx: &mut EditorLspTestContext) {
+        cx.update_editor(|editor, window, cx| {
+            editor.toggle_code_actions(
+                &editor::actions::ToggleCodeActions {
+                    deployed_from: None,
+                    quick_launch: false,
+                },
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        cx.condition(|editor, _| editor.context_menu_visible())
+            .await;
+        cx.update_editor(|editor, window, cx| {
+            editor
+                .confirm_code_action(
+                    &editor::actions::ConfirmCodeAction { item_ix: Some(0) },
+                    window,
+                    cx,
+                )
+                .expect("the lens is the first item")
+                .detach_and_log_err(cx);
+        });
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    async fn test_code_lens_references_open_the_usages_popup_with_the_lens_locations(
+        cx: &mut TestAppContext,
+    ) {
+        let mut cx = lens_cx("references", FOUR.to_vec(), cx).await;
+        click_lens(&mut cx).await;
+        let modal = lens_popup(&mut cx);
+        let (kind, symbol, rows) = read(&mut cx, &modal, |m| {
+            (m.kind, m.symbol.to_string(), m.row_texts())
+        });
+        assert_eq!(kind, Kind::Usages);
+        // The word at the lens's origin position, as the header says "Usages of two".
+        assert_eq!(symbol, "two");
+        assert_eq!(
+            rows,
+            [
+                "file.rs:2 let mut a = two();",
+                "file.rs:5 fn two() {}",
+                "file.rs:8 two();",
+                "file.rs:9 two();",
+            ]
+        );
+        assert!(other_editors(&mut cx).is_empty(), "no references tab yet");
+    }
+
+    #[gpui::test]
+    async fn test_open_in_tab_from_a_lens_lists_the_lens_locations(cx: &mut TestAppContext) {
+        // No `textDocument/references` handler: the tab can only come from the lens.
+        let mut cx = lens_cx("references", FOUR.to_vec(), cx).await;
+        click_lens(&mut cx).await;
+        lens_popup(&mut cx);
+        cx.dispatch_action(OpenUsagesInTab);
+        cx.run_until_parked();
+        assert!(modal(&mut cx).is_none(), "the popup closes");
+        let tabs = other_editors(&mut cx);
+        assert_eq!(tabs.len(), 1, "one new multibuffer tab");
+        assert!(tabs[0].contains("fn three()"), "{:?}", tabs[0]);
+    }
+
+    #[gpui::test]
+    async fn test_implementations_lens_opens_the_implementation_chooser(cx: &mut TestAppContext) {
+        let mut cx = lens_cx("implementations", vec![(4, 3, 6), (6, 3, 8)], cx).await;
+        click_lens(&mut cx).await;
+        let modal = lens_popup(&mut cx);
+        let (kind, symbol, rows, count) = read(&mut cx, &modal, |m| {
+            (
+                m.kind,
+                m.symbol.to_string(),
+                m.row_texts(),
+                summary(m.kind, m.rows.len(), m.capped),
+            )
+        });
+        assert_eq!(kind, Kind::Implementations);
+        assert_eq!(symbol, "two");
+        assert_eq!(rows, ["file.rs:5 fn two() {}", "file.rs:7 fn three() {"]);
+        assert_eq!(count, "2 implementations");
+    }
+
+    #[gpui::test]
+    async fn test_a_single_implementation_lens_jumps_straight_to_it(cx: &mut TestAppContext) {
+        let mut cx = lens_cx("implementations", vec![(6, 3, 8)], cx).await;
+        click_lens(&mut cx).await;
+        assert!(modal(&mut cx).is_none(), "nothing to choose from");
+        let state = cx.editor_state();
+        let line = state.lines().nth(6).unwrap_or_default();
+        assert!(line.contains('ˇ'), "the cursor is on `fn three`: {state}");
+    }
+
+    #[test]
+    fn test_code_lens_is_on_by_default() {
+        let defaults: settings::SettingsContent =
+            settings::parse_json_with_comments(&settings::default_settings()).unwrap();
+        assert_eq!(defaults.editor.code_lens, Some(settings::CodeLens::On));
+    }
+
     #[test]
     fn test_cap_cuts_to_the_limit_and_says_so() {
         let mut rows: Vec<usize> = (0..MAX_USAGES + 5).collect();
@@ -675,9 +987,14 @@ mod tests {
 
     #[test]
     fn test_summary_counts_and_marks_a_capped_list() {
-        assert_eq!(summary(0, false), "No usages found");
-        assert_eq!(summary(1, false), "1 usage");
-        assert_eq!(summary(12, false), "12 usages");
-        assert_eq!(summary(MAX_USAGES, true), "300+ usages");
+        assert_eq!(summary(Kind::Usages, 0, false), "No usages found");
+        assert_eq!(summary(Kind::Usages, 1, false), "1 usage");
+        assert_eq!(summary(Kind::Usages, 12, false), "12 usages");
+        assert_eq!(summary(Kind::Usages, MAX_USAGES, true), "300+ usages");
+        assert_eq!(
+            summary(Kind::Implementations, 0, false),
+            "No implementations found"
+        );
+        assert_eq!(summary(Kind::Implementations, 1, false), "1 implementation");
     }
 }
