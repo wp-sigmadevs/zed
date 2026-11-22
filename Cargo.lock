@@ -23063,7 +23063,9 @@ dependencies = [
  "editor",
  "gpui",
  "icons",
+ "language",
  "libc",
+ "lsp",
  "menu",
  "pretty_assertions",
  "project",
@@ -23190,7 +23192,9 @@ dependencies = [
  "editor",
  "gpui",
  "icons",
+ "language",
  "libc",
+ "lsp",
  "menu",
  "pretty_assertions",
  "project",
@@ -23212,9 +23216,13 @@ dependencies = [
 name = "zenith_php_tools"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "editor",
  "futures 0.3.34",
+ "fuzzy",
  "gpui",
  "http_client",
+ "language",
  "libc",
  "log",
  "project",

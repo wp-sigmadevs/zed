@@ -8,6 +8,7 @@
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
+    rc::Rc,
     sync::{Arc, PoisonError, RwLock, RwLockWriteGuard},
 };
 
@@ -22,10 +23,13 @@ use settings::{RegisterSetting, Settings, SettingsContent, SettingsStore};
 use util::{paths::PathStyle, rel_path::RelPath};
 use workspace::Workspace;
 use worktree::{Snapshot, Worktree};
-use zenith_php_tools::{read_regular, worktree_trusted};
+use zenith_php_tools::{
+    StringCompletionSource, add_string_completions, read_regular, worktree_trusted,
+};
 
 use crate::{
     AppRouterKind, NextJsIndex, NextJsPanel, ToggleNextJsPanel, classify, nextjs_panel::read_index,
+    route_path_prefix,
 };
 
 /// Most App Router files indexed per worktree; the rest are left out.
@@ -119,9 +123,15 @@ impl Wiring {
         project: Entity<Project>,
         cx: &mut Context<Self>,
     ) -> Self {
+        let index: Arc<RwLock<NextJsIndex>> = Arc::default();
+        let route_paths = Rc::new(RoutePaths {
+            wiring: cx.weak_entity(),
+            index: index.clone(),
+        });
         let mut subscriptions = vec![
             cx.subscribe(&project, Self::on_project_event),
             cx.observe_global::<SettingsStore>(|this, cx| this.refresh(cx)),
+            add_string_completions(&project, route_paths, cx),
         ];
         if let Some(store) = TrustedWorktrees::try_get_global(cx) {
             subscriptions.push(cx.subscribe(
@@ -137,7 +147,7 @@ impl Wiring {
             workspace,
             window,
             project,
-            index: Arc::default(),
+            index,
             panel: None,
             scans: HashMap::new(),
             nextjs: HashMap::new(),
@@ -356,6 +366,42 @@ impl Wiring {
         if let Some(panel) = &self.panel {
             panel.update(cx, |panel, cx| panel.index_changed(cx));
         }
+    }
+}
+
+/// Route paths inside `href="…"` and `router.push('…')`, in a JS or TS file of a trusted folder
+/// this workspace found to be Next.js, while the setting is on.
+struct RoutePaths {
+    wiring: WeakEntity<Wiring>,
+    index: Arc<RwLock<NextJsIndex>>,
+}
+
+impl StringCompletionSource for RoutePaths {
+    fn prefix<'a>(
+        &self,
+        worktree_id: WorktreeId,
+        path: &str,
+        line: &'a str,
+        cx: &mut App,
+    ) -> Option<&'a str> {
+        let is_script = path.rsplit_once('.').is_some_and(|(_, extension)| {
+            matches!(extension, "js" | "jsx" | "ts" | "tsx" | "mjs")
+        });
+        if !NextJsSettings::get_global(cx).enabled || !is_script {
+            return None;
+        }
+        let prefix = route_path_prefix(line)?;
+        let wiring = self.wiring.upgrade()?;
+        let wiring = wiring.read(cx);
+        if !wiring.nextjs.contains_key(&worktree_id) {
+            return None;
+        }
+        let project = wiring.project.clone();
+        worktree_trusted(&project, worktree_id, cx).then_some(prefix)
+    }
+
+    fn candidates(&self, prefix: &str) -> Vec<String> {
+        read_index(&self.index).route_completions(prefix)
     }
 }
 
@@ -949,6 +995,74 @@ mod tests {
         let panel = panel_of(&workspace, cx).expect("panel added once trusted");
         cx.run_until_parked();
         assert_eq!(files(&index_of(&panel, cx), env.dir.path()), NEXT_FILES);
+    }
+
+    /// The route paths the editor's provider adds at `offset` (the custom ones, so the language
+    /// server and buffer words are left out).
+    async fn route_completions_at(
+        editor: &Entity<editor::Editor>,
+        buffer: &Entity<language::Buffer>,
+        offset: usize,
+        cx: &mut gpui::VisualTestContext,
+    ) -> Vec<String> {
+        let task = editor.update_in(cx, |editor, window, cx| {
+            let provider = editor.completion_provider().expect("a completion provider");
+            let position = buffer.read(cx).anchor_before(offset);
+            let trigger = editor::CompletionContext {
+                trigger_kind: lsp::CompletionTriggerKind::INVOKED,
+                trigger_character: None,
+            };
+            provider.completions(buffer, position, trigger, window, cx)
+        });
+        task.await
+            .unwrap()
+            .into_iter()
+            .flat_map(|response| response.completions)
+            .filter(|completion| matches!(completion.source, project::CompletionSource::Custom))
+            .map(|completion| completion.new_text)
+            .collect()
+    }
+
+    #[gpui::test]
+    async fn test_route_paths_complete_inside_href_strings_in_an_editor(cx: &mut TestAppContext) {
+        use gpui::VisualContext as _;
+
+        let env = setup(cx, json!({}), false, true).await;
+        let (project, _workspace, cx) = open_workspace(&env, cx).await;
+        cx.run_until_parked();
+        let buffer = project
+            .update(cx, |project, cx| {
+                let worktree_id = project.worktrees(cx).next().unwrap().read(cx).id();
+                project.open_buffer(
+                    project::ProjectPath {
+                        worktree_id,
+                        path: util::rel_path::rel_path("app/components/Button.tsx").into(),
+                    },
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+        let text = "export const B = () => <Link href=\"/a\">x</Link>;\n";
+        buffer.update(cx, |buffer, cx| {
+            buffer.set_text(text, cx);
+        });
+        let editor = cx.new_window_entity(|window, cx| {
+            editor::Editor::for_buffer(buffer.clone(), Some(project.clone()), window, cx)
+        });
+        let inside = text.find("\"/a").unwrap() + 3;
+        let outside = text.find("const").unwrap() + 3;
+
+        // `/` and `/blog/:slug` are in the index too; the typed `/a` leaves them out.
+        assert_eq!(
+            route_completions_at(&editor, &buffer, inside, cx).await,
+            ["/about", "/api/hook"]
+        );
+        assert!(route_completions_at(&editor, &buffer, outside, cx).await.is_empty());
+
+        set_enabled(false, cx);
+        cx.run_until_parked();
+        assert!(route_completions_at(&editor, &buffer, inside, cx).await.is_empty());
     }
 
     /// Adds `name` with `content` to both the real disk and the fake one.

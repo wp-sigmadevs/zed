@@ -9,6 +9,7 @@
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
+    rc::Rc,
     sync::{Arc, PoisonError, RwLock, RwLockWriteGuard},
 };
 
@@ -23,9 +24,13 @@ use settings::{RegisterSetting, Settings, SettingsContent, SettingsStore};
 use util::{paths::PathStyle, rel_path::RelPath};
 use workspace::Workspace;
 use worktree::{Snapshot, Worktree};
-use zenith_php_tools::{read_regular, worktree_trusted};
+use zenith_php_tools::{
+    StringCompletionSource, add_string_completions, read_regular, worktree_trusted,
+};
 
-use crate::{LaravelIndex, LaravelPanel, ToggleLaravelPanel, laravel_panel::read_index};
+use crate::{
+    LaravelIndex, LaravelPanel, ToggleLaravelPanel, laravel_panel::read_index, route_name_prefix,
+};
 
 /// Most view files indexed per worktree; the rest are left out.
 /// ponytail: a large app has a few hundred views. Raise it if a monorepo needs more.
@@ -119,9 +124,15 @@ impl Wiring {
         project: Entity<Project>,
         cx: &mut Context<Self>,
     ) -> Self {
+        let index: Arc<RwLock<LaravelIndex>> = Arc::default();
+        let route_names = Rc::new(RouteNames {
+            wiring: cx.weak_entity(),
+            index: index.clone(),
+        });
         let mut subscriptions = vec![
             cx.subscribe(&project, Self::on_project_event),
             cx.observe_global::<SettingsStore>(|this, cx| this.refresh(cx)),
+            add_string_completions(&project, route_names, cx),
         ];
         if let Some(store) = TrustedWorktrees::try_get_global(cx) {
             subscriptions.push(cx.subscribe(
@@ -137,7 +148,7 @@ impl Wiring {
             workspace,
             window,
             project,
-            index: Arc::default(),
+            index,
             panel: None,
             scans: HashMap::new(),
             laravel: HashMap::new(),
@@ -356,6 +367,39 @@ impl Wiring {
         if let Some(panel) = &self.panel {
             panel.update(cx, |panel, cx| panel.index_changed(cx));
         }
+    }
+}
+
+/// Route names inside `route('…')` and its kin, in a PHP file of a trusted folder this workspace
+/// found to be Laravel, while the setting is on.
+struct RouteNames {
+    wiring: WeakEntity<Wiring>,
+    index: Arc<RwLock<LaravelIndex>>,
+}
+
+impl StringCompletionSource for RouteNames {
+    fn prefix<'a>(
+        &self,
+        worktree_id: WorktreeId,
+        path: &str,
+        line: &'a str,
+        cx: &mut App,
+    ) -> Option<&'a str> {
+        if !LaravelSettings::get_global(cx).enabled || !path.ends_with(".php") {
+            return None;
+        }
+        let prefix = route_name_prefix(line)?;
+        let wiring = self.wiring.upgrade()?;
+        let wiring = wiring.read(cx);
+        if !wiring.laravel.contains_key(&worktree_id) {
+            return None;
+        }
+        let project = wiring.project.clone();
+        worktree_trusted(&project, worktree_id, cx).then_some(prefix)
+    }
+
+    fn candidates(&self, prefix: &str) -> Vec<String> {
+        read_index(&self.index).route_completions(prefix)
     }
 }
 
@@ -1016,6 +1060,71 @@ mod tests {
         let panel = panel_of(&workspace, cx).expect("panel added once trusted");
         cx.run_until_parked();
         assert_eq!(route_names(&index_of(&panel, cx)), ["api.login", "home"]);
+    }
+
+    /// The route names the editor's provider adds at `offset` (the custom ones, so the language
+    /// server and buffer words are left out).
+    async fn route_completions_at(
+        editor: &Entity<editor::Editor>,
+        buffer: &Entity<language::Buffer>,
+        offset: usize,
+        cx: &mut gpui::VisualTestContext,
+    ) -> Vec<String> {
+        let task = editor.update_in(cx, |editor, window, cx| {
+            let provider = editor.completion_provider().expect("a completion provider");
+            let position = buffer.read(cx).anchor_before(offset);
+            let trigger = editor::CompletionContext {
+                trigger_kind: lsp::CompletionTriggerKind::INVOKED,
+                trigger_character: None,
+            };
+            provider.completions(buffer, position, trigger, window, cx)
+        });
+        task.await
+            .unwrap()
+            .into_iter()
+            .flat_map(|response| response.completions)
+            .filter(|completion| matches!(completion.source, project::CompletionSource::Custom))
+            .map(|completion| completion.new_text)
+            .collect()
+    }
+
+    #[gpui::test]
+    async fn test_route_names_complete_inside_route_strings_in_an_editor(cx: &mut TestAppContext) {
+        use gpui::VisualContext as _;
+
+        let env = setup(cx, json!({}), false, true).await;
+        let (project, _workspace, cx) = open_workspace(&env, cx).await;
+        cx.run_until_parked();
+        let buffer = project
+            .update(cx, |project, cx| {
+                let worktree_id = project.worktrees(cx).next().unwrap().read(cx).id();
+                project.open_buffer(
+                    project::ProjectPath {
+                        worktree_id,
+                        path: util::rel_path::rel_path("config/app.php").into(),
+                    },
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+        let text = "<?php\nreturn redirect()->route('h');\n";
+        buffer.update(cx, |buffer, cx| {
+            buffer.set_text(text, cx);
+        });
+        let editor = cx.new_window_entity(|window, cx| {
+            editor::Editor::for_buffer(buffer.clone(), Some(project.clone()), window, cx)
+        });
+        let inside = text.find("('h").unwrap() + 3;
+        let outside = text.find("return").unwrap() + 3;
+
+        // `api.login` is in the index too; the typed `h` leaves it out.
+        assert_eq!(route_completions_at(&editor, &buffer, inside, cx).await, ["home"]);
+        assert!(route_completions_at(&editor, &buffer, outside, cx).await.is_empty());
+
+        set_enabled(false, cx);
+        cx.run_until_parked();
+        assert!(route_completions_at(&editor, &buffer, inside, cx).await.is_empty());
     }
 
     /// Adds `name` with `content` to both the real disk and the fake one.
