@@ -5,7 +5,7 @@
 
 use std::ops::Range;
 
-use editor::{Editor, actions::FindAllReferences};
+use editor::{CodeLensOpenInTab, Editor, actions::FindAllReferences};
 use gpui::{
     App, ClickEvent, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable,
     HighlightStyle, IntoElement, ParentElement, Render, Role, ScrollStrategy, SharedString, Styled,
@@ -60,6 +60,9 @@ pub(crate) struct UsagesModal {
     frame: Frame,
     search: Task<()>,
     _syntax_watch: Vec<Subscription>,
+    /// Set when a code lens opened the popup: "Open in Tab" lists the lens's locations
+    /// instead of asking the language server about the cursor.
+    open_lens_in_tab: Option<CodeLensOpenInTab>,
 }
 
 impl ModalView for UsagesModal {}
@@ -98,6 +101,48 @@ impl UsagesModal {
         } else {
             symbol
         };
+        Self::present(workspace, editor, symbol, locations, None, window, cx);
+    }
+
+    /// A code lens click ("3 references"): lists the lens's own locations. Returns false
+    /// without a workspace, so the editor falls back to its own list.
+    pub(crate) fn open_for_code_lens(
+        locations: Task<anyhow::Result<Vec<Location>>>,
+        open_in_tab: CodeLensOpenInTab,
+        editor: &mut Editor,
+        window: &mut Window,
+        cx: &mut Context<Editor>,
+    ) -> bool {
+        let Some(workspace) = editor.workspace() else {
+            return false;
+        };
+        let editor = cx.entity();
+        // The editor is mid-update here; open the popup once it is released.
+        window.defer(cx, move |window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                Self::present(
+                    workspace,
+                    editor,
+                    String::new(),
+                    Some(locations),
+                    Some(open_in_tab),
+                    window,
+                    cx,
+                )
+            });
+        });
+        true
+    }
+
+    fn present(
+        workspace: &mut Workspace,
+        editor: Entity<Editor>,
+        symbol: String,
+        locations: Option<Task<anyhow::Result<Vec<Location>>>>,
+        open_lens_in_tab: Option<CodeLensOpenInTab>,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) {
         let workspace_handle = cx.entity().downgrade();
         workspace.toggle_modal(window, cx, move |window, cx| {
             let mut modal = Self {
@@ -113,6 +158,7 @@ impl UsagesModal {
                 frame: Frame::default(),
                 search: Task::ready(()),
                 _syntax_watch: Vec::new(),
+                open_lens_in_tab,
             };
             match locations {
                 Some(locations) => {
@@ -200,13 +246,17 @@ impl UsagesModal {
     }
 
     /// Closes the popup and lets the editor open its own references tab, which asks the
-    /// language server again (`Editor::find_all_references`, `navigation.rs`).
+    /// language server again (`Editor::find_all_references`, `navigation.rs`). A popup a
+    /// code lens opened lists that lens's locations instead, as the lens itself would.
     fn open_in_tab(&mut self, _: &OpenUsagesInTab, window: &mut Window, cx: &mut Context<Self>) {
         let editor = self.editor.clone();
+        let open_lens_in_tab = self.open_lens_in_tab.take();
         cx.emit(DismissEvent);
         window.defer(cx, move |window, cx| {
             editor.update(cx, |editor, cx| {
-                if let Some(task) =
+                if let Some(open) = open_lens_in_tab {
+                    open(editor, window, cx);
+                } else if let Some(task) =
                     editor.find_all_references(&FindAllReferences::default(), window, cx)
                 {
                     task.detach_and_log_err(cx);
@@ -660,6 +710,131 @@ mod tests {
         cx.run_until_parked();
         assert!(modal(&mut cx).is_none());
         assert_eq!(other_editors(&mut cx).len(), 1);
+    }
+
+    /// A Rust editor whose server puts one "4 references" lens on `fn two`, with the
+    /// command and arguments PHPantom sends (`locations_lens_command`: origin uri,
+    /// origin position, `Location[]`). The lens shows in the code actions menu
+    /// (`"code_lens": "menu"`), so the test can pick it without a mouse; picking it runs
+    /// the same `try_handle_client_command` as a click on the inline lens.
+    async fn lens_cx(
+        places: Vec<(u32, u32, u32)>,
+        cx: &mut TestAppContext,
+    ) -> EditorLspTestContext {
+        cx.update(crate::init);
+        let mut cx = EditorLspTestContext::new_rust(
+            lsp::ServerCapabilities {
+                code_lens_provider: Some(lsp::CodeLensOptions {
+                    resolve_provider: None,
+                }),
+                ..Default::default()
+            },
+            cx,
+        )
+        .await;
+        cx.update(|_, cx| {
+            <settings::SettingsStore as gpui::UpdateGlobal>::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.editor.code_lens = Some(settings::CodeLens::Menu);
+                });
+            });
+        });
+        cx.lsp
+            .set_request_handler::<lsp::request::CodeLensRequest, _, _>(move |params, _| {
+                let places = places.clone();
+                async move {
+                    let uri = params.text_document.uri;
+                    let locations = references(uri.clone(), &places);
+                    Ok(Some(vec![lsp::CodeLens {
+                        range: lsp::Range::new(
+                            lsp::Position::new(4, 0),
+                            lsp::Position::new(4, 11),
+                        ),
+                        command: Some(lsp::Command {
+                            title: format!("{} references", locations.len()),
+                            command: "editor.action.showReferences".to_string(),
+                            arguments: Some(vec![
+                                serde_json::json!(uri),
+                                serde_json::json!(lsp::Position::new(4, 3)),
+                                serde_json::json!(locations),
+                            ]),
+                        }),
+                        data: None,
+                    }]))
+                }
+            });
+        cx.set_state("fn one() {\n    let mut a = two();\n}\n\nfn tˇwo() {}\n\nfn three() {\n    two();\n    two();\n}");
+        cx.executor().advance_clock(std::time::Duration::from_secs(1));
+        cx.run_until_parked();
+        cx
+    }
+
+    /// Picks the lens from the code actions menu.
+    async fn click_lens(cx: &mut EditorLspTestContext) {
+        cx.update_editor(|editor, window, cx| {
+            editor.toggle_code_actions(
+                &editor::actions::ToggleCodeActions {
+                    deployed_from: None,
+                    quick_launch: false,
+                },
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        cx.condition(|editor, _| editor.context_menu_visible()).await;
+        cx.update_editor(|editor, window, cx| {
+            editor
+                .confirm_code_action(
+                    &editor::actions::ConfirmCodeAction { item_ix: Some(0) },
+                    window,
+                    cx,
+                )
+                .expect("the lens is the first item")
+                .detach_and_log_err(cx);
+        });
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    async fn test_code_lens_references_open_the_usages_popup_with_the_lens_locations(
+        cx: &mut TestAppContext,
+    ) {
+        let mut cx = lens_cx(FOUR.to_vec(), cx).await;
+        click_lens(&mut cx).await;
+        let modal = modal(&mut cx).expect("a references lens opens the usages popup");
+        let rows = read(&mut cx, &modal, |m| m.row_texts());
+        assert_eq!(
+            rows,
+            [
+                "file.rs:2 let mut a = two();",
+                "file.rs:5 fn two() {}",
+                "file.rs:8 two();",
+                "file.rs:9 two();",
+            ]
+        );
+        assert!(other_editors(&mut cx).is_empty(), "no references tab yet");
+    }
+
+    #[gpui::test]
+    async fn test_open_in_tab_from_a_lens_lists_the_lens_locations(cx: &mut TestAppContext) {
+        // No `textDocument/references` handler: the tab can only come from the lens.
+        let mut cx = lens_cx(FOUR.to_vec(), cx).await;
+        click_lens(&mut cx).await;
+        assert!(modal(&mut cx).is_some());
+        cx.dispatch_action(OpenUsagesInTab);
+        cx.run_until_parked();
+        assert!(modal(&mut cx).is_none(), "the popup closes");
+        let tabs = other_editors(&mut cx);
+        assert_eq!(tabs.len(), 1, "one new multibuffer tab");
+        assert!(tabs[0].contains("fn three()"), "{:?}", tabs[0]);
+    }
+
+    #[test]
+    fn test_code_lens_is_on_by_default() {
+        let defaults: settings::SettingsContent =
+            settings::parse_json_with_comments(&settings::default_settings()).unwrap();
+        assert_eq!(defaults.editor.code_lens, Some(settings::CodeLens::On));
     }
 
     #[test]
