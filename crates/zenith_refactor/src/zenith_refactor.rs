@@ -1,7 +1,7 @@
 use anyhow::{Context as _, Result, bail, ensure};
 use fs::{Fs, RemoveOptions};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 
 pub mod editor_actions;
@@ -678,113 +678,17 @@ pub fn plan_change_signature(
     .ok()
     .and_then(|reg| reg.find(def_content))
     .and_then(|found| {
+        let by_ref = found.as_str().contains('&');
         let (close, pieces) = scan_balanced(def_content, found.end())?;
-        Some((found.start(), close + 1, pieces_of(def_content, &pieces)))
+        Some((
+            found.start(),
+            close + 1,
+            by_ref,
+            pieces_of(def_content, &pieces),
+        ))
     });
 
-    match definition {
-        Some((start, end, raw_params)) => {
-            let mut new_params: Vec<String> = reordered_indices
-                .iter()
-                .filter_map(|&idx| raw_params.get(idx).cloned())
-                .collect();
-            for added in added_params {
-                let mut param_str = String::new();
-                if let Some(ref th) = added.type_hint {
-                    param_str.push_str(th);
-                    param_str.push(' ');
-                }
-                if !added.name.starts_with('$') {
-                    param_str.push('$');
-                }
-                param_str.push_str(&added.name);
-                if let Some(ref def_val) = added.default_value {
-                    param_str.push_str(" = ");
-                    param_str.push_str(def_val);
-                }
-                new_params.push(param_str);
-            }
-            let new_full = format!("function {function_name}({})", new_params.join(", "));
-            let mut modified_def = def_content.to_string();
-            modified_def.replace_range(start..end, &new_full);
-            file_diffs.push(FileDiff {
-                file_path: def_file.to_path_buf(),
-                original_content: def_content.to_string(),
-                modified_content: modified_def,
-                replacements: vec![TextReplacement {
-                    line: line_of(def_content, start),
-                    old_text: def_content[start..end].to_string(),
-                    new_text: new_full,
-                }],
-                is_included: true,
-            });
-        }
-        None => {
-            can_apply_safely = false;
-            warnings.push(format!(
-                "Could not read the signature of '{function_name}' in {}; nothing was changed",
-                def_file.display()
-            ));
-        }
-    }
-
-    for (caller_path, caller_content) in caller_files {
-        if caller_path == def_file {
-            continue;
-        }
-        let (calls, skipped, unclear) = find_calls(caller_content, function_name);
-        if skipped > 0 {
-            warnings.push(format!(
-                "{skipped} method-style or other-namespace call(s) of '{function_name}' in {} were left unchanged; check them by hand",
-                caller_path.display()
-            ));
-        }
-        if unclear > 0 {
-            can_apply_safely = false;
-            warnings.push(format!(
-                "{unclear} call(s) of '{function_name}' in {} are nested or could not be parsed and were left unchanged",
-                caller_path.display()
-            ));
-        }
-
-        let mut replacements = Vec::new();
-        let mut modified = caller_content.clone();
-        // Later calls first, so earlier byte offsets stay valid.
-        for call in calls.iter().rev() {
-            let mut args: Vec<String> = reordered_indices
-                .iter()
-                .filter_map(|&idx| call.args.get(idx).cloned())
-                .collect();
-            for added in added_params {
-                args.push(
-                    added
-                        .default_value
-                        .clone()
-                        .unwrap_or_else(|| "null".to_string()),
-                );
-            }
-            let new_call = format!("{function_name}({})", args.join(", "));
-            replacements.push(TextReplacement {
-                line: line_of(caller_content, call.start),
-                old_text: caller_content[call.start..call.end].to_string(),
-                new_text: new_call.clone(),
-            });
-            modified.replace_range(call.start..call.end, &new_call);
-        }
-        replacements.reverse();
-
-        if !replacements.is_empty() {
-            file_diffs.push(FileDiff {
-                file_path: caller_path.clone(),
-                original_content: caller_content.clone(),
-                modified_content: modified,
-                replacements,
-                is_included: true,
-            });
-        }
-    }
-
-    RefactorPlan {
+    let plan = |file_diffs, can_apply_safely, warnings| RefactorPlan {
         kind: RefactorKind::ChangeSignature {
             function_name: function_name.to_string(),
             file_path: def_file.to_path_buf(),
@@ -795,7 +699,189 @@ pub fn plan_change_signature(
         file_diffs,
         can_apply_safely,
         warnings,
+    };
+
+    let Some((start, end, by_ref, raw_params)) = definition else {
+        warnings.push(format!(
+            "Could not read the signature of '{function_name}' in {}; nothing was changed",
+            def_file.display()
+        ));
+        return plan(file_diffs, false, warnings);
+    };
+
+    let mut seen = HashSet::new();
+    if let Some(&bad) = reordered_indices
+        .iter()
+        .find(|&&idx| idx >= raw_params.len() || !seen.insert(idx))
+    {
+        warnings.push(format!(
+            "Parameter index {bad} is out of range or repeated ('{function_name}' has {} parameter(s), numbered from 0); nothing was changed",
+            raw_params.len()
+        ));
+        return plan(file_diffs, false, warnings);
     }
+    for added in added_params
+        .iter()
+        .filter(|added| added.default_value.is_none())
+    {
+        can_apply_safely = false;
+        warnings.push(format!(
+            "New parameter '{}' has no default value; existing calls will pass null",
+            added.name
+        ));
+    }
+
+    let mut new_params: Vec<String> = reordered_indices
+        .iter()
+        .map(|&idx| raw_params[idx].clone())
+        .collect();
+    for added in added_params {
+        let mut param_str = String::new();
+        if let Some(ref th) = added.type_hint {
+            param_str.push_str(th);
+            param_str.push(' ');
+        }
+        if !added.name.starts_with('$') {
+            param_str.push('$');
+        }
+        param_str.push_str(&added.name);
+        if let Some(ref def_val) = added.default_value {
+            param_str.push_str(" = ");
+            param_str.push_str(def_val);
+        }
+        new_params.push(param_str);
+    }
+    let amp = if by_ref { "&" } else { "" };
+    let new_full = format!("function {amp}{function_name}({})", new_params.join(", "));
+
+    // The defining file is rewritten once: its signature plus any calls inside it
+    // (recursion, helpers used further down).
+    let mut def_edits = vec![(start, end, new_full)];
+    def_edits.extend(
+        rewrite_calls(
+            def_content,
+            def_file,
+            function_name,
+            reordered_indices,
+            added_params,
+            raw_params.len(),
+            &mut warnings,
+            &mut can_apply_safely,
+        )
+        .into_iter()
+        .filter(|&(call_start, call_end, _)| call_end <= start || call_start >= end),
+    );
+    file_diffs.push(file_diff(def_file, def_content, def_edits));
+
+    for (caller_path, caller_content) in caller_files {
+        if caller_path == def_file {
+            continue;
+        }
+        let edits = rewrite_calls(
+            caller_content,
+            caller_path,
+            function_name,
+            reordered_indices,
+            added_params,
+            raw_params.len(),
+            &mut warnings,
+            &mut can_apply_safely,
+        );
+        if !edits.is_empty() {
+            file_diffs.push(file_diff(caller_path, caller_content, edits));
+        }
+    }
+
+    plan(file_diffs, can_apply_safely, warnings)
+}
+
+/// Applies non-overlapping `(start, end, new_text)` edits to `content`.
+fn file_diff(path: &Path, content: &str, mut edits: Vec<(usize, usize, String)>) -> FileDiff {
+    edits.sort_by_key(|&(start, _, _)| start);
+    let mut modified = content.to_string();
+    // Later edits first, so earlier byte offsets stay valid.
+    for (start, end, new_text) in edits.iter().rev() {
+        modified.replace_range(*start..*end, new_text);
+    }
+    FileDiff {
+        file_path: path.to_path_buf(),
+        original_content: content.to_string(),
+        modified_content: modified,
+        replacements: edits
+            .into_iter()
+            .map(|(start, end, new_text)| TextReplacement {
+                line: line_of(content, start),
+                old_text: content[start..end].to_string(),
+                new_text,
+            })
+            .collect(),
+        is_included: true,
+    }
+}
+
+/// Rewritten calls of `function_name` in `content`. A call whose arguments can't be
+/// mapped onto the new order (extra variadic arguments, or omitted optional ones that
+/// would leave a gap) is left as it is and the plan is marked unsafe.
+#[allow(clippy::too_many_arguments)]
+fn rewrite_calls(
+    content: &str,
+    path: &Path,
+    function_name: &str,
+    reordered_indices: &[usize],
+    added_params: &[SignatureParam],
+    param_count: usize,
+    warnings: &mut Vec<String>,
+    can_apply_safely: &mut bool,
+) -> Vec<(usize, usize, String)> {
+    let (calls, skipped, mut unclear) = find_calls(content, function_name);
+    if skipped > 0 {
+        warnings.push(format!(
+            "{skipped} method-style or other-namespace call(s) of '{function_name}' in {} were left unchanged; check them by hand",
+            path.display()
+        ));
+    }
+    let mut edits = Vec::new();
+    for call in calls {
+        let given = call.args.len();
+        let mut args = Vec::new();
+        let mut gap = false;
+        let mut mappable = given <= param_count;
+        for &idx in reordered_indices {
+            match call.args.get(idx) {
+                Some(arg) if !gap => args.push(arg.clone()),
+                Some(_) => mappable = false,
+                None => gap = true,
+            }
+        }
+        if gap && !added_params.is_empty() {
+            mappable = false;
+        }
+        if !mappable {
+            unclear += 1;
+            continue;
+        }
+        for added in added_params {
+            args.push(
+                added
+                    .default_value
+                    .clone()
+                    .unwrap_or_else(|| "null".to_string()),
+            );
+        }
+        edits.push((
+            call.start,
+            call.end,
+            format!("{function_name}({})", args.join(", ")),
+        ));
+    }
+    if unclear > 0 {
+        *can_apply_safely = false;
+        warnings.push(format!(
+            "{unclear} call(s) of '{function_name}' in {} are nested, could not be parsed, or pass a different number of arguments, and were left unchanged",
+            path.display()
+        ));
+    }
+    edits
 }
 
 #[cfg(test)]
@@ -1400,6 +1486,53 @@ function calculate_tax($subtotal, $rate) {
         let missing = change("<?php // nothing here", "<?php calc(1, 2);");
         assert!(!missing.can_apply_safely);
         assert!(missing.warnings[0].contains("Could not read the signature"));
+        assert!(missing.file_diffs.is_empty());
+    }
+
+    #[test]
+    fn test_change_signature_rewrites_calls_in_the_defining_file() {
+        let def = "<?php\nfunction &calc($a, $b) { return calc($b, $a - 1); }\n$z = calc(1, 2);\n";
+        let plan = change(def, "<?php calc(3, 4);");
+        let applied = plan.apply();
+        assert_eq!(
+            applied[Path::new("/p/def.php")],
+            "<?php\nfunction &calc($b, $a) { return calc($a - 1, $b); }\n$z = calc(2, 1);\n"
+        );
+        assert_eq!(applied[Path::new("/p/use.php")], "<?php calc(4, 3);");
+        assert!(plan.can_apply_safely);
+    }
+
+    #[test]
+    fn test_change_signature_refuses_bad_indices_and_flags_missing_defaults() {
+        let def = "<?php\nfunction calc($a, $b) {}\n";
+        for order in [&[0, 2][..], &[1, 1][..]] {
+            let plan = plan_change_signature("calc", Path::new("/p/def.php"), def, order, &[], &[]);
+            assert!(!plan.can_apply_safely);
+            assert!(plan.file_diffs.is_empty(), "{order:?}");
+        }
+        let added = [SignatureParam {
+            name: "limit".to_string(),
+            type_hint: Some("int".to_string()),
+            default_value: None,
+        }];
+        let plan = plan_change_signature(
+            "calc",
+            Path::new("/p/def.php"),
+            def,
+            &[0, 1],
+            &added,
+            &[(
+                PathBuf::from("/p/use.php"),
+                "<?php calc(1, 2); calc(1);".to_string(),
+            )],
+        );
+        assert!(!plan.can_apply_safely);
+        assert!(plan.warnings.iter().any(|w| w.contains("no default value")));
+        // calc(1) omits $b, so the new argument would land in $b's slot: left alone.
+        assert_eq!(
+            plan.apply()[Path::new("/p/use.php")],
+            "<?php calc(1, 2, null); calc(1);"
+        );
     }
 
     #[gpui::test]

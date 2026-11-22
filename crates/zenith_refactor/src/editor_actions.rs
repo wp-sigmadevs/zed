@@ -94,6 +94,9 @@ fn word_at(line: &str, column: usize) -> String {
     line.get(start..end).unwrap_or_default().to_string()
 }
 
+/// Same bound as the WordPress and Laravel indexers.
+const MAX_PHP_FILES: usize = 20_000;
+
 fn toast(workspace: &mut Workspace, message: &str, cx: &mut Context<Workspace>) {
     workspace.show_error(anyhow!(message.to_string()), cx);
 }
@@ -110,17 +113,30 @@ fn plan_and_preview(
 ) {
     let project = workspace.project().read(cx);
     let fs = project.fs().clone();
+    let mut seen = std::collections::HashSet::new();
+    seen.insert(extra.clone());
     let mut paths = vec![extra];
     for worktree in project.visible_worktrees(cx) {
         let snapshot = worktree.read(cx).snapshot();
         for entry in snapshot.files(false, 0) {
             if entry.path.extension() == Some("php") {
                 let abs = snapshot.absolutize(&entry.path);
-                if !paths.contains(&abs) {
+                if seen.insert(abs.clone()) {
                     paths.push(abs);
                 }
             }
         }
+    }
+    // A partial scan would miss call sites silently, so refuse instead of truncating.
+    if paths.len() > MAX_PHP_FILES {
+        toast(
+            workspace,
+            &format!(
+                "{failure}: the project has more than {MAX_PHP_FILES} PHP files outside ignored folders"
+            ),
+            cx,
+        );
+        return;
     }
     cx.spawn_in(window, async move |workspace, cx| {
         let plan = cx
