@@ -480,7 +480,8 @@ impl<'a> Iterator for InlayChunks<'a> {
                         is_inlay: true,
                         ..Chunk::default()
                     },
-                    renderer,
+                    renderer: renderer
+                        .or_else(|| crate::inlays::zenith_hint_renderer(inlay.id, chunk)),
                 }
             }
         };

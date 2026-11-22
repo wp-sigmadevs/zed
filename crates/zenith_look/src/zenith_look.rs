@@ -14,6 +14,7 @@ use util::ResultExt as _;
 use workspace::Workspace;
 
 mod bulb;
+mod hints;
 mod hover_card;
 mod indent;
 pub use indent::{IndentIndicator, indent_label};
@@ -23,6 +24,7 @@ const THEME_FILE: &str = "icon_themes/archipelago-icons.json";
 
 pub fn init(cx: &mut App) {
     bulb::init(cx);
+    hints::init(cx);
     hover_card::init(cx);
     cx.observe_new(|workspace: &mut Workspace, window, cx| {
         let Some(window) = window else { return };

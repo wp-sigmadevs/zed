@@ -18,6 +18,9 @@
       "warning": "#e2b13c",
       "warning.background": "#3d3420",
       "warning.border": "#6b5a28",
+      // PhpStorm: thin, low-contrast indent guides; the caret's scope a little brighter.
+      "editor.indent_guide": "#373b43",
+      "editor.indent_guide_active": "#4b505a",
     },
   },
   // The name of a base set of key bindings to use.
@@ -796,13 +799,13 @@
     // 1. "disabled"
     // 2. "fixed"
     // 3. "indent_aware"
-    "coloring": "indent_aware",
+    "coloring": "fixed",
     // Determines how indent guide backgrounds are colored.
     // This setting can take the following two values:
     //
     // 1. "disabled"
     // 2. "indent_aware"
-    "background_coloring": "indent_aware",
+    "background_coloring": "disabled",
   },
   // Whether the editor will scroll beyond the last line.
   "scroll_beyond_last_line": "one_page",

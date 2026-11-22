@@ -121,6 +121,7 @@ use git::{DiffReviewDragState, DiffReviewOverlay, InlineBlamePopover};
 pub(crate) use git::{DisplayDiffHunk, PhantomDiffReviewIndicator};
 pub use hover_popover::hover_markdown_style;
 pub use inlays::Inlay;
+pub use inlays::{inlay_hints::set_inlay_hint_filter, set_inlay_hint_renderer}; // Zenith
 pub use inline_input::InlineInputState;
 pub(crate) use inline_input::{InlineInputHistoryDirection, InlineInputPreview};
 pub use items::MAX_TAB_TITLE_LEN;

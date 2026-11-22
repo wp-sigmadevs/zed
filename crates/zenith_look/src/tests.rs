@@ -311,3 +311,54 @@ mod hover_card_tests {
         assert_eq!(text(None, None), "message");
     }
 }
+
+#[test]
+fn test_parameter_hints_only_before_literals() {
+    use crate::hints::starts_with_literal as literal;
+    for argument in [
+        "'text', 'domain' )",
+        "\"warning\")",
+        "`tpl`",
+        "<<<EOT",
+        "42)",
+        "3.14,",
+        ".5",
+        "-1)",
+        "- 2",
+        "+7",
+        "-.5",
+        "0x1F",
+        "true)",
+        "FALSE,",
+        "null )",
+        "NULL",
+        "[]",
+        "['a' => 1]",
+        "array()",
+        "ARRAY ('a')",
+        "  'leading space'",
+    ] {
+        assert!(literal(argument), "{argument:?} is a literal");
+    }
+    for argument in [
+        "$original_id,",
+        "$this->slug)",
+        "get_option('x')",
+        "SD_EDI_ROOT_FILE)",
+        "__FILE__",
+        "self::FORMAT",
+        "Foo::class",
+        "new Foo()",
+        "array_merge($a, $b)",
+        "nullable_thing",
+        "true_value",
+        "-$x",
+        "-'a'",
+        "!$flag",
+        "fn() => 1",
+        "(int) $x",
+        "",
+    ] {
+        assert!(!literal(argument), "{argument:?} is not a literal");
+    }
+}
