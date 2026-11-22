@@ -7107,6 +7107,7 @@ dependencies = [
  "watch",
  "workspace",
  "zed_actions",
+ "zenith_todo",
  "zlog",
  "ztracing",
 ]
@@ -23353,16 +23354,19 @@ name = "zenith_scratches"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "collections",
  "editor",
  "file_icons",
  "fs",
  "futures 0.3.34",
  "gpui",
+ "log",
  "menu",
  "paths",
  "picker",
  "project",
  "settings",
+ "task",
  "theme",
  "theme_settings",
  "ui",
@@ -23464,9 +23468,11 @@ dependencies = [
 name = "zenith_todo"
 version = "0.1.0"
 dependencies = [
+ "clock",
  "editor",
  "file_icons",
  "fs",
+ "git",
  "gpui",
  "language",
  "project",

@@ -12,7 +12,7 @@ use editor::{Editor, EditorEvent, HighlightKey, SelectionEffects, scroll::Autosc
 use file_icons::FileIcons;
 use fs::Fs;
 use git::{blame::BlameEntry, repository::DiffType};
-use gpui::{
+use gpui::{AnyElement, 
     Action, App, AppContext as _, ClickEvent, Context, Entity, EntityId, EventEmitter, FocusHandle,
     Focusable, FontWeight, Global, HighlightStyle, IntoElement, ParentElement, Pixels, PromptLevel,
     Render, Role, ScrollStrategy, Styled, Task, UniformListScrollHandle, WeakEntity, Window,
@@ -1106,7 +1106,7 @@ impl TodoPanel {
         role: Role,
         cx: &mut Context<Self>,
         on_click: impl Fn(&mut Self, &mut Context<Self>) + 'static,
-    ) -> impl IntoElement {
+    ) -> AnyElement {
         let border = if active {
             cx.theme().colors().border_focused
         } else {
@@ -1121,6 +1121,7 @@ impl TodoPanel {
                 .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| on_click(this, cx)))
                 .child(Label::new(label)),
         )
+        .into_any_element()
     }
 
     /// Author dropdown (authors seen in the results) and age chips.

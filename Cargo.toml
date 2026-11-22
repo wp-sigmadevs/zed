@@ -551,7 +551,7 @@ x_ai_subscribed = { path = "crates/x_ai_subscribed" }
 zed_actions = { path = "crates/zed_actions" }
 zed_credentials_provider = { path = "crates/zed_credentials_provider" }
 zed_env_vars = { path = "crates/zed_env_vars" }
-zenith = { path = "crates/zenith" }
+zenith = { path = "crates/zenith", default-features = false }
 zenith_agent_review = { path = "crates/zenith_agent_review" }
 zenith_external_libraries = { path = "crates/zenith_external_libraries" }
 zenith_folds = { path = "crates/zenith_folds" }
