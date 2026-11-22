@@ -70,7 +70,10 @@ fn load_managed(path: &Path) -> Managed {
 
 /// Writes `text` to a temp file next to `path`, then renames it over `path`: PHPantom polls
 /// the file, and a torn read at startup would mean defaults for the whole session.
+/// A symlinked file (dotfiles) is written at its target, so the link survives.
 fn write_atomic(path: &Path, text: &str) -> Result<(), String> {
+    let resolved = std::fs::canonicalize(path).ok();
+    let path = resolved.as_deref().unwrap_or(path);
     let parent = path
         .parent()
         .ok_or_else(|| format!("{} has no parent directory", path.display()))?;
@@ -186,15 +189,33 @@ fn sync_config(home: &Path, xdg: Option<PathBuf>, include: &[String]) -> Result<
         )?,
         legacy_stubs: Vec::new(),
     };
+    // Claim old and new entries before touching the config, and drop the old ones only
+    // after it is written: a failed write then never leaves an entry nobody manages.
+    let write_sidecar = |include: &[String], stubs: &[String]| {
+        let json = if stubs.is_empty() {
+            serde_json::json!({ "include": include })
+        } else {
+            serde_json::json!({ "include": include, "stubs": stubs })
+        };
+        write_atomic(&sidecar, &json.to_string())
+    };
+    let mut claimed = previous.include.clone();
+    claimed.extend(
+        managed
+            .include
+            .iter()
+            .filter(|entry| !previous.include.contains(entry))
+            .cloned(),
+    );
+    if claimed != previous.include {
+        write_sidecar(&claimed, &previous.legacy_stubs)?;
+    }
     let new_text = doc.to_string();
     if new_text != text {
         write_atomic(&config, &new_text)?;
     }
-    if managed != previous {
-        write_atomic(
-            &sidecar,
-            &serde_json::json!({ "include": managed.include }).to_string(),
-        )?;
+    if managed.include != claimed || !previous.legacy_stubs.is_empty() {
+        write_sidecar(&managed.include, &[])?;
     }
     Ok(())
 }
@@ -258,4 +279,41 @@ pub(crate) fn sync(project: &Entity<Project>, cx: &mut App) {
         }
     })
     .detach();
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::{config_file, sync_config};
+
+    #[test]
+    fn test_sync_keeps_user_entries_prunes_its_own_and_follows_symlinks() {
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path();
+        let real = home.join("dotfiles/phpantom.toml");
+        std::fs::create_dir_all(real.parent().unwrap()).unwrap();
+        std::fs::write(&real, "[indexing]\ninclude = [\"/mine\"]\n").unwrap();
+        let config = config_file(home, None);
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&real, &config).unwrap();
+
+        sync_config(home, None, &["/lib".into(), "/mine".into()]).unwrap();
+        let text = std::fs::read_to_string(&real).unwrap();
+        assert!(
+            text.contains("\"/mine\"") && text.contains("\"/lib\""),
+            "{text}"
+        );
+        assert!(std::fs::symlink_metadata(&config).unwrap().is_symlink());
+
+        // Neither wanted any more: only the entry Zenith added goes.
+        sync_config(home, None, &[]).unwrap();
+        let text = std::fs::read_to_string(&real).unwrap();
+        assert!(
+            text.contains("\"/mine\"") && !text.contains("\"/lib\""),
+            "{text}"
+        );
+
+        std::fs::write(&real, "not = [toml").unwrap();
+        assert!(sync_config(home, None, &["/lib".into()]).is_err());
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), "not = [toml");
+    }
 }
