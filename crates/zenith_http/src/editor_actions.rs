@@ -9,7 +9,7 @@ use crate::{
     CopyAsCurl, EnvironmentStore, HttpRequest, HttpResponse, HttpResponseView, RunAllRequests,
     RunRequest, SelectEnvironment, execute_request, parse_http_file,
 };
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 use editor::Editor;
 use fs::Fs;
 use gpui::{
@@ -152,19 +152,41 @@ fn env_dirs(workspace: &Workspace, file_dir: Option<PathBuf>, cx: &App) -> Vec<P
     dirs
 }
 
-async fn read_first(fs: &Arc<dyn Fs>, dirs: &[PathBuf], name: &str) -> Result<Option<String>> {
-    for dir in dirs {
-        let path = dir.join(name);
-        if fs.is_file(&path).await {
-            return Ok(Some(fs.load(&path).await?));
-        }
+/// Environment files are small JSON; anything bigger is not one.
+const MAX_ENV_FILE_BYTES: u64 = 1024 * 1024;
+
+/// A regular environment file at `path`. Symlinks are refused: a cloned project could
+/// otherwise point the private file at any JSON secret on disk and send it in a request.
+async fn read_env_file(fs: &Arc<dyn Fs>, path: &Path) -> Result<Option<String>> {
+    let Some(metadata) = fs.metadata(path).await? else {
+        return Ok(None);
+    };
+    if metadata.is_dir || metadata.is_fifo {
+        return Ok(None);
     }
-    Ok(None)
+    if metadata.is_symlink {
+        bail!(
+            "{} is a symlink; environment files must be regular files",
+            path.display()
+        );
+    }
+    if metadata.len > MAX_ENV_FILE_BYTES {
+        bail!("{} is larger than 1 MB", path.display());
+    }
+    Ok(Some(fs.load(path).await?))
 }
 
+/// Public and private files come from the same folder: the first one that has either, so
+/// one folder's requests never pick up another folder's secrets.
 async fn load_environments(fs: &Arc<dyn Fs>, dirs: &[PathBuf]) -> Result<EnvironmentStore> {
-    let public = read_first(fs, dirs, PUBLIC_ENV_FILE).await?;
-    let private = read_first(fs, dirs, PRIVATE_ENV_FILE).await?;
+    let (mut public, mut private) = (None, None);
+    for dir in dirs {
+        public = read_env_file(fs, &dir.join(PUBLIC_ENV_FILE)).await?;
+        private = read_env_file(fs, &dir.join(PRIVATE_ENV_FILE)).await?;
+        if public.is_some() || private.is_some() {
+            break;
+        }
+    }
     let mut store = EnvironmentStore::new();
     store
         .load_from_json(public.as_deref().unwrap_or_default(), private.as_deref())
