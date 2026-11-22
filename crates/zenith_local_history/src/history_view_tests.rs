@@ -956,6 +956,11 @@ fn test_history_view_agent_rows_name_the_turn() {
         size: 0,
     };
     assert_eq!(
+        row_title(&entry(Some("agent:0a1b-2c:1763800000000:3"), "agent")),
+        "Agent · turn 3"
+    );
+    // Labels from before the run id was added.
+    assert_eq!(
         row_title(&entry(Some("agent:0a1b-2c:3"), "agent")),
         "Agent · turn 3"
     );

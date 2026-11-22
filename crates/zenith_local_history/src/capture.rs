@@ -723,7 +723,8 @@ fn send_record(
 /// Records `text` as an "agent" revision of the buffer's file under `label`,
 /// even when it equals the latest revision. `false` when nothing is queued:
 /// local history is off or not started, or the file is not a local plain
-/// file, is private, ignored, excluded, a likely secret or over the size cap.
+/// file, is private, ignored, excluded, a likely secret, over the size cap or
+/// binary (contains NUL).
 pub fn checkpoint(buffer: &Entity<Buffer>, text: Rope, label: &str, cx: &App) -> bool {
     let Some(history) = cx.try_global::<LocalHistory>() else {
         return false;
@@ -738,6 +739,10 @@ pub fn checkpoint(buffer: &Entity<Buffer>, text: Rope, label: &str, cx: &App) ->
         .abs_path()
         .join(file.path.as_std_path());
     if is_secret_file(&abs_path) {
+        return false;
+    }
+    // The store drops binary text silently (see `Job::Record`).
+    if text.chunks().any(|chunk| chunk.contains('\0')) {
         return false;
     }
     send_record(history, file, text, Some(label.to_owned()), "agent", cx)

@@ -855,5 +855,6 @@ async fn test_checkpoint_refuses_secret_private_and_disabled(cx: &mut TestAppCon
     let too_big = "x".repeat(2048);
     assert!(!cx.update(|cx| crate::checkpoint(&buffer, too_big.into(), "agent:s:1", cx)));
     configure(cx, |_| {});
+    assert!(!cx.update(|cx| crate::checkpoint(&buffer, "a\0b".into(), "agent:s:1", cx)));
     assert!(cx.update(|cx| crate::checkpoint(&buffer, "x".into(), "agent:s:1", cx)));
 }

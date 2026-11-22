@@ -760,7 +760,7 @@ fn source_name(source: &str) -> String {
 
 fn row_title(entry: &Entry) -> String {
     let label = entry.revision.label.as_deref();
-    // Agent checkpoints are labelled `agent:<session>:<turn>`; the session id is noise.
+    // Agent checkpoints are labelled `agent:<session>:<run>:<turn>`; session and run are noise.
     match label.and_then(|label| label.rsplit_once(':')) {
         Some((_, turn)) if entry.revision.source == "agent" => format!("Agent · turn {turn}"),
         _ => label
