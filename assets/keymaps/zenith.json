@@ -29,6 +29,8 @@
       // Next.js tool window, App Router routes (Next.js projects only). PhpStorm has no key for
       // it; ⌘⇧9 is unbound in the macOS, Linux and JetBrains keymaps.
       "secondary-shift-9": "zenith_nextjs::ToggleNextJsPanel",
+      // Agent Review tool window (plan 23). Only the image viewer binds ⌘⇧0, in its own context.
+      "secondary-shift-0": "zenith_agent_review::ToggleFocus",
       // New Scratch File, as in PhpStorm (⌘⇧N); overrides Go to File and New Window.
       "secondary-shift-n": "zenith_scratches::NewScratchFile",
       "secondary-shift-f": "zenith_search::FindInFiles",
@@ -75,6 +77,16 @@
     "bindings": {
       "left": "zenith_nextjs::PreviousFilter",
       "right": "zenith_nextjs::NextFilter",
+    },
+  },
+  {
+    // Agent Review tool window: the agent diff's own keep / reject keys, on the selected row.
+    "context": "AgentReviewPanel",
+    "bindings": {
+      "secondary-y": "agent::Keep",
+      "secondary-alt-z": "agent::Reject",
+      "shift-alt-y": "agent::KeepAll",
+      "shift-alt-z": "agent::RejectAll",
     },
   },
   {

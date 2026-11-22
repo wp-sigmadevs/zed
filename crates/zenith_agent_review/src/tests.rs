@@ -6,14 +6,22 @@ use std::{
 use acp_thread::{AcpThread, AgentConnection as _, StubAgentConnection};
 use action_log::ActionLog;
 use agent_client_protocol::{v1::schema as acp_v1, v2::schema as acp_v2};
-use gpui::{AppContext as _, Entity, TestAppContext};
+use editor::Editor;
+use gpui::{
+    AppContext as _, Entity, Focusable as _, KeyBinding, TestAppContext, VisualTestContext,
+};
 use language::Buffer;
 use project::{FakeFs, Fs as _, Project};
 use serde_json::json;
 use settings::SettingsStore;
 use util::path_list::PathList;
+use workspace::{AppState, MultiWorkspace, Workspace};
+use zenith_title_bar::{AgentChip, AgentCounts, agent_chip_label};
 
-use crate::{AgentReview, ReviewStatus, Summary, keep_all, revert_turn};
+use crate::{
+    AgentReview, AgentReviewPanel, ReviewStatus, Summary, ToggleFocus, keep_all, revert_turn,
+    status::status_text,
+};
 
 struct Setup {
     // Dropping it deletes the local-history database.
@@ -271,4 +279,172 @@ async fn test_subagent_threads_are_not_tracked(cx: &mut TestAppContext) {
             .len()
     });
     assert_eq!(tracked, 1, "only the parent thread");
+}
+
+/// [`setup`] inside a real window and workspace, so the panel and status item exist.
+async fn setup_in_workspace(
+    cx: &mut TestAppContext,
+) -> (Setup, Entity<Workspace>, &mut VisualTestContext) {
+    let history = tempfile::tempdir().expect("temp dir");
+    let directory = history.path().to_path_buf();
+    let app_state = cx.update(|cx| {
+        let app_state = AppState::test(cx);
+        editor::init(cx);
+        workspace::init(app_state.clone(), cx);
+        zenith_local_history::start_in(directory, cx);
+        crate::init(cx);
+        cx.bind_keys([KeyBinding::new(
+            "down",
+            menu::SelectNext,
+            Some("AgentReviewPanel"),
+        )]);
+        app_state
+    });
+    let fs = app_state.fs.as_fake();
+    fs.insert_tree("/dir", json!({ "a.txt": "base\n" })).await;
+    let project = Project::test(app_state.fs.clone(), [Path::new("/dir")], cx).await;
+    let connection = Rc::new(StubAgentConnection::new());
+    let thread = cx
+        .update(|cx| {
+            connection
+                .clone()
+                .new_session(project.clone(), PathList::new(&["/dir"]), cx)
+        })
+        .await
+        .expect("stub session");
+    thread.update(cx, |thread, cx| {
+        thread.set_provisional_title("Fix nonce".into(), cx)
+    });
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let workspace = multi_workspace.read_with(cx, |multi, _| multi.workspace().clone());
+    cx.run_until_parked();
+    let setup = Setup {
+        _history: history,
+        fs,
+        project,
+        connection,
+        thread,
+    };
+    (setup, workspace, cx)
+}
+
+fn panel(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> Entity<AgentReviewPanel> {
+    workspace
+        .read_with(cx, |workspace, cx| workspace.panel::<AgentReviewPanel>(cx))
+        .expect("panel is registered")
+}
+
+fn rows(panel: &Entity<AgentReviewPanel>, cx: &mut VisualTestContext) -> Vec<String> {
+    panel.read_with(cx, |panel, _| panel.row_texts())
+}
+
+#[gpui::test]
+async fn test_panel_lists_a_pending_file_and_keep_removes_it(cx: &mut TestAppContext) {
+    let (setup, workspace, cx) = setup_in_workspace(cx).await;
+    let panel = panel(&workspace, cx);
+    assert!(rows(&panel, cx).is_empty(), "no turn yet");
+
+    run_turn(&setup, "one\n", cx).await;
+    assert_eq!(
+        rows(&panel, cx),
+        [
+            "Fix nonce, Review, turn 1, 1 file to review",
+            "a.txt, +1 −1",
+            "Actions for turn 1",
+        ]
+    );
+
+    // Keyboard path: focus the panel, select the file row, keep it.
+    cx.dispatch_action(ToggleFocus);
+    cx.run_until_parked();
+    cx.simulate_keystrokes("down down");
+    assert_eq!(panel.read_with(cx, |panel, _| panel.selected()), Some(1));
+    cx.dispatch_action(agent_ui::Keep);
+    cx.run_until_parked();
+    assert_eq!(
+        rows(&panel, cx),
+        [
+            "Fix nonce, Done, turn 1, 0 files to review",
+            "Actions for turn 1"
+        ]
+    );
+    assert_eq!(summary(&setup, cx), Summary::default());
+}
+
+#[gpui::test]
+async fn test_chip_and_status_text_follow_the_thread(cx: &mut TestAppContext) {
+    let (setup, _workspace, cx) = setup_in_workspace(cx).await;
+    let project_id = setup.project.entity_id();
+    let chip = |cx: &mut VisualTestContext| cx.update(|_, cx| AgentChip::counts(project_id, cx));
+    let status = |cx: &mut VisualTestContext| {
+        cx.update(|_, cx| {
+            let review = AgentReview::global(cx).expect("review");
+            status_text(review.read(cx), project_id)
+        })
+    };
+    assert_eq!(agent_chip_label(chip(cx)), ("Agents".to_string(), None));
+    assert_eq!(status(cx), None);
+
+    let turn = start_turn(&setup, cx);
+    assert_eq!(
+        chip(cx),
+        AgentCounts {
+            running: 1,
+            review: 0
+        }
+    );
+    assert_eq!(agent_chip_label(chip(cx)).0, "1 running");
+    assert_eq!(status(cx).as_deref(), Some("Fix nonce running…"));
+
+    agent_writes(&setup, "one\n", cx).await;
+    end_turn(&setup, turn, cx).await;
+    assert_eq!(agent_chip_label(chip(cx)), ("review".to_string(), Some(1)));
+    assert_eq!(
+        status(cx).as_deref(),
+        Some("Fix nonce waiting for review (1 file)")
+    );
+
+    cx.update(|_, cx| keep_all(&setup.thread, cx));
+    cx.run_until_parked();
+    assert_eq!(agent_chip_label(chip(cx)), ("Agents".to_string(), None));
+    assert_eq!(status(cx), None);
+}
+
+// Pre-bundle gate: the panel, its rail button and the status item render in a real
+// workspace with an editor open and an agent running, without reading an entity mid-update.
+#[gpui::test]
+async fn test_opening_a_file_and_toggling_the_panel_renders(cx: &mut TestAppContext) {
+    let (setup, workspace, cx) = setup_in_workspace(cx).await;
+    let editor = workspace
+        .update_in(cx, |workspace, window, cx| {
+            workspace.open_abs_path(
+                "/dir/a.txt".into(),
+                workspace::OpenOptions::default(),
+                window,
+                cx,
+            )
+        })
+        .await
+        .expect("file opens")
+        .downcast::<Editor>()
+        .expect("an editor");
+    cx.run_until_parked();
+    let turn = start_turn(&setup, cx);
+    agent_writes(&setup, "one\n", cx).await;
+
+    cx.dispatch_action(ToggleFocus);
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let panel = panel(&workspace, cx);
+    assert!(cx.update(|window, cx| panel.read(cx).focus_handle(cx).contains_focused(window, cx)));
+    assert!(cx.debug_bounds("zenith-agent-review-panel").is_some());
+    assert!(cx.debug_bounds("zenith-agent-status").is_some());
+
+    end_turn(&setup, turn, cx).await;
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    cx.dispatch_action(ToggleFocus);
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert_eq!(editor.read_with(cx, |editor, cx| editor.text(cx)), "one\n");
 }
