@@ -58,7 +58,7 @@ impl Into<BaseKeymapContent> for BaseKeymap {
 impl Display for BaseKeymap {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            BaseKeymap::Zed => write!(f, "Zed"),
+            BaseKeymap::Zed => write!(f, "Zenith"),
             BaseKeymap::VSCode => write!(f, "VS Code"),
             BaseKeymap::JetBrains => write!(f, "JetBrains"),
             BaseKeymap::SublimeText => write!(f, "Sublime Text"),
@@ -74,10 +74,10 @@ impl Display for BaseKeymap {
 impl BaseKeymap {
     #[cfg(target_os = "macos")]
     pub const OPTIONS: [(&'static str, Self); 8] = [
-        ("Zed (Default)", Self::Zed),
+        ("Zenith", Self::Zed),
         ("VS Code", Self::VSCode),
         ("Atom", Self::Atom),
-        ("JetBrains", Self::JetBrains),
+        ("JetBrains (Default)", Self::JetBrains),
         ("Sublime Text", Self::SublimeText),
         ("Emacs (beta)", Self::Emacs),
         ("TextMate", Self::TextMate),
@@ -86,10 +86,10 @@ impl BaseKeymap {
 
     #[cfg(not(target_os = "macos"))]
     pub const OPTIONS: [(&'static str, Self); 7] = [
-        ("Zed (Default)", Self::Zed),
+        ("Zenith", Self::Zed),
         ("VS Code", Self::VSCode),
         ("Atom", Self::Atom),
-        ("JetBrains", Self::JetBrains),
+        ("JetBrains (Default)", Self::JetBrains),
         ("Sublime Text", Self::SublimeText),
         ("Emacs (beta)", Self::Emacs),
         ("Cursor", Self::Cursor),
@@ -139,5 +139,21 @@ impl BaseKeymap {
 impl Settings for BaseKeymap {
     fn from_settings(s: &crate::settings_content::SettingsContent) -> Self {
         s.base_keymap.unwrap().into()
+    }
+}
+
+#[cfg(test)]
+mod zenith_tests {
+    use super::*;
+
+    #[test]
+    fn test_keymap_labels_say_zenith_and_default_to_jetbrains() {
+        assert!(BaseKeymap::names().all(|name| !name.contains("Zed")));
+        assert_eq!(BaseKeymap::Zed.to_string(), "Zenith");
+        assert_eq!(BaseKeymap::from_names("Zenith"), BaseKeymap::Zed);
+        assert_eq!(
+            BaseKeymap::from_names("JetBrains (Default)"),
+            BaseKeymap::JetBrains
+        );
     }
 }
