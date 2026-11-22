@@ -101,7 +101,7 @@ fn is_secret_name(name: &str) -> bool {
     let name = normalize(name);
     SECRET_NAMES
         .iter()
-        .any(|secret| name.contains(&normalize(secret)))
+        .any(|secret| name.ends_with(&normalize(secret)))
 }
 
 fn mask_secret_headers(headers: &mut [(String, String)]) {
