@@ -506,6 +506,26 @@ fn extract_string_literal(input: &str) -> Option<(String, &str)> {
     Some((literal.to_string(), remainder))
 }
 
+/// The route name typed so far when `line` (a line up to the cursor) ends inside the first string
+/// argument of `route(`, `to_route(` or `->route(` (as in `redirect()->route(`).
+/// shortcut: any `->route(` counts, `$request->route('id')` too; check the receiver if that
+/// shows up in practice.
+pub fn route_name_prefix(line: &str) -> Option<&str> {
+    let quote_at = line.rfind(|character: char| character == '\'' || character == '"')?;
+    let prefix = &line[quote_at + 1..];
+    if !prefix
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || "._-:".contains(character))
+    {
+        return None;
+    }
+    let call = line[..quote_at].trim_end().strip_suffix('(')?.trim_end();
+    let function = call
+        .rsplit(|character: char| !(character.is_ascii_alphanumeric() || character == '_'))
+        .next()?;
+    matches!(function, "route" | "to_route").then_some(prefix)
+}
+
 /// A manifest is small; only this much of one is read.
 const MANIFEST_MAX_BYTES: u64 = 1024 * 1024;
 
@@ -813,5 +833,32 @@ DB_HOST=127.0.0.1
             std::ffi::CString::new(dir.path().join("composer.json").to_str().unwrap()).unwrap();
         assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
         assert!(!LaravelIndex::is_laravel_project(dir.path()));
+    }
+
+    #[test]
+    fn test_route_name_prefix_inside_a_route_string() {
+        for (line, prefix) in [
+            ("    return route('", ""),
+            ("    return route('users.in", "users.in"),
+            ("$url = route(\"admin.dash", "admin.dash"),
+            ("return to_route('home", "home"),
+            ("return redirect()->route('posts.", "posts."),
+            ("return Redirect::route( 'a-b_c:d", "a-b_c:d"),
+        ] {
+            assert_eq!(route_name_prefix(line), Some(prefix), "{line}");
+        }
+        for line in [
+            "return route('home')",
+            "return route('home', '",
+            "return route('a') . '",
+            "return myroute('",
+            "return view('",
+            "return route($name . '",
+            "return route('two words",
+            "return 'route(",
+            "",
+        ] {
+            assert_eq!(route_name_prefix(line), None, "{line}");
+        }
     }
 }
