@@ -11,24 +11,28 @@ use std::{
 };
 
 use anyhow::{Result, ensure};
-use editor::Editor;
+use collections::HashMap;
+use editor::{Addon, Editor};
 use file_icons::FileIcons;
 use fs::{CreateOptions, Fs, RemoveOptions, RenameOptions};
 use futures::StreamExt as _;
 use gpui::{
     Action, AnyElement, App, ClickEvent, Context, DismissEvent, Entity, EventEmitter, FocusHandle,
-    Focusable, IntoElement, MouseDownEvent, ParentElement, Pixels, Point, Render, Role,
+    Focusable, IntoElement, KeyContext, MouseDownEvent, ParentElement, Pixels, Point, Render, Role,
     SharedString, Styled, Subscription, Task, UniformListScrollHandle, WeakEntity, Window, actions,
     anchored, deferred, px, uniform_list,
 };
 use picker::{Picker, PickerDelegate};
-use std::ops::Range;
+use project::TaskSourceKind;
+use settings::{RegisterSetting, Settings, SettingsContent, SettingsStore};
+use std::{any::Any, ops::Range};
+use task::{TaskContext, TaskTemplate, TaskVariables, VariableName};
 use ui::{ContextMenu, ListItem, ListItemSpacing, Tooltip, prelude::*};
 use util::ResultExt as _;
 use workspace::{
-    ModalView, OpenOptions, Workspace,
+    ModalView, OpenOptions, Toast, Workspace,
     dock::{DockPosition, Panel, PanelEvent},
-    notifications::DetachAndPromptErr as _,
+    notifications::{DetachAndPromptErr as _, NotificationId},
 };
 
 actions!(
@@ -44,6 +48,8 @@ actions!(
         DeleteScratch,
         /// Shows the selected scratch file in the file manager.
         RevealScratch,
+        /// Runs the scratch file in the terminal, with the runner for its extension.
+        RunScratch,
     ]
 );
 
@@ -51,7 +57,7 @@ const HEADER_HEIGHT: f32 = 38.;
 const ROW_HEIGHT: f32 = 28.;
 
 /// Language picker entries: label and file extension.
-const KINDS: [(&str, &str); 10] = [
+const KINDS: [(&str, &str); 11] = [
     ("PHP", "php"),
     ("JavaScript", "js"),
     ("TypeScript", "ts"),
@@ -62,17 +68,127 @@ const KINDS: [(&str, &str); 10] = [
     ("Plain Text", "txt"),
     ("SQL", "sql"),
     ("Shell", "sh"),
+    ("Python", "py"),
 ];
 
-/// Where scratch files live: global, so one folder for every window and project.
-pub fn store_dir() -> PathBuf {
+/// Built-in run commands by extension, as program and arguments. The task system substitutes
+/// `$ZED_FILE` and quotes each argument for the shell, so a path is never spliced into a
+/// command line by hand.
+const RUNNERS: [(&str, &[&str]); 6] = [
+    ("php", &["php", "$ZED_FILE"]),
+    ("js", &["node", "$ZED_FILE"]),
+    ("mjs", &["node", "$ZED_FILE"]),
+    ("ts", &["npx", "tsx", "$ZED_FILE"]),
+    ("py", &["python3", "$ZED_FILE"]),
+    ("sh", &["bash", "$ZED_FILE"]),
+];
+
+#[derive(Clone, Debug, PartialEq, RegisterSetting)]
+pub struct ScratchesSettings {
+    pub enabled: bool,
+    /// The configured folder, `None` when unset or not absolute.
+    pub directory: Option<PathBuf>,
+    pub runners: HashMap<String, Vec<String>>,
+    pub use_project_cwd: bool,
+}
+
+impl Settings for ScratchesSettings {
+    fn from_settings(content: &SettingsContent) -> Self {
+        let scratches = content
+            .zenith
+            .as_ref()
+            .and_then(|zenith| zenith.scratches.as_ref());
+        Self {
+            enabled: scratches
+                .and_then(|scratches| scratches.enabled)
+                .unwrap_or(true),
+            directory: absolute_dir(scratches.and_then(|scratches| scratches.directory.as_deref())),
+            runners: scratches
+                .and_then(|scratches| scratches.runners.clone())
+                .unwrap_or_default(),
+            use_project_cwd: scratches
+                .and_then(|scratches| scratches.use_project_cwd)
+                .unwrap_or(true),
+        }
+    }
+}
+
+/// A relative folder would depend on the process's cwd, so it is ignored (with a log).
+fn absolute_dir(directory: Option<&str>) -> Option<PathBuf> {
+    let directory = Path::new(directory?);
+    if directory.is_absolute() {
+        Some(directory.to_path_buf())
+    } else {
+        log::warn!(
+            "zenith.scratches.directory must be an absolute path, ignoring {}",
+            directory.display()
+        );
+        None
+    }
+}
+
+fn default_store_dir() -> PathBuf {
     paths::data_dir().join("scratches")
 }
 
+/// Where scratch files live: global, so one folder for every window and project.
+pub fn store_dir(cx: &App) -> PathBuf {
+    ScratchesSettings::get_global(cx)
+        .directory
+        .clone()
+        .unwrap_or_else(default_store_dir)
+}
+
+/// Marks an editor showing a scratch file, so `ctrl-r` (context `zenith_scratch`) runs it.
+struct ScratchEditor;
+
+impl Addon for ScratchEditor {
+    fn extend_key_context(&self, key_context: &mut KeyContext, _: &App) {
+        key_context.add("zenith_scratch");
+    }
+
+    fn to_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+fn editor_file_path(editor: &Editor, cx: &App) -> Option<PathBuf> {
+    let buffer = editor.buffer().read(cx).as_singleton()?;
+    Some(buffer.read(cx).file()?.as_local()?.abs_path(cx))
+}
+
+fn is_scratch(path: &Path, cx: &App) -> bool {
+    path.parent() == Some(store_dir(cx).as_path())
+}
+
 pub fn init(cx: &mut App) {
+    ScratchesSettings::register(cx);
+    // shortcut: `enabled` is read when a window or editor opens, so toggling it needs a restart.
+    cx.observe_new(|editor: &mut Editor, _, cx| {
+        if !ScratchesSettings::get_global(cx).enabled || !editor.mode().is_full() {
+            return;
+        }
+        if editor_file_path(editor, cx).is_some_and(|path| is_scratch(&path, cx)) {
+            editor.register_addon(ScratchEditor);
+        }
+    })
+    .detach();
     cx.observe_new(|workspace: &mut Workspace, window, cx| {
+        if !ScratchesSettings::get_global(cx).enabled {
+            return;
+        }
         workspace.register_action(|workspace, _: &ToggleFocus, window, cx| {
             workspace.toggle_panel_focus::<ScratchesPanel>(window, cx);
+        });
+        workspace.register_action(|workspace, _: &RunScratch, window, cx| {
+            let path = workspace
+                .active_item_as::<Editor>(cx)
+                .and_then(|editor| editor_file_path(editor.read(cx), cx))
+                .filter(|path| is_scratch(path, cx));
+            match path {
+                Some(path) => run_scratch(workspace, &path, window, cx),
+                None => show_toast(workspace, "The active file is not a scratch file.", cx),
+            }
         });
         workspace.register_action(|workspace, _: &NewScratchFile, window, cx| {
             let fs = workspace.app_state().fs.clone();
@@ -88,6 +204,112 @@ pub fn init(cx: &mut App) {
         workspace.add_panel(panel, window, cx);
     })
     .detach();
+}
+
+// ---- run ----
+
+/// The run command for `ext`: the user's runner when set (an empty one disables it), else the
+/// built-in one.
+fn runner(ext: &str, user_runners: &HashMap<String, Vec<String>>) -> Option<Vec<String>> {
+    let ext = ext.to_lowercase();
+    let argv = match user_runners.get(&ext) {
+        Some(argv) => argv.clone(),
+        None => RUNNERS
+            .iter()
+            .find(|(runner_ext, _)| *runner_ext == ext)?
+            .1
+            .iter()
+            .map(|arg| arg.to_string())
+            .collect(),
+    };
+    argv.first()
+        .is_some_and(|program| !program.trim().is_empty())
+        .then_some(argv)
+}
+
+/// The task for `path`: program and arguments stay separate, so the task system quotes them.
+fn run_task(path: &Path, argv: &[String], cwd: Option<PathBuf>) -> Option<task::ResolvedTask> {
+    let (command, args) = argv.split_first()?;
+    let template = TaskTemplate {
+        label: format!(
+            "Run {}",
+            path.file_name().unwrap_or_default().to_string_lossy()
+        ),
+        command: command.clone(),
+        args: args.to_vec(),
+        ..TaskTemplate::default()
+    };
+    let mut task_variables = TaskVariables::default();
+    task_variables.insert(VariableName::File, path.to_string_lossy().into_owned());
+    if let Some(name) = path.file_name() {
+        task_variables.insert(VariableName::Filename, name.to_string_lossy().into_owned());
+    }
+    if let Some(stem) = path.file_stem() {
+        task_variables.insert(VariableName::Stem, stem.to_string_lossy().into_owned());
+    }
+    if let Some(dir) = path.parent() {
+        task_variables.insert(VariableName::Dirname, dir.to_string_lossy().into_owned());
+    }
+    let context = TaskContext {
+        cwd,
+        task_variables,
+        ..TaskContext::default()
+    };
+    template.resolve_task("zenith_scratch", &context)
+}
+
+fn run_scratch(
+    workspace: &mut Workspace,
+    path: &Path,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let settings = ScratchesSettings::get_global(cx);
+    let ext = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or_default();
+    let Some(argv) = runner(ext, &settings.runners) else {
+        let message = format!(
+            "No runner for .{ext} files. Add one under zenith.scratches.runners in settings."
+        );
+        show_toast(workspace, message, cx);
+        return;
+    };
+    let project_root = settings
+        .use_project_cwd
+        .then(|| {
+            workspace
+                .project()
+                .read(cx)
+                .visible_worktrees(cx)
+                .find_map(|worktree| worktree.read(cx).root_dir())
+        })
+        .flatten();
+    let cwd = project_root
+        .map(|root| root.to_path_buf())
+        .or_else(|| path.parent().map(Path::to_path_buf));
+    match run_task(path, &argv, cwd) {
+        Some(task) => {
+            workspace.schedule_resolved_task(TaskSourceKind::UserInput, task, true, window, cx)
+        }
+        None => show_toast(
+            workspace,
+            format!("Could not build the run command for {}.", path.display()),
+            cx,
+        ),
+    }
+}
+
+fn show_toast(
+    workspace: &mut Workspace,
+    message: impl Into<std::borrow::Cow<'static, str>>,
+    cx: &mut Context<Workspace>,
+) {
+    workspace.show_toast(
+        Toast::new(NotificationId::unique::<RunScratch>(), message),
+        cx,
+    );
 }
 
 // ---- files: pure of any UI so the rules are testable on their own ----
@@ -146,6 +368,46 @@ async fn list(fs: &dyn Fs, dir: &Path) -> Result<Vec<Scratch>> {
     }
     items.sort_by(|a, b| b.mtime.cmp(&a.mtime).then_with(|| a.name.cmp(&b.name)));
     Ok(items)
+}
+
+/// A row of the panel list: a language section header, or a scratch (index into the items).
+#[derive(Clone, Debug, PartialEq)]
+enum Row {
+    Header(SharedString),
+    Scratch(usize),
+}
+
+/// The section a scratch is listed under: its language, by extension.
+fn language_label(name: &str) -> SharedString {
+    let Some(ext) = Path::new(name)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(str::to_lowercase)
+    else {
+        return "Other".into();
+    };
+    KINDS
+        .iter()
+        .find(|(_, kind_ext)| *kind_ext == ext)
+        .map_or_else(|| ext.to_uppercase().into(), |(label, _)| (*label).into())
+}
+
+/// Orders `items` (newest first) by language, keeping newest first inside each language,
+/// and returns them with the rows to draw: a header before each language's scratches.
+fn grouped(mut items: Vec<Scratch>) -> (Vec<Scratch>, Vec<Row>) {
+    // A stable sort, so the newest-first order holds within a language.
+    items.sort_by_cached_key(|item| language_label(&item.name));
+    let mut rows = Vec::with_capacity(items.len());
+    let mut current = None;
+    for (ix, item) in items.iter().enumerate() {
+        let label = language_label(&item.name);
+        if current.as_ref() != Some(&label) {
+            rows.push(Row::Header(label.clone()));
+            current = Some(label);
+        }
+        rows.push(Row::Scratch(ix));
+    }
+    (items, rows)
 }
 
 /// Creates an empty `scratch*.<ext>` in `dir` and returns its path. Never overwrites.
@@ -235,44 +497,56 @@ pub struct ScratchesPanel {
     focus_handle: FocusHandle,
     scroll_handle: UniformListScrollHandle,
     items: Vec<Scratch>,
+    rows: Vec<Row>,
     selected: Option<PathBuf>,
     context_menu: Option<(Entity<ContextMenu>, Point<Pixels>, Subscription)>,
     load_task: Task<()>,
-    _watch_task: Task<()>,
+    watch_task: Task<()>,
+    _settings_subscription: Subscription,
 }
 
 impl ScratchesPanel {
     fn new(workspace: &Workspace, cx: &mut Context<Self>) -> Self {
-        let fs = workspace.app_state().fs.clone();
-        let dir = store_dir();
-        // Scratches are global: another window may add one, so follow the folder.
-        let watch_task = cx.spawn({
-            let fs = fs.clone();
-            let dir = dir.clone();
-            async move |this, cx| {
-                fs.create_dir(&dir).await.log_err();
-                let (mut events, _watcher) = fs.watch(&dir, Duration::from_millis(100)).await;
-                while events.next().await.is_some() {
-                    if this.update(cx, |this, cx| this.refresh(cx)).is_err() {
-                        break;
-                    }
-                }
+        let settings_subscription = cx.observe_global::<SettingsStore>(|this, cx| {
+            let dir = store_dir(cx);
+            if dir != this.dir {
+                this.dir = dir;
+                this.selected = None;
+                this.watch(cx);
             }
         });
         let mut this = Self {
-            fs,
-            dir,
+            fs: workspace.app_state().fs.clone(),
+            dir: store_dir(cx),
             workspace: workspace.weak_handle(),
             focus_handle: cx.focus_handle(),
             scroll_handle: UniformListScrollHandle::new(),
             items: Vec::new(),
+            rows: Vec::new(),
             selected: None,
             context_menu: None,
             load_task: Task::ready(()),
-            _watch_task: watch_task,
+            watch_task: Task::ready(()),
+            _settings_subscription: settings_subscription,
         };
-        this.refresh(cx);
+        this.watch(cx);
         this
+    }
+
+    /// Lists `self.dir` and follows it: scratches are global, so another window may add one.
+    fn watch(&mut self, cx: &mut Context<Self>) {
+        let fs = self.fs.clone();
+        let dir = self.dir.clone();
+        self.watch_task = cx.spawn(async move |this, cx| {
+            fs.create_dir(&dir).await.log_err();
+            let (mut events, _watcher) = fs.watch(&dir, Duration::from_millis(100)).await;
+            while events.next().await.is_some() {
+                if this.update(cx, |this, cx| this.refresh(cx)).is_err() {
+                    break;
+                }
+            }
+        });
+        self.refresh(cx);
     }
 
     fn refresh(&mut self, cx: &mut Context<Self>) {
@@ -288,7 +562,7 @@ impl ScratchesPanel {
                 {
                     this.selected = None;
                 }
-                this.items = items;
+                (this.items, this.rows) = grouped(items);
                 cx.notify();
             })
             .ok();
@@ -303,8 +577,10 @@ impl ScratchesPanel {
     fn select_ix(&mut self, ix: usize, cx: &mut Context<Self>) {
         if let Some(item) = self.items.get(ix) {
             self.selected = Some(item.path.clone());
-            self.scroll_handle
-                .scroll_to_item(ix, gpui::ScrollStrategy::Center);
+            if let Some(row_ix) = self.rows.iter().position(|row| *row == Row::Scratch(ix)) {
+                self.scroll_handle
+                    .scroll_to_item(row_ix, gpui::ScrollStrategy::Center);
+            }
             cx.notify();
         }
     }
@@ -382,6 +658,16 @@ impl ScratchesPanel {
         );
     }
 
+    fn run(&mut self, _: &RunScratch, window: &mut Window, cx: &mut Context<Self>) {
+        let (Some(path), Some(workspace)) = (self.selected.clone(), self.workspace.upgrade())
+        else {
+            return;
+        };
+        workspace.update(cx, |workspace, cx| {
+            run_scratch(workspace, &path, window, cx)
+        });
+    }
+
     fn reveal(&mut self, _: &RevealScratch, _: &mut Window, cx: &mut Context<Self>) {
         if let Some(path) = &self.selected {
             cx.reveal_path(path);
@@ -399,6 +685,8 @@ impl ScratchesPanel {
         let focus = self.focus_handle.clone();
         let menu = ContextMenu::build(window, cx, move |menu, _, _| {
             menu.context(focus)
+                .action("Run", RunScratch.boxed_clone())
+                .separator()
                 .action("Rename…", RenameScratch.boxed_clone())
                 .action("Delete", DeleteScratch.boxed_clone())
                 .separator()
@@ -416,8 +704,28 @@ impl ScratchesPanel {
         cx.notify();
     }
 
-    fn render_row(&self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
-        let item = &self.items[ix];
+    fn render_row(&self, row_ix: usize, cx: &mut Context<Self>) -> AnyElement {
+        match self.rows.get(row_ix) {
+            Some(Row::Scratch(ix)) => self.render_scratch(*ix, cx),
+            Some(Row::Header(label)) => h_flex()
+                .id(("zenith-scratch-group", row_ix))
+                .role(Role::Heading)
+                .h(px(ROW_HEIGHT))
+                .px_2()
+                .child(
+                    Label::new(label.clone())
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                )
+                .into_any_element(),
+            None => gpui::Empty.into_any_element(),
+        }
+    }
+
+    fn render_scratch(&self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
+        let Some(item) = self.items.get(ix) else {
+            return gpui::Empty.into_any_element();
+        };
         let age = age_label(item.mtime);
         let icon = FileIcons::get_icon(Path::new(&item.name), cx)
             .map(|path| Icon::from_path(path).size(IconSize::Small));
@@ -500,7 +808,7 @@ impl Render for ScratchesPanel {
         } else {
             uniform_list(
                 "zenith-scratches-rows",
-                self.items.len(),
+                self.rows.len(),
                 cx.processor(|this, range: Range<usize>, _, cx| {
                     range.map(|ix| this.render_row(ix, cx)).collect::<Vec<_>>()
                 }),
@@ -520,6 +828,7 @@ impl Render for ScratchesPanel {
             .on_action(cx.listener(Self::rename))
             .on_action(cx.listener(Self::delete))
             .on_action(cx.listener(Self::reveal))
+            .on_action(cx.listener(Self::run))
             .size_full()
             .child(self.render_header(cx))
             .child(body)
@@ -688,9 +997,10 @@ impl PickerDelegate for KindDelegate {
     fn confirm(&mut self, _: bool, window: &mut Window, cx: &mut Context<Picker<Self>>) {
         if let Some(&ix) = self.matches.get(self.selected) {
             let (fs, workspace, ext) = (self.fs.clone(), self.workspace.clone(), KINDS[ix].1);
+            let dir = store_dir(cx);
             window
                 .spawn(cx, async move |cx| {
-                    let path = create(fs.as_ref(), &store_dir(), ext).await?;
+                    let path = create(fs.as_ref(), &dir, ext).await?;
                     workspace
                         .update_in(cx, |workspace, window, cx| {
                             workspace.open_abs_path(path, OpenOptions::default(), window, cx)
@@ -837,6 +1147,7 @@ impl ModalView for RenameModal {}
 mod tests {
     use super::*;
     use gpui::{KeyBinding, TestAppContext, VisualTestContext};
+    use settings::{ZenithScratchesSettingsContent, ZenithSettingsContent};
     use workspace::{AppState, MultiWorkspace};
 
     struct Fixture {
@@ -900,6 +1211,162 @@ mod tests {
         cx.run_until_parked();
     }
 
+    fn scratch(name: &str, age_secs: u64) -> Scratch {
+        Scratch {
+            name: name.to_string(),
+            path: PathBuf::from("/s").join(name),
+            mtime: SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000 - age_secs),
+        }
+    }
+
+    fn argv(args: &[&str]) -> Vec<String> {
+        args.iter().map(|arg| arg.to_string()).collect()
+    }
+
+    #[test]
+    fn runner_resolution_built_in_override_and_unknown() {
+        let mut user = HashMap::default();
+        assert_eq!(runner("php", &user), Some(argv(&["php", "$ZED_FILE"])));
+        assert_eq!(
+            runner("TS", &user),
+            Some(argv(&["npx", "tsx", "$ZED_FILE"]))
+        );
+        assert_eq!(runner("py", &user), Some(argv(&["python3", "$ZED_FILE"])));
+        assert_eq!(runner("rb", &user), None, "no built-in runner");
+        assert_eq!(runner("", &user), None);
+
+        user.insert(
+            "php".to_string(),
+            argv(&["php8.3", "-d", "display_errors=1", "$ZED_FILE"]),
+        );
+        user.insert("rb".to_string(), argv(&["ruby", "$ZED_FILE"]));
+        user.insert("sh".to_string(), Vec::new());
+        user.insert("js".to_string(), argv(&["  "]));
+        assert_eq!(
+            runner("php", &user),
+            Some(argv(&["php8.3", "-d", "display_errors=1", "$ZED_FILE"])),
+            "the user's runner wins"
+        );
+        assert_eq!(runner("rb", &user), Some(argv(&["ruby", "$ZED_FILE"])));
+        assert_eq!(
+            runner("sh", &user),
+            None,
+            "an empty runner disables the built-in"
+        );
+        assert_eq!(runner("js", &user), None, "a blank program is no runner");
+        assert_eq!(
+            runner("ts", &user),
+            Some(argv(&["npx", "tsx", "$ZED_FILE"]))
+        );
+    }
+
+    #[test]
+    fn run_task_keeps_the_path_one_argument() {
+        let path = Path::new("/scratches/my scratch; rm -rf ~.php");
+        let task = run_task(
+            path,
+            &argv(&["php", "-f", "$ZED_FILE"]),
+            Some(PathBuf::from("/project")),
+        )
+        .expect("resolves");
+        assert_eq!(task.resolved.command.as_deref(), Some("php"));
+        assert_eq!(
+            task.resolved.args,
+            ["-f", "/scratches/my scratch; rm -rf ~.php"]
+        );
+        assert_eq!(task.resolved.cwd.as_deref(), Some(Path::new("/project")));
+        assert!(run_task(path, &[], None).is_none());
+    }
+
+    #[test]
+    fn directory_setting_must_be_absolute() {
+        assert_eq!(absolute_dir(None), None);
+        assert_eq!(absolute_dir(Some("")), None);
+        assert_eq!(absolute_dir(Some("scratches")), None);
+        assert_eq!(absolute_dir(Some("~/scratches")), None);
+        assert_eq!(
+            absolute_dir(Some("/tmp/scratches")),
+            Some(PathBuf::from("/tmp/scratches"))
+        );
+    }
+
+    #[test]
+    fn grouping_by_language_newest_first_within() {
+        // `list` hands them over newest first.
+        let items = vec![
+            scratch("b.php", 1),
+            scratch("x.js", 2),
+            scratch("a.php", 3),
+            scratch("notes", 4),
+            scratch("y.JS", 5),
+            scratch("tool.rb", 6),
+        ];
+        let (items, rows) = grouped(items);
+        let names: Vec<_> = items.iter().map(|item| item.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["x.js", "y.JS", "notes", "b.php", "a.php", "tool.rb"]
+        );
+        assert_eq!(
+            rows,
+            [
+                Row::Header("JavaScript".into()),
+                Row::Scratch(0),
+                Row::Scratch(1),
+                Row::Header("Other".into()),
+                Row::Scratch(2),
+                Row::Header("PHP".into()),
+                Row::Scratch(3),
+                Row::Scratch(4),
+                Row::Header("RB".into()),
+                Row::Scratch(5),
+            ]
+        );
+        assert_eq!(grouped(Vec::new()), (Vec::new(), Vec::new()));
+    }
+
+    fn set_directory(directory: &str, cx: &mut VisualTestContext) {
+        let directory = directory.to_string();
+        cx.update(|_, cx| {
+            cx.update_global::<SettingsStore, _>(|store, cx| {
+                store.update_user_settings(cx, |content| {
+                    content.zenith = Some(ZenithSettingsContent {
+                        scratches: Some(ZenithScratchesSettingsContent {
+                            directory: Some(directory),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    });
+                });
+            });
+        });
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    async fn directory_setting_moves_the_store(cx: &mut TestAppContext) {
+        let (fixture, cx) = fixture(cx).await;
+        open_panel(&fixture, cx);
+        new_scratch(cx, 0);
+        assert_eq!(names(&fixture, cx), ["scratch.php"]);
+
+        let custom = PathBuf::from("/custom/scratches");
+        set_directory("/custom/scratches", cx);
+        assert_eq!(cx.update(|_, cx| store_dir(cx)), custom);
+        assert!(
+            names(&fixture, cx).is_empty(),
+            "the panel lists the new folder"
+        );
+        new_scratch(cx, 1);
+        assert!(fixture.fs.is_file(&custom.join("scratch.js")).await);
+        assert_eq!(names(&fixture, cx), ["scratch.js"]);
+
+        // A relative folder is ignored: back to the default store.
+        set_directory("relative/scratches", cx);
+        assert_eq!(cx.update(|_, cx| store_dir(cx)), default_store_dir());
+        assert_eq!(names(&fixture, cx), ["scratch.php"]);
+    }
+
     #[test]
     fn next_free_name_skips_taken_names() {
         let mut taken = HashSet::new();
@@ -914,7 +1381,7 @@ mod tests {
     #[gpui::test]
     async fn create_never_reuses_a_name(cx: &mut TestAppContext) {
         let fs = fs::FakeFs::new(cx.executor());
-        let dir = store_dir();
+        let dir = default_store_dir();
         let first = create(fs.as_ref(), &dir, "php").await.unwrap();
         let second = create(fs.as_ref(), &dir, "php").await.unwrap();
         assert_eq!(first, dir.join("scratch.php"));
@@ -928,7 +1395,7 @@ mod tests {
         assert!(names(&fixture, cx).is_empty());
 
         new_scratch(cx, 0);
-        let path = store_dir().join("scratch.php");
+        let path = default_store_dir().join("scratch.php");
         assert!(fixture.fs.is_file(&path).await, "PHP is the first language");
         assert_eq!(names(&fixture, cx), ["scratch.php"]);
         let opened = fixture.workspace.read_with(cx, |workspace, cx| {
@@ -942,6 +1409,15 @@ mod tests {
             opened.as_deref().and_then(|path| path.file_name()),
             Some("scratch.php".as_ref())
         );
+        let is_scratch_editor = fixture.workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .active_item_as::<Editor>(cx)
+                .is_some_and(|editor| editor.read(cx).addon::<ScratchEditor>().is_some())
+        });
+        assert!(
+            is_scratch_editor,
+            "ctrl-r runs it: key context zenith_scratch"
+        );
         let visible_worktrees = fixture.workspace.read_with(cx, |workspace, cx| {
             workspace.project().read(cx).visible_worktrees(cx).count()
         });
@@ -949,7 +1425,12 @@ mod tests {
 
         // The second language (JavaScript), and the panel follows the folder.
         new_scratch(cx, 1);
-        assert!(fixture.fs.is_file(&store_dir().join("scratch.js")).await);
+        assert!(
+            fixture
+                .fs
+                .is_file(&default_store_dir().join("scratch.js"))
+                .await
+        );
         assert_eq!(names(&fixture, cx).len(), 2);
     }
 
@@ -958,7 +1439,7 @@ mod tests {
         let (fixture, cx) = fixture(cx).await;
         open_panel(&fixture, cx);
         new_scratch(cx, 0);
-        let path = store_dir().join("scratch.php");
+        let path = default_store_dir().join("scratch.php");
 
         fixture.panel.update_in(cx, |panel, window, cx| {
             panel.select_ix(0, cx);
@@ -977,7 +1458,7 @@ mod tests {
             gpui::private::serde_json::json!({"keep.php": ""}),
         )
         .await;
-        let dir = store_dir();
+        let dir = default_store_dir();
         create(fs.as_ref(), &dir, "php").await.unwrap();
 
         let err = delete(fs.as_ref(), &dir, Path::new("/elsewhere/keep.php")).await;
@@ -995,7 +1476,7 @@ mod tests {
     #[gpui::test]
     async fn rename_refuses_traversal_and_overwrite(cx: &mut TestAppContext) {
         let fs = fs::FakeFs::new(cx.executor());
-        let dir = store_dir();
+        let dir = default_store_dir();
         let a = create(fs.as_ref(), &dir, "php").await.unwrap();
         let b = create(fs.as_ref(), &dir, "php").await.unwrap();
 
@@ -1061,7 +1542,12 @@ mod tests {
         cx.simulate_keystrokes("enter");
         cx.run_until_parked();
         assert!(modal.read_with(cx, |modal, _| modal.error.is_some()));
-        assert!(fixture.fs.is_file(&store_dir().join("scratch.php")).await);
+        assert!(
+            fixture
+                .fs
+                .is_file(&default_store_dir().join("scratch.php"))
+                .await
+        );
 
         modal.update_in(cx, |modal, window, cx| {
             modal
