@@ -23369,7 +23369,6 @@ dependencies = [
  "open_path_prompt",
  "outline",
  "picker",
- "picker_preview",
  "project",
  "project_symbols",
  "search",
