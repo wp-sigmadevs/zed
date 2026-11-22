@@ -25,6 +25,8 @@ pub struct ZenithSettingsContent {
     pub hover_card: Option<ZenithHoverCardSettingsContent>,
     /// Settings for agent review.
     pub agent_review: Option<ZenithAgentReviewSettingsContent>,
+    /// Settings for scratch files.
+    pub scratches: Option<ZenithScratchesSettingsContent>,
 }
 
 /// Settings for agent review.
@@ -177,4 +179,27 @@ pub struct ZenithLocalHistorySettingsContent {
     ///
     /// Default: true
     pub snapshot_external_changes: Option<bool>,
+}
+
+/// Settings for scratch files.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+pub struct ZenithScratchesSettingsContent {
+    /// Whether the Scratches tool window and scratch actions are offered.
+    ///
+    /// Default: true
+    pub enabled: Option<bool>,
+    /// Absolute folder that holds scratch files, instead of the default one in the data dir.
+    ///
+    /// Default: null
+    pub directory: Option<String>,
+    /// Run commands by file extension, as a program and its arguments; `$ZED_FILE` is the
+    /// scratch file. Merged over the built-in runners; an empty list disables one.
+    ///
+    /// Default: {}
+    pub runners: Option<collections::HashMap<String, Vec<String>>>,
+    /// Whether a scratch runs in the project's root folder (e.g. so PHP's
+    /// `vendor/autoload.php` resolves), instead of the scratches folder.
+    ///
+    /// Default: true
+    pub use_project_cwd: Option<bool>,
 }

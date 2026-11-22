@@ -3051,6 +3051,19 @@
       // Record a local-history checkpoint per agent turn and offer review.
       "enabled": true,
     },
+    // Scratch files (⌘⇧N): global files of any language, run with ⌃R.
+    "scratches": {
+      // Offer the Scratches tool window and scratch actions.
+      "enabled": true,
+      // Absolute folder for scratch files; null keeps them in the data dir.
+      "directory": null,
+      // Run commands by extension, as program and arguments; "$ZED_FILE" is the scratch.
+      // Merged over the built-ins (php, js, mjs, ts, py, sh); [] disables one, e.g.
+      // "rb": ["ruby", "$ZED_FILE"].
+      "runners": {},
+      // Run in the project's root folder instead of the scratches folder.
+      "use_project_cwd": true,
+    },
   },
   // The server to connect to. If the environment variable
   // ZED_SERVER_URL is set, it will override this setting.
