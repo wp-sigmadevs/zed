@@ -46,6 +46,8 @@ pub struct ZenithSettingsContent {
     pub scratches: Option<ZenithScratchesSettingsContent>,
     /// Settings for Deployment (Remote Host tool window).
     pub deploy: Option<ZenithDeploySettingsContent>,
+    /// Settings for PHP tools.
+    pub php_tools: Option<ZenithPhpToolsSettingsContent>,
 }
 
 /// Settings for Deployment. Upload on save is a per-server option, never a setting.
@@ -59,6 +61,17 @@ pub struct ZenithDeploySettingsContent {
     ///
     /// Default: right
     pub dock: Option<crate::DockPosition>,
+}
+
+/// Settings for PHP tools.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+pub struct ZenithPhpToolsSettingsContent {
+    /// Absolute path of the PHP command line interpreter that tools and inspections run,
+    /// tried before every PHP found on this machine. Read from user settings only: a
+    /// binary chosen by a project would run its code.
+    ///
+    /// Default: null
+    pub php_binary: Option<String>,
 }
 
 /// Settings for agent review.

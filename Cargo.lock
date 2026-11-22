@@ -23364,6 +23364,7 @@ dependencies = [
  "language",
  "libc",
  "log",
+ "lsp",
  "project",
  "serde_json",
  "settings",

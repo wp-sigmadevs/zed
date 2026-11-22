@@ -21,6 +21,7 @@ gpui.workspace = true
 http_client.workspace = true
 language.workspace = true
 log.workspace = true
+lsp.workspace = true
 project.workspace = true
 serde_json.workspace = true
 settings.workspace = true
