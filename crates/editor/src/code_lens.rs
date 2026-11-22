@@ -196,7 +196,7 @@ fn try_show_references(
     if locations.is_empty() {
         return false;
     }
-    if zenith_show_locations(&locations, action.server_id, editor, window, cx) {
+    if zenith_show_locations(&locations, action, editor, window, cx) {
         return true;
     }
 
@@ -2196,10 +2196,11 @@ mod tests {
 }
 
 // Zenith: lets a zenith crate show a lens's locations in its own popup (PhpStorm's Usages).
-// The handler gets the locations as buffer ranges and, for its "Open in Tab", the upstream
-// list; it returns false to leave the click to the upstream code above.
+// The handler gets the lens, its locations as buffer ranges and, for its "Open in Tab", the
+// upstream list; it returns false to leave the click to the upstream code above.
 pub type CodeLensOpenInTab = Box<dyn FnOnce(&mut Editor, &mut Window, &mut Context<Editor>)>;
 pub type CodeLensLocationsFn = fn(
+    &CodeAction,
     Task<anyhow::Result<Vec<project::Location>>>,
     CodeLensOpenInTab,
     &mut Editor,
@@ -2213,7 +2214,7 @@ pub fn set_code_lens_locations_handler(show: CodeLensLocationsFn) {
 
 fn zenith_show_locations(
     locations: &[lsp::Location],
-    server_id: language::LanguageServerId,
+    action: &CodeAction,
     editor: &mut Editor,
     window: &mut Window,
     cx: &mut Context<Editor>,
@@ -2221,6 +2222,7 @@ fn zenith_show_locations(
     let (Some(show), Some(project)) = (CODE_LENS_LOCATIONS.get(), editor.project.clone()) else {
         return false;
     };
+    let server_id = action.server_id;
     // Same conversion as `Editor::compute_target_location` (navigation.rs), all at once.
     let opening = locations
         .iter()
@@ -2257,5 +2259,5 @@ fn zenith_show_locations(
                 .detach_and_log_err(cx);
         },
     );
-    show(resolved, open_in_tab, editor, window, cx)
+    show(action, resolved, open_in_tab, editor, window, cx)
 }
