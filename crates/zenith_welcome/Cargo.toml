@@ -16,6 +16,7 @@ doctest = false
 anyhow.workspace = true
 chrono.workspace = true
 db.workspace = true
+extension_host.workspace = true
 fs.workspace = true
 futures.workspace = true
 fuzzy_nucleo.workspace = true
@@ -32,6 +33,7 @@ zed_actions.workspace = true
 
 [dev-dependencies]
 language.workspace = true
+menu.workspace = true
 assets.workspace = true
 client.workspace = true
 editor = { workspace = true, features = ["test-support"] }
