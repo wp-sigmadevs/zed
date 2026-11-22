@@ -1,30 +1,30 @@
 //! PhpStorm's Find in Files / Replace in Files popup (⌘⇧F / ⌘⇧R): a header with the
 //! live match count and the file mask, a query box with case, word and regex toggles,
-//! an In Project / Directory scope, the matching lines, a code preview of the picked
+//! an In Project / Directory scope, the matching lines, an editable preview of the picked
 //! one, and a hand-off to the project search tab ("Open in Find Window") that does
 //! the replacing.
 
 use std::{
     ops::Range,
     path::{Path, PathBuf},
-    sync::Arc,
 };
 
-use editor::{Editor, EditorEvent, SelectionEffects, scroll::Autoscroll};
+use editor::{
+    Editor, EditorEvent, SelectionEffects, display_map::HighlightKey, scroll::Autoscroll,
+};
 use gpui::{
     App, ClickEvent, Context, DismissEvent, Div, Entity, EventEmitter, FocusHandle, Focusable,
     HighlightStyle, IntoElement, ParentElement, Render, Role, ScrollStrategy, SharedString, Styled,
     StyledText, Subscription, Task, UniformListScrollHandle, WeakEntity, Window, div, prelude::*,
     px, uniform_list,
 };
-use language::{BufferSnapshot, HighlightId, LanguageAwareStyling};
-use picker::{MatchLocation, PreviewBackend, PreviewLayout, PreviewUpdate};
+use language::{BufferEvent, BufferSnapshot, HighlightId, LanguageAwareStyling};
 use project::{
     Project, ProjectPath,
     search::{SearchQuery, SearchResult},
 };
 use settings::SeedQuerySetting;
-use text::{Point, ToOffset as _, ToPoint as _};
+use text::{Point, ToPoint as _};
 use ui::{
     Button, ButtonSize, ButtonStyle, Checkbox, ContextMenu, IconButton, IconPosition, Label,
     PopoverMenu, PopoverMenuHandle, ScrollAxes, Scrollbars, TintColor, Tooltip, WithScrollbar,
@@ -152,8 +152,14 @@ pub struct FindInFilesModal {
     workspace: WeakEntity<Workspace>,
     project: Entity<Project>,
     previous_focus: FocusHandle,
-    /// The picked hit's code, drawn under the list.
-    preview: Arc<dyn PreviewBackend>,
+    /// The picked hit's file in an ordinary editor under the list: edits go to the
+    /// project's buffer, so open tabs see them too.
+    preview: Option<Entity<Editor>>,
+    /// The preview was typed in since it was last saved.
+    preview_edited: bool,
+    _preview_edits: Option<Subscription>,
+    /// Redraw the rows when a buffer they come from gets its language or a parse.
+    _syntax_watch: Vec<Subscription>,
     scroll: UniformListScrollHandle,
     hits: Vec<Hit>,
     selected: usize,
@@ -189,8 +195,16 @@ pub struct FindInFilesModal {
 }
 
 impl ModalView for FindInFilesModal {
-    fn on_before_dismiss(&mut self, _: &mut Window, _: &mut Context<Self>) -> DismissDecision {
-        DismissDecision::Dismiss(!self.pinned || self.closing)
+    fn on_before_dismiss(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> DismissDecision {
+        let dismiss = !self.pinned || self.closing;
+        if dismiss {
+            self.save_preview(window, cx);
+        }
+        DismissDecision::Dismiss(dismiss)
     }
 }
 impl EventEmitter<DismissEvent> for FindInFilesModal {}
@@ -274,7 +288,6 @@ impl FindInFilesModal {
         let mask = field("*.php, *.js", window, cx);
         let directory = field("Directory, relative to the project", window, cx);
         let replace_field = replace.then(|| field("Replace with", window, cx));
-        let preview = picker_preview::editor_preview(project.clone(), window, cx);
 
         let mut subscriptions = Vec::new();
         for editor in [&query, &mask, &directory] {
@@ -308,7 +321,10 @@ impl FindInFilesModal {
             workspace,
             project,
             previous_focus,
-            preview,
+            preview: None,
+            preview_edited: false,
+            _preview_edits: None,
+            _syntax_watch: Vec::new(),
             scroll: UniformListScrollHandle::new(),
             hits: Vec::new(),
             selected: 0,
@@ -466,6 +482,7 @@ impl FindInFilesModal {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self._syntax_watch = watch_syntax(&hits, cx);
         self.hits = hits;
         self.capped = capped;
         self.select(0, window, cx);
@@ -480,9 +497,11 @@ impl FindInFilesModal {
         cx.notify();
     }
 
+    /// Points the preview at the picked hit, saving what was typed in it first.
     fn update_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(hit) = self.hits.get(self.selected) else {
-            self.preview.clear(cx);
+        self.save_preview(window, cx);
+        let Some(hit) = self.hits.get(self.selected).cloned() else {
+            self.preview = None;
             #[cfg(test)]
             {
                 self.previewed = None;
@@ -493,25 +512,134 @@ impl FindInFilesModal {
         {
             self.previewed = Some((hit.project_path.clone(), hit.point.row));
         }
-        self.preview.update(
-            PreviewUpdate::from_buffer(
-                hit.buffer.clone(),
-                MatchLocation {
-                    anchor_range: hit.anchors.clone(),
-                    range: hit.offsets.clone(),
-                },
-            ),
-            window,
-            cx,
-        );
-        // The editor knows its height only after it is drawn; then centre the match.
-        let preview = self.preview.clone();
-        window.on_next_frame(move |window, _| {
-            window.on_next_frame(move |window, cx| preview.adjust_to_new_size(window, cx));
+        let same_file = self.preview.clone().filter(|editor| {
+            editor.read(cx).buffer().read(cx).as_singleton().as_ref() == Some(&hit.buffer)
+        });
+        let editor = match same_file {
+            Some(editor) => editor,
+            None => {
+                let editor = cx.new(|cx| {
+                    Editor::for_buffer(hit.buffer.clone(), Some(self.project.clone()), window, cx)
+                });
+                self._preview_edits =
+                    Some(cx.subscribe(&editor, |this, _, event: &EditorEvent, _| {
+                        if matches!(event, EditorEvent::BufferEdited) {
+                            this.preview_edited = true;
+                        }
+                    }));
+                self.preview = Some(editor.clone());
+                editor
+            }
+        };
+        let text = hit.buffer.read(cx).text_snapshot();
+        let start = hit.anchors.start.to_point(&text);
+        let end = hit.anchors.end.to_point(&text);
+        editor.update(cx, |editor, cx| {
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            let range = snapshot.anchor_after(start)..snapshot.anchor_before(end);
+            editor.highlight_background(
+                HighlightKey::PickerPreview,
+                &[range],
+                |_, theme| theme.colors().search_match_background,
+                cx,
+            );
+            editor.change_selections(
+                SelectionEffects::scroll(Autoscroll::center()),
+                window,
+                cx,
+                |selections| selections.select_ranges([start..start]),
+            );
         });
     }
 
+    fn preview_buffer(&self, cx: &App) -> Option<Entity<language::Buffer>> {
+        self.preview
+            .as_ref()?
+            .read(cx)
+            .buffer()
+            .read(cx)
+            .as_singleton()
+    }
+
+    fn preview_focused(&self, window: &Window, cx: &App) -> bool {
+        self.preview.as_ref().is_some_and(|editor| {
+            editor
+                .read(cx)
+                .focus_handle(cx)
+                .contains_focused(window, cx)
+        })
+    }
+
+    /// Saves the preview's file if it was typed in, as PhpStorm keeps no unsaved
+    /// edits: on switching hits and on closing.
+    fn save_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !std::mem::take(&mut self.preview_edited) {
+            return;
+        }
+        if let Some(buffer) = self.preview_buffer(cx) {
+            self.save_buffer(buffer, window, cx);
+        }
+    }
+
+    fn save_buffer(
+        &self,
+        buffer: Entity<language::Buffer>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (dirty, conflict) = {
+            let buffer = buffer.read(cx);
+            (buffer.is_dirty(), buffer.has_conflict())
+        };
+        if !dirty {
+            return;
+        }
+        if conflict {
+            // Changed on disk too: open it in a tab, which keeps the edits and asks
+            // before overwriting. Deferred, as the workspace may be mid-update here.
+            let Some(file) = buffer.read(cx).file() else {
+                return;
+            };
+            let project_path = ProjectPath {
+                worktree_id: file.worktree_id(cx),
+                path: file.path().clone(),
+            };
+            let workspace = self.workspace.clone();
+            cx.spawn_in(window, async move |_, cx| {
+                let open = workspace.update_in(cx, |workspace, window, cx| {
+                    workspace.open_path(project_path, None, false, window, cx)
+                })?;
+                open.await?;
+                // Held until the tab has it: the project keeps only a weak handle.
+                drop(buffer);
+                anyhow::Ok(())
+            })
+            .detach_and_log_err(cx);
+            return;
+        }
+        self.project
+            .update(cx, |project, cx| project.save_buffer(buffer, cx))
+            .detach_and_log_err(cx);
+    }
+
+    /// ⌘S in the preview saves its file; elsewhere it does what it does in the workspace.
+    fn save(&mut self, _: &workspace::Save, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.preview_focused(window, cx) {
+            cx.propagate();
+            return;
+        }
+        self.preview_edited = false;
+        if let Some(buffer) = self.preview_buffer(cx) {
+            self.save_buffer(buffer, window, cx);
+        }
+    }
+
     fn select_next(&mut self, _: &menu::SelectNext, window: &mut Window, cx: &mut Context<Self>) {
+        // The picker's arrow keys reach the preview too; there they move the caret.
+        if self.preview_focused(window, cx) {
+            cx.propagate();
+            return;
+        }
         // In the mask box the arrows open its history, as in a combo box.
         if self.mask.read(cx).focus_handle(cx).is_focused(window) {
             self.mask_menu.toggle(window, cx);
@@ -528,6 +656,10 @@ impl FindInFilesModal {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.preview_focused(window, cx) {
+            cx.propagate();
+            return;
+        }
         if self.mask.read(cx).focus_handle(cx).is_focused(window) {
             self.mask_menu.toggle(window, cx);
             return;
@@ -546,7 +678,12 @@ impl FindInFilesModal {
         self.select(self.hits.len().saturating_sub(1), window, cx);
     }
 
-    fn cancel(&mut self, _: &menu::Cancel, _: &mut Window, cx: &mut Context<Self>) {
+    /// Esc in the preview goes back to the search box; anywhere else it closes.
+    fn cancel(&mut self, _: &menu::Cancel, window: &mut Window, cx: &mut Context<Self>) {
+        if self.preview_focused(window, cx) {
+            window.focus(&self.query.read(cx).focus_handle(cx), cx);
+            return;
+        }
         self.close(cx);
     }
 
@@ -602,6 +739,11 @@ impl FindInFilesModal {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Tab indents in the preview.
+        if self.preview_focused(window, cx) {
+            cx.propagate();
+            return;
+        }
         let mut fields = vec![self.query.read(cx).focus_handle(cx)];
         fields.extend(self.replace.iter().map(|e| e.read(cx).focus_handle(cx)));
         if self.scope == Scope::Directory {
@@ -854,6 +996,22 @@ impl FindInFilesModal {
     #[cfg(test)]
     pub(crate) fn previewed(&self) -> Option<(ProjectPath, u32)> {
         self.previewed.clone()
+    }
+
+    /// How many coloured runs each row is drawn with now.
+    #[cfg(test)]
+    pub(crate) fn syntax_runs(&self, cx: &App) -> Vec<usize> {
+        self.hits.iter().map(|hit| hit.syntax(cx).len()).collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn preview_editor(&self) -> Option<Entity<Editor>> {
+        self.preview.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn query_focused(&self, window: &Window, cx: &App) -> bool {
+        self.query.read(cx).focus_handle(cx).is_focused(window)
     }
 
     /// A rounded box round an editor whose border turns blue while it has focus.
@@ -1211,7 +1369,8 @@ impl FindInFilesModal {
             background_color: Some(colors.search_match_background),
             ..Default::default()
         };
-        let syntax = cx.theme().syntax().resolve_runs(&hit.syntax);
+        let syntax = hit.syntax(cx);
+        let syntax = cx.theme().syntax().resolve_runs(&syntax);
         let highlights = row_highlights(&hit.line, syntax, &hit.matches, chip);
         let text_color = if is_comment_line(&hit.line) {
             colors.text_muted
@@ -1232,6 +1391,8 @@ impl FindInFilesModal {
             })
             .hover(|row| row.bg(colors.ghost_element_hover))
             .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                // Back from the preview, so the arrows walk the list again.
+                window.focus(&this.query.read(cx).focus_handle(cx), cx);
                 this.select(ix, window, cx);
                 if event.click_count() > 1 {
                     this.confirm(&menu::Confirm, window, cx);
@@ -1272,7 +1433,14 @@ impl FindInFilesModal {
                     .debug_selector(|| "zenith-find-preview".into())
                     .h(px(PREVIEW_HEIGHT))
                     .overflow_hidden()
-                    .child(self.preview.render(PreviewLayout::Below, cx)),
+                    .map(|this| match &self.preview {
+                        Some(editor) => this.child(editor.clone()),
+                        None => this
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(Label::new("No results to preview").color(Color::Muted)),
+                    }),
             )
     }
 
@@ -1354,6 +1522,7 @@ impl Render for FindInFilesModal {
             .on_action(cx.listener(Self::confirm))
             .on_action(cx.listener(Self::secondary_confirm))
             .on_action(cx.listener(Self::cancel))
+            .on_action(cx.listener(Self::save))
             .on_action(cx.listener(Self::focus_next_field))
             .on_action(cx.listener(Self::toggle_pin))
             .on_action(cx.listener(Self::cycle_scope))
@@ -1389,7 +1558,6 @@ pub struct Hit {
     pub(super) buffer: Entity<language::Buffer>,
     /// The first match, for the preview.
     pub(super) anchors: Range<text::Anchor>,
-    pub(super) offsets: Range<usize>,
     pub(super) project_path: ProjectPath,
     pub(super) file_name: SharedString,
     pub(super) directory: SharedString,
@@ -1397,9 +1565,39 @@ pub struct Hit {
     /// The line with leading space removed, and the byte ranges that matched in it.
     pub(super) line: String,
     pub(super) matches: Vec<Range<usize>>,
-    /// The syntax colours of `line`, found once with the hit and turned into styles
-    /// with the current theme when the row is drawn.
-    pub(super) syntax: Vec<(Range<usize>, HighlightId)>,
+    /// The bytes of leading space cut off `line`.
+    lead: usize,
+}
+
+impl Hit {
+    /// The syntax colours of `line`, read when the row is drawn: a file the search
+    /// opened is usually not parsed yet when its hit is made, so they come later.
+    pub(super) fn syntax(&self, cx: &App) -> Vec<(Range<usize>, HighlightId)> {
+        let snapshot = self.buffer.read(cx).snapshot();
+        let row = self.anchors.start.to_point(&snapshot).row;
+        line_syntax(&snapshot, row, snapshot.line_len(row), self.lead)
+    }
+}
+
+/// Subscriptions that redraw the rows when one of their buffers gets a language or
+/// finishes a parse, so rows drawn before that get their colours.
+pub(super) fn watch_syntax<T: 'static>(hits: &[Hit], cx: &mut Context<T>) -> Vec<Subscription> {
+    let mut buffers: Vec<&Entity<language::Buffer>> = hits.iter().map(|hit| &hit.buffer).collect();
+    buffers.sort_by_key(|buffer| buffer.entity_id());
+    buffers.dedup();
+    buffers
+        .into_iter()
+        .map(|buffer| {
+            cx.subscribe(buffer, |_, _, event: &BufferEvent, cx| {
+                if matches!(
+                    event,
+                    BufferEvent::LanguageChanged(_) | BufferEvent::Reparsed
+                ) {
+                    cx.notify();
+                }
+            })
+        })
+        .collect()
 }
 
 /// What one buffer's hits are built from. Made on the main thread, which owns the
@@ -1472,14 +1670,13 @@ impl HitSource {
             hits.push(Hit {
                 buffer: self.buffer.clone(),
                 anchors: range.clone(),
-                offsets: range.start.to_offset(snapshot)..range.end.to_offset(snapshot),
                 project_path: self.project_path.clone(),
                 file_name: self.file_name.clone(),
                 directory: self.directory.clone(),
                 point: start,
                 line: text[lead..].to_string(),
                 matches: vec![matched],
-                syntax: line_syntax(snapshot, start.row, line_len, lead),
+                lead,
             });
         }
         hits

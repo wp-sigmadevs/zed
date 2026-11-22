@@ -9,8 +9,8 @@ use editor::{Editor, actions::FindAllReferences};
 use gpui::{
     App, ClickEvent, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable,
     HighlightStyle, IntoElement, ParentElement, Render, Role, ScrollStrategy, SharedString, Styled,
-    StyledText, Task, UniformListScrollHandle, WeakEntity, Window, div, prelude::*, px,
-    uniform_list,
+    StyledText, Subscription, Task, UniformListScrollHandle, WeakEntity, Window, div, prelude::*,
+    px, uniform_list,
 };
 use project::Location;
 use settings::SeedQuerySetting;
@@ -23,7 +23,9 @@ use workspace::{ModalView, Workspace, searchable::SearchableItem};
 
 use super::{
     OpenUsagesInTab,
-    find_in_files::{Hit, HitSource, SearchContext, is_comment_line, open_hit, row_highlights},
+    find_in_files::{
+        Hit, HitSource, SearchContext, is_comment_line, open_hit, row_highlights, watch_syntax,
+    },
     popup::{Frame, PopupKind},
     style::{
         FOOTER_HEIGHT, HEADER_GAP, HEADER_HEIGHT, PADDING, POPUP_BAND, POPUP_FOOTER, ROW_HEIGHT,
@@ -57,6 +59,7 @@ pub(crate) struct UsagesModal {
     scroll: UniformListScrollHandle,
     frame: Frame,
     search: Task<()>,
+    _syntax_watch: Vec<Subscription>,
 }
 
 impl ModalView for UsagesModal {}
@@ -109,6 +112,7 @@ impl UsagesModal {
                 scroll: UniformListScrollHandle::new(),
                 frame: Frame::default(),
                 search: Task::ready(()),
+                _syntax_watch: Vec::new(),
             };
             match locations {
                 Some(locations) => {
@@ -129,6 +133,7 @@ impl UsagesModal {
         match result {
             Ok(locations) => {
                 (self.rows, self.capped) = usage_rows(locations, cx);
+                self._syntax_watch = watch_syntax(&self.rows, cx);
                 self.state = State::Done;
             }
             Err(error) => {
@@ -290,7 +295,8 @@ impl UsagesModal {
             background_color: Some(colors.search_match_background),
             ..Default::default()
         };
-        let syntax = cx.theme().syntax().resolve_runs(&row.syntax);
+        let syntax = row.syntax(cx);
+        let syntax = cx.theme().syntax().resolve_runs(&syntax);
         let highlights = row_highlights(&row.line, syntax, &row.matches, chip);
         let text_color = if is_comment_line(&row.line) {
             colors.text_muted

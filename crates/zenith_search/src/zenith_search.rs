@@ -3016,6 +3016,129 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_find_in_files_colours_rows_of_files_parsed_after_the_search(
+        cx: &mut TestAppContext,
+    ) {
+        let (workspace, modal, cx) = open_find_in_files(
+            serde_json::json!({
+                "a.rs": "fn alpha() {}\n",
+                "b.rs": "fn beta() {}\n",
+                "c.rs": "fn gamma() {}\n",
+            }),
+            cx,
+        )
+        .await;
+        modal.update_in(cx, |m, window, cx| m.set_query("fn", window, cx));
+        cx.run_until_parked();
+        let syntax_runs =
+            |cx: &mut VisualTestContext| modal.read_with(cx, |m, cx| m.syntax_runs(cx));
+        // The search opened these files; none has a language or a parse yet.
+        assert_eq!(syntax_runs(cx), [0, 0, 0]);
+        let rust = language::rust_lang();
+        rust.set_theme(&theme::SyntaxTheme::new([(
+            "keyword".to_string(),
+            gpui::HighlightStyle::default(),
+        )]));
+        let languages = workspace.read_with(cx, |workspace, cx| {
+            workspace.project().read(cx).languages().clone()
+        });
+        languages.add(rust);
+        cx.run_until_parked();
+        // Every row is coloured once its file is parsed, without searching again.
+        let runs = syntax_runs(cx);
+        assert_eq!(runs.len(), 3);
+        assert!(
+            runs.iter().all(|runs| *runs > 0),
+            "uncoloured rows: {runs:?}"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_find_in_files_preview_edits_reach_the_file_and_are_saved(
+        cx: &mut TestAppContext,
+    ) {
+        let (workspace, modal, cx) = open_find_in_files(
+            serde_json::json!({
+                "a.php": "<?php\nadd_action('a');\n",
+                "b.php": "add_action('b');\n",
+            }),
+            cx,
+        )
+        .await;
+        let project = workspace.read_with(cx, |workspace, _| workspace.project().clone());
+        let fs = project.read_with(cx, |project, _| project.fs().clone());
+        let disk = |name: &'static str| {
+            let fs = fs.clone();
+            async move {
+                let path = std::path::Path::new("/root").join(name);
+                fs.load(&path).await.expect("file loads")
+            }
+        };
+        modal.update_in(cx, |m, window, cx| m.set_query("add_action", window, cx));
+        cx.run_until_parked();
+        let type_in_preview = |text: &'static str, cx: &mut VisualTestContext| {
+            let editor = modal
+                .read_with(cx, |m, _| m.preview_editor())
+                .expect("preview");
+            editor.update_in(cx, |editor, window, cx| {
+                window.focus(&editor.focus_handle(cx), cx);
+                editor.insert(text, window, cx);
+            });
+            cx.run_until_parked();
+        };
+
+        // Typing in the preview edits the project's buffer, at the match.
+        type_in_preview("x", cx);
+        let buffer = modal
+            .read_with(cx, |m, cx| {
+                m.preview_editor()?
+                    .read(cx)
+                    .buffer()
+                    .read(cx)
+                    .as_singleton()
+            })
+            .expect("one file");
+        let project_buffer = project
+            .update(cx, |project, cx| {
+                project.open_local_buffer("/root/a.php", cx)
+            })
+            .await
+            .expect("buffer opens");
+        assert_eq!(project_buffer, buffer);
+        assert_eq!(
+            buffer.read_with(cx, |buffer, _| buffer.text()),
+            "<?php\nxadd_action('a');\n"
+        );
+        // The arrows move the caret there, not the list; Esc goes back to the query.
+        cx.dispatch_action(menu::SelectNext);
+        assert_eq!(modal.read_with(cx, |m, _| m.selected_index()), 0);
+        cx.dispatch_action(menu::Cancel);
+        assert!(modal.update_in(cx, |m, window, cx| m.query_focused(window, cx)));
+        // Moving to another hit saves the edited file.
+        cx.dispatch_action(menu::SelectNext);
+        cx.run_until_parked();
+        assert_eq!(disk("a.php").await, "<?php\nxadd_action('a');\n");
+
+        // ⌘S in the preview saves at once.
+        type_in_preview("y", cx);
+        cx.dispatch_action(workspace::Save { save_intent: None });
+        cx.run_until_parked();
+        assert_eq!(disk("b.php").await, "yadd_action('b');\n");
+
+        // Closing the popup saves what was typed last.
+        type_in_preview("z", cx);
+        cx.dispatch_action(menu::Cancel);
+        cx.dispatch_action(menu::Cancel);
+        cx.run_until_parked();
+        assert!(workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .active_modal::<find_in_files::FindInFilesModal>(cx)
+                .is_none()
+        }));
+        assert_eq!(disk("b.php").await, "yzadd_action('b');\n");
+    }
+
+    #[gpui::test]
     async fn test_open_results_in_new_tab_decides_what_enter_does(cx: &mut TestAppContext) {
         let (workspace, modal, cx) = open_find_in_files(
             serde_json::json!({ "a.php": "<?php\n\nadd_action('init');\n" }),
