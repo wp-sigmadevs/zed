@@ -384,9 +384,9 @@ impl StringCompletionSource for RoutePaths {
         line: &'a str,
         cx: &mut App,
     ) -> Option<&'a str> {
-        let is_script = path.rsplit_once('.').is_some_and(|(_, extension)| {
-            matches!(extension, "js" | "jsx" | "ts" | "tsx" | "mjs")
-        });
+        let is_script = path
+            .rsplit_once('.')
+            .is_some_and(|(_, extension)| matches!(extension, "js" | "jsx" | "ts" | "tsx" | "mjs"));
         if !NextJsSettings::get_global(cx).enabled || !is_script {
             return None;
         }
@@ -764,10 +764,16 @@ mod tests {
         apply(&index, &roots, HashMap::from([(known.clone(), true)]), caps);
         assert_eq!(read_index(&index).route_count(), 3);
         apply(&index, &roots, HashMap::from([(known, false)]), caps);
+        // Which of b1/b2 got the slot depends on HashMap order: add the other one.
+        let (indexed_b, refused_b) = if read_index(&index).contains_file(&page(b.path(), "b1")) {
+            ("b1", "b2")
+        } else {
+            ("b2", "b1")
+        };
         apply(
             &index,
             &roots,
-            HashMap::from([(page(b.path(), "b2"), true)]),
+            HashMap::from([(page(b.path(), refused_b), true)]),
             caps,
         );
         assert_eq!(
@@ -776,7 +782,7 @@ mod tests {
         );
 
         // A batch that deletes one file and adds another nets out: the delete is counted first.
-        let held = page(b.path(), "b1");
+        let held = page(b.path(), indexed_b);
         let swap = HashMap::from([(held, false), (page(b.path(), "b3"), true)]);
         apply(&index, &roots, swap, caps);
         assert!(read_index(&index).contains_file(&page(b.path(), "b3")));
@@ -1058,11 +1064,19 @@ mod tests {
             route_completions_at(&editor, &buffer, inside, cx).await,
             ["/about", "/api/hook"]
         );
-        assert!(route_completions_at(&editor, &buffer, outside, cx).await.is_empty());
+        assert!(
+            route_completions_at(&editor, &buffer, outside, cx)
+                .await
+                .is_empty()
+        );
 
         set_enabled(false, cx);
         cx.run_until_parked();
-        assert!(route_completions_at(&editor, &buffer, inside, cx).await.is_empty());
+        assert!(
+            route_completions_at(&editor, &buffer, inside, cx)
+                .await
+                .is_empty()
+        );
     }
 
     /// Adds `name` with `content` to both the real disk and the fake one.

@@ -22916,6 +22916,7 @@ dependencies = [
  "zenith_local_history",
  "zenith_look",
  "zenith_markdown",
+ "zenith_navbar",
  "zenith_nextjs",
  "zenith_php_tools",
  "zenith_postfix",
@@ -23178,6 +23179,22 @@ dependencies = [
  "gpui",
  "language",
  "markdown_preview",
+ "project",
+ "serde_json",
+ "ui",
+ "util",
+ "workspace",
+]
+
+[[package]]
+name = "zenith_navbar"
+version = "0.1.0"
+dependencies = [
+ "editor",
+ "file_icons",
+ "gpui",
+ "language",
+ "menu",
  "project",
  "serde_json",
  "ui",
