@@ -1,6 +1,8 @@
 //! Zenith additions to the title bar (plan 34, step 2).
 
-use gpui::{Action, Entity, FontWeight, Hsla};
+use std::collections::HashMap;
+
+use gpui::{Action, Entity, EntityId, FontWeight, Global, Hsla};
 use project::{Inventory, Project};
 use ui::{ButtonLike, IconButton, Tooltip, Vector, VectorName, prelude::*};
 
@@ -42,7 +44,7 @@ pub fn middle(project: &Entity<Project>, cx: &App) -> impl IntoElement + use<> {
         .child(div().w(px(10.)))
         .child(run_controls(project, cx))
         .child(div().w(px(8.)))
-        .child(agent_chip())
+        .child(agent_chip(project, cx))
         .child(div().w(px(4.)))
         .child(
             IconButton::new("zenith-settings", IconName::Settings)
@@ -151,17 +153,86 @@ fn run_controls(project: &Entity<Project>, cx: &App) -> impl IntoElement + use<>
 /// Plan 34: orange marks anything an agent did; nothing else in the UI uses it.
 pub const AGENT_ORANGE: u32 = 0xff7a3d;
 
-/// Agent chip; toggles the agent panel. Live "1 running · review 2" counts come with plan 22.
-fn agent_chip() -> impl IntoElement {
+/// Agent activity of one project, as the title-bar chip shows it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AgentCounts {
+    pub running: usize,
+    /// Files with agent edits waiting for review.
+    pub review: usize,
+}
+
+/// Per-project agent counts, written by the agent review queue. A global, so the title bar
+/// needs no dependency on the agent crates.
+#[derive(Default)]
+pub struct AgentChip(HashMap<EntityId, AgentCounts>);
+
+impl Global for AgentChip {}
+
+impl AgentChip {
+    pub fn counts(project_id: EntityId, cx: &App) -> AgentCounts {
+        cx.try_global::<Self>()
+            .and_then(|chip| chip.0.get(&project_id).copied())
+            .unwrap_or_default()
+    }
+
+    /// Callers notify the workspace afterwards so the title bar repaints.
+    pub fn set(project_id: EntityId, counts: AgentCounts, cx: &mut App) {
+        let chip = cx.default_global::<Self>();
+        if counts == AgentCounts::default() {
+            chip.0.remove(&project_id);
+        } else {
+            chip.0.insert(project_id, counts);
+        }
+    }
+}
+
+/// Chip text and the review count for its badge: "Agents" when idle, else the non-zero
+/// parts, e.g. "1 running · review" with badge 2.
+pub fn agent_chip_label(counts: AgentCounts) -> (String, Option<usize>) {
+    let running = (counts.running > 0).then(|| format!("{} running", counts.running));
+    let review = (counts.review > 0).then(|| "review".to_string());
+    let text = [running, review].into_iter().flatten().collect::<Vec<_>>();
+    if text.is_empty() {
+        return ("Agents".to_string(), None);
+    }
+    (
+        text.join(" · "),
+        (counts.review > 0).then_some(counts.review),
+    )
+}
+
+/// What a screen reader says for the chip, e.g. "Agents: 1 running, 2 files to review".
+fn agent_chip_aria_label(counts: AgentCounts) -> String {
+    let mut parts = Vec::new();
+    if counts.running > 0 {
+        parts.push(format!("{} running", counts.running));
+    }
+    if counts.review > 0 {
+        let plural = if counts.review == 1 { "" } else { "s" };
+        parts.push(format!("{} file{plural} to review", counts.review));
+    }
+    if parts.is_empty() {
+        "Agents".to_string()
+    } else {
+        format!("Agents: {}", parts.join(", "))
+    }
+}
+
+/// Agent chip with live counts; toggles the agent panel.
+fn agent_chip(project: &Entity<Project>, cx: &App) -> impl IntoElement + use<> {
+    let counts = AgentChip::counts(project.entity_id(), cx);
+    let (text, badge) = agent_chip_label(counts);
     let orange: Hsla = gpui::rgb(AGENT_ORANGE).into();
-    // Board: 26 px pill, rgba(255,122,61,.14), 12 px / 500 orange text.
+    // Board: 26 px pill, rgba(255,122,61,.14), 12 px / 500 orange text; with a badge the
+    // right padding is 6 px and the badge is a 16 px orange pill, 10.5 px / 700 dark text.
     ButtonLike::new("zenith-agent-chip")
         .style(ButtonStyle::Transparent)
+        .aria_label(agent_chip_aria_label(counts))
         .child(
             h_flex()
                 .h(px(26.))
                 .pl(px(9.))
-                .pr(px(9.))
+                .pr(px(if badge.is_some() { 6. } else { 9. }))
                 .gap(px(6.))
                 .rounded_full()
                 .bg(orange.opacity(0.14))
@@ -175,8 +246,25 @@ fn agent_chip() -> impl IntoElement {
                         .text_size(px(12.))
                         .font_weight(FontWeight::MEDIUM)
                         .text_color(orange)
-                        .child("Agents"),
-                ),
+                        .child(text),
+                )
+                .when_some(badge, |this, count| {
+                    this.child(
+                        div()
+                            .h(px(16.))
+                            .min_w(px(16.))
+                            .px(px(4.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_full()
+                            .bg(orange)
+                            .text_color(gpui::rgb(0x1e1f22))
+                            .text_size(px(10.5))
+                            .font_weight(FontWeight::BOLD)
+                            .child(count.to_string()),
+                    )
+                }),
         )
         .tooltip(action_tooltip(
             "Agents",
@@ -223,8 +311,11 @@ fn initials(name: &str) -> Option<SharedString> {
 
 #[cfg(test)]
 mod tests {
-    use super::{initials, run_label, show_mark};
-    use gpui::TestAppContext;
+    use super::{
+        AgentChip, AgentCounts, agent_chip_aria_label, agent_chip_label, initials, run_label,
+        show_mark,
+    };
+    use gpui::{EntityId, TestAppContext};
     use project::{Inventory, TaskSourceKind};
     use task::{TaskContext, TaskTemplate};
 
@@ -270,5 +361,45 @@ mod tests {
         assert_eq!(initials("ünïcode-tëst").as_deref(), Some("ÜT"));
         assert_eq!(initials("--"), None);
         assert_eq!(initials(""), None);
+    }
+
+    #[test]
+    fn test_agent_chip_label() {
+        let counts = |running, review| AgentCounts { running, review };
+        assert_eq!(agent_chip_label(counts(0, 0)), ("Agents".to_string(), None));
+        assert_eq!(
+            agent_chip_label(counts(1, 2)),
+            ("1 running · review".to_string(), Some(2))
+        );
+        assert_eq!(
+            agent_chip_label(counts(2, 0)),
+            ("2 running".to_string(), None)
+        );
+        assert_eq!(
+            agent_chip_label(counts(0, 1)),
+            ("review".to_string(), Some(1))
+        );
+        assert_eq!(
+            agent_chip_aria_label(counts(1, 2)),
+            "Agents: 1 running, 2 files to review"
+        );
+        assert_eq!(agent_chip_aria_label(counts(0, 0)), "Agents");
+    }
+
+    #[gpui::test]
+    fn test_agent_chip_counts_per_project(cx: &mut TestAppContext) {
+        let (first, second) = (EntityId::from(1u64), EntityId::from(2u64));
+        let busy = AgentCounts {
+            running: 1,
+            review: 0,
+        };
+        cx.update(|cx| {
+            assert_eq!(AgentChip::counts(first, cx), AgentCounts::default());
+            AgentChip::set(first, busy, cx);
+            assert_eq!(AgentChip::counts(first, cx), busy);
+            assert_eq!(AgentChip::counts(second, cx), AgentCounts::default());
+            AgentChip::set(first, AgentCounts::default(), cx);
+            assert_eq!(AgentChip::counts(first, cx), AgentCounts::default());
+        });
     }
 }
