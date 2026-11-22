@@ -16,8 +16,9 @@ use workspace::Workspace;
 
 pub use panel::AgentReviewPanel;
 pub use queue::{
-    AgentReview, AgentReviewEvent, ReviewStatus, Summary, ThreadReview, Turn, TurnFile, keep_all,
-    keep_all_in_project, keep_file, open_diff, reject_all, reject_file, revert_turn,
+    AgentReview, AgentReviewEvent, RevertOutcome, ReviewStatus, Summary, ThreadReview, Turn,
+    TurnFile, keep_all, keep_all_in_project, keep_file, open_diff, reject_all, reject_file,
+    revert_turn,
 };
 
 actions!(

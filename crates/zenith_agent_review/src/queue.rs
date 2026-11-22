@@ -12,7 +12,7 @@ use gpui::{
     App, Context, Entity, EntityId, EventEmitter, Global, SharedString, Subscription, Task,
     WeakEntity, Window,
 };
-use language::{Anchor, Buffer};
+use language::{Anchor, Buffer, TextBufferSnapshot};
 use util::ResultExt as _;
 use workspace::Workspace;
 
@@ -41,23 +41,44 @@ pub struct TurnFile {
     pub buffer: WeakEntity<Buffer>,
     /// The agent created the file this turn: there is no text to restore.
     pub created: bool,
-    /// Local history accepted the checkpoint. It can still lack text (a
-    /// binary file), so revert reports such files instead of trusting this.
+    /// Local history accepted the checkpoint. Revert still reports the file
+    /// when the text is gone from the store; when this is false it never looks.
     pub checkpointed: bool,
+}
+
+/// A file with pending agent edits when its turn started: its text then, kept
+/// in memory and recorded only if the turn edits the file.
+#[derive(Clone)]
+pub(crate) struct HeldFile {
+    pub(crate) buffer: WeakEntity<Buffer>,
+    pub(crate) snapshot: TextBufferSnapshot,
+}
+
+impl std::fmt::Debug for HeldFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HeldFile")
+            .field("buffer", &self.buffer)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Clone, Debug)]
 pub struct Turn {
     /// 1-based, counted since the thread was first seen in this app session.
     pub number: u32,
-    /// Files with a checkpoint under `agent:<session>:<number>`.
+    /// Files this turn changed, checkpointed under [`ThreadReview::label`].
     pub files: Vec<TurnFile>,
+    pub(crate) held: Vec<HeldFile>,
 }
 
 pub struct ThreadReview {
     pub thread: WeakEntity<AcpThread>,
     pub project_id: EntityId,
     pub session_id: SharedString,
+    /// Tells this app session's turns apart from earlier ones of the same
+    /// session (turn numbers restart per thread entity): the time the thread
+    /// was first seen, in milliseconds.
+    pub(crate) run: u64,
     pub title: Option<SharedString>,
     pub status: ReviewStatus,
     /// Files with pending agent edits in this thread's action log.
@@ -75,7 +96,15 @@ impl ThreadReview {
     }
 
     pub fn label(&self, turn: u32) -> String {
-        label(&self.session_id, turn)
+        label(&self.session_id, self.run, turn)
+    }
+
+    /// The agent may still edit files: a revert now would race it.
+    pub fn is_running(&self) -> bool {
+        matches!(
+            self.status,
+            ReviewStatus::Running | ReviewStatus::NeedsInput
+        )
     }
 
     pub(crate) fn update_status(&mut self) {
@@ -88,8 +117,9 @@ impl ThreadReview {
     }
 }
 
-pub(crate) fn label(session_id: &str, turn: u32) -> String {
-    format!("agent:{session_id}:{turn}")
+/// `agent:<session>:<run>:<turn>`; the history view shows the last part.
+pub(crate) fn label(session_id: &str, run: u64, turn: u32) -> String {
+    format!("agent:{session_id}:{run}:{turn}")
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -98,7 +128,8 @@ pub enum AgentReviewEvent {
     SummaryChanged(EntityId),
 }
 
-/// Also notifies whenever any thread's status, title, turns or pending files change.
+/// Also notifies whenever any thread's status, title, turns or pending files
+/// change, and after every action-log update (the +N −M counts).
 #[derive(Default)]
 pub struct AgentReview {
     pub(crate) threads: Vec<ThreadReview>,
@@ -214,15 +245,25 @@ pub fn keep_all_in_project(project_id: EntityId, cx: &mut App) {
     }
 }
 
+/// What [`revert_turn`] could not do.
+#[derive(Debug, Default)]
+pub struct RevertOutcome {
+    /// Files with no checkpoint text for the turn, left as they are.
+    pub missing: Vec<Entity<Buffer>>,
+    /// Files reverted in the buffer but not saved, or created files that could
+    /// not be deleted, with the error.
+    pub failed: Vec<(Entity<Buffer>, anyhow::Error)>,
+}
+
 /// Restores every file turn `turn` changed to its checkpoint, each as one
 /// undoable edit, and saves it; files the agent created that turn are rejected
-/// (deleted). Also undoes user edits made to those files since. Resolves to
-/// the files that had no checkpoint text and were left as they are.
+/// (deleted). Also undoes user edits made to those files since. A failing
+/// file does not stop the others. Refused while the agent is running.
 pub fn revert_turn(
     thread: &Entity<AcpThread>,
     turn: u32,
     cx: &mut App,
-) -> Task<Result<Vec<Entity<Buffer>>>> {
+) -> Task<Result<RevertOutcome>> {
     let files = AgentReview::global(cx).and_then(|review| {
         let review = review.read(cx);
         let thread = review.thread(thread.entity_id())?;
@@ -232,15 +273,21 @@ pub fn revert_turn(
             .find(|t| t.number == turn)?
             .files
             .clone();
-        Some((files, thread.label(turn)))
+        Some((files, thread.label(turn), thread.is_running()))
     });
-    let Some((files, label)) = files else {
+    let Some((files, label, running)) = files else {
         return Task::ready(Err(anyhow!("agent turn {turn} is not tracked")));
     };
+    // apply_diff would drop the hunks the agent edits meanwhile.
+    if running {
+        return Task::ready(Err(anyhow!(
+            "the agent is still working; revert once the turn has ended"
+        )));
+    }
     let action_log = thread.read(cx).action_log().clone();
     let project = thread.read(cx).project().clone();
     cx.spawn(async move |cx| {
-        let mut missing = Vec::new();
+        let mut outcome = RevertOutcome::default();
         for file in files {
             // A closed buffer has no pending edits left to revert.
             let Some(buffer) = file.buffer.upgrade() else {
@@ -252,16 +299,23 @@ pub fn revert_turn(
                     log.reject_edits_in_ranges(buffer.clone(), vec![range], None, cx)
                         .0
                 });
-                reject.await.log_err();
+                if let Err(error) = reject.await {
+                    outcome.failed.push((buffer, error));
+                }
                 continue;
             }
-            let text = cx
-                .update(|cx| zenith_local_history::labeled_text(&buffer, &label, cx))
-                .await
-                .log_err()
-                .flatten();
+            // An earlier run's record may share the label: never look one up
+            // for a file this turn did not checkpoint.
+            let text = if file.checkpointed {
+                cx.update(|cx| zenith_local_history::labeled_text(&buffer, &label, cx))
+                    .await
+                    .log_err()
+                    .flatten()
+            } else {
+                None
+            };
             let Some(text) = text else {
-                missing.push(buffer);
+                outcome.missing.push(buffer);
                 continue;
             };
             let diff = buffer
@@ -273,11 +327,12 @@ pub fn revert_turn(
                 buffer.apply_diff(diff, cx);
                 buffer.finalize_last_transaction();
             });
-            project
-                .update(cx, |project, cx| project.save_buffer(buffer.clone(), cx))
-                .await?;
+            let save = project.update(cx, |project, cx| project.save_buffer(buffer.clone(), cx));
+            if let Err(error) = save.await {
+                outcome.failed.push((buffer, error));
+            }
         }
-        Ok(missing)
+        Ok(outcome)
     })
 }
 

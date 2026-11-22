@@ -1,13 +1,15 @@
 //! Turn tracking: finds agent threads, counts their turns and records a
 //! local-history checkpoint of every file a turn changes, before the change.
 
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use acp_thread::{AcpThread, AcpThreadEvent, ThreadStatus};
 use action_log::ActionLog;
 use gpui::{App, AppContext as _, Context, Entity, EntityId, SharedString};
 use settings::Settings as _;
 
 use crate::AgentReviewSettings;
-use crate::queue::{AgentReview, GlobalAgentReview, ThreadReview, Turn, TurnFile, label};
+use crate::queue::{AgentReview, GlobalAgentReview, HeldFile, ThreadReview, Turn, TurnFile, label};
 
 pub(crate) fn init(cx: &mut App) {
     let review = cx.new(|_| AgentReview::default());
@@ -74,6 +76,9 @@ impl AgentReview {
             thread: thread.downgrade(),
             project_id,
             session_id,
+            run: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_millis() as u64),
             title: None,
             status: crate::ReviewStatus::Idle,
             pending_files: 0,
@@ -114,8 +119,8 @@ impl AgentReview {
         cx.notify();
     }
 
-    /// Checkpoints the pre-agent text of files first changed in the current
-    /// turn, and refreshes the pending count.
+    /// Checkpoints the pre-turn text of files the current turn changed, and
+    /// refreshes the pending count. Always notifies: the diff counts changed.
     fn action_log_changed(
         &mut self,
         thread_id: EntityId,
@@ -128,17 +133,47 @@ impl AgentReview {
         let changed: Vec<_> = action_log.read(cx).changed_buffers(cx).collect();
         let enabled = AgentReviewSettings::get_global(cx).enabled;
         let review = &mut self.threads[ix];
-        let mut dirty = false;
         // Not gated on `generating`: the diff behind `changed_buffers` lands
         // asynchronously, possibly after the turn ended.
         if let Some(turn) = review.turns.last_mut().filter(|_| enabled) {
-            let label = label(&review.session_id, turn.number);
+            let label = label(&review.session_id, review.run, turn.number);
+            // A held file kept or rejected meanwhile is no longer this turn's
+            // to restore; a later agent edit shows up below as a new file.
+            turn.held.retain(|held| {
+                changed
+                    .iter()
+                    .any(|(buffer, _)| buffer.entity_id() == held.buffer.entity_id())
+            });
             for (buffer, diff) in &changed {
                 if turn
                     .files
                     .iter()
                     .any(|file| file.buffer.entity_id() == buffer.entity_id())
                 {
+                    continue;
+                }
+                if let Some(ix) = turn
+                    .held
+                    .iter()
+                    .position(|held| held.buffer.entity_id() == buffer.entity_id())
+                {
+                    if !buffer
+                        .read(cx)
+                        .has_edits_since(turn.held[ix].snapshot.version())
+                    {
+                        continue;
+                    }
+                    let held = turn.held.swap_remove(ix);
+                    turn.files.push(TurnFile {
+                        checkpointed: zenith_local_history::checkpoint(
+                            buffer,
+                            held.snapshot.as_rope().clone(),
+                            &label,
+                            cx,
+                        ),
+                        buffer: buffer.downgrade(),
+                        created: false,
+                    });
                     continue;
                 }
                 // The diff base is the text before the agent's first unkept edit.
@@ -157,7 +192,6 @@ impl AgentReview {
                     created,
                     checkpointed,
                 });
-                dirty = true;
             }
         }
         if review.pending_files != changed.len() {
@@ -165,32 +199,27 @@ impl AgentReview {
             review.update_status();
             let project_id = review.project_id;
             self.update_summary(project_id, cx);
-            dirty = true;
         }
-        if dirty {
-            cx.notify();
-        }
+        cx.notify();
     }
 }
 
-/// Starts the next turn with a checkpoint of the current text of every file
-/// that already has pending agent edits (from earlier turns).
+/// Starts the next turn holding the current text of every file that already
+/// has pending agent edits (from earlier turns); `action_log_changed`
+/// records it once the file changes during the turn.
 fn start_turn(review: &mut ThreadReview, action_log: &Entity<ActionLog>, cx: &App) {
     let number = review.turn() + 1;
-    let label = label(&review.session_id, number);
-    let files = action_log
+    let held = action_log
         .read(cx)
         .changed_buffers(cx)
-        .map(|(buffer, _)| TurnFile {
-            checkpointed: zenith_local_history::checkpoint(
-                &buffer,
-                buffer.read(cx).as_rope().clone(),
-                &label,
-                cx,
-            ),
+        .map(|(buffer, _)| HeldFile {
+            snapshot: buffer.read(cx).text_snapshot(),
             buffer: buffer.downgrade(),
-            created: false,
         })
         .collect();
-    review.turns.push(Turn { number, files });
+    review.turns.push(Turn {
+        number,
+        files: Vec::new(),
+        held,
+    });
 }

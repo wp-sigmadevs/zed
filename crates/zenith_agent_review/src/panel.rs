@@ -1,14 +1,14 @@
 //! The Agent Review tool window: every agent thread of the project with its status, the
 //! files it changed that nobody kept or rejected yet, and keep / reject / revert controls.
 
-use std::{collections::HashMap, ops::Range};
+use std::ops::Range;
 
 use acp_thread::AcpThread;
 use action_log::DiffStats;
 use agent_ui::{Keep, KeepAll, Reject, RejectAll};
 use gpui::{
-    Action, AnyElement, EntityId, EventEmitter, FocusHandle, Focusable, FontWeight, Hsla, Pixels,
-    PromptLevel, Role, ScrollStrategy, Subscription, UniformListScrollHandle, WeakEntity,
+    Action, AnyElement, Entity, EntityId, EventEmitter, FocusHandle, Focusable, FontWeight, Hsla,
+    Pixels, PromptLevel, Role, ScrollStrategy, Subscription, UniformListScrollHandle, WeakEntity,
     uniform_list,
 };
 use language::Buffer;
@@ -31,6 +31,8 @@ const ROW_HEIGHT: f32 = 28.;
 
 type Handler = fn(&mut AgentReviewPanel, &mut Window, &mut Context<AgentReviewPanel>);
 const FILE_INDENT: f32 = 20.;
+const REVERT_WHILE_RUNNING: &str =
+    "Revert Turn is available once the turn has ended: the agent may still edit these files.";
 // Unique among dock panels (debug builds panic on a duplicate); 8-13 are other Zenith panels.
 const ACTIVATION_PRIORITY: u32 = 14;
 
@@ -93,10 +95,42 @@ enum Row {
         thread: WeakEntity<AcpThread>,
         turn: u32,
         pending: usize,
+        /// The agent is still editing: no revert.
+        running: bool,
     },
 }
 
+/// A row's identity across rebuilds, which reorder and shift rows on every
+/// action-log update.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RowKey {
+    Thread(EntityId),
+    File { thread: EntityId, buffer: EntityId },
+    Actions(EntityId),
+}
+
+impl RowKey {
+    fn thread(self) -> EntityId {
+        match self {
+            RowKey::Thread(thread) | RowKey::File { thread, .. } | RowKey::Actions(thread) => {
+                thread
+            }
+        }
+    }
+}
+
 impl Row {
+    fn key(&self) -> RowKey {
+        match self {
+            Row::Thread { thread, .. } => RowKey::Thread(thread.entity_id()),
+            Row::File { thread, buffer, .. } => RowKey::File {
+                thread: thread.entity_id(),
+                buffer: buffer.entity_id(),
+            },
+            Row::Actions { thread, .. } => RowKey::Actions(thread.entity_id()),
+        }
+    }
+
     fn thread(&self) -> &WeakEntity<AcpThread> {
         match self {
             Row::Thread { thread, .. } | Row::File { thread, .. } | Row::Actions { thread, .. } => {
@@ -144,18 +178,21 @@ pub struct AgentReviewPanel {
     focus_handle: FocusHandle,
     scroll_handle: UniformListScrollHandle,
     rows: Vec<Row>,
-    selected: Option<usize>,
+    selected: Option<RowKey>,
     /// Pending files of all threads, for the tool-window button badge.
     pending_files: usize,
+    /// Shown in its dock; rows are rebuilt only then.
+    active: bool,
+    /// The queue changed while hidden: rebuild on show.
+    stale: bool,
+    // The queue also notifies after every action-log update, so this is the only one.
     _review_subscription: Option<Subscription>,
-    /// Per thread's action log: the +N −M counts change without a queue notification.
-    action_log_subscriptions: HashMap<EntityId, Subscription>,
 }
 
 impl AgentReviewPanel {
     fn new(workspace: &Workspace, cx: &mut Context<Self>) -> Self {
         let review_subscription = AgentReview::global(cx)
-            .map(|review| cx.observe(&review, |this, _, cx| this.rebuild(cx)));
+            .map(|review| cx.observe(&review, |this, _, cx| this.review_changed(cx)));
         let mut panel = Self {
             project_id: workspace.project().entity_id(),
             workspace: workspace.weak_handle(),
@@ -164,16 +201,34 @@ impl AgentReviewPanel {
             rows: Vec::new(),
             selected: None,
             pending_files: 0,
+            active: false,
+            stale: true,
             _review_subscription: review_subscription,
-            action_log_subscriptions: HashMap::new(),
         };
-        panel.rebuild(cx);
+        panel.review_changed(cx);
         panel
     }
 
+    /// The badge always follows; the rows (a walk of every action log) only while shown.
+    fn review_changed(&mut self, cx: &mut Context<Self>) {
+        let pending_files = AgentReview::global(cx)
+            .map_or(0, |review| review.read(cx).summary(self.project_id).review);
+        let badge_changed = pending_files != self.pending_files;
+        self.pending_files = pending_files;
+        if self.active {
+            self.rebuild(cx);
+        } else {
+            self.stale = true;
+            // The dock observes the panel: notifying while hidden redraws it.
+            if badge_changed {
+                cx.notify();
+            }
+        }
+    }
+
     fn rebuild(&mut self, cx: &mut Context<Self>) {
+        self.stale = false;
         let mut rows = Vec::new();
-        let mut action_logs = Vec::new();
         if let Some(review) = AgentReview::global(cx) {
             // Newest thread first.
             for thread_review in review.read(cx).threads().iter().rev() {
@@ -184,6 +239,7 @@ impl AgentReviewPanel {
                     continue;
                 };
                 let turn = thread_review.turn();
+                let running = thread_review.is_running();
                 // A thread that never ran a turn has nothing to show.
                 if turn == 0 && thread_review.status == ReviewStatus::Idle {
                     continue;
@@ -231,33 +287,35 @@ impl AgentReviewPanel {
                     thread: thread_review.thread.clone(),
                     turn,
                     pending,
+                    running,
                 });
-                action_logs.push(action_log);
             }
         }
 
-        self.action_log_subscriptions
-            .retain(|id, _| action_logs.iter().any(|log| log.entity_id() == *id));
-        for action_log in action_logs {
-            self.action_log_subscriptions
-                .entry(action_log.entity_id())
-                .or_insert_with(|| cx.observe(&action_log, |this, _, cx| this.rebuild(cx)));
-        }
-        self.pending_files = rows
-            .iter()
-            .filter(|row| matches!(row, Row::File { .. }))
-            .count();
         self.rows = rows;
-        self.selected = self
-            .rows
-            .len()
-            .checked_sub(1)
-            .and_then(|last| self.selected.map(|ix| ix.min(last)));
+        // A selected file that is gone (kept, rejected) falls back to its thread.
+        self.selected = self.selected.and_then(|key| {
+            let thread_key = match key {
+                RowKey::File { .. } | RowKey::Actions(_) => RowKey::Thread(key.thread()),
+                RowKey::Thread(_) => key,
+            };
+            [key, thread_key]
+                .into_iter()
+                .find(|key| self.rows.iter().any(|row| row.key() == *key))
+        });
         cx.notify();
     }
 
+    fn selected_ix(&self) -> Option<usize> {
+        let key = self.selected?;
+        self.rows.iter().position(|row| row.key() == key)
+    }
+
     fn select(&mut self, ix: usize, cx: &mut Context<Self>) {
-        self.selected = Some(ix);
+        let Some(row) = self.rows.get(ix) else {
+            return;
+        };
+        self.selected = Some(row.key());
         self.scroll_handle
             .scroll_to_item(ix, ScrollStrategy::Nearest);
         cx.notify();
@@ -267,7 +325,7 @@ impl AgentReviewPanel {
         let Some(last) = self.rows.len().checked_sub(1) else {
             return;
         };
-        self.select(self.selected.map_or(0, |ix| (ix + 1).min(last)), cx);
+        self.select(self.selected_ix().map_or(0, |ix| (ix + 1).min(last)), cx);
     }
 
     fn select_previous(
@@ -277,7 +335,7 @@ impl AgentReviewPanel {
         cx: &mut Context<Self>,
     ) {
         if !self.rows.is_empty() {
-            self.select(self.selected.map_or(0, |ix| ix.saturating_sub(1)), cx);
+            self.select(self.selected_ix().map_or(0, |ix| ix.saturating_sub(1)), cx);
         }
     }
 
@@ -294,7 +352,7 @@ impl AgentReviewPanel {
     }
 
     fn selected_row(&self) -> Option<&Row> {
-        self.selected.and_then(|ix| self.rows.get(ix))
+        self.selected_ix().and_then(|ix| self.rows.get(ix))
     }
 
     /// Enter: the thread's per-hunk review tab.
@@ -355,20 +413,40 @@ impl AgentReviewPanel {
         }
     }
 
-    /// The selected thread's latest turn, else the newest thread's.
+    /// The selected thread's latest turn, else the newest thread's. Reads the queue, not
+    /// the rows: those are stale while the panel is hidden.
     fn revert_latest_turn(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let thread = self
-            .selected_row()
-            .or_else(|| self.rows.first())
-            .map(|row| row.thread().clone());
-        let turn = thread.as_ref().and_then(|thread| {
-            let review = AgentReview::global(cx)?;
-            let turn = review.read(cx).thread(thread.entity_id())?.turn();
-            (turn > 0).then_some(turn)
-        });
-        if let (Some(thread), Some(turn)) = (thread, turn) {
-            self.revert(thread, turn, window, cx);
+        let Some(review) = AgentReview::global(cx) else {
+            return;
+        };
+        let target =
+            {
+                let review = review.read(cx);
+                self.selected
+                    .and_then(|key| review.thread(key.thread()))
+                    .or_else(|| {
+                        review.threads().iter().rev().find(|thread| {
+                            thread.project_id == self.project_id && thread.turn() > 0
+                        })
+                    })
+                    .map(|thread| (thread.thread.clone(), thread.turn(), thread.is_running()))
+            };
+        let Some((thread, turn, running)) = target.filter(|(_, turn, _)| *turn > 0) else {
+            return;
+        };
+        if running {
+            window
+                .prompt(
+                    PromptLevel::Info,
+                    "The agent is still working",
+                    Some(REVERT_WHILE_RUNNING),
+                    &["OK"],
+                    cx,
+                )
+                .detach();
+            return;
         }
+        self.revert(thread, turn, window, cx);
     }
 
     fn revert(
@@ -396,30 +474,52 @@ impl AgentReviewPanel {
             if !matches!(answer.await, Ok(0)) {
                 return anyhow::Ok(());
             }
-            let missing = cx.update(|_, cx| revert_turn(&thread, turn, cx))?.await?;
-            if missing.is_empty() {
+            let outcome = cx.update(|_, cx| revert_turn(&thread, turn, cx))?.await?;
+            if outcome.missing.is_empty() && outcome.failed.is_empty() {
                 return Ok(());
             }
-            let names = cx.update(|_, cx| {
-                missing
-                    .iter()
-                    .map(|buffer| {
-                        buffer
-                            .read(cx)
-                            .file()
-                            .map(|file| file.path().as_unix_str().to_string())
-                            .unwrap_or_else(|| "untitled".to_string())
-                    })
-                    .collect::<Vec<_>>()
-                    .join(", ")
+            let detail = cx.update(|_, cx| {
+                let name = |buffer: &Entity<Buffer>| {
+                    buffer
+                        .read(cx)
+                        .file()
+                        .map(|file| file.path().as_unix_str().to_string())
+                        .unwrap_or_else(|| "untitled".to_string())
+                };
+                let mut detail = Vec::new();
+                if !outcome.failed.is_empty() {
+                    let failed = outcome
+                        .failed
+                        .iter()
+                        .map(|(buffer, error)| format!("{} ({error:#})", name(buffer)))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    detail.push(format!("Could not save or delete: {failed}."));
+                }
+                if !outcome.missing.is_empty() {
+                    let missing = outcome
+                        .missing
+                        .iter()
+                        .map(name)
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    detail.push(format!(
+                        "Local History has no checkpoint of these files for turn {turn}, so \
+                         they were left as they are: {missing}."
+                    ));
+                }
+                detail.join("\n\n")
             })?;
+            let level = if outcome.failed.is_empty() {
+                PromptLevel::Info
+            } else {
+                PromptLevel::Warning
+            };
             let shown = this.update_in(cx, |_, window, cx| {
                 window.prompt(
-                    PromptLevel::Info,
-                    "Some files were left as they are",
-                    Some(&format!(
-                        "Local History has no checkpoint of these files for turn {turn}: {names}."
-                    )),
+                    level,
+                    "Some files were not reverted",
+                    Some(&detail),
                     &["OK"],
                     cx,
                 )
@@ -441,14 +541,20 @@ impl AgentReviewPanel {
         };
         let orange: Hsla = gpui::rgb(AGENT_ORANGE).into();
         let thread_id = row.thread().entity_id();
+        let key = row.key();
         let item = |id: String| {
             ListItem::new(SharedString::from(id))
                 .height(px(ROW_HEIGHT))
                 .rounded()
-                .toggle_state(self.selected == Some(ix))
+                .toggle_state(self.selected == Some(key))
                 .aria_role(Role::TreeItem)
                 .aria_label(row.text())
-                .on_click(cx.listener(move |this, _, _, cx| this.select(ix, cx)))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    // By identity: the rows may have been rebuilt since this render.
+                    if let Some(ix) = this.rows.iter().position(|row| row.key() == key) {
+                        this.select(ix, cx);
+                    }
+                }))
         };
         // A click calls the handler directly: a dispatched action would go to whatever has
         // focus (often the editor). Selecting the row first makes the handler act on it.
@@ -463,7 +569,7 @@ impl AgentReviewPanel {
                 .aria_label(aria)
                 .tooltip(Tooltip::for_action_title(label, action))
                 .on_click(cx.listener(move |this, _, window, cx| {
-                    this.selected = Some(ix);
+                    this.selected = Some(key);
                     handler(this, window, cx);
                 }))
         };
@@ -560,7 +666,12 @@ impl AgentReviewPanel {
                     )
                     .into_any_element()
             }
-            Row::Actions { turn, pending, .. } => item(format!("agent-review-actions-{thread_id}"))
+            Row::Actions {
+                turn,
+                pending,
+                running,
+                ..
+            } => item(format!("agent-review-actions-{thread_id}"))
                 .indent_level(1)
                 .indent_step_size(px(FILE_INDENT))
                 .child(
@@ -603,11 +714,27 @@ impl AgentReviewPanel {
                             .aria_label(format!(
                                 "Revert turn {turn}, including your own edits from that turn"
                             ))
-                            .tooltip(Tooltip::for_action_title("Revert Turn", &RevertTurn))
-                            .disabled(*turn == 0)
+                            .map(|button| {
+                                if *running {
+                                    button.tooltip(|_, cx| {
+                                        Tooltip::with_meta(
+                                            "Revert Turn",
+                                            Some(&RevertTurn),
+                                            REVERT_WHILE_RUNNING,
+                                            cx,
+                                        )
+                                    })
+                                } else {
+                                    button.tooltip(Tooltip::for_action_title(
+                                        "Revert Turn",
+                                        &RevertTurn,
+                                    ))
+                                }
+                            })
+                            .disabled(*turn == 0 || *running)
                             .on_click(cx.listener(
                                 move |this, _, window, cx| {
-                                    this.selected = Some(ix);
+                                    this.selected = Some(key);
                                     this.revert_latest_turn(window, cx);
                                 },
                             )),
@@ -716,6 +843,13 @@ impl Panel for AgentReviewPanel {
 
     fn set_position(&mut self, _: DockPosition, _: &mut Window, _: &mut Context<Self>) {}
 
+    fn set_active(&mut self, active: bool, _: &mut Window, cx: &mut Context<Self>) {
+        self.active = active;
+        if active && self.stale {
+            self.rebuild(cx);
+        }
+    }
+
     fn default_size(&self, _: &Window, _: &App) -> Pixels {
         px(360.)
     }
@@ -753,6 +887,10 @@ impl AgentReviewPanel {
     }
 
     pub(crate) fn selected(&self) -> Option<usize> {
-        self.selected
+        self.selected_ix()
+    }
+
+    pub(crate) fn pending_files(&self) -> usize {
+        self.pending_files
     }
 }
