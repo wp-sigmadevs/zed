@@ -1,7 +1,11 @@
 //! JetBrains scratch files: global, project-independent files of any language, kept in one
 //! folder under the data dir, listed in a "Scratches" panel and opened as ordinary files.
 //! They work with no project open: the file is opened through an invisible worktree, so the
-//! scratches folder never shows up in the project panel.
+//! scratches folder never shows up as a project root. `project_node` also keeps that folder open
+//! as an invisible worktree, which the project panel lists under "Scratches and Consoles".
+
+mod project_node;
+pub use project_node::{is_store_worktree, store_worktree};
 
 use std::{
     collections::HashSet,
@@ -23,7 +27,7 @@ use gpui::{
     anchored, deferred, px, uniform_list,
 };
 use picker::{Picker, PickerDelegate};
-use project::TaskSourceKind;
+use project::{Project, TaskSourceKind};
 use settings::{RegisterSetting, Settings, SettingsContent, SettingsStore};
 use std::{any::Any, ops::Range};
 use task::{TaskContext, TaskTemplate, TaskVariables, VariableName};
@@ -34,6 +38,7 @@ use workspace::{
     dock::{DockPosition, Panel, PanelEvent},
     notifications::{DetachAndPromptErr as _, NotificationId},
 };
+use worktree::Worktree;
 
 actions!(
     zenith_scratches,
@@ -90,6 +95,8 @@ pub struct ScratchesSettings {
     pub directory: Option<PathBuf>,
     pub runners: HashMap<String, Vec<String>>,
     pub use_project_cwd: bool,
+    /// List the scratches under a "Scratches and Consoles" node in the project panel.
+    pub project_panel_node: bool,
 }
 
 impl Settings for ScratchesSettings {
@@ -108,6 +115,9 @@ impl Settings for ScratchesSettings {
                 .unwrap_or_default(),
             use_project_cwd: scratches
                 .and_then(|scratches| scratches.use_project_cwd)
+                .unwrap_or(true),
+            project_panel_node: scratches
+                .and_then(|scratches| scratches.project_panel_node)
                 .unwrap_or(true),
         }
     }
@@ -492,6 +502,7 @@ fn age_label(then: SystemTime) -> String {
 
 pub struct ScratchesPanel {
     fs: Arc<dyn Fs>,
+    project: Entity<Project>,
     dir: PathBuf,
     workspace: WeakEntity<Workspace>,
     focus_handle: FocusHandle,
@@ -502,7 +513,13 @@ pub struct ScratchesPanel {
     context_menu: Option<(Entity<ContextMenu>, Point<Pixels>, Subscription)>,
     load_task: Task<()>,
     watch_task: Task<()>,
+    /// The store as an invisible worktree of `project` (held here: the project keeps those
+    /// weakly), and the folder it was opened for.
+    store_worktree: Option<Entity<Worktree>>,
+    store_worktree_dir: Option<PathBuf>,
+    store_worktree_task: Task<()>,
     _settings_subscription: Subscription,
+    _project_subscription: Subscription,
 }
 
 impl ScratchesPanel {
@@ -514,9 +531,24 @@ impl ScratchesPanel {
                 this.selected = None;
                 this.watch(cx);
             }
+            this.sync_store_worktree(cx);
+        });
+        let project = workspace.project().clone();
+        let project_subscription = cx.subscribe(&project, |this, _, event, cx| {
+            if let project::Event::WorktreeRemoved(id) = event
+                && this
+                    .store_worktree
+                    .as_ref()
+                    .is_some_and(|worktree| worktree.read(cx).id() == *id)
+            {
+                this.store_worktree = None;
+                this.store_worktree_dir = None;
+                this.sync_store_worktree(cx);
+            }
         });
         let mut this = Self {
             fs: workspace.app_state().fs.clone(),
+            project,
             dir: store_dir(cx),
             workspace: workspace.weak_handle(),
             focus_handle: cx.focus_handle(),
@@ -527,9 +559,14 @@ impl ScratchesPanel {
             context_menu: None,
             load_task: Task::ready(()),
             watch_task: Task::ready(()),
+            store_worktree: None,
+            store_worktree_dir: None,
+            store_worktree_task: Task::ready(()),
             _settings_subscription: settings_subscription,
+            _project_subscription: project_subscription,
         };
         this.watch(cx);
+        this.sync_store_worktree(cx);
         this
     }
 
@@ -1157,6 +1194,15 @@ mod tests {
     }
 
     async fn fixture(cx: &mut TestAppContext) -> (Fixture, &mut VisualTestContext) {
+        fixture_with(cx, &[], None).await
+    }
+
+    /// A window on `roots` (empty folders), with the store folder set to `directory` first.
+    async fn fixture_with<'a>(
+        cx: &'a mut TestAppContext,
+        roots: &[&str],
+        directory: Option<&str>,
+    ) -> (Fixture, &'a mut VisualTestContext) {
         let app_state = cx.update(|cx| {
             let app_state = AppState::test(cx);
             theme_settings::init(theme::LoadThemes::JustBase, cx);
@@ -1171,8 +1217,28 @@ mod tests {
             ]);
             app_state
         });
+        if let Some(directory) = directory {
+            cx.update(|cx| {
+                set_scratches(
+                    cx,
+                    ZenithScratchesSettingsContent {
+                        directory: Some(directory.to_string()),
+                        ..Default::default()
+                    },
+                )
+            });
+        }
+        for root in roots {
+            app_state
+                .fs
+                .as_fake()
+                .create_dir(Path::new(root))
+                .await
+                .unwrap();
+        }
         // No worktree: scratches must work with no project open.
-        let project = project::Project::test(app_state.fs.clone(), [], cx).await;
+        let roots: Vec<&Path> = roots.iter().map(Path::new).collect();
+        let project = project::Project::test(app_state.fs.clone(), roots, cx).await;
         let (multi_workspace, cx) =
             cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
         let workspace = multi_workspace.read_with(cx, |multi, _| multi.workspace().clone());
@@ -1325,20 +1391,27 @@ mod tests {
         assert_eq!(grouped(Vec::new()), (Vec::new(), Vec::new()));
     }
 
+    fn set_scratches(cx: &mut App, scratches: ZenithScratchesSettingsContent) {
+        cx.update_global::<SettingsStore, _>(|store, cx| {
+            store.update_user_settings(cx, |content| {
+                content.zenith = Some(ZenithSettingsContent {
+                    scratches: Some(scratches),
+                    ..Default::default()
+                });
+            });
+        });
+    }
+
     fn set_directory(directory: &str, cx: &mut VisualTestContext) {
         let directory = directory.to_string();
         cx.update(|_, cx| {
-            cx.update_global::<SettingsStore, _>(|store, cx| {
-                store.update_user_settings(cx, |content| {
-                    content.zenith = Some(ZenithSettingsContent {
-                        scratches: Some(ZenithScratchesSettingsContent {
-                            directory: Some(directory),
-                            ..Default::default()
-                        }),
-                        ..Default::default()
-                    });
-                });
-            });
+            set_scratches(
+                cx,
+                ZenithScratchesSettingsContent {
+                    directory: Some(directory),
+                    ..Default::default()
+                },
+            )
         });
         cx.run_until_parked();
     }
@@ -1578,5 +1651,101 @@ mod tests {
         cx.simulate_click(bounds.center(), gpui::Modifiers::none());
         cx.run_until_parked();
         assert!(!is_open(&fixture, cx));
+    }
+
+    fn store_worktree_of(
+        fixture: &Fixture,
+        cx: &mut VisualTestContext,
+    ) -> Option<worktree::WorktreeId> {
+        fixture.workspace.read_with(cx, |workspace, cx| {
+            store_worktree(workspace.project().read(cx), cx).map(|worktree| worktree.read(cx).id())
+        })
+    }
+
+    #[gpui::test]
+    async fn the_store_is_an_invisible_worktree_the_file_finder_never_lists(
+        cx: &mut TestAppContext,
+    ) {
+        let (fixture, cx) = fixture(cx).await;
+        cx.run_until_parked();
+        let store = default_store_dir();
+        assert!(
+            fixture.fs.is_dir(&store).await,
+            "the folder is created for the worktree"
+        );
+        let (held, visible, finder_candidates, all) =
+            fixture.workspace.read_with(cx, |workspace, cx| {
+                let project = workspace.project().read(cx);
+                let ids = |worktrees: Vec<Entity<Worktree>>| -> Vec<(PathBuf, bool)> {
+                    worktrees
+                        .iter()
+                        .map(|worktree| {
+                            (
+                                worktree.read(cx).abs_path().to_path_buf(),
+                                worktree.read(cx).is_visible(),
+                            )
+                        })
+                        .collect()
+                };
+                (
+                    store_worktree(project, cx).is_some(),
+                    ids(project.visible_worktrees(cx).collect()),
+                    // What the file finder searches (file_finder.rs `visible_worktrees_and_single_files`).
+                    ids(project
+                        .worktree_store()
+                        .read(cx)
+                        .visible_worktrees_and_single_files(cx)
+                        .collect()),
+                    ids(project.worktrees(cx).collect()),
+                )
+            });
+        assert!(held, "the panel opened the store: {all:?}");
+        assert_eq!(all, [(store, false)]);
+        assert!(
+            visible.is_empty() && finder_candidates.is_empty(),
+            "{visible:?} {finder_candidates:?}"
+        );
+    }
+
+    #[gpui::test]
+    async fn the_setting_off_releases_the_worktree_and_on_reopens_it(cx: &mut TestAppContext) {
+        let (fixture, cx) = fixture(cx).await;
+        cx.run_until_parked();
+        assert!(store_worktree_of(&fixture, cx).is_some());
+
+        cx.update(|_, cx| {
+            set_scratches(
+                cx,
+                ZenithScratchesSettingsContent {
+                    project_panel_node: Some(false),
+                    ..Default::default()
+                },
+            )
+        });
+        cx.run_until_parked();
+        assert!(store_worktree_of(&fixture, cx).is_none());
+        let remaining = fixture.workspace.read_with(cx, |workspace, cx| {
+            workspace.project().read(cx).worktrees(cx).count()
+        });
+        assert_eq!(remaining, 0, "nothing holds the worktree any more");
+
+        cx.update(|_, cx| set_scratches(cx, ZenithScratchesSettingsContent::default()));
+        cx.run_until_parked();
+        assert!(store_worktree_of(&fixture, cx).is_some());
+    }
+
+    #[gpui::test]
+    async fn a_store_inside_a_project_folder_is_not_held(cx: &mut TestAppContext) {
+        let (fixture, cx) = fixture_with(cx, &["/proj"], Some("/proj/scratches")).await;
+        cx.run_until_parked();
+        assert!(
+            store_worktree_of(&fixture, cx).is_none(),
+            "the project's own visible worktree contains the store"
+        );
+        assert!(
+            fixture
+                .panel
+                .read_with(cx, |panel, _| panel.store_worktree.is_none())
+        );
     }
 }
