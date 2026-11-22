@@ -753,16 +753,20 @@ fn source_name(source: &str) -> String {
         "save" => "Saved".to_string(),
         "before-revert" => "Before revert".to_string(),
         "external" => "External change".to_string(),
+        "agent" => "Agent".to_string(),
         other => other.to_string(),
     }
 }
 
 fn row_title(entry: &Entry) -> String {
-    entry
-        .revision
-        .label
-        .clone()
-        .unwrap_or_else(|| source_name(&entry.revision.source))
+    let label = entry.revision.label.as_deref();
+    // Agent checkpoints are labelled `agent:<session>:<turn>`; the session id is noise.
+    match label.and_then(|label| label.rsplit_once(':')) {
+        Some((_, turn)) if entry.revision.source == "agent" => format!("Agent · turn {turn}"),
+        _ => label
+            .map(str::to_owned)
+            .unwrap_or_else(|| source_name(&entry.revision.source)),
+    }
 }
 
 /// Size change against the next older revision; the oldest shows its size.

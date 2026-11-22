@@ -56,4 +56,6 @@ pub fn init(cx: &mut App) {
     zenith_refactor::init(cx);
     #[cfg(feature = "external_libraries")]
     zenith_external_libraries::init(cx);
+    #[cfg(feature = "agent_review")]
+    zenith_agent_review::init(cx);
 }

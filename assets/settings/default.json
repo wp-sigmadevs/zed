@@ -3043,6 +3043,11 @@
       // Show the combined card instead of separate popovers.
       "enabled": true,
     },
+    // Agent review: checkpoints and a review queue for AI agent edits.
+    "agent_review": {
+      // Record a local-history checkpoint per agent turn and offer review.
+      "enabled": true,
+    },
   },
   // The server to connect to. If the environment variable
   // ZED_SERVER_URL is set, it will override this setting.

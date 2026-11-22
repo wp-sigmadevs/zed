@@ -940,3 +940,26 @@ async fn test_history_view_status_is_forgotten_when_another_revision_is_selected
     cx.simulate_keystrokes("up");
     assert_eq!(status(&view, cx), None);
 }
+
+#[test]
+fn test_history_view_agent_rows_name_the_turn() {
+    let entry = |label: Option<&str>, source: &str| capture::Entry {
+        revision: crate::store::Revision {
+            id: 1,
+            worktree_root: "/r".into(),
+            rel_path: "a.txt".into(),
+            blob_hash: String::new(),
+            ts: 0,
+            label: label.map(str::to_owned),
+            source: source.into(),
+        },
+        size: 0,
+    };
+    assert_eq!(
+        row_title(&entry(Some("agent:0a1b-2c:3"), "agent")),
+        "Agent · turn 3"
+    );
+    assert_eq!(row_title(&entry(None, "agent")), "Agent");
+    assert_eq!(row_title(&entry(Some("Release"), "save")), "Release");
+    assert_eq!(row_title(&entry(None, "save")), "Saved");
+}

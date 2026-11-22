@@ -12,6 +12,9 @@ workspace = true
 path = "src/zenith_local_history.rs"
 doctest = false
 
+[features]
+test-support = []
+
 [dependencies]
 anyhow.workspace = true
 buffer_diff.workspace = true
