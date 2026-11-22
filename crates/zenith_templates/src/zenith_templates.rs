@@ -26,7 +26,30 @@ actions!(
     ]
 );
 
+/// `zenith.templates.enabled`: read once at init, so a change takes effect after a restart.
+#[derive(Clone, Copy, settings::RegisterSetting)]
+pub struct TemplatesSettings {
+    pub enabled: bool,
+}
+
+impl settings::Settings for TemplatesSettings {
+    fn from_settings(content: &settings::SettingsContent) -> Self {
+        let templates = content
+            .zenith
+            .as_ref()
+            .and_then(|zenith| zenith.templates.as_ref());
+        Self {
+            enabled: templates
+                .and_then(|templates| templates.enabled)
+                .unwrap_or(true),
+        }
+    }
+}
+
 pub fn init(cx: &mut App) {
+    if !<TemplatesSettings as settings::Settings>::get_global(cx).enabled {
+        return;
+    }
     cx.observe_new(|workspace: &mut Workspace, _, _| {
         workspace.register_action(|workspace, _: &NewFromTemplate, window, cx| {
             NewPopup::open(workspace, window, cx)
@@ -600,6 +623,28 @@ mod tests {
                 .build_action("zenith_templates::NewFromTemplate", None)
                 .expect("registered under its namespaced name");
             assert!(built.as_any().is::<NewFromTemplate>());
+        });
+    }
+
+    #[gpui::test]
+    async fn test_disabled_registers_no_new_popup(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let mut store = settings::SettingsStore::test(cx);
+            store.update_user_settings(cx, |content| {
+                content.zenith = Some(settings::ZenithSettingsContent {
+                    templates: Some(settings::ZenithTemplatesSettingsContent {
+                        enabled: Some(false),
+                    }),
+                    ..Default::default()
+                });
+            });
+            cx.set_global(store);
+        });
+        let (setup, cx) = setup(cx).await;
+        cx.dispatch_action(NewFromTemplate);
+        cx.run_until_parked();
+        setup.workspace.read_with(cx, |workspace, cx| {
+            assert!(workspace.active_modal::<NewPopup>(cx).is_none())
         });
     }
 
