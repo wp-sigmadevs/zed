@@ -362,3 +362,36 @@ fn test_parameter_hints_only_before_literals() {
         assert!(!literal(argument), "{argument:?} is not a literal");
     }
 }
+
+#[gpui::test]
+async fn test_look_setting_off_installs_nothing(cx: &mut gpui::TestAppContext) {
+    cx.update(|cx| {
+        let mut store = settings::SettingsStore::test(cx);
+        store.update_user_settings(cx, |content| {
+            content.zenith = Some(settings::ZenithSettingsContent {
+                look: Some(settings::ZenithLookSettingsContent {
+                    enabled: Some(false),
+                }),
+                ..Default::default()
+            });
+        });
+        cx.set_global(store);
+    });
+    let app_state = cx.update(|cx| {
+        let app_state = workspace::AppState::test(cx);
+        theme_settings::init(theme::LoadThemes::JustBase, cx);
+        editor::init(cx);
+        workspace::init(app_state.clone(), cx);
+        init(cx);
+        app_state
+    });
+    let project = project::Project::test(app_state.fs.clone(), [], cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| workspace::MultiWorkspace::test_new(project, window, cx));
+    cx.run_until_parked();
+    let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+    workspace.read_with(cx, |workspace, cx| {
+        let status_bar = workspace.status_bar().read(cx);
+        assert!(status_bar.item_of_type::<IndentIndicator>().is_none());
+    });
+}
