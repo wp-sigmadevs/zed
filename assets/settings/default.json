@@ -3006,6 +3006,8 @@
       "scope": "project",
       // Where the panel docks: "left", "bottom" or "right".
       "dock": "bottom",
+      // The TODO panel, editor colouring and the warning on commits that add TODOs.
+      "enabled": true,
     },
     // Local History: automatic file revisions, independent of git.
     "local_history": {

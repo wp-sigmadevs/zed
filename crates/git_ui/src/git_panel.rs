@@ -4371,6 +4371,16 @@ impl GitPanel {
             return;
         };
 
+        // Zenith (plan 27): hold the commit while the changes are checked for new TODOs.
+        let (this, staged) = (cx.weak_entity(), self.has_staged_changes());
+        let resume = move |window: &mut Window, cx: &mut App| {
+            this.update(cx, |this, cx| this.commit_changes(options, window, cx))
+                .log_err();
+        };
+        if zenith_todo::hold_commit(&active_repository, staged, window, cx, resume) {
+            return;
+        }
+
         if self.add_coauthors {
             self.fill_co_authors(&mut message, cx);
         }

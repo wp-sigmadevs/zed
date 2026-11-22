@@ -13,9 +13,11 @@ path = "src/zenith_todo.rs"
 doctest = false
 
 [dependencies]
+clock.workspace = true
 editor.workspace = true
 file_icons.workspace = true
 fs.workspace = true
+git.workspace = true
 gpui.workspace = true
 language.workspace = true
 project.workspace = true

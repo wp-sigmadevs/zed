@@ -1,31 +1,37 @@
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    cell::Cell,
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     future::Future,
     ops::Range,
     path::Path,
     sync::Arc,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use editor::{Editor, EditorEvent, HighlightKey, SelectionEffects, scroll::Autoscroll};
 use file_icons::FileIcons;
 use fs::Fs;
+use git::{blame::BlameEntry, repository::DiffType};
 use gpui::{
     Action, App, AppContext as _, ClickEvent, Context, Entity, EntityId, EventEmitter, FocusHandle,
-    Focusable, FontWeight, HighlightStyle, IntoElement, ParentElement, Pixels, Render, Role,
-    ScrollStrategy, Styled, Task, UniformListScrollHandle, WeakEntity, Window, actions, px,
-    uniform_list,
+    Focusable, FontWeight, Global, HighlightStyle, IntoElement, ParentElement, Pixels, PromptLevel,
+    Render, Role, ScrollStrategy, Styled, Task, UniformListScrollHandle, WeakEntity, Window,
+    actions, px, uniform_list,
 };
 use language::{Buffer, BufferEvent, BufferSnapshot};
 use project::{
     Project, ProjectItem as _, ProjectPath, SearchResults,
     buffer_store::BufferStoreEvent,
+    git_store::Repository,
     search::{SearchQuery, SearchResult},
 };
 use regex::{Regex, RegexBuilder};
 use settings::{RegisterSetting, Settings, SettingsContent, SettingsStore, ZenithTodoScope};
 use text::{Anchor, Point, ToOffset as _, ToPoint as _};
-use ui::{ButtonLike, ListItem, ListItemSpacing, Tooltip, prelude::*};
+use ui::{
+    ButtonLike, ContextMenu, DropdownMenu, DropdownStyle, IconPosition, ListItem, ListItemSpacing,
+    Tooltip, prelude::*,
+};
 use util::{ResultExt as _, paths::PathMatcher};
 use workspace::{
     Workspace,
@@ -68,6 +74,7 @@ pub struct TodoSettings {
     pub highlight: bool,
     pub scope: Scope,
     pub dock: DockPosition,
+    pub enabled: bool,
 }
 
 impl Settings for TodoSettings {
@@ -91,6 +98,7 @@ impl Settings for TodoSettings {
                 Some(settings::DockPosition::Right) => DockPosition::Right,
                 Some(settings::DockPosition::Bottom) | None => DockPosition::Bottom,
             },
+            enabled: todo.and_then(|todo| todo.enabled).unwrap_or(true),
         }
     }
 }
@@ -114,8 +122,14 @@ fn combined_pattern(patterns: &[String]) -> String {
         .join("|")
 }
 
+/// Marks that `init` ran, so the commit hook stays off when the feature is compiled out of `zenith`.
+struct Installed;
+
+impl Global for Installed {}
+
 pub fn init(cx: &mut App) {
     TodoSettings::register(cx);
+    cx.set_global(Installed);
     cx.observe_new(|editor: &mut Editor, _, cx| {
         if editor.mode().is_full() && editor.project().is_some() {
             install_highlighter(editor, cx);
@@ -129,6 +143,10 @@ pub fn init(cx: &mut App) {
         let Some(window) = window else {
             return;
         };
+        // shortcut: read once per workspace, so toggling `enabled` shows or hides the panel in new windows only; add/remove on settings change if that bites.
+        if !TodoSettings::get_global(cx).enabled {
+            return;
+        }
         let panel = cx.new(|cx| TodoPanel::new(workspace, cx));
         workspace.add_panel(panel, window, cx);
     })
@@ -248,8 +266,7 @@ fn install_highlighter(editor: &Editor, cx: &mut Context<Editor>) {
 fn schedule_highlight(editor: &Editor, cx: &mut Context<Editor>) -> Task<()> {
     let settings = TodoSettings::get_global(cx);
     let buffer = editor.buffer().read(cx).as_singleton();
-    let regex = settings
-        .highlight
+    let regex = (settings.enabled && settings.highlight)
         .then(|| build_regex(&combined_pattern(&settings.patterns)))
         .flatten();
     let (Some(buffer), Some(regex)) = (buffer, regex) else {
@@ -418,6 +435,80 @@ struct TodoItem {
     row: u32,
     pattern: SharedString,
     text: SharedString,
+    /// Author and unix time of the line, once the file is blamed.
+    blame: Option<(SharedString, i64)>,
+}
+
+/// How recently a TODO line was last changed, for the age chips.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Age {
+    Any,
+    Week,
+    Month,
+    Year,
+}
+
+impl Age {
+    const CHIPS: [(Age, &'static str); 4] = [
+        (Age::Any, "Any"),
+        (Age::Week, "7 d"),
+        (Age::Month, "30 d"),
+        (Age::Year, "1 y"),
+    ];
+
+    fn max_seconds(self) -> Option<i64> {
+        const DAY: i64 = 24 * 60 * 60;
+        match self {
+            Age::Any => None,
+            Age::Week => Some(7 * DAY),
+            Age::Month => Some(30 * DAY),
+            Age::Year => Some(365 * DAY),
+        }
+    }
+}
+
+const NOT_COMMITTED: &str = "Not Committed Yet";
+
+fn unix_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs() as i64)
+}
+
+/// Author and time of `row`; blame leaves uncommitted lines out, so those are new.
+fn line_blame(entries: &[BlameEntry], row: u32, now: i64) -> (SharedString, i64) {
+    match entries.iter().find(|entry| entry.range.contains(&row)) {
+        Some(entry) => (
+            entry.author.clone().unwrap_or_default().into(),
+            entry.author_time.unwrap_or(now),
+        ),
+        None => (NOT_COMMITTED.into(), now),
+    }
+}
+
+/// Whether an item passes the author and age filters; an unblamed item passes only when
+/// no filter is set.
+fn passes_filters(
+    blame: Option<&(SharedString, i64)>,
+    author: Option<&str>,
+    age: Age,
+    now: i64,
+) -> bool {
+    if author.is_none() && age == Age::Any {
+        return true;
+    }
+    let Some((item_author, time)) = blame else {
+        return false;
+    };
+    author.is_none_or(|author| item_author.as_ref() == author)
+        && age.max_seconds().is_none_or(|max| now - time <= max)
+}
+
+/// A file's blame and the buffer version it was taken at; `None` entries mean the file
+/// has no blame (not in a repository, or blame failed).
+struct FileBlame {
+    version: clock::Global,
+    entries: Option<Vec<BlameEntry>>,
 }
 
 pub struct TodoPanel {
@@ -438,6 +529,10 @@ pub struct TodoPanel {
     message: Option<SharedString>,
     scan_task: Task<()>,
     buffer_tasks: HashMap<EntityId, Task<()>>,
+    blame: HashMap<EntityId, FileBlame>,
+    blame_task: Task<()>,
+    author_filter: Option<SharedString>,
+    age_filter: Age,
 }
 
 impl TodoPanel {
@@ -499,6 +594,10 @@ impl TodoPanel {
             message: None,
             scan_task: Task::ready(()),
             buffer_tasks: HashMap::default(),
+            blame: HashMap::default(),
+            blame_task: Task::ready(()),
+            author_filter: None,
+            age_filter: Age::Any,
         }
     }
 
@@ -677,21 +776,114 @@ impl TodoPanel {
         self.limit_reached = limit_reached;
         self.message = message;
         self.scanning = false;
+        self.apply_blame(cx);
+        self.refresh_blame(cx);
         self.rebuild_rows(cx);
     }
 
-    fn file_count(&self) -> usize {
+    /// Fills each item's author and time from blame taken at the buffer's current version.
+    fn apply_blame(&mut self, cx: &App) {
+        let now = unix_now();
+        for item in &mut self.items {
+            item.blame = self
+                .blame
+                .get(&item.buffer.entity_id())
+                .filter(|blame| blame.version == item.buffer.read(cx).version())
+                .and_then(|blame| blame.entries.as_deref())
+                .map(|entries| line_blame(entries, item.row, now));
+        }
+    }
+
+    /// Blames, one file after another in the background, the result files whose blame is
+    /// missing or older than the buffer.
+    fn refresh_blame(&mut self, cx: &mut Context<Self>) {
+        let mut seen = HashSet::new();
+        let stale: Vec<Entity<Buffer>> = self
+            .items
+            .iter()
+            .map(|item| &item.buffer)
+            .filter(|buffer| seen.insert(buffer.entity_id()))
+            .filter(|buffer| {
+                self.blame
+                    .get(&buffer.entity_id())
+                    .is_none_or(|blame| blame.version != buffer.read(cx).version())
+            })
+            .cloned()
+            .collect();
+        self.blame.retain(|buffer_id, _| seen.contains(buffer_id));
+        if stale.is_empty() {
+            return;
+        }
+        let project = self.project.clone();
+        self.blame_task = cx.spawn(async move |this, cx| {
+            for buffer in stale {
+                let (version, blame) = cx.update(|cx| {
+                    let version = buffer.read(cx).version();
+                    let in_repository = project
+                        .read(cx)
+                        .git_store()
+                        .read(cx)
+                        .repository_and_path_for_buffer_id(buffer.read(cx).remote_id(), cx)
+                        .is_some();
+                    let blame = if in_repository {
+                        project.update(cx, |project, cx| project.blame_buffer(&buffer, None, cx))
+                    } else {
+                        Task::ready(Ok(None))
+                    };
+                    (version, blame)
+                });
+                let entries = blame.await.log_err().flatten().map(|blame| blame.entries);
+                let updated = this.update(cx, |this, cx| {
+                    this.blame
+                        .insert(buffer.entity_id(), FileBlame { version, entries });
+                    this.apply_blame(cx);
+                    this.rebuild_rows(cx);
+                });
+                if updated.is_err() {
+                    return;
+                }
+            }
+        });
+    }
+
+    fn set_author_filter(&mut self, author: Option<SharedString>, cx: &mut Context<Self>) {
+        self.author_filter = author;
+        self.rebuild_rows(cx);
+    }
+
+    fn set_age_filter(&mut self, age: Age, cx: &mut Context<Self>) {
+        self.age_filter = age;
+        self.rebuild_rows(cx);
+    }
+
+    /// Indices of the items that pass the author and age filters.
+    fn visible(&self) -> Vec<usize> {
+        let now = unix_now();
         self.items
             .iter()
-            .map(|item| &item.path)
-            .collect::<HashSet<_>>()
-            .len()
+            .enumerate()
+            .filter(|(_, item)| {
+                passes_filters(
+                    item.blame.as_ref(),
+                    self.author_filter.as_deref(),
+                    self.age_filter,
+                    now,
+                )
+            })
+            .map(|(ix, _)| ix)
+            .collect()
     }
 
     fn summary(&self) -> String {
+        let visible = self.visible();
+        let files = visible
+            .iter()
+            .map(|&ix| &self.items[ix].path)
+            .collect::<HashSet<_>>()
+            .len();
         summary_text(
-            self.items.len(),
-            self.file_count(),
+            visible.len(),
+            files,
             self.limit_reached,
             self.scanning,
             self.message.as_deref(),
@@ -700,10 +892,11 @@ impl TodoPanel {
 
     fn rebuild_rows(&mut self, cx: &mut Context<Self>) {
         let mut rows = vec![Row::Summary];
-        if !self.items.is_empty() && !self.collapsed.contains(&Node::Summary) {
+        let groups = self.groups();
+        if !groups.is_empty() && !self.collapsed.contains(&Node::Summary) {
             rows.push(Row::Project);
             if !self.collapsed.contains(&Node::Project) {
-                for (key, indices) in self.groups() {
+                for (key, indices) in groups {
                     rows.push(Row::Group(key.clone(), indices.len()));
                     if !self.collapsed.contains(&Node::Group(key)) {
                         rows.extend(indices.into_iter().map(Row::Item));
@@ -794,7 +987,7 @@ impl TodoPanel {
             Row::Project => format!(
                 "{} - {}",
                 self.project_name(cx),
-                items_label(self.items.len())
+                items_label(self.visible().len())
             ),
             Row::Group(key, count) => {
                 format!("{} {}", group_name(key, self.group_by), items_label(*count))
@@ -831,7 +1024,8 @@ impl TodoPanel {
     /// Item indices per group, in item order (path, then line).
     fn groups(&self) -> BTreeMap<SharedString, Vec<usize>> {
         let mut groups: BTreeMap<SharedString, Vec<usize>> = BTreeMap::new();
-        for (ix, item) in self.items.iter().enumerate() {
+        for ix in self.visible() {
+            let item = &self.items[ix];
             let key = match self.group_by {
                 GroupBy::File => item.path.clone(),
                 GroupBy::Pattern => item.pattern.clone(),
@@ -880,13 +1074,13 @@ fn todo_items(buffer: Entity<Buffer>, ranges: Vec<Range<Anchor>>, cx: &App) -> V
                 row: point.row,
                 pattern: pattern_label(&matched),
                 text: line.trim().to_string().into(),
+                blame: None,
             })
         })
         .collect()
 }
 
 impl TodoPanel {
-    /// A rounded chip for the scope tabs; the active one is outlined and tinted.
     fn scope_chip(
         &self,
         id: &'static str,
@@ -894,7 +1088,25 @@ impl TodoPanel {
         scope: Scope,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let active = self.scope == scope;
+        Self::chip(
+            id,
+            label,
+            self.scope == scope,
+            Role::Tab,
+            cx,
+            move |this, cx| this.set_scope(scope, cx),
+        )
+    }
+
+    /// A rounded chip for the scope tabs and age filters; the active one is outlined and tinted.
+    fn chip(
+        id: impl Into<ElementId>,
+        label: &'static str,
+        active: bool,
+        role: Role,
+        cx: &mut Context<Self>,
+        on_click: impl Fn(&mut Self, &mut Context<Self>) + 'static,
+    ) -> impl IntoElement {
         let border = if active {
             cx.theme().colors().border_focused
         } else {
@@ -904,11 +1116,61 @@ impl TodoPanel {
             ButtonLike::new(id)
                 .style(ButtonStyle::Subtle)
                 .toggle_state(active)
-                .aria_role(Role::Tab)
+                .aria_role(role)
                 .aria_label(label)
-                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.set_scope(scope, cx)))
+                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| on_click(this, cx)))
                 .child(Label::new(label)),
         )
+    }
+
+    /// Author dropdown (authors seen in the results) and age chips.
+    fn render_filters(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let authors: BTreeSet<SharedString> = self
+            .items
+            .iter()
+            .filter_map(|item| item.blame.as_ref().map(|(author, _)| author.clone()))
+            .collect();
+        let selected = self.author_filter.clone();
+        let panel = cx.weak_entity();
+        let menu = ContextMenu::build(window, cx, move |mut menu, _, _| {
+            for author in std::iter::once(None).chain(authors.into_iter().map(Some)) {
+                let label = author.clone().unwrap_or_else(|| "All Authors".into());
+                let panel = panel.clone();
+                menu = menu.toggleable_entry(
+                    label,
+                    author == selected,
+                    IconPosition::Start,
+                    None,
+                    move |_, cx| {
+                        panel
+                            .update(cx, |panel, cx| panel.set_author_filter(author.clone(), cx))
+                            .log_err();
+                    },
+                );
+            }
+            menu
+        });
+        let author_label = self
+            .author_filter
+            .clone()
+            .unwrap_or_else(|| "All Authors".into());
+        h_flex()
+            .gap_1()
+            .child(
+                DropdownMenu::new("zenith-todo-author", author_label, menu)
+                    .style(DropdownStyle::Subtle)
+                    .aria_label("Filter by author"),
+            )
+            .children(Age::CHIPS.into_iter().map(|(age, label)| {
+                Self::chip(
+                    ("zenith-todo-age", age as usize),
+                    label,
+                    self.age_filter == age,
+                    Role::Button,
+                    cx,
+                    move |this, cx| this.set_age_filter(age, cx),
+                )
+            }))
     }
 
     fn strip_button(
@@ -1008,7 +1270,7 @@ impl TodoPanel {
                         .gap_2()
                         .child(bold(self.project_name(cx).to_string()))
                         .child(
-                            Label::new(format!("- {}", items_label(self.items.len())))
+                            Label::new(format!("- {}", items_label(self.visible().len())))
                                 .color(Color::Muted),
                         ),
                 )
@@ -1060,7 +1322,7 @@ impl TodoPanel {
 }
 
 impl Render for TodoPanel {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let header = h_flex()
             .h(px(HEADER_HEIGHT))
             .flex_none()
@@ -1082,7 +1344,9 @@ impl Render for TodoPanel {
                 "Changed Files",
                 Scope::ChangedFiles,
                 cx,
-            ));
+            ))
+            .child(div().flex_1())
+            .child(self.render_filters(window, cx));
         let list = uniform_list(
             "zenith-todo-rows",
             self.rows.len(),
@@ -1113,6 +1377,132 @@ impl Render for TodoPanel {
                     .child(self.render_strip(cx))
                     .child(v_flex().flex_1().min_w_0().h_full().child(list)),
             )
+    }
+}
+
+/// Added lines of a unified diff that carry a marker inside a comment, as (path, line).
+/// A marker line that the same diff also removes was moved, not added.
+fn new_todo_lines(diff: &str, regex: &Regex) -> Vec<(String, String)> {
+    let has_marker = |line: &str| {
+        regex
+            .find_iter(line)
+            .any(|found| has_comment_marker(line.get(..found.start()).unwrap_or_default()))
+    };
+    let mut path = String::new();
+    let mut in_header = false;
+    let mut added = Vec::new();
+    let mut removed = HashSet::new();
+    for line in diff.lines() {
+        if line.starts_with("diff --git ") {
+            in_header = true;
+        } else if line.starts_with("@@") {
+            in_header = false;
+        } else if in_header {
+            if let Some(new_path) = line.strip_prefix("+++ ") {
+                path = new_path.strip_prefix("b/").unwrap_or(new_path).to_string();
+            }
+        } else if let Some(text) = line.strip_prefix('+') {
+            if has_marker(text) {
+                added.push((path.clone(), text.trim().to_string()));
+            }
+        } else if let Some(text) = line.strip_prefix('-') {
+            if has_marker(text) {
+                removed.insert(text.trim().to_string());
+            }
+        }
+    }
+    added.retain(|(_, text)| !removed.contains(text));
+    added
+}
+
+thread_local! {
+    /// Set while `hold_commit` resumes a commit the user confirmed, so it is not held again.
+    static COMMIT_CONFIRMED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Commit hook for the git panel: returns `true` when it holds the commit to check the
+/// changes for new TODOs. It then calls `resume` when none are found or the user picks
+/// "Commit Anyway", and opens the TODO panel on "Review".
+pub fn hold_commit(
+    repository: &Entity<Repository>,
+    staged: bool,
+    window: &mut Window,
+    cx: &mut App,
+    resume: impl FnOnce(&mut Window, &mut App) + 'static,
+) -> bool {
+    if COMMIT_CONFIRMED.get() || !cx.has_global::<Installed>() {
+        return false;
+    }
+    let settings = TodoSettings::get_global(cx);
+    if !settings.enabled {
+        return false;
+    }
+    let Some(regex) = build_regex(&combined_pattern(&settings.patterns)) else {
+        return false;
+    };
+    let diff_type = if staged {
+        DiffType::HeadToIndex
+    } else {
+        DiffType::HeadToWorktree
+    };
+    let diff = repository.update(cx, |repository, cx| repository.diff(diff_type, cx));
+    window
+        .spawn(cx, async move |cx| {
+            // A failed diff must not block the commit; it is logged and the commit goes on.
+            let new_todos = diff
+                .await
+                .ok()
+                .and_then(|diff| diff.log_err())
+                .map(|diff| new_todo_lines(&diff, &regex))
+                .unwrap_or_default();
+            let answer = if new_todos.is_empty() {
+                Some(0)
+            } else {
+                let message = match new_todos.len() {
+                    1 => "This commit adds a TODO comment.".to_string(),
+                    count => format!("This commit adds {count} TODO comments."),
+                };
+                let detail = new_todos
+                    .iter()
+                    .take(5)
+                    .map(|(path, text)| format!("{path}: {text}"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let prompt = cx.update(|window, cx| {
+                    window.prompt(
+                        PromptLevel::Warning,
+                        &message,
+                        Some(&detail),
+                        &["Commit Anyway", "Review"],
+                        cx,
+                    )
+                })?;
+                prompt.await.ok()
+            };
+            cx.update(|window, cx| match answer {
+                Some(0) => {
+                    COMMIT_CONFIRMED.set(true);
+                    resume(window, cx);
+                    COMMIT_CONFIRMED.set(false);
+                }
+                Some(_) => review_changed_todos(window, cx),
+                None => {}
+            })
+        })
+        .detach_and_log_err(cx);
+    true
+}
+
+/// Opens the TODO panel on the Changed Files scope.
+fn review_changed_todos(window: &mut Window, cx: &mut App) {
+    let Some(workspace) = Workspace::for_window(window, cx) else {
+        return;
+    };
+    let panel = workspace.update(cx, |workspace, cx| {
+        workspace.focus_panel::<TodoPanel>(window, cx)
+    });
+    if let Some(panel) = panel {
+        panel.update(cx, |panel, cx| panel.set_scope(Scope::ChangedFiles, cx));
     }
 }
 
@@ -1472,5 +1862,140 @@ mod tests {
         panel.update_in(cx, |panel, window, cx| panel.step_item(false, window, cx));
         cx.run_until_parked();
         assert_eq!(selected(&panel, cx), Some(4));
+    }
+
+    #[test]
+    fn filters_by_author_and_age() {
+        let now = 1_000_000_000;
+        let day = 24 * 60 * 60;
+        let alice = Some((SharedString::from("Alice"), now - 3 * day));
+        let bob = Some((SharedString::from("Bob"), now - 40 * day));
+        assert!(passes_filters(None, None, Age::Any, now));
+        assert!(!passes_filters(None, Some("Alice"), Age::Any, now));
+        assert!(!passes_filters(None, None, Age::Year, now));
+        assert!(passes_filters(
+            alice.as_ref(),
+            Some("Alice"),
+            Age::Week,
+            now
+        ));
+        assert!(!passes_filters(bob.as_ref(), Some("Alice"), Age::Any, now));
+        assert!(!passes_filters(bob.as_ref(), None, Age::Month, now));
+        assert!(passes_filters(bob.as_ref(), None, Age::Year, now));
+        assert!(passes_filters(bob.as_ref(), Some("Bob"), Age::Any, now));
+    }
+
+    #[test]
+    fn blame_lines_without_a_commit_are_new() {
+        let entry = BlameEntry {
+            sha: "0123456789abcdef0123456789abcdef01234567"
+                .parse()
+                .expect("valid sha"),
+            range: 2..4,
+            original_line_number: 3,
+            author: Some("Alice".into()),
+            author_mail: None,
+            author_time: Some(500),
+            author_tz: None,
+            committer_name: None,
+            committer_email: None,
+            committer_time: None,
+            committer_tz: None,
+            summary: None,
+            previous: None,
+            filename: "a.rs".into(),
+            boundary: false,
+        };
+        let entries = [entry];
+        assert_eq!(line_blame(&entries, 3, 900), ("Alice".into(), 500));
+        assert_eq!(line_blame(&entries, 4, 900), (NOT_COMMITTED.into(), 900));
+    }
+
+    #[test]
+    fn new_todos_in_a_diff() {
+        let diff = "diff --git a/src/a.rs b/src/a.rs\n\
+            index 1111111..2222222 100644\n\
+            --- a/src/a.rs\n\
+            +++ b/src/a.rs\n\
+            @@ -1,2 +1,4 @@\n\
+            \x20fn a() {} // TODO: old\n\
+            +// TODO: new one\n\
+            +let todo = 1;\n\
+            -// FIXME: moved\n\
+            +    // FIXME: moved\n\
+            +++ y // HACK\n\
+            diff --git a/new.php b/new.php\n\
+            new file mode 100644\n\
+            --- /dev/null\n\
+            +++ b/new.php\n\
+            @@ -0,0 +1 @@\n\
+            +<?php # @todo x\n";
+        let regex = build_regex(&combined_pattern(&[])).expect("valid pattern");
+        let found = new_todo_lines(diff, &regex);
+        let expected = [
+            ("src/a.rs", "// TODO: new one"),
+            ("src/a.rs", "++ y // HACK"),
+            ("new.php", "<?php # @todo x"),
+        ]
+        .map(|(path, text)| (path.to_string(), text.to_string()));
+        assert_eq!(found, expected);
+    }
+
+    #[gpui::test]
+    async fn disabled_means_no_panel_and_no_colours(cx: &mut gpui::TestAppContext) {
+        let app_state = cx.update(|cx| {
+            let app_state = workspace::AppState::test(cx);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            editor::init(cx);
+            workspace::init(app_state.clone(), cx);
+            init(cx);
+            cx.update_global::<SettingsStore, _>(|store, cx| {
+                store.update_user_settings(cx, |content| {
+                    content
+                        .zenith
+                        .get_or_insert_default()
+                        .todo
+                        .get_or_insert_default()
+                        .enabled = Some(false);
+                });
+            });
+            app_state
+        });
+        app_state
+            .fs
+            .as_fake()
+            .insert_tree("/project", serde_json::json!({ "a.txt": "// TODO: one\n" }))
+            .await;
+        let project =
+            Project::test(app_state.fs.clone(), [std::path::Path::new("/project")], cx).await;
+        let (multi_workspace, cx) = cx
+            .add_window_view(|window, cx| workspace::MultiWorkspace::test_new(project, window, cx));
+        let workspace = multi_workspace.read_with(cx, |multi, _| multi.workspace().clone());
+        let panel = workspace.update_in(cx, |workspace, window, cx| {
+            workspace.focus_panel::<TodoPanel>(window, cx)
+        });
+        assert!(panel.is_none());
+        let editor = workspace
+            .update_in(cx, |workspace, window, cx| {
+                workspace.open_abs_path(
+                    "/project/a.txt".into(),
+                    workspace::OpenOptions::default(),
+                    window,
+                    cx,
+                )
+            })
+            .await
+            .expect("file opens")
+            .downcast::<Editor>()
+            .expect("an editor");
+        cx.executor().advance_clock(Duration::from_millis(400));
+        cx.run_until_parked();
+        editor.update(cx, |editor, cx| {
+            assert!(
+                editor
+                    .text_highlights(HighlightKey::ZenithTodo(2), cx)
+                    .is_none()
+            );
+        });
     }
 }

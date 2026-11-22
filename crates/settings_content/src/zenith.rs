@@ -139,6 +139,10 @@ pub struct ZenithTodoSettingsContent {
     ///
     /// Default: bottom
     pub dock: Option<crate::DockPosition>,
+    /// Whether the TODO panel, its editor colouring and the commit warning are on.
+    ///
+    /// Default: true
+    pub enabled: Option<bool>,
 }
 
 /// Which files the TODO panel lists.
