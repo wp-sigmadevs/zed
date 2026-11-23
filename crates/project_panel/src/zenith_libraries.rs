@@ -155,7 +155,7 @@ impl ProjectPanel {
     }
 
     /// Context menu of the "External Libraries" row (a synthetic entry, so the regular menu has
-    /// nothing for it): Add Library Path…. Does nothing for any other row.
+    /// nothing for it): Add Library Path… and Configure PHP Include Paths…. Does nothing for any other row.
     pub(super) fn zenith_section_menu(
         &mut self,
         placement: ContextMenuPlacement,
@@ -180,6 +180,10 @@ impl ProjectPanel {
             menu.action(
                 "Add Library Path…",
                 Box::new(zenith_external_libraries::AddLibraryPath),
+            )
+            .action(
+                "Configure PHP Include Paths…",
+                Box::new(zenith_external_libraries::ConfigurePhpIncludePaths),
             )
         });
         let (position, anchor) = match placement {
