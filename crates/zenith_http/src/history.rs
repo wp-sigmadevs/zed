@@ -26,22 +26,23 @@ pub const MASKED_VALUE: &str = "***";
 /// (`password1`). So `X-Api-Key`, `XApiKey`, `user[password]`, `user%5Bpassword%5D`,
 /// `new_password1` and `aws_secret_access_key` are caught. `token` counts only as the last
 /// segment (`access_token`, not `total_tokens`), and the words below only as a whole segment
-/// or its ending (`userpassword`, not `secretary`). Weak words (`key`, `policy`, `session`)
-/// count only as the whole name.
+/// or its ending (`userpassword`, not `secretary`). Weak words (`key`, `policy`, `session`,
+/// `tokens`, `refresh`) count only as the whole name; bare `access` is never a secret.
 // shortcut: a descriptor ending (`password_min_length`, `forgot_password_url`) or a paging
 // token (`next_token`) stays readable, so a secret hidden behind such a name is not caught;
 // drop the exemptions if that bites.
 fn is_secret_name(name: &str) -> bool {
-    const ENDINGS: [&str; 6] = [
+    const ENDINGS: [&str; 7] = [
         "password",
         "passwd",
         "pwd",
         "secret",
+        "secrets",
         "authorization",
         "cookie",
     ];
     // The word before `key` that makes it a credential: `api_key`, `X-Auth-Key`, `XApiKey`.
-    const KEY_PREFIXES: [&str; 13] = [
+    const KEY_PREFIXES: [&str; 16] = [
         "api",
         "app",
         "application",
@@ -55,8 +56,11 @@ fn is_secret_name(name: &str) -> bool {
         "secret",
         "private",
         "auth",
+        "account",
+        "signing",
+        "write",
     ];
-    const WHOLE_NAMES: [&str; 7] = [
+    const WHOLE_NAMES: [&str; 14] = [
         "key",
         "sig",
         "policy",
@@ -64,8 +68,15 @@ fn is_secret_name(name: &str) -> bool {
         "session",
         "sessionid",
         "idtokenhint",
+        "tokens",
+        "refresh",
+        "cardnumber",
+        "creditcardnumber",
+        "mfacode",
+        "otpcode",
+        "pincode",
     ];
-    const LAST_SEGMENTS: [&str; 12] = [
+    const LAST_SEGMENTS: [&str; 18] = [
         "pass",
         "pw",
         "signature",
@@ -78,6 +89,12 @@ fn is_secret_name(name: &str) -> bool {
         "passcode",
         "authentication",
         "jwt",
+        "ssn",
+        "cvv",
+        "cvc",
+        "otp",
+        "totp",
+        "pin",
     ];
     const DESCRIPTORS: [&str; 8] = [
         "url", "uri", "endpoint", "length", "type", "min", "max", "required",
@@ -245,20 +262,40 @@ fn mask_secret_pairs(pairs: &str) -> Option<String> {
 }
 
 /// `url` without its `user:password@` part, or `None` when it has none.
+///
+/// A URL that parses is rebuilt from the parsed form, so every spelling the client accepts
+/// (`https:/u:p@h`, `https:u:p@h`, extra slashes, backslashes) loses its userinfo. A template that
+/// does not parse (`{{scheme}}://u:p@h`) is cut by hand: any run of `/` and `\` after the
+/// scheme's colon, then an authority ending at `/`, `\`, `?` or `#`.
 fn strip_url_userinfo(url: &str) -> Option<String> {
-    let (scheme, rest) = url.trim_start().split_once("://")?;
-    // The scheme may be a template (`{{scheme}}`), but a `://` further in, after a path or a
+    let url = url.trim_start();
+    if let Ok(mut parsed) = Url::parse(url.trim_end()) {
+        if parsed.username().is_empty() && parsed.password().is_none() {
+            return None;
+        }
+        // Never fails for http(s); otherwise the cut by hand below still runs.
+        if parsed.set_username("").is_ok() && parsed.set_password(None).is_ok() {
+            return Some(parsed.into());
+        }
+    }
+    let (scheme, rest) = url.split_once(':')?;
+    // The scheme may be a template (`{{scheme}}`), but a `:` further in, after a path or a
     // query, is not the URL's own.
     if scheme.is_empty()
         || scheme
             .chars()
-            .any(|c| c.is_whitespace() || "/?#@:".contains(c))
+            .any(|c| c.is_whitespace() || "/\\?#@".contains(c))
     {
         return None;
     }
-    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority_start = rest.len() - rest.trim_start_matches(['/', '\\']).len();
+    let (slashes, rest) = rest.split_at(authority_start);
+    let authority_end = rest.find(['/', '\\', '?', '#']).unwrap_or(rest.len());
     let (_, host) = rest[..authority_end].rsplit_once('@')?;
-    Some(format!("{scheme}://{host}{}", &rest[authority_end..]))
+    Some(format!(
+        "{scheme}:{slashes}{host}{}",
+        &rest[authority_end..]
+    ))
 }
 
 /// Masks the query and the fragment (`#access_token=...`) of `url` like pairs; everything
@@ -673,6 +710,26 @@ mod tests {
             "private_key",
             "apikey",
             "api-key",
+            "ssn",
+            "user_ssn",
+            "cvv",
+            "card_cvc",
+            "otp",
+            "totp",
+            "pin",
+            "user_pin",
+            "card_number",
+            "creditCardNumber",
+            "mfa_code",
+            "otp_code",
+            "pin_code",
+            "secrets",
+            "client_secrets",
+            "tokens",
+            "refresh",
+            "AccountKey",
+            "signing_key",
+            "write_key",
         ] {
             assert!(is_secret_name(name), "{name}");
         }
@@ -693,7 +750,13 @@ mod tests {
             "monkey",
             "compass",
             "bypass",
-            "ssn",
+            "access",
+            "access_level",
+            "refresh_rate",
+            "pinned",
+            "spin",
+            "pin_length",
+            "card_type",
         ] {
             assert!(!is_secret_name(name), "{name}");
         }
@@ -949,14 +1012,14 @@ mod tests {
         );
         assert_eq!(
             strip_url_userinfo("http://ann:not-a-real-value-4@[::1]:80/p").as_deref(),
-            Some("http://[::1]:80/p")
+            Some("http://[::1]/p")
         );
         // An `@` only in the path, query or fragment is not userinfo; nor is no `@` at all.
         assert_eq!(strip_url_userinfo("https://a.test/@ann"), None);
         assert_eq!(strip_url_userinfo("https://a.test?m=a@b.test"), None);
         assert_eq!(strip_url_userinfo("https://a.test#a@b"), None);
         assert_eq!(strip_url_userinfo("https://a.test/p"), None);
-        // A templated scheme still gets its userinfo stripped, and so does an uppercase one.
+        // A templated scheme still gets its userinfo stripped; a parsed URL is stored as parsed (lowercase scheme, no default port).
         assert_eq!(
             strip_url_userinfo("{{scheme}}://ann:not-a-real-value-5@a.test/p").as_deref(),
             Some("{{scheme}}://a.test/p")
@@ -967,12 +1030,41 @@ mod tests {
         );
         assert_eq!(
             strip_url_userinfo("HTTPS://ann:not-a-real-value-7@a.test/p").as_deref(),
-            Some("HTTPS://a.test/p")
+            Some("https://a.test/p")
         );
         assert_eq!(
             strip_url_userinfo("  https://ann:not-a-real-value-8@a.test/p").as_deref(),
             Some("https://a.test/p")
         );
+        // Every spelling `Url::parse` accepts loses its userinfo; the stored URL is the parsed one.
+        for url in [
+            "https:/ann:not-a-real-value-10@a.test/p",
+            "https:ann:not-a-real-value-11@a.test/p",
+            "https:///ann:not-a-real-value-12@a.test/p",
+            "https:\\\\ann:not-a-real-value-13@a.test\\p",
+            "https:/\\/ann:not-a-real-value-14@a.test/p",
+        ] {
+            assert_eq!(
+                strip_url_userinfo(url).as_deref(),
+                Some("https://a.test/p"),
+                "{url}"
+            );
+        }
+        // A template that does not parse: slashes and backslashes after the colon are kept, and
+        // a backslash ends the authority.
+        assert_eq!(
+            strip_url_userinfo("{{scheme}}:/ann:not-a-real-value-15@a.test/p").as_deref(),
+            Some("{{scheme}}:/a.test/p")
+        );
+        assert_eq!(
+            strip_url_userinfo("{{scheme}}:ann:not-a-real-value-16@a.test/p").as_deref(),
+            Some("{{scheme}}:a.test/p")
+        );
+        assert_eq!(
+            strip_url_userinfo("{{scheme}}:\\\\ann:not-a-real-value-17@a.test\\p?x").as_deref(),
+            Some("{{scheme}}:\\\\a.test\\p?x")
+        );
+        assert_eq!(strip_url_userinfo("{{scheme}}://a.test\\@ann"), None);
         // A raw `/ ? #` inside a password ends the authority early, so the rest of the
         // password stays. Such a URL mostly fails `Url::parse` in the client and
         // `history_view::record` skips failed requests; a digits-only password before the `/`
@@ -1000,6 +1092,28 @@ mod tests {
         let raw_index = std::fs::read_to_string(history.directory().join(INDEX_FILE))?;
         assert!(!raw_index.contains("not-a-real-value"), "{raw_index}");
         assert_eq!(history.load(id)?.request.url, "{{scheme}}://a.test/p");
+
+        // Spellings the client sends that do not contain `://`.
+        for (ix, url) in [
+            "https:/ann:not-a-real-value-20@a.test/p",
+            "https:ann:not-a-real-value-21@a.test/p",
+            "https:///ann:not-a-real-value-22@a.test/p",
+            "https:\\\\ann:not-a-real-value-23@a.test/p",
+            "{{scheme}}:\\\\ann:not-a-real-value-24@a.test\\p",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let request = HttpRequest::new("GET", url, 3 + ix);
+            let id = history.append(request, ok(""))?.expect("stored");
+            let raw = std::fs::read_to_string(history.directory().join(format!("{id}.json")))?;
+            assert!(!raw.contains("not-a-real-value"), "{url}: {raw}");
+            let raw_index = std::fs::read_to_string(history.directory().join(INDEX_FILE))?;
+            assert!(
+                !raw_index.contains("not-a-real-value"),
+                "{url}: {raw_index}"
+            );
+        }
         Ok(())
     }
 
