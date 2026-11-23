@@ -314,7 +314,7 @@ pub struct ZenithScratchesSettingsContent {
     ///
     /// Default: true
     pub use_project_cwd: Option<bool>,
-    /// Whether the project panel ends with a "Scratches and Consoles" node listing the
+    /// Whether the project panel ends with a "Scratches" node listing the
     /// scratch files, as in PhpStorm.
     ///
     /// Default: true

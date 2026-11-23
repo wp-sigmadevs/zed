@@ -1,4 +1,4 @@
-//! The "Scratches and Consoles" node: the scratch store, an invisible worktree that
+//! The "Scratches" node: the scratch store, an invisible worktree that
 //! `zenith_scratches` keeps open, listed after "External Libraries" with its files under a
 //! "Scratches" folder. It reuses the External Libraries machinery: a synthetic node row whose
 //! expansion lives in the store worktree's expanded ids, and a row group of its own.
@@ -9,7 +9,7 @@ use zenith_external_libraries::{
     section_worktree,
 };
 
-const NODE_LABEL: &str = "Scratches and Consoles";
+const NODE_LABEL: &str = "Scratches";
 const FOLDER_LABEL: &str = "Scratches";
 
 /// What a scratch row's context menu offers, as `(label, action)`; `None` is a separator. The
@@ -370,12 +370,12 @@ mod tests {
         let collapsed = names(&mut opened);
         assert_eq!(
             collapsed[collapsed.len() - 2..],
-            ["External Libraries", "Scratches and Consoles"],
+            ["External Libraries", "Scratches"],
             "{collapsed:?}"
         );
 
         toggle(&mut opened, "External Libraries");
-        toggle(&mut opened, "Scratches and Consoles");
+        toggle(&mut opened, "Scratches");
         let expanded = names(&mut opened);
         let position = |name: &str| {
             expanded
@@ -383,15 +383,10 @@ mod tests {
                 .position(|n| n == name)
                 .unwrap_or_else(|| panic!("no row {name:?} in {expanded:?}"))
         };
-        assert!(position("Composer Packages (read-only)") < position("Scratches and Consoles"));
+        assert!(position("Composer Packages (read-only)") < position("Scratches"));
         assert_eq!(
-            expanded[position("Scratches and Consoles")..],
-            [
-                "Scratches and Consoles",
-                "Scratches",
-                "notes.md",
-                "rest-api.http"
-            ],
+            expanded[position("Scratches")..],
+            ["Scratches", "Scratches", "notes.md", "rest-api.http"],
             "the node is the last group and lists the scratches in the panel's sort order"
         );
     }
@@ -402,7 +397,7 @@ mod tests {
         let collapsed = rows(&mut opened);
         assert_eq!(
             collapsed.last(),
-            Some(&("Scratches and Consoles".to_string(), 0)),
+            Some(&("Scratches".to_string(), 0)),
             "{collapsed:?}"
         );
         assert!(
@@ -412,12 +407,12 @@ mod tests {
             "{collapsed:?}"
         );
 
-        toggle(&mut opened, "Scratches and Consoles");
+        toggle(&mut opened, "Scratches");
         let expanded = rows(&mut opened);
         assert_eq!(
             expanded[expanded.len() - 4..],
             [
-                ("Scratches and Consoles".to_string(), 0),
+                ("Scratches".to_string(), 0),
                 ("Scratches".to_string(), 1),
                 ("notes.md".to_string(), 2),
                 ("rest-api.http".to_string(), 2),
@@ -460,7 +455,7 @@ mod tests {
     #[gpui::test]
     async fn test_rename_and_trash_a_scratch(cx: &mut TestAppContext) {
         let mut opened = open(cx, json!({ "src": { "main.php": "" } })).await;
-        toggle(&mut opened, "Scratches and Consoles");
+        toggle(&mut opened, "Scratches");
         select_scratch(&mut opened, "notes.md");
         opened.panel.update_in(&mut opened.cx, |panel, window, cx| {
             panel.rename(&Rename, window, cx)
@@ -497,7 +492,7 @@ mod tests {
     #[gpui::test]
     async fn test_scratch_rows_have_no_drag_and_drop(cx: &mut TestAppContext) {
         let mut opened = open(cx, json!({ "src": { "main.php": "" } })).await;
-        toggle(&mut opened, "Scratches and Consoles");
+        toggle(&mut opened, "Scratches");
         let allowed = opened.panel.update_in(&mut opened.cx, |panel, window, cx| {
             let mut rows = Vec::new();
             panel.for_each_visible_entry(0..200, window, cx, &mut |entry_id, details, _, _| {
@@ -513,13 +508,9 @@ mod tests {
                 .collect::<Vec<_>>()
         });
         for (name, drag_and_drop) in &allowed {
-            let is_scratch_row = [
-                "Scratches and Consoles",
-                "Scratches",
-                "notes.md",
-                "rest-api.http",
-            ]
-            .contains(&name.as_str());
+            // "Scratches" appears twice: the node row and the store-root folder row.
+            let is_scratch_row =
+                ["Scratches", "Scratches", "notes.md", "rest-api.http"].contains(&name.as_str());
             assert_eq!(*drag_and_drop, !is_scratch_row, "{name}: {allowed:?}");
         }
         assert!(allowed.iter().any(|(name, _)| name == "src"));
@@ -528,7 +519,7 @@ mod tests {
     #[gpui::test]
     async fn test_scratch_menu_has_no_remove_from_project(cx: &mut TestAppContext) {
         let mut opened = open(cx, json!({ "src": { "main.php": "" } })).await;
-        toggle(&mut opened, "Scratches and Consoles");
+        toggle(&mut opened, "Scratches");
         let worktree_id = scratch_worktree_id(&mut opened);
         let (file, root) = opened.panel.read_with(&opened.cx, |panel, cx| {
             let worktree = panel
@@ -610,7 +601,7 @@ mod tests {
     #[gpui::test]
     async fn test_keyboard_cannot_rename_or_remove_the_store_folder(cx: &mut TestAppContext) {
         let mut opened = open(cx, json!({ "src": { "main.php": "" } })).await;
-        toggle(&mut opened, "Scratches and Consoles");
+        toggle(&mut opened, "Scratches");
         let worktree_id = scratch_worktree_id(&mut opened);
         let root = opened.panel.read_with(&opened.cx, |panel, cx| {
             let worktree = panel
@@ -661,14 +652,15 @@ mod tests {
                     .await
             );
         }
-        let shown = names(&mut opened);
-        assert!(shown.contains(&"Scratches".to_string()), "{shown:?}");
+        // The folder row (depth 1) survives, not just the node row (depth 0).
+        let shown = rows(&mut opened);
+        assert!(shown.contains(&("Scratches".to_string(), 1)), "{shown:?}");
     }
 
     #[gpui::test]
     async fn test_setting_off_hides_the_node(cx: &mut TestAppContext) {
         let mut opened = open(cx, json!({ "src": { "main.php": "" } })).await;
-        assert!(names(&mut opened).contains(&"Scratches and Consoles".to_string()));
+        assert!(names(&mut opened).contains(&"Scratches".to_string()));
 
         set_node_setting(&mut opened, false);
         opened.panel.update_in(&mut opened.cx, |panel, window, cx| {
@@ -686,7 +678,7 @@ mod tests {
             panel.update_visible_entries(None, false, false, window, cx)
         });
         opened.cx.run_until_parked();
-        assert!(names(&mut opened).contains(&"Scratches and Consoles".to_string()));
+        assert!(names(&mut opened).contains(&"Scratches".to_string()));
     }
 
     fn store_root(opened: &mut Opened) -> ProjectEntryId {
@@ -711,7 +703,7 @@ mod tests {
     #[gpui::test]
     async fn test_new_file_and_directory_do_nothing_on_scratch_rows(cx: &mut TestAppContext) {
         let mut opened = open(cx, json!({ "src": { "main.php": "" } })).await;
-        toggle(&mut opened, "Scratches and Consoles");
+        toggle(&mut opened, "Scratches");
         let worktree_id = scratch_worktree_id(&mut opened);
         let root = store_root(&mut opened);
         for entry_id in [None, Some(root)] {
@@ -764,7 +756,7 @@ mod tests {
     #[gpui::test]
     async fn test_stale_scratch_rows_cannot_rename_the_store_folder(cx: &mut TestAppContext) {
         let mut opened = open(cx, json!({ "src": { "main.php": "" } })).await;
-        toggle(&mut opened, "Scratches and Consoles");
+        toggle(&mut opened, "Scratches");
         let worktree_id = scratch_worktree_id(&mut opened);
         let root = store_root(&mut opened);
         select_scratch(&mut opened, "notes.md");
@@ -861,14 +853,14 @@ mod tests {
             panel.update_in(cx, |panel, window, cx| {
                 let mut rows = Vec::new();
                 panel.for_each_visible_entry(0..200, window, cx, &mut |id, details, _, _| {
-                    rows.push((id, details.filename));
+                    rows.push((id, details.filename, details.depth));
                 });
                 rows
             })
         };
         let node = names(&panel, cx)
             .into_iter()
-            .find(|(_, name)| name == "Scratches and Consoles")
+            .find(|(_, name, depth)| name == "Scratches" && *depth == 0)
             .expect("the node is listed")
             .0;
         panel.update_in(cx, |panel, window, cx| {
@@ -876,13 +868,14 @@ mod tests {
         });
         cx.run_until_parked();
         let rows = names(&panel, cx);
-        let row = |label: &str| {
+        let row = |label: &str, depth: usize| {
             rows.iter()
-                .find(|(_, name)| name == label)
-                .unwrap_or_else(|| panic!("no row {label:?} in {rows:?}"))
+                .find(|(_, name, d)| name == label && *d == depth)
+                .unwrap_or_else(|| panic!("no row {label:?} at depth {depth} in {rows:?}"))
                 .0
         };
-        let (scratch_row, root_row) = (row(&name), row("Scratches"));
+        // The node (depth 0) and the store-root folder (depth 1) share the label "Scratches".
+        let (scratch_row, root_row) = (row(&name, 2), row("Scratches", 1));
 
         panel.update(cx, |panel, _| {
             panel.selection = Some(SelectedEntry {
