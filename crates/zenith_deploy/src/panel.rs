@@ -26,7 +26,7 @@ use workspace::{
 };
 
 use crate::{
-    DeploySettings, EntryKind, RemoteEntry, ServerConfig, ServerStore, Transport,
+    DeploySettings, EntryKind, RemoteEntry, ServerConfig, ServerRefused, ServerStore, Transport,
     dialog::{DeploymentDialog, project_root},
     download_entry,
     remote_path::{join_remote, validate_name, validate_remote_path},
@@ -98,6 +98,8 @@ pub struct RemoteHostPanel {
     rows: Vec<Row>,
     selected: Option<usize>,
     status: Option<SharedString>,
+    /// The host dropdown's menu; dropped when the servers or the selection change.
+    host_menu: Option<Entity<ContextMenu>>,
     active: bool,
     scroll_handle: UniformListScrollHandle,
     /// Running operations by key; dropping one cancels it.
@@ -126,6 +128,7 @@ impl RemoteHostPanel {
             rows: Vec::new(),
             selected: None,
             status: None,
+            host_menu: None,
             active: false,
             scroll_handle: UniformListScrollHandle::new(),
             operations: HashMap::new(),
@@ -142,9 +145,7 @@ impl RemoteHostPanel {
 
     fn server(&self, cx: &App) -> Option<ServerConfig> {
         let id = self.server_id.as_ref()?;
-        self.host_options(cx)
-            .into_iter()
-            .find(|server| &server.id == id)
+        self.store.read(cx).server_for(self.project.as_deref(), id)
     }
 
     fn root(&self, cx: &App) -> Option<String> {
@@ -158,6 +159,7 @@ impl RemoteHostPanel {
     }
 
     fn store_changed(&mut self, cx: &mut Context<Self>) {
+        self.host_menu = None;
         let store = self.store.read(cx);
         if !store.is_loaded() {
             return;
@@ -185,6 +187,7 @@ impl RemoteHostPanel {
 
     /// Picks a host from the dropdown; `None` is `<None>`.
     pub(crate) fn select_server(&mut self, server_id: Option<String>, cx: &mut Context<Self>) {
+        self.host_menu = None;
         self.reset(cx);
         self.server_id = server_id;
         if self.server_id.is_some() {
@@ -215,6 +218,9 @@ impl RemoteHostPanel {
 
     pub(crate) fn disconnect(&mut self, cx: &mut Context<Self>) {
         self.reset(cx);
+        if let Some(server_id) = &self.server_id {
+            self.store.read(cx).clear_cache(server_id, cx);
+        }
     }
 
     pub(crate) fn refresh(&mut self, cx: &mut Context<Self>) {
@@ -263,9 +269,12 @@ impl RemoteHostPanel {
     }
 
     fn fail(&mut self, error: anyhow::Error, cx: &mut Context<Self>) {
-        // A failed or timed-out operation can leave the connection mid-command: start over.
-        self.session = None;
-        self.connected_config = None;
+        // A refusal (550 on one folder) leaves the connection good. A timeout or I/O error can
+        // leave it mid-command: start over.
+        if error.downcast_ref::<ServerRefused>().is_none() {
+            self.session = None;
+            self.connected_config = None;
+        }
         self.status = Some(format!("{error:#}").into());
         cx.notify();
     }
@@ -308,7 +317,11 @@ impl RemoteHostPanel {
                             this.status = None;
                             this.rebuild_rows(cx);
                         }
-                        Err(error) => this.fail(error, cx),
+                        Err(error) => {
+                            this.expanded.remove(&path);
+                            this.rebuild_rows(cx);
+                            this.fail(error, cx);
+                        }
                     }
                 })
                 .log_err();
@@ -527,13 +540,12 @@ impl RemoteHostPanel {
             .into_any_element()
     }
 
-    fn render_toolbar(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn host_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Entity<ContextMenu> {
+        if let Some(menu) = &self.host_menu {
+            return menu.clone();
+        }
         let options = self.host_options(cx);
         let selected = self.server_id.clone();
-        let label = self
-            .server(cx)
-            .map(|server| server.name)
-            .unwrap_or_else(|| "<None>".into());
         let panel = cx.weak_entity();
         let menu = ContextMenu::build(window, cx, move |mut menu, _, _| {
             let choices = std::iter::once((None, "<None>".to_string())).chain(
@@ -558,6 +570,16 @@ impl RemoteHostPanel {
             }
             menu
         });
+        self.host_menu = Some(menu.clone());
+        menu
+    }
+
+    fn render_toolbar(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let label = self
+            .server(cx)
+            .map(|server| server.name)
+            .unwrap_or_else(|| "<None>".into());
+        let menu = self.host_menu(window, cx);
         let connected = self.session.is_some();
         let has_server = self.server_id.is_some();
         h_flex()

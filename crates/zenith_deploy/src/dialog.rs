@@ -84,8 +84,6 @@ pub struct DeploymentDialog {
     selected: Option<usize>,
     project: Option<String>,
     fields: Fields,
-    /// Set while the editors are filled from a server, so their edit events do not write back.
-    loading_fields: bool,
     port_invalid: bool,
     advanced_open: bool,
     test_status: Option<TestStatus>,
@@ -150,7 +148,7 @@ impl DeploymentDialog {
             .into_iter()
             .map(|editor| {
                 cx.subscribe(editor, |this, _, event: &EditorEvent, cx| {
-                    if matches!(event, EditorEvent::BufferEdited) && !this.loading_fields {
+                    if matches!(event, EditorEvent::BufferEdited) {
                         this.read_fields(cx);
                     }
                 })
@@ -170,7 +168,6 @@ impl DeploymentDialog {
             selected: None,
             project,
             fields,
-            loading_fields: false,
             port_invalid: false,
             advanced_open: false,
             test_status: None,
@@ -237,7 +234,6 @@ impl DeploymentDialog {
         self.port_invalid = false;
         let server = self.selected_server().cloned().unwrap_or_default();
         let password = self.passwords.get(&server.id).cloned().unwrap_or_default();
-        self.loading_fields = true;
         let texts = [
             (&self.fields.name, server.name.clone()),
             (&self.fields.host, server.host.clone()),
@@ -250,7 +246,6 @@ impl DeploymentDialog {
         for (editor, text) in texts {
             editor.update(cx, |editor, cx| editor.set_text(text, window, cx));
         }
-        self.loading_fields = false;
         cx.notify();
     }
 
@@ -354,11 +349,9 @@ impl DeploymentDialog {
             server.anonymous = false;
         }
         let port = server.port.to_string();
-        self.loading_fields = true;
         self.fields
             .port
             .update(cx, |editor, cx| editor.set_text(port, window, cx));
-        self.loading_fields = false;
         self.port_invalid = false;
         self.test_status = None;
         cx.notify();
@@ -392,6 +385,21 @@ impl DeploymentDialog {
         };
         let typed = self.passwords.get(&server.id).cloned();
         let store = self.store.read(cx);
+        let needs_password = !server.anonymous && server.server_type != ServerType::Sftp;
+        // The stored password belongs to the saved host and type: never send it to another.
+        let saved_target = store.servers().servers.iter().any(|saved| {
+            saved.id == server.id
+                && saved.host == server.host
+                && saved.server_type == server.server_type
+        });
+        if needs_password && typed.is_none() && !saved_target {
+            self.test_status = Some(TestStatus::Failed(
+                "Type the password to test a changed host or type; the saved one is not sent to it."
+                    .into(),
+            ));
+            cx.notify();
+            return;
+        }
         let session = match typed {
             Some(password) if !server.anonymous && server.server_type != ServerType::Sftp => {
                 let mut server = server;
@@ -435,7 +443,7 @@ impl DeploymentDialog {
     }
 
     pub(crate) fn save(&mut self, cx: &mut Context<Self>) {
-        if !self.loaded || self.port_invalid {
+        if !self.loaded || self.port_invalid || self.store.read(cx).load_error().is_some() {
             return;
         }
         let mut keychain: Vec<Task<anyhow::Result<()>>> = Vec::new();
