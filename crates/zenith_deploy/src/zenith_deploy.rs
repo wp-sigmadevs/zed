@@ -82,6 +82,22 @@ struct GlobalServerStore(Entity<ServerStore>);
 
 impl Global for GlobalServerStore {}
 
+/// Runs `remove` up to three times, 100 ms apart, while it fails (a cancelled download that is
+/// still creating files makes `remove_dir_all` fail with "directory not empty").
+fn remove_with_retry(mut remove: impl FnMut() -> std::io::Result<()>) -> std::io::Result<()> {
+    let mut result = remove();
+    for _ in 0..2 {
+        match &result {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                result = remove();
+            }
+            _ => break,
+        }
+    }
+    result
+}
+
 impl ServerStore {
     pub fn global(cx: &App) -> Entity<Self> {
         cx.global::<GlobalServerStore>().0.clone()
@@ -193,14 +209,17 @@ impl ServerStore {
     }
 
     /// Deletes the cached copies of a server's remote files (maybe `wp-config.php`) off the
-    /// main thread.
+    /// main thread. Cancelled downloads only stop at their next await, so one can still be
+    /// writing here: the removal is retried (see [`remove_with_retry`]).
+    /// The cache is shared by every window: Disconnect in one window also deletes the files
+    /// another window has open.
     pub(crate) fn clear_cache(&self, server_id: &str, cx: &App) {
         if remote_path::validate_name(server_id).is_err() {
             return;
         }
         let directory = self.cache_dir.join(server_id);
         cx.background_spawn(async move {
-            match std::fs::remove_dir_all(&directory) {
+            match remove_with_retry(|| std::fs::remove_dir_all(&directory)) {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => log::warn!("deploy: removing {}: {error}", directory.display()),
@@ -291,6 +310,8 @@ pub(crate) mod test_support {
         pub fail_connect: bool,
         /// Folders whose listing fails like a dead connection, not a refusal.
         pub broken: Vec<String>,
+        /// Folders that refuse the listing (like a 550) even though the tree has them.
+        pub refusing: Arc<Mutex<Vec<String>>>,
     }
 
     impl FakeRemote {
@@ -349,6 +370,13 @@ pub(crate) mod test_support {
         }
         async fn list_dir(&mut self, path: &str) -> Result<Vec<RemoteEntry>> {
             self.push(format!("list {path}"));
+            if self
+                .refusing
+                .lock()
+                .is_ok_and(|refusing| refusing.iter().any(|refused| refused == path))
+            {
+                return Err(anyhow::Error::new(ServerRefused(format!("550 {path}"))));
+            }
             self.tree.get(path).cloned().ok_or_else(|| {
                 if self.broken.iter().any(|broken| broken == path) {
                     anyhow!("connection reset by peer")
@@ -420,6 +448,29 @@ pub(crate) mod test_support {
 mod tests {
     use super::*;
     use gpui::{BorrowAppContext as _, TestAppContext};
+
+    #[test]
+    fn removing_the_cache_is_retried_while_a_cancelled_download_still_writes() {
+        let mut calls = 0;
+        let result = remove_with_retry(|| {
+            calls += 1;
+            if calls == 1 {
+                Err(std::io::ErrorKind::DirectoryNotEmpty.into())
+            } else {
+                Ok(())
+            }
+        });
+        assert!(result.is_ok());
+        assert_eq!(calls, 2);
+
+        let mut calls = 0;
+        let result = remove_with_retry(|| {
+            calls += 1;
+            Err(std::io::ErrorKind::NotFound.into())
+        });
+        assert!(result.is_err());
+        assert_eq!(calls, 1, "a missing folder needs no retry");
+    }
     use settings::{SettingsStore, ZenithDeploySettingsContent, ZenithSettingsContent};
 
     #[gpui::test]
@@ -497,8 +548,27 @@ mod tests {
         let ftp_code: String = include_str!("ftp.rs")
             .lines()
             .filter(|line| !line.trim_start().starts_with("//"))
-            .collect();
-        assert!(ftp_code.contains("http_client_tls::tls_config()"));
+            .collect::<Vec<_>>()
+            .join("\n");
+        let ftps_branch = ftp_code
+            .split("ServerType::Ftps =>")
+            .nth(1)
+            .and_then(|rest| rest.split("ServerType::Sftp").next())
+            .expect("the FTPS branch of connect_with_logger");
+        assert!(ftps_branch.contains("tls_connector()"), "{ftps_branch}");
+        assert!(
+            ftps_branch.contains("into_secure(connector"),
+            "{ftps_branch}"
+        );
+        let connector_body = ftp_code
+            .split("fn tls_connector()")
+            .nth(1)
+            .and_then(|rest| rest.split("\nasync fn open").next())
+            .expect("tls_connector");
+        assert!(
+            connector_body.contains("http_client_tls::tls_config()"),
+            "{connector_body}"
+        );
     }
 
     /// Run with `ZENITH_DEPLOY_SELF_SIGNED_FTPS=host:port cargo test -p zenith_deploy -- --ignored`

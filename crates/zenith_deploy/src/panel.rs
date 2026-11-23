@@ -319,6 +319,8 @@ impl RemoteHostPanel {
                         }
                         Err(error) => {
                             this.expanded.remove(&path);
+                            // A stale listing would be shown again when the folder is re-expanded.
+                            this.children.remove(&path);
                             this.rebuild_rows(cx);
                             this.fail(error, cx);
                         }
@@ -968,6 +970,116 @@ mod tests {
         fixture.cx.run_until_parked();
         assert_eq!(remote.log().last().map(String::as_str), Some("disconnect"));
         assert!(row_names(&mut fixture).is_empty());
+    }
+
+    #[gpui::test]
+    async fn a_refused_folder_keeps_the_session_and_the_rest_of_the_tree(cx: &mut TestAppContext) {
+        let remote = remote();
+        remote
+            .refusing
+            .lock()
+            .expect("lock")
+            .push("/www/wp-content".into());
+        let mut fixture = fixture(&remote, cx).await;
+        let id = fixture.servers[0].id.clone();
+        fixture
+            .panel
+            .update(fixture.cx, |panel, cx| panel.select_server(Some(id), cx));
+        fixture.cx.run_until_parked();
+        let wp_content = row_index(&mut fixture, "wp-content");
+        fixture.panel.update_in(fixture.cx, |panel, window, cx| {
+            panel.activate_row(wp_content, window, cx)
+        });
+        fixture.cx.run_until_parked();
+        remote.refusing.lock().expect("lock").clear();
+        let wp_content = row_index(&mut fixture, "wp-content");
+        fixture.panel.update_in(fixture.cx, |panel, window, cx| {
+            panel.activate_row(wp_content, window, cx)
+        });
+        fixture.cx.run_until_parked();
+        let connects = remote
+            .log()
+            .iter()
+            .filter(|line| line.starts_with("connect"))
+            .count();
+        assert_eq!(connects, 1, "a refusal keeps the session");
+        let names = row_names(&mut fixture);
+        assert!(names.contains(&("index.php".to_string(), 0)), "{names:?}");
+        assert!(names.contains(&("themes".to_string(), 1)), "{names:?}");
+    }
+
+    #[gpui::test]
+    async fn disconnect_deletes_the_servers_cached_copies(cx: &mut TestAppContext) {
+        let remote = remote();
+        let fixture = fixture(&remote, cx).await;
+        let id = fixture.servers[0].id.clone();
+        let cached = fixture.cache.path().join(&id);
+        std::fs::create_dir_all(&cached).expect("mkdir");
+        std::fs::write(cached.join("wp-config.php"), "<?php").expect("write");
+        fixture
+            .panel
+            .update(fixture.cx, |panel, cx| panel.select_server(Some(id), cx));
+        fixture.cx.run_until_parked();
+        fixture
+            .panel
+            .update(fixture.cx, |panel, cx| panel.disconnect(cx));
+        fixture.cx.run_until_parked();
+        for _ in 0..50 {
+            if !cached.exists() {
+                break;
+            }
+            fixture
+                .cx
+                .background_executor
+                .timer(std::time::Duration::from_millis(20))
+                .await;
+        }
+        assert!(!cached.exists());
+    }
+
+    #[gpui::test]
+    async fn a_failed_refresh_drops_the_stale_listing(cx: &mut TestAppContext) {
+        let remote = remote();
+        let mut fixture = fixture(&remote, cx).await;
+        let id = fixture.servers[0].id.clone();
+        fixture
+            .panel
+            .update(fixture.cx, |panel, cx| panel.select_server(Some(id), cx));
+        fixture.cx.run_until_parked();
+        let wp_content = row_index(&mut fixture, "wp-content");
+        fixture.panel.update_in(fixture.cx, |panel, window, cx| {
+            panel.activate_row(wp_content, window, cx)
+        });
+        fixture.cx.run_until_parked();
+        assert!(row_names(&mut fixture).contains(&("themes".to_string(), 1)));
+
+        remote
+            .refusing
+            .lock()
+            .expect("lock")
+            .push("/www/wp-content".into());
+        fixture
+            .panel
+            .update(fixture.cx, |panel, cx| panel.refresh(cx));
+        fixture.cx.run_until_parked();
+        let (expanded, listed) = fixture.panel.read_with(fixture.cx, |panel, _| {
+            (
+                panel.expanded.contains("/www/wp-content"),
+                panel.children.contains_key("/www/wp-content"),
+            )
+        });
+        assert!(!expanded && !listed, "expanded={expanded} listed={listed}");
+
+        remote.refusing.lock().expect("lock").clear();
+        let wp_content = row_index(&mut fixture, "wp-content");
+        fixture.panel.update_in(fixture.cx, |panel, window, cx| {
+            panel.activate_row(wp_content, window, cx)
+        });
+        fixture.cx.run_until_parked();
+        assert!(
+            row_names(&mut fixture).contains(&("themes".to_string(), 1)),
+            "re-expanding lists the folder again"
+        );
     }
 
     #[gpui::test]

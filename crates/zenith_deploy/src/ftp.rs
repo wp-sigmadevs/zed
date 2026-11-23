@@ -180,14 +180,33 @@ pub(crate) fn parse_listing(listing: &str, use_list: bool) -> Vec<RemoteEntry> {
         .collect()
 }
 
-/// A reply code the server chose (`550 Permission denied`) leaves the control connection usable.
+/// A 4xx/5xx reply the server chose (`550 Permission denied`) leaves the control connection
+/// usable. 421 is the exception: the server is closing it, so the session must be reset.
 fn refusal(error: suppaftp::FtpError) -> anyhow::Error {
     match error {
-        suppaftp::FtpError::UnexpectedResponse(_) => {
+        suppaftp::FtpError::UnexpectedResponse(ref response) if keeps_session(response.status) => {
             anyhow::Error::new(ServerRefused(error.to_string()))
         }
         error => error.into(),
     }
+}
+
+fn keeps_session(status: Status) -> bool {
+    let code = status.code();
+    (400..600).contains(&code) && code != 421
+}
+
+/// Creates the partial download readable by its owner only.
+async fn create_part_file(path: &Path) -> std::io::Result<smol::fs::File> {
+    let mut options = smol::fs::OpenOptions::new();
+    // create_new: never opens (or follows) something that is already at the path.
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use smol::fs::unix::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    options.open(path).await
 }
 
 impl<T: SmolTlsStream + Send + 'static> FtpSession<T> {
@@ -240,11 +259,7 @@ impl<T: SmolTlsStream + Send + 'static> Transport for FtpSession<T> {
 
     async fn download_file(&mut self, remote_path: &str, local_path: &Path) -> Result<()> {
         let remote_path = validate_remote_path(remote_path)?;
-        // create_new: never opens (or follows) something that is already at the path.
-        let mut file = smol::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(local_path)
+        let mut file = create_part_file(local_path)
             .await
             .with_context(|| format!("creating {}", local_path.display()))?;
         let transfer = self
@@ -267,6 +282,31 @@ impl<T: SmolTlsStream + Send + 'static> Transport for FtpSession<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_chosen_4xx_5xx_reply_keeps_the_session() {
+        assert!(keeps_session(Status::FileUnavailable));
+        assert!(keeps_session(Status::BadFilename));
+        assert!(keeps_session(Status::RequestFileActionIgnored));
+        assert!(!keeps_session(Status::NotAvailable));
+        assert!(!keeps_session(Status::CommandOk));
+        assert!(!keeps_session(Status::AlreadyOpen));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_ftp_part_file_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("f");
+        smol::block_on(create_part_file(&path)).expect("create");
+        let mode = std::fs::metadata(&path).expect("meta").permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        assert!(
+            smol::block_on(create_part_file(&path)).is_err(),
+            "create_new"
+        );
+    }
 
     #[test]
     fn mlsd_listing_marks_symlinks_and_skips_dot_entries() {

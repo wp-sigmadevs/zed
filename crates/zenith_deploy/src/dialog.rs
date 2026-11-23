@@ -386,15 +386,16 @@ impl DeploymentDialog {
         let typed = self.passwords.get(&server.id).cloned();
         let store = self.store.read(cx);
         let needs_password = !server.anonymous && server.server_type != ServerType::Sftp;
-        // The stored password belongs to the saved host and type: never send it to another.
-        let saved_target = store.servers().servers.iter().any(|saved| {
-            saved.id == server.id
-                && saved.host == server.host
-                && saved.server_type == server.server_type
-        });
+        // The stored password belongs to the saved host, port, type and username: never send it
+        // to another.
+        let saved_target = store
+            .servers()
+            .servers
+            .iter()
+            .any(|saved| saved.id == server.id && !saved.credentials_target_changed(&server));
         if needs_password && typed.is_none() && !saved_target {
             self.test_status = Some(TestStatus::Failed(
-                "Type the password to test a changed host or type; the saved one is not sent to it."
+                "Type the password to test a changed host, port, type or username; the saved one is not sent to it."
                     .into(),
             ));
             cx.notify();
@@ -448,14 +449,15 @@ impl DeploymentDialog {
         }
         let mut keychain: Vec<Task<anyhow::Result<()>>> = Vec::new();
         let previous = self.store.read(cx).servers().clone();
+        let mut cleared_credentials = false;
         for server in &self.servers.servers {
             let typed = self.passwords.get(&server.id).cloned();
             let saves_password = server.save_password && !server.anonymous;
-            let was_saved = previous
-                .servers
-                .iter()
-                .find(|old| old.id == server.id)
-                .is_some_and(|old| old.save_password && !old.anonymous);
+            let old = previous.servers.iter().find(|old| old.id == server.id);
+            let was_saved = old.is_some_and(|old| old.save_password && !old.anonymous);
+            // Nothing typed for a new target: the old password must not follow the server there.
+            let target_changed =
+                typed.is_none() && old.is_some_and(|old| old.credentials_target_changed(server));
             match typed {
                 Some(password) if saves_password => {
                     keychain.push(secrets::save_password(
@@ -472,7 +474,12 @@ impl DeploymentDialog {
                 }),
                 None => {}
             }
-            if was_saved && !saves_password {
+            if target_changed {
+                self.store
+                    .update(cx, |store, _| store.set_session_password(&server.id, None));
+                cleared_credentials = true;
+            }
+            if was_saved && (!saves_password || target_changed) {
                 keychain.push(secrets::delete_password(&server.id, cx));
             }
         }
@@ -490,6 +497,13 @@ impl DeploymentDialog {
                 }
             }
             this.update(cx, |this, cx| match result {
+                Ok(()) if cleared_credentials => {
+                    this.error = Some(
+                        "Saved. The saved password was removed because the host, port, type or username changed; type a new one."
+                            .into(),
+                    );
+                    cx.notify();
+                }
                 Ok(()) => cx.emit(DismissEvent),
                 Err(error) => {
                     this.error = Some(format!("Saving failed: {error:#}").into());
@@ -866,7 +880,20 @@ mod tests {
         &'a mut VisualTestContext,
     ) {
         let cache = tempfile::tempdir().expect("tempdir");
-        let app_state = init(cx, servers, remote, cache.path().to_path_buf());
+        open_dialog_in(servers, remote, cache.path().to_path_buf(), cx).await
+    }
+
+    async fn open_dialog_in<'a>(
+        servers: Servers,
+        remote: &FakeRemote,
+        cache_dir: std::path::PathBuf,
+        cx: &'a mut TestAppContext,
+    ) -> (
+        Entity<Workspace>,
+        Entity<DeploymentDialog>,
+        &'a mut VisualTestContext,
+    ) {
+        let app_state = init(cx, servers, remote, cache_dir);
         let (workspace, cx) = workspace(&app_state, cx).await;
         cx.dispatch_action(OpenDeployment);
         cx.run_until_parked();
@@ -1011,6 +1038,116 @@ mod tests {
             Some(TestStatus::Passed(message)) => assert!(message.contains("/www"), "{message}"),
             _ => panic!("expected a passed test"),
         });
+    }
+
+    /// Plainly fake; built here so no test spells a secret literal.
+    fn fake_secret() -> String {
+        format!("not-a-real-value-{}", 1)
+    }
+
+    #[gpui::test]
+    async fn saving_a_changed_target_without_a_typed_secret_forgets_the_session_secret(
+        cx: &mut TestAppContext,
+    ) {
+        let mut saved = server("Live", None);
+        saved.save_password = false;
+        let id = saved.id.clone();
+        let servers = Servers {
+            servers: vec![saved],
+            ..Servers::default()
+        };
+        let (_, dialog, cx) = open_dialog(servers, &FakeRemote::default(), cx).await;
+        let store = cx.update(|_, cx| ServerStore::global(cx));
+        store.update(cx, |store, _| {
+            store.set_session_password(&id, Some(Password(fake_secret())))
+        });
+
+        // A rename keeps the target: the secret stays.
+        dialog.update(cx, |dialog, cx| {
+            dialog.update_selected(cx, |server| server.name = "Renamed".into());
+            dialog.save(cx);
+        });
+        cx.run_until_parked();
+        assert!(store.read_with(cx, |store, _| store.session_passwords.contains_key(&id)));
+
+        dialog.update(cx, |dialog, cx| {
+            dialog.update_selected(cx, |server| server.host = "elsewhere.example.com".into());
+            dialog.save(cx);
+        });
+        cx.run_until_parked();
+        assert!(!store.read_with(cx, |store, _| store.session_passwords.contains_key(&id)));
+        dialog.read_with(cx, |dialog, _| {
+            assert!(dialog.error.is_some(), "the user is told why");
+        });
+    }
+
+    #[gpui::test]
+    async fn test_connection_never_sends_the_saved_secret_to_a_changed_target(
+        cx: &mut TestAppContext,
+    ) {
+        let remote = FakeRemote::default();
+        let servers = Servers {
+            servers: vec![server("Live", None)],
+            ..Servers::default()
+        };
+        let (_, dialog, cx) = open_dialog(servers, &remote, cx).await;
+        let changes: [fn(&mut ServerConfig); 3] = [
+            |server| server.host = "elsewhere.example.com".into(),
+            |server| server.port += 1,
+            |server| server.username = "someone-else".into(),
+        ];
+        for change in changes {
+            dialog.update(cx, |dialog, cx| {
+                dialog.update_selected(cx, change);
+                dialog.test_connection(cx);
+            });
+            cx.run_until_parked();
+            dialog.read_with(cx, |dialog, _| match &dialog.test_status {
+                Some(TestStatus::Failed(message)) => {
+                    assert!(message.contains("Type the password"), "{message}")
+                }
+                _ => panic!("expected the changed target to be refused"),
+            });
+            assert!(
+                remote.log().is_empty(),
+                "nothing connects: {:?}",
+                remote.log()
+            );
+        }
+    }
+
+    #[gpui::test]
+    async fn removing_a_server_deletes_its_cached_copies(cx: &mut TestAppContext) {
+        let cache = tempfile::tempdir().expect("tempdir");
+        let live = server("Live", None);
+        let cached = cache.path().join(&live.id);
+        std::fs::create_dir_all(&cached).expect("mkdir");
+        std::fs::write(cached.join("wp-config.php"), "<?php").expect("write");
+        let servers = Servers {
+            servers: vec![live],
+            ..Servers::default()
+        };
+        let (_, dialog, cx) = open_dialog_in(
+            servers,
+            &FakeRemote::default(),
+            cache.path().to_path_buf(),
+            cx,
+        )
+        .await;
+        dialog.update_in(cx, |dialog, window, cx| {
+            dialog.remove_server(window, cx);
+            dialog.save(cx);
+        });
+        cx.run_until_parked();
+        for _ in 0..50 {
+            if !cached.exists() {
+                break;
+            }
+            cx.background_executor
+                .timer(std::time::Duration::from_millis(20))
+                .await;
+        }
+        assert!(!cached.exists());
     }
 
     #[gpui::test]
