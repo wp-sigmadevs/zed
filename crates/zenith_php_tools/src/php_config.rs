@@ -67,7 +67,7 @@ pub(crate) async fn probe_php(candidate: &Path) -> Option<String> {
 }
 
 /// A `php -v` that has not answered after this long is dropped from the list.
-const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+pub(crate) const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Every candidate that answers `php -v` within [`PROBE_TIMEOUT`], in the order given. Probes
 /// run side by side; call it from a background task.
@@ -81,27 +81,36 @@ pub async fn probe_interpreters(
     .await
 }
 
+/// `probe`'s answer, or `None` when it has not finished after [`PROBE_TIMEOUT`]. The probe is
+/// dropped then, which kills its child (`kill_on_drop`).
+pub(crate) async fn within_probe_timeout(
+    executor: &BackgroundExecutor,
+    probe: impl Future<Output = Option<String>>,
+) -> Option<String> {
+    match futures::future::select(Box::pin(probe), executor.timer(PROBE_TIMEOUT)).await {
+        Either::Left((version, _)) => version,
+        Either::Right(_) => None,
+    }
+}
+
 async fn probe_all<F: Future<Output = Option<String>>>(
     executor: &BackgroundExecutor,
     candidates: &[PathBuf],
     probe: impl Fn(PathBuf) -> F,
 ) -> Vec<PhpInterpreter> {
-    let versions = join_all(candidates.iter().map(|path| {
-        let probe = Box::pin(probe(path.clone()));
-        // A dropped probe kills its child (`kill_on_drop`).
-        futures::future::select(probe, executor.timer(PROBE_TIMEOUT))
-    }))
+    let versions = join_all(
+        candidates
+            .iter()
+            .map(|path| within_probe_timeout(executor, probe(path.clone()))),
+    )
     .await;
     candidates
         .iter()
         .zip(versions)
-        .filter_map(|(path, result)| {
+        .filter_map(|(path, version)| {
             Some(PhpInterpreter {
                 path: path.clone(),
-                version: match result {
-                    Either::Left((version, _)) => version?,
-                    Either::Right(_) => return None,
-                },
+                version: version?,
             })
         })
         .collect()
@@ -308,6 +317,24 @@ fn remove_version(doc: &mut DocumentMut) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `path` with links followed; an error when that lands outside `root`.
+async fn resolve_inside_project(fs: &dyn Fs, root: &Path, path: &Path) -> anyhow::Result<PathBuf> {
+    let Ok(target) = fs.canonicalize(path).await else {
+        return Ok(path.to_path_buf());
+    };
+    let root = fs
+        .canonicalize(root)
+        .await
+        .unwrap_or_else(|_| root.to_path_buf());
+    anyhow::ensure!(
+        target.starts_with(&root),
+        "{} is a link to {}, outside the project; not using it",
+        path.display(),
+        target.display()
+    );
+    Ok(target)
+}
+
 /// `<root>/.phpantom.toml`'s settings; a missing file reads as the defaults.
 pub async fn read_project_config(
     fs: &dyn Fs,
@@ -317,7 +344,8 @@ pub async fn read_project_config(
     if !fs.is_file(&path).await {
         return Ok(ProjectPhpantomConfig::default());
     }
-    parse_project_config(&fs.load(&path).await?)
+    let target = resolve_inside_project(fs, root, &path).await?;
+    parse_project_config(&fs.load(&target).await?)
         .map_err(|error| anyhow::anyhow!("{}: {error}", path.display()))
 }
 
@@ -334,8 +362,12 @@ pub async fn write_language_level(
     if !exists && level.is_none() {
         return Ok(());
     }
+    // A symlinked file (dotfiles) is read and written at its target, so the link survives; a
+    // target outside the project is refused before anything is read (a cloned repo must not
+    // make us read or write elsewhere). A dangling link does not canonicalize and is replaced.
+    let target = resolve_inside_project(fs, root, &path).await?;
     let text = if exists {
-        fs.load(&path).await?
+        fs.load(&target).await?
     } else {
         String::new()
     };
@@ -344,25 +376,6 @@ pub async fn write_language_level(
     if edited == text {
         return Ok(());
     }
-    // A symlinked file (dotfiles) is written at its target, so the link survives; a target
-    // outside the project is refused (a cloned repo must not make us write elsewhere). A
-    // dangling link does not canonicalize and is replaced.
-    let target = match fs.canonicalize(&path).await {
-        Ok(target) => {
-            let root = fs
-                .canonicalize(root)
-                .await
-                .unwrap_or_else(|_| root.to_path_buf());
-            anyhow::ensure!(
-                target.starts_with(&root),
-                "{} is a link to {}, outside the project; not writing it",
-                path.display(),
-                target.display()
-            );
-            target
-        }
-        Err(_) => path,
-    };
     fs.atomic_write(target, edited).await
 }
 
@@ -576,6 +589,28 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_symlink_out_of_the_project_is_refused_without_reading(cx: &mut TestAppContext) {
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/dot", json!({ "secret.txt": "TOP-SECRET-LINE\nsecond" }))
+            .await;
+        fs.insert_tree("/p", json!({ "composer.json": "{}" })).await;
+        fs.insert_symlink("/p/.phpantom.toml", PathBuf::from("/dot/secret.txt"))
+            .await;
+        let read = read_project_config(fs.as_ref(), Path::new("/p"))
+            .await
+            .unwrap_err()
+            .to_string();
+        let write = write_language_level(fs.as_ref(), Path::new("/p"), Some("8.3"))
+            .await
+            .unwrap_err()
+            .to_string();
+        for error in [read, write] {
+            assert!(error.contains("outside the project"), "{error}");
+            assert!(!error.contains("TOP-SECRET"), "{error}");
+        }
+    }
+
+    #[gpui::test]
     async fn test_write_round_trips_through_the_file(cx: &mut TestAppContext) {
         let fs = FakeFs::new(cx.executor());
         fs.insert_tree("/p", json!({ "composer.json": "{}" })).await;
@@ -748,7 +783,7 @@ mod tests {
             PathBuf::from("/also-hangs/php"),
         ];
         let executor = cx.executor();
-        let task = cx.background_spawn({
+        let mut task = cx.background_spawn({
             let executor = executor.clone();
             async move {
                 probe_all(&executor, &candidates, |path| {
@@ -765,7 +800,11 @@ mod tests {
             }
         });
         cx.run_until_parked();
-        executor.advance_clock(PROBE_TIMEOUT + Duration::from_millis(1));
+        // Just short of the timeout the hanging probes are still pending.
+        executor.advance_clock(PROBE_TIMEOUT - Duration::from_millis(1));
+        cx.run_until_parked();
+        assert!(futures::poll!(&mut task).is_pending());
+        executor.advance_clock(Duration::from_millis(2));
         assert_eq!(
             task.await,
             [PhpInterpreter {

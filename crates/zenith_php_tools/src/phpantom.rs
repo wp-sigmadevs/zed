@@ -12,7 +12,7 @@ use settings::SettingsStore;
 use std::{
     io::ErrorKind,
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{Arc, Mutex},
 };
 use toml_edit::{Array, DocumentMut, Item, Table};
 
@@ -250,16 +250,44 @@ fn sync_config(home: &Path, xdg: Option<PathBuf>, include: &[String]) -> Result<
 /// The include list this project's PHPantom was last given, so each project decides on its own
 /// whether a change needs a restart (the file is shared, so "the file changed" is only true for
 /// the first project to look).
-#[derive(Default)]
-pub(crate) struct AppliedInclude(Option<Vec<String>>);
+#[derive(Default, Clone)]
+pub(crate) struct AppliedInclude(Arc<Mutex<Option<Vec<String>>>>);
 
 impl AppliedInclude {
     /// Records `include`; `true` when it differs from the previous one. The first call only
-    /// records: PHPantom reads the file when it starts.
-    fn changed(&mut self, include: &[String]) -> bool {
-        let changed = self.0.as_deref().is_some_and(|old| old != include);
-        self.0 = Some(include.to_vec());
-        changed
+    /// records.
+    #[cfg(test)]
+    fn changed(&self, include: &[String]) -> bool {
+        self.record(include).is_some_and(|old| old != include)
+    }
+
+    /// Records `include` and returns what was recorded before.
+    fn record(&self, include: &[String]) -> Option<Vec<String>> {
+        let mut applied = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        applied.replace(include.to_vec())
+    }
+
+    /// Whether PHPantom must restart once the list is written. `previous` is what
+    /// [`record`](Self::record) returned. `write` is what `write_own_config` said: `Ok(true)`
+    /// when the file changed (so a PHPantom that started before the write, e.g. after the list
+    /// was edited while Zenith was closed, has a stale list), `Err` when it failed. A failed
+    /// write puts `previous` back, so the retry still sees the change and restarts.
+    fn restart_after_write(
+        &self,
+        include: &[String],
+        previous: Option<Vec<String>>,
+        write: Result<bool, ()>,
+    ) -> bool {
+        match write {
+            Ok(file_changed) => previous.is_some_and(|old| old != include) || file_changed,
+            Err(()) => {
+                let mut applied = self.0.lock().unwrap_or_else(|e| e.into_inner());
+                if applied.as_deref() == Some(include) {
+                    *applied = previous;
+                }
+                false
+            }
+        }
     }
 }
 
@@ -298,30 +326,32 @@ pub(crate) fn sync(project: &Entity<Project>, applied: &mut AppliedInclude, cx: 
     let env_unset = user_binary
         .and_then(|binary| binary.env.as_ref())
         .is_none_or(|env| !env.contains_key("XDG_CONFIG_HOME"));
-    let include_changed = applied.changed(&include);
+    let previous = applied.record(&include);
+    let applied = applied.clone();
+    let applied_include = include.clone();
     let fs = project.read(cx).fs().clone();
     let home = crate::home_dir();
     let xdg = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from);
     let project = project.clone();
     cx.spawn(async move |cx| {
         let binary = binary_path(&home);
-        let set_binary = cx
+        let (write, set_binary) = cx
             .background_spawn(async move {
                 // Take back what older Zenith versions added to the global (shared) file.
                 if let Err(error) = sync_config(&home, xdg, &[]) {
                     log::warn!("phpantom config: {error}");
                 }
-                write_own_config(&home, &include)
-                    .map_err(|error| log::warn!("phpantom config: {error}"))
-                    .ok();
+                let write = write_own_config(&home, &applied_include)
+                    .map_err(|error| log::warn!("phpantom config: {error}"));
                 let own = own_config_home(&home).display().to_string();
-                ((binary_unset || env_unset) && binary.is_file())
-                    .then(|| (binary.display().to_string(), own))
+                let set_binary = ((binary_unset || env_unset) && binary.is_file())
+                    .then(|| (binary.display().to_string(), own));
+                (write, set_binary)
             })
             .await;
         // The library list changed since this project last saw it (the PHP modal or a settings
         // edit): PHPantom re-reads it on start. Every window restarts its own PHPantom.
-        if include_changed {
+        if applied.restart_after_write(&include, previous, write) {
             cx.update(|cx| crate::php_config::restart_phpantom(&project, cx));
         }
         if let Some((path, own)) = set_binary {
@@ -352,7 +382,7 @@ mod tests {
     fn test_each_project_restarts_for_a_changed_list() {
         let a_list = vec!["/libs/a".to_string()];
         let b_list = vec!["/libs/a".to_string(), "/libs/b".to_string()];
-        let (mut one, mut two) = (AppliedInclude::default(), AppliedInclude::default());
+        let (one, two) = (AppliedInclude::default(), AppliedInclude::default());
         assert!(!one.changed(&a_list) && !two.changed(&a_list), "first run");
         assert!(!one.changed(&a_list), "unchanged");
         // The shared file is rewritten once, but both projects see the new list.
@@ -363,6 +393,39 @@ mod tests {
             "no restart loop"
         );
         assert!(one.changed(&[]), "an emptied list is a change");
+    }
+
+    #[test]
+    fn test_restart_when_the_file_changed_under_a_running_phpantom() {
+        let list = vec!["/libs/a".to_string()];
+        let applied = AppliedInclude::default();
+        let previous = applied.record(&list);
+        assert!(previous.is_none(), "first call only records");
+        // Edited while Zenith was closed: the write changed the file, PHPantom may be stale.
+        assert!(applied.restart_after_write(&list, previous, Ok(true)));
+        let previous = applied.record(&list);
+        assert!(!applied.restart_after_write(&list, previous, Ok(false)));
+        let previous = applied.record(&["/libs/b".to_string()]);
+        assert!(applied.restart_after_write(&["/libs/b".to_string()], previous, Ok(false)));
+    }
+
+    #[test]
+    fn test_a_failed_write_is_not_recorded_so_a_retry_restarts() {
+        let (old, new) = (vec!["/libs/a".to_string()], vec!["/libs/b".to_string()]);
+        let applied = AppliedInclude::default();
+        applied.record(&old);
+        let previous = applied.record(&new);
+        assert!(!applied.restart_after_write(&new, previous, Err(())));
+        // The file did not change meanwhile (another window wrote it): only the recorded
+        // list tells this project its PHPantom is behind.
+        let previous = applied.record(&new);
+        assert!(applied.restart_after_write(&new, previous, Ok(false)));
+        // A newer list recorded meanwhile is not rolled back.
+        let newest = vec!["/libs/c".to_string()];
+        let previous = applied.record(&new);
+        applied.record(&newest);
+        applied.restart_after_write(&new, previous, Err(()));
+        assert!(!applied.changed(&newest));
     }
 
     #[test]

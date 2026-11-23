@@ -9,9 +9,11 @@ mod string_completions;
 
 pub use string_completions::{StringCompletionSource, add_string_completions};
 
+use gpui::BackgroundExecutor;
 use http_client::HttpClient;
 use std::{
     fs,
+    future::Future,
     path::{Component, Path, PathBuf},
     sync::Arc,
 };
@@ -266,18 +268,39 @@ pub struct PhpInfo {
     pub php_path: Option<PathBuf>,
 }
 
-/// The first candidate whose `php -v` answers.
-pub async fn find_php(candidates: &[PathBuf]) -> Option<(PathBuf, String)> {
+/// The first candidate whose `php -v` answers within the probe timeout; one that hangs is
+/// dropped (and killed). Call it from a background task.
+pub async fn find_php(
+    executor: &BackgroundExecutor,
+    candidates: &[PathBuf],
+) -> Option<(PathBuf, String)> {
+    find_first(executor, candidates, |path| async move {
+        php_config::probe_php(&path).await
+    })
+    .await
+}
+
+async fn find_first<F: Future<Output = Option<String>>>(
+    executor: &BackgroundExecutor,
+    candidates: &[PathBuf],
+    probe: impl Fn(PathBuf) -> F,
+) -> Option<(PathBuf, String)> {
     for candidate in candidates {
-        if let Some(version) = php_config::probe_php(candidate).await {
+        if let Some(version) =
+            php_config::within_probe_timeout(executor, probe(candidate.clone())).await
+        {
             return Some((candidate.clone(), version));
         }
     }
     None
 }
 
-pub async fn detect_php(root: &Path, candidates: &[PathBuf]) -> PhpInfo {
-    let found = find_php(candidates).await;
+pub async fn detect_php(
+    executor: &BackgroundExecutor,
+    root: &Path,
+    candidates: &[PathBuf],
+) -> PhpInfo {
+    let found = find_php(executor, candidates).await;
     PhpInfo {
         kind: detect_project(root),
         version: found.as_ref().map(|(_, version)| version.clone()),
@@ -613,10 +636,11 @@ fn show_status(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<
         return;
     };
     cx.spawn_in(window, async move |workspace, cx| {
+        let executor = cx.background_executor().clone();
         let report = cx
             .background_spawn(async move {
                 let (candidates, path_dirs) = environment();
-                let info = detect_php(&root, &candidates).await;
+                let info = detect_php(&executor, &root, &candidates).await;
                 let managed = std::env::var_os("HOME")
                     .map(|home| managed_bin(Path::new(&home), Profile::for_project(info.kind)));
                 status_report(&root, &info, managed.as_deref(), &path_dirs)
@@ -680,12 +704,13 @@ impl PhpStatus {
             return;
         };
         cx.spawn(async move |this, cx| {
+            let executor = cx.background_executor().clone();
             let info = cx
                 .background_spawn({
                     let root = root.clone();
                     async move {
                         if looks_like_php(&root) {
-                            Some(detect_php(&root, &environment().0).await)
+                            Some(detect_php(&executor, &root, &environment().0).await)
                         } else {
                             None
                         }
@@ -1104,6 +1129,7 @@ fn manage(
         {
             return anyhow::Ok(());
         }
+        let executor = cx.background_executor().clone();
         let (profile, php, composer) = cx
             .background_spawn({
                 let home = home.clone();
@@ -1113,7 +1139,7 @@ fn manage(
                         return (profile, None, None);
                     }
                     let (candidates, path_dirs) = environment();
-                    let php = find_php(&candidates).await.map(|(php, _)| php);
+                    let php = find_php(&executor, &candidates).await.map(|(php, _)| php);
                     (profile, php, find_composer(&home, &path_dirs))
                 }
             })
@@ -1396,8 +1422,10 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn test_detect_php_runs_the_first_working_candidate() {
+    #[gpui::test]
+    async fn test_detect_php_runs_the_first_working_candidate(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let executor = cx.executor();
         let broken = tempfile::tempdir().unwrap();
         let working = tempfile::tempdir().unwrap();
         let broken_php = fake_php(broken.path(), "not php at all");
@@ -1405,23 +1433,72 @@ mod tests {
         let project = tempfile::tempdir().unwrap();
         write(project.path(), "composer.json", "{}");
 
-        let info = futures::executor::block_on(detect_php(
+        let info = detect_php(
+            &executor,
             project.path(),
             &[
                 PathBuf::from("/nonexistent/php"),
                 broken_php,
                 working_php.clone(),
             ],
-        ));
+        )
+        .await;
         assert_eq!(info.version.as_deref(), Some("8.5.0"));
         assert_eq!(info.php_path, Some(working_php));
         assert!(looks_like_php(project.path()));
 
-        let none = futures::executor::block_on(detect_php(project.path(), &[]));
+        let none = detect_php(&executor, project.path(), &[]).await;
         assert_eq!(none.version, None);
         let report = status_report(project.path(), &none, None, &[]);
         assert!(report.contains("PHP: not found"));
         assert!(report.contains("phpcs: not found"));
+    }
+
+    #[gpui::test]
+    async fn test_find_php_drops_a_hanging_probe_and_kills_it(cx: &mut gpui::TestAppContext) {
+        struct Killed(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Killed {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let executor = cx.executor();
+        let mut task = cx.background_spawn({
+            let (executor, dropped) = (executor.clone(), dropped.clone());
+            async move {
+                find_first(
+                    &executor,
+                    &[PathBuf::from("/hangs/php"), PathBuf::from("/fine/php")],
+                    |path| {
+                        let killed = Killed(dropped.clone());
+                        async move {
+                            if path.to_string_lossy().contains("hangs") {
+                                let _killed = killed;
+                                futures::future::pending().await
+                            } else {
+                                Some("8.4.1".to_string())
+                            }
+                        }
+                    },
+                )
+                .await
+            }
+        });
+        cx.run_until_parked();
+        executor.advance_clock(php_config::PROBE_TIMEOUT - std::time::Duration::from_millis(1));
+        cx.run_until_parked();
+        assert!(futures::poll!(&mut task).is_pending());
+        assert!(!dropped.load(std::sync::atomic::Ordering::SeqCst));
+        executor.advance_clock(std::time::Duration::from_millis(2));
+        assert_eq!(
+            task.await,
+            Some((PathBuf::from("/fine/php"), "8.4.1".to_string()))
+        );
+        assert!(
+            dropped.load(std::sync::atomic::Ordering::SeqCst),
+            "the timed-out probe is dropped, which kills its child"
+        );
     }
 
     #[test]

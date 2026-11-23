@@ -152,7 +152,11 @@ impl PhpModal {
         };
         self.level = level.clone();
         let fs = self.project.read(cx).fs().clone();
+        // Writes run one after the other, in click order: dropping an in-flight write would not
+        // stop its rename, which could land after a newer write and leave the older level on disk.
+        let previous = std::mem::replace(&mut self._write, Task::ready(()));
         self._write = cx.spawn(async move |this, cx| {
+            previous.await;
             let result =
                 php_config::write_language_level(fs.as_ref(), &root, level.as_deref()).await;
             this.update(cx, |this, cx| {
@@ -162,10 +166,12 @@ impl PhpModal {
                         this.error = None;
                         php_config::restart_phpantom(&this.project, cx);
                     }
-                    Err(error) => {
+                    // A newer click is queued behind this one and reports for itself.
+                    Err(error) if this.level == level => {
                         this.level = this.saved_level.clone();
                         this.error = Some(error.to_string().into());
                     }
+                    Err(_) => {}
                 }
                 cx.notify();
             })
@@ -637,6 +643,36 @@ mod tests {
         modal.read_with(cx, |modal, _| {
             assert_eq!(modal.level.as_deref(), Some("8.2"), "not the cancelled 8.4")
         });
+    }
+
+    #[gpui::test]
+    async fn test_a_started_write_is_never_cancelled_by_a_newer_click(cx: &mut TestAppContext) {
+        let (fixture, cx) = setup(cx, json!({ "composer.json": "{}" })).await;
+        let modal = open(&fixture, Vec::new(), cx);
+        let file = Path::new("/p/.phpantom.toml");
+        // Click 8.5 after the 8.4 write has progressed by every possible number of steps.
+        for steps in 0..60 {
+            let before = fixture.fs.write_count_for_path(file);
+            modal.update(cx, |modal, cx| {
+                modal.set_language_level(Some("8.4".into()), cx)
+            });
+            for _ in 0..steps {
+                cx.executor().tick();
+            }
+            modal.update(cx, |modal, cx| {
+                modal.set_language_level(Some("8.5".into()), cx)
+            });
+            cx.run_until_parked();
+            let text = fixture.fs.load(file).await.unwrap();
+            assert!(text.contains("version = \"8.5\""), "{steps}: {text}");
+            modal.read_with(cx, |modal, _| {
+                assert_eq!(modal.saved_level.as_deref(), Some("8.5"), "{steps}");
+            });
+            let writes = fixture.fs.write_count_for_path(file) - before;
+            assert_eq!(writes, 2, "{steps}: 8.4 lands in full, then 8.5");
+            modal.update(cx, |modal, cx| modal.set_language_level(None, cx));
+            cx.run_until_parked();
+        }
     }
 
     #[gpui::test]
