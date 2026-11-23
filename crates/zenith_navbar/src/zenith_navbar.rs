@@ -17,6 +17,7 @@ use gpui::{
 };
 use language::ToOffset as _;
 use project::{Project, ProjectPath, WorktreeId};
+use settings::Settings as _;
 use ui::{ButtonLike, ContextMenu, ContextMenuEntry, prelude::*};
 use util::rel_path::RelPath;
 use workspace::{
@@ -46,14 +47,35 @@ actions!(
     ]
 );
 
+/// `zenith.navbar.enabled`: read once at init, so a change takes effect after a restart.
+#[derive(Clone, Copy, settings::RegisterSetting)]
+pub struct NavbarSettings {
+    pub enabled: bool,
+}
+
+impl settings::Settings for NavbarSettings {
+    fn from_settings(content: &settings::SettingsContent) -> Self {
+        let navbar = content
+            .zenith
+            .as_ref()
+            .and_then(|zenith| zenith.navbar.as_ref());
+        Self {
+            enabled: navbar.and_then(|navbar| navbar.enabled).unwrap_or(true),
+        }
+    }
+}
+
 pub fn init(cx: &mut App) {
+    if !NavbarSettings::get_global(cx).enabled {
+        return;
+    }
     cx.observe_new(|workspace: &mut Workspace, window, cx| {
         let Some(window) = window else { return };
         let project = workspace.project().clone();
         let bar = cx.new(|_| NavBar::new(project, workspace.weak_handle()));
-        workspace
-            .status_bar()
-            .update(cx, |status_bar, cx| status_bar.add_left_item(bar, window, cx));
+        workspace.status_bar().update(cx, |status_bar, cx| {
+            status_bar.add_left_item(bar, window, cx)
+        });
         workspace.register_action(|workspace, _: &JumpToNavigationBar, window, cx| {
             if let Some(bar) = workspace.status_bar().read(cx).item_of_type::<NavBar>() {
                 bar.update(cx, |bar, cx| bar.jump(window, cx));
@@ -238,9 +260,13 @@ impl NavBar {
         let workspace = self.workspace.clone();
         ContextMenu::build(window, cx, move |mut menu, _, cx| {
             if let Some(up) = up {
-                menu = menu
-                    .header(dir.as_unix_str().to_string())
-                    .item(drill_entry("..", up, ix, bar.clone(), cx));
+                menu = menu.header(dir.as_unix_str().to_string()).item(drill_entry(
+                    "..",
+                    up,
+                    ix,
+                    bar.clone(),
+                    cx,
+                ));
             }
             if children.is_empty() {
                 menu = menu.label("Empty");
@@ -334,7 +360,9 @@ impl NavBar {
                                         SelectionEffects::scroll(Autoscroll::center()),
                                         window,
                                         cx,
-                                        |selections| selections.select_anchor_ranges([anchor..anchor]),
+                                        |selections| {
+                                            selections.select_anchor_ranges([anchor..anchor])
+                                        },
                                     );
                                     window.focus(&editor.focus_handle(cx), cx);
                                 })
@@ -373,7 +401,9 @@ impl NavBar {
             }
         });
         window.focus(&menu.focus_handle(cx), cx);
-        menu.update(cx, |menu, cx| menu.select_first(&menu::SelectFirst, window, cx));
+        menu.update(cx, |menu, cx| {
+            menu.select_first(&menu::SelectFirst, window, cx)
+        });
         self.menu = Some(OpenMenu {
             segment: ix,
             menu,
@@ -483,9 +513,9 @@ impl Render for NavBar {
             .on_action(cx.listener(|this, _: &SelectPreviousSegment, window, cx| {
                 this.step(false, window, cx)
             }))
-            .on_action(cx.listener(|this, _: &SelectNextSegment, window, cx| {
-                this.step(true, window, cx)
-            }))
+            .on_action(
+                cx.listener(|this, _: &SelectNextSegment, window, cx| this.step(true, window, cx)),
+            )
             .children(slot_elements)
             .children(self.menu.as_ref().map(|open| {
                 deferred(
