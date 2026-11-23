@@ -268,8 +268,9 @@ pub struct PhpInfo {
     pub php_path: Option<PathBuf>,
 }
 
-/// The first candidate whose `php -v` answers within the probe timeout, with one longer retry
-/// when none did; one that hangs is dropped (and killed). Call it from a background task.
+/// The first candidate whose `php -v` answers within the probe timeout; one that hangs is
+/// dropped (and killed). No retry: [`detect_php`], for the status bar, waits longer once.
+/// Call it from a background task.
 pub async fn find_php(
     executor: &BackgroundExecutor,
     candidates: &[PathBuf],
@@ -691,6 +692,8 @@ pub struct PhpStatus {
     applied_include: phpantom::AppliedInclude,
     /// The running lookup; a newer one replaces it, which kills a hanging `php -v`.
     _refresh: Task<()>,
+    /// An offering lookup was replaced before it finished; the next one offers for it.
+    pending_offer: bool,
 }
 
 impl PhpStatus {
@@ -720,6 +723,7 @@ impl PhpStatus {
             info: None,
             applied_include: Default::default(),
             _refresh: Task::ready(()),
+            pending_offer: false,
         };
         this.refresh(cx);
         this
@@ -736,9 +740,12 @@ impl PhpStatus {
         let Some(root) = first_root(&self.project, cx) else {
             self.info = None;
             self._refresh = Task::ready(());
+            self.pending_offer = false;
             cx.notify();
             return;
         };
+        self.pending_offer |= offer;
+        let offer = self.pending_offer;
         #[cfg(test)]
         let test_candidates = TEST_CANDIDATES.with(|candidates| candidates.borrow().clone());
         self._refresh = cx.spawn(async move |this, cx| {
@@ -760,6 +767,7 @@ impl PhpStatus {
                 .await;
             this.update(cx, |this, cx| {
                 this.info = info.clone();
+                this.pending_offer = false;
                 cx.notify();
                 if let (true, Some(info)) = (offer, info) {
                     this.workspace
@@ -1720,6 +1728,41 @@ mod tests {
 
     #[cfg(unix)]
     #[gpui::test]
+    async fn test_a_click_during_an_offering_lookup_does_not_lose_the_offer(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tools = tempfile::tempdir().unwrap();
+        let (started, go) = (tools.path().join("started"), tools.path().join("go"));
+        let php = tools.path().join("php");
+        // Answers only once `go` exists, so the first lookup is still running at the click.
+        fs::write(
+            &php,
+            format!(
+                "#!/bin/sh\ntouch '{}'\nwhile [ ! -f '{}' ]; do sleep 0.05; done\necho 'PHP 8.5.0 (cli)'\n",
+                started.display(),
+                go.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&php, fs::Permissions::from_mode(0o755)).unwrap();
+        let before = OFFERS.with(|n| n.get());
+        let refreshes = REFRESHES.with(|n| n.get());
+        let (_dir, status, cx) = php_window(cx, vec![php]).await;
+        wait_for(cx, || started.exists());
+        status.update(cx, |status, cx| status.refresh_info(false, cx));
+        fs::write(&go, "").unwrap();
+        wait_for(cx, || REFRESHES.with(|n| n.get()) > refreshes);
+        cx.run_until_parked();
+        assert_eq!(
+            OFFERS.with(|n| n.get()) - before,
+            1,
+            "the offer survives the click"
+        );
+    }
+
+    #[cfg(unix)]
+    #[gpui::test]
     async fn test_a_newer_lookup_kills_the_hanging_php_of_the_older_one(
         cx: &mut gpui::TestAppContext,
     ) {
@@ -1730,7 +1773,7 @@ mod tests {
         fs::write(
             &php,
             format!(
-                "#!/bin/sh\necho $$ > '{}'\nexec sleep 60\n",
+                "#!/bin/sh\necho $$ > '{}'\nexec sleep 20\n",
                 pid_file.display()
             ),
         )
@@ -1741,14 +1784,16 @@ mod tests {
             pid_file.exists() && !fs::read_to_string(&pid_file).unwrap().is_empty()
         });
         let pid = fs::read_to_string(&pid_file).unwrap().trim().to_string();
-        #[allow(clippy::disallowed_methods, reason = "signal 0 has no std API")]
+        // A killed child stays a zombie (`Z`) until reaped: that counts as gone.
+        #[allow(clippy::disallowed_methods, reason = "no std API for a process state")]
         let alive = |pid: &str| {
-            std::process::Command::new("kill")
-                .args(["-0", pid])
-                .stderr(std::process::Stdio::null())
-                .status()
-                .unwrap()
-                .success()
+            let state = std::process::Command::new("ps")
+                .args(["-o", "stat=", "-p", pid])
+                .output()
+                .unwrap();
+            let state = String::from_utf8_lossy(&state.stdout);
+            let state = state.trim();
+            !state.is_empty() && !state.starts_with('Z')
         };
         assert!(alive(&pid), "the first lookup is hanging in php -v");
         status.update(cx, |status, cx| status.refresh_info(false, cx));
