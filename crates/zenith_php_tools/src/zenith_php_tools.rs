@@ -638,6 +638,7 @@ pub struct PhpStatus {
     project: Entity<Project>,
     workspace: WeakEntity<Workspace>,
     info: Option<PhpInfo>,
+    applied_include: phpantom::AppliedInclude,
 }
 
 impl PhpStatus {
@@ -657,19 +658,22 @@ impl PhpStatus {
         .detach();
         cx.observe_global::<Installing>(|_, cx| cx.notify())
             .detach();
-        cx.observe_global::<settings::SettingsStore>(|this, cx| phpantom::sync(&this.project, cx))
-            .detach();
+        cx.observe_global::<settings::SettingsStore>(|this, cx| {
+            phpantom::sync(&this.project, &mut this.applied_include, cx)
+        })
+        .detach();
         let mut this = Self {
             project,
             workspace,
             info: None,
+            applied_include: Default::default(),
         };
         this.refresh(cx);
         this
     }
 
     fn refresh(&mut self, cx: &mut Context<Self>) {
-        phpantom::sync(&self.project, cx);
+        phpantom::sync(&self.project, &mut self.applied_include, cx);
         let Some(root) = first_root(&self.project, cx) else {
             self.info = None;
             cx.notify();

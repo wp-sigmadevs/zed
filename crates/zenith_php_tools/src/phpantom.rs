@@ -247,10 +247,26 @@ fn sync_config(home: &Path, xdg: Option<PathBuf>, include: &[String]) -> Result<
     Ok(())
 }
 
+/// The include list this project's PHPantom was last given, so each project decides on its own
+/// whether a change needs a restart (the file is shared, so "the file changed" is only true for
+/// the first project to look).
+#[derive(Default)]
+pub(crate) struct AppliedInclude(Option<Vec<String>>);
+
+impl AppliedInclude {
+    /// Records `include`; `true` when it differs from the previous one. The first call only
+    /// records: PHPantom reads the file when it starts.
+    fn changed(&mut self, include: &[String]) -> bool {
+        let changed = self.0.as_deref().is_some_and(|old| old != include);
+        self.0 = Some(include.to_vec());
+        changed
+    }
+}
+
 /// Runs [`sync_config`] on the background executor, then points `lsp.phpantom.binary.path` at
 /// the Zenith-built binary when it exists and the user set no path. Called at startup, when
 /// worktrees change and when settings change; cheap and idempotent.
-pub(crate) fn sync(project: &Entity<Project>, cx: &mut App) {
+pub(crate) fn sync(project: &Entity<Project>, applied: &mut AppliedInclude, cx: &mut App) {
     // User settings not loaded yet: the library list would read as empty and prune entries.
     let Some(user) = SettingsStore::global(cx).raw_user_settings() else {
         return;
@@ -282,30 +298,29 @@ pub(crate) fn sync(project: &Entity<Project>, cx: &mut App) {
     let env_unset = user_binary
         .and_then(|binary| binary.env.as_ref())
         .is_none_or(|env| !env.contains_key("XDG_CONFIG_HOME"));
+    let include_changed = applied.changed(&include);
     let fs = project.read(cx).fs().clone();
     let home = crate::home_dir();
     let xdg = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from);
     let project = project.clone();
     cx.spawn(async move |cx| {
         let binary = binary_path(&home);
-        let (set_binary, include_changed) = cx
+        let set_binary = cx
             .background_spawn(async move {
                 // Take back what older Zenith versions added to the global (shared) file.
                 if let Err(error) = sync_config(&home, xdg, &[]) {
                     log::warn!("phpantom config: {error}");
                 }
-                let include_changed = write_own_config(&home, &include)
+                write_own_config(&home, &include)
                     .map_err(|error| log::warn!("phpantom config: {error}"))
-                    .unwrap_or(false);
+                    .ok();
                 let own = own_config_home(&home).display().to_string();
-                let set_binary = ((binary_unset || env_unset) && binary.is_file())
-                    .then(|| (binary.display().to_string(), own));
-                (set_binary, include_changed)
+                ((binary_unset || env_unset) && binary.is_file())
+                    .then(|| (binary.display().to_string(), own))
             })
             .await;
-        // The library list changed (the PHP modal or a settings edit): PHPantom re-reads it on
-        // start. shortcut: only this window's project restarts; other windows keep the old list
-        // until they restart PHPantom.
+        // The library list changed since this project last saw it (the PHP modal or a settings
+        // edit): PHPantom re-reads it on start. Every window restarts its own PHPantom.
         if include_changed {
             cx.update(|cx| crate::php_config::restart_phpantom(&project, cx));
         }
@@ -331,7 +346,24 @@ pub(crate) fn sync(project: &Entity<Project>, cx: &mut App) {
 
 #[cfg(all(test, unix))]
 mod tests {
-    use super::{config_file, own_config_home, sync_config, write_own_config};
+    use super::{AppliedInclude, config_file, own_config_home, sync_config, write_own_config};
+
+    #[test]
+    fn test_each_project_restarts_for_a_changed_list() {
+        let a_list = vec!["/libs/a".to_string()];
+        let b_list = vec!["/libs/a".to_string(), "/libs/b".to_string()];
+        let (mut one, mut two) = (AppliedInclude::default(), AppliedInclude::default());
+        assert!(!one.changed(&a_list) && !two.changed(&a_list), "first run");
+        assert!(!one.changed(&a_list), "unchanged");
+        // The shared file is rewritten once, but both projects see the new list.
+        assert!(one.changed(&b_list));
+        assert!(two.changed(&b_list));
+        assert!(
+            !one.changed(&b_list) && !two.changed(&b_list),
+            "no restart loop"
+        );
+        assert!(one.changed(&[]), "an emptied list is a change");
+    }
 
     #[test]
     fn test_own_config_is_separate_from_the_global_one() {
