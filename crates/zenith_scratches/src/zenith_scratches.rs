@@ -1796,6 +1796,77 @@ mod tests {
         );
     }
 
+    /// A store open still in flight when the project is shared lands as a strong handle the
+    /// panel never held; it is removed when it arrives.
+    #[gpui::test]
+    async fn a_store_open_in_flight_during_a_share_is_removed(cx: &mut TestAppContext) {
+        let (fixture, cx) = fixture_with(cx, &["/proj"], None).await;
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            set_scratches(
+                cx,
+                ZenithScratchesSettingsContent {
+                    project_panel_node: Some(false),
+                    ..Default::default()
+                },
+            )
+        });
+        cx.run_until_parked();
+        assert!(store_worktree_of(&fixture, cx).is_none());
+
+        let project = fixture
+            .workspace
+            .read_with(cx, |workspace, _| workspace.project().clone());
+        let store = default_store_dir();
+        cx.update(|_, cx| set_scratches(cx, ZenithScratchesSettingsContent::default()));
+        let open = project.update(cx, |project, cx| {
+            project.find_or_create_worktree(&store, false, cx)
+        });
+        project.update(cx, |project, cx| project.shared(1, cx).unwrap());
+        open.await.unwrap();
+        cx.run_until_parked();
+        let paths = project.read_with(cx, |project, cx| {
+            project
+                .worktrees(cx)
+                .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(paths, [PathBuf::from("/proj")], "the store is not shared");
+    }
+
+    /// A tab holding the old store worktree keeps it alive; it must still leave the project.
+    #[gpui::test]
+    async fn moving_the_store_removes_the_old_worktree_even_when_held(cx: &mut TestAppContext) {
+        let (fixture, cx) = fixture_with(cx, &["/proj"], None).await;
+        cx.run_until_parked();
+        let held = fixture
+            .workspace
+            .read_with(cx, |workspace, cx| {
+                store_worktree(workspace.project().read(cx), cx)
+            })
+            .expect("the store is open");
+        fixture
+            .fs
+            .create_dir(Path::new("/elsewhere"))
+            .await
+            .unwrap();
+        set_directory("/elsewhere", cx);
+        let paths = fixture.workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .project()
+                .read(cx)
+                .worktrees(cx)
+                .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(
+            paths,
+            [PathBuf::from("/proj"), PathBuf::from("/elsewhere")],
+            "only the new store is open"
+        );
+        drop(held);
+    }
+
     /// A collab share sends invisible worktrees to guests: the store is let go while shared.
     #[gpui::test]
     async fn sharing_the_project_releases_the_store(cx: &mut TestAppContext) {

@@ -4,6 +4,14 @@
 //! repositories. It is not invisible everywhere, though: an empty window counts any worktree
 //! (`Workspace::open_workspace_for_paths`) and a collab share sends invisible worktrees too, so
 //! the store is held only while the project has a folder of its own and is not shared.
+//!
+//! Sharing is guarded on the host only, without upstream hooks: the store is let go when the
+//! share starts, so its entries and file contents never reach guests. The share's first
+//! `ShareProject` message is built before that happens, so the store's worktree metadata (id,
+//! root name, absolute path) can reach the server and guests briefly.
+//!
+//! A scratch opened from the Scratches panel while shared goes through `open_abs_path` and
+//! becomes an invisible single-file worktree, sent to guests like any file outside the project.
 
 use super::*;
 
@@ -48,13 +56,16 @@ impl ScratchesPanel {
             && !project.is_shared()
             && project.visible_worktrees(cx).next().is_some();
         if !wanted {
-            self.store_worktree_dir = None;
+            let previous = self.store_worktree_dir.take();
             self.store_worktree_task = Task::ready(());
-            // Removed, not just dropped: an open scratch (or a share) holds it strongly.
-            if let Some(worktree) = self.store_worktree.take() {
-                let id = worktree.read(cx).id();
-                self.project
-                    .update(cx, |project, cx| project.remove_worktree(id, cx));
+            self.store_worktree = None;
+            // Removed, not just dropped: an open scratch (or a share) holds it strongly. Every
+            // store worktree goes, not only ours: an open still in flight when the project was
+            // shared lands as one the panel never held.
+            let dir = store_dir(cx);
+            self.remove_store_worktrees(&dir, cx);
+            if let Some(previous) = previous.filter(|previous| *previous != dir) {
+                self.remove_store_worktrees(&previous, cx);
             }
             return;
         }
@@ -62,6 +73,11 @@ impl ScratchesPanel {
             return;
         }
         self.store_worktree = None;
+        // The old store is removed by path: a held tab keeps it alive, and a later share would
+        // upgrade it to a strong handle.
+        if let Some(previous) = self.store_worktree_dir.take() {
+            self.remove_store_worktrees(&previous, cx);
+        }
         self.store_worktree_dir = Some(self.dir.clone());
         let (project, fs, dir) = (self.project.clone(), self.fs.clone(), self.dir.clone());
         self.store_worktree_task = cx.spawn(async move |this, cx| {
@@ -81,6 +97,23 @@ impl ScratchesPanel {
                 }
             })
             .ok();
+        });
+    }
+
+    /// Removes every invisible worktree of the project rooted at `dir`.
+    fn remove_store_worktrees(&self, dir: &Path, cx: &mut Context<Self>) {
+        self.project.update(cx, |project, cx| {
+            let ids: Vec<_> = project
+                .worktrees(cx)
+                .filter(|worktree| {
+                    let worktree = worktree.read(cx);
+                    !worktree.is_visible() && worktree.abs_path().as_ref() == dir
+                })
+                .map(|worktree| worktree.read(cx).id())
+                .collect();
+            for id in ids {
+                project.remove_worktree(id, cx);
+            }
         });
     }
 }
