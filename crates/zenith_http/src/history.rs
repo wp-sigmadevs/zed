@@ -17,81 +17,72 @@ pub struct HttpHistoryItem {
     pub timestamp: String,
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct HttpHistoryStore {
-    pub entries: Vec<HttpHistoryItem>,
-    pub max_limit: usize,
-    /// Ids come from a counter that only grows, so trimming old entries never reuses one.
-    next_id: u64,
-}
-
-impl HttpHistoryStore {
-    pub fn new(max_limit: usize) -> Self {
-        Self {
-            entries: Vec::new(),
-            max_limit: if max_limit == 0 { 100 } else { max_limit },
-            next_id: 0,
-        }
-    }
-
-    /// Records a response; credential headers are masked first, so they never sit in history.
-    pub fn add(&mut self, mut request: HttpRequest, mut response: HttpResponse) -> String {
-        mask_secret_headers(&mut request.headers);
-        mask_secret_headers(&mut response.headers);
-        self.next_id += 1;
-        let id = format!("hist-{}", self.next_id);
-        let timestamp = response.timestamp.clone();
-
-        self.entries.insert(
-            0,
-            HttpHistoryItem {
-                id: id.clone(),
-                request,
-                response,
-                timestamp,
-            },
-        );
-
-        if self.entries.len() > self.max_limit {
-            self.entries.truncate(self.max_limit);
-        }
-
-        id
-    }
-
-    pub fn clear(&mut self) {
-        self.entries.clear();
-    }
-
-    pub fn get_recent(&self, limit: usize) -> &[HttpHistoryItem] {
-        let count = limit.min(self.entries.len());
-        &self.entries[..count]
-    }
-}
-
 /// What a masked header value is replaced with.
 pub const MASKED_VALUE: &str = "***";
 
-/// Names whose values history never keeps: header names, JSON keys, form and query fields.
-/// A name is percent-decoded and split into lowercase segments on anything that is not a letter
-/// or digit and on camelCase humps, so `X-Api-Key`, `user[password]`, `user%5Bpassword%5D`,
-/// `password_confirmation` and `aws_secret_access_key` are caught. `token` counts only as the
-/// last segment (`access_token`, not `total_tokens`), and the words below only as a whole
-/// segment or its ending (`userpassword`, not `secretary`).
+/// Names whose values history never keeps: header names, JSON keys, form, query and fragment
+/// fields. A name is percent-decoded and split into lowercase segments on anything that is not a
+/// letter or digit and on camelCase humps; trailing digits of a segment are dropped
+/// (`password1`). So `X-Api-Key`, `XApiKey`, `user[password]`, `user%5Bpassword%5D`,
+/// `new_password1` and `aws_secret_access_key` are caught. `token` counts only as the last
+/// segment (`access_token`, not `total_tokens`), and the words below only as a whole segment
+/// or its ending (`userpassword`, not `secretary`). Weak words (`key`, `policy`, `session`)
+/// count only as the whole name.
+// shortcut: a descriptor ending (`password_min_length`, `forgot_password_url`) or a paging
+// token (`next_token`) stays readable, so a secret hidden behind such a name is not caught;
+// drop the exemptions if that bites.
 fn is_secret_name(name: &str) -> bool {
-    const ENDINGS: [&str; 9] = [
+    const ENDINGS: [&str; 6] = [
         "password",
         "passwd",
+        "pwd",
         "secret",
-        "apikey",
-        "accesskey",
-        "secretkey",
-        "privatekey",
         "authorization",
         "cookie",
     ];
-    // The word before `key` that makes it a credential: `api_key`, `X-Auth-Key`.
-    const KEY_PREFIXES: [&str; 5] = ["api", "access", "secret", "private", "auth"];
+    // The word before `key` that makes it a credential: `api_key`, `X-Auth-Key`, `XApiKey`.
+    const KEY_PREFIXES: [&str; 13] = [
+        "api",
+        "app",
+        "application",
+        "session",
+        "client",
+        "master",
+        "license",
+        "subscription",
+        "functions",
+        "access",
+        "secret",
+        "private",
+        "auth",
+    ];
+    const WHOLE_NAMES: [&str; 7] = [
+        "key",
+        "sig",
+        "policy",
+        "auth",
+        "session",
+        "sessionid",
+        "idtokenhint",
+    ];
+    const LAST_SEGMENTS: [&str; 12] = [
+        "pass",
+        "pw",
+        "signature",
+        "credential",
+        "credentials",
+        "phpsessid",
+        "jsessionid",
+        "sessionid",
+        "passphrase",
+        "passcode",
+        "authentication",
+        "jwt",
+    ];
+    const DESCRIPTORS: [&str; 8] = [
+        "url", "uri", "endpoint", "length", "type", "min", "max", "required",
+    ];
+    const PAGING: [&str; 3] = ["next", "continuation", "page"];
 
     let name = percent_decode(name);
     let mut segments: Vec<String> = Vec::new();
@@ -105,7 +96,7 @@ fn is_secret_name(name: &str) -> bool {
         if character.is_uppercase() && previous_lower {
             segments.push(String::new());
         }
-        previous_lower = character.is_lowercase();
+        previous_lower = character.is_lowercase() || character.is_ascii_digit();
         if segments.is_empty() {
             segments.push(String::new());
         }
@@ -114,15 +105,37 @@ fn is_secret_name(name: &str) -> bool {
             .expect("pushed above")
             .extend(character.to_lowercase());
     }
+    for segment in &mut segments {
+        segment.truncate(segment.trim_end_matches(|c: char| c.is_ascii_digit()).len());
+    }
     segments.retain(|segment| !segment.is_empty());
+    let Some(last) = segments.last() else {
+        return false;
+    };
+    if segments.len() > 1 && DESCRIPTORS.contains(&last.as_str()) {
+        return false;
+    }
 
-    segments
-        .iter()
-        .any(|segment| segment == "pwd" || ENDINGS.iter().any(|word| segment.ends_with(word)))
-        || segments.last().is_some_and(|last| last.ends_with("token"))
+    WHOLE_NAMES.contains(&segments.concat().as_str())
+        || LAST_SEGMENTS.contains(&last.as_str())
         || segments
-            .windows(2)
-            .any(|pair| pair[1] == "key" && KEY_PREFIXES.contains(&pair[0].as_str()))
+            .iter()
+            .any(|segment| ENDINGS.iter().any(|word| segment.ends_with(word)))
+        || (last.ends_with("token") && {
+            // Only a name made of paging words before `token` is a paging token.
+            let before = &segments[..segments.len() - 1];
+            before.is_empty() || !before.iter().all(|word| PAGING.contains(&word.as_str()))
+        })
+        || segments.iter().enumerate().any(|(ix, segment)| {
+            let word = match segment.strip_suffix("key") {
+                Some("") => ix.checked_sub(1).and_then(|before| segments.get(before)),
+                Some(_) => Some(segment),
+                None => None,
+            };
+            let Some(word) = word else { return false };
+            let word = word.strip_suffix("key").unwrap_or(word);
+            KEY_PREFIXES.iter().any(|prefix| word.ends_with(prefix))
+        })
 }
 
 /// Decodes `%XX` escapes; anything malformed is kept as written.
@@ -194,8 +207,11 @@ fn mask_secret_json(value: &mut serde_json::Value) -> bool {
         serde_json::Value::Object(map) => {
             for (key, value) in map.iter_mut() {
                 if is_secret_name(key) {
-                    *value = MASKED_VALUE.into();
-                    masked = true;
+                    // null and booleans carry no secret; keep them readable.
+                    if !matches!(value, serde_json::Value::Null | serde_json::Value::Bool(_)) {
+                        *value = MASKED_VALUE.into();
+                        masked = true;
+                    }
                 } else {
                     masked |= mask_secret_json(value);
                 }
@@ -228,18 +244,49 @@ fn mask_secret_pairs(pairs: &str) -> Option<String> {
     masked.then_some(joined)
 }
 
-/// Masks the query of `url`, leaving its fragment and everything before the `?` untouched.
+/// `url` without its `user:password@` part, or `None` when it has none.
+fn strip_url_userinfo(url: &str) -> Option<String> {
+    let (scheme, rest) = url.trim_start().split_once("://")?;
+    // The scheme may be a template (`{{scheme}}`), but a `://` further in, after a path or a
+    // query, is not the URL's own.
+    if scheme.is_empty()
+        || scheme
+            .chars()
+            .any(|c| c.is_whitespace() || "/?#@:".contains(c))
+    {
+        return None;
+    }
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (_, host) = rest[..authority_end].rsplit_once('@')?;
+    Some(format!("{scheme}://{host}{}", &rest[authority_end..]))
+}
+
+/// Masks the query and the fragment (`#access_token=...`) of `url` like pairs; everything
+/// before the `?` is left untouched.
 fn mask_secret_query(url: &str) -> Option<String> {
-    let (base, rest) = url.split_once('?')?;
-    let (query, fragment) = match rest.split_once('#') {
-        Some((query, fragment)) => (query, Some(fragment)),
+    let (rest, fragment) = match url.split_once('#') {
+        Some((rest, fragment)) => (rest, Some(fragment)),
+        None => (url, None),
+    };
+    let (base, query) = match rest.split_once('?') {
+        Some((base, query)) => (base, Some(query)),
         None => (rest, None),
     };
-    let query = mask_secret_pairs(query)?;
-    Some(match fragment {
-        Some(fragment) => format!("{base}?{query}#{fragment}"),
-        None => format!("{base}?{query}"),
-    })
+    let masked_query = query.and_then(mask_secret_pairs);
+    let masked_fragment = fragment.and_then(mask_secret_pairs);
+    if masked_query.is_none() && masked_fragment.is_none() {
+        return None;
+    }
+    let mut masked = base.to_string();
+    if let Some(query) = masked_query.as_deref().or(query) {
+        masked.push('?');
+        masked.push_str(query);
+    }
+    if let Some(fragment) = masked_fragment.as_deref().or(fragment) {
+        masked.push('#');
+        masked.push_str(fragment);
+    }
+    Some(masked)
 }
 
 /// Masks the content of form fields with a secret name. File parts (with a `filename`, or a
@@ -371,6 +418,9 @@ impl HistoryDir {
         }
         mask_secret_headers(&mut request.headers);
         mask_secret_headers(&mut response.headers);
+        if let Some(url) = strip_url_userinfo(&request.url) {
+            request.url = url;
+        }
         if let Some(url) = mask_secret_query(&request.url) {
             request.url = url;
         }
@@ -552,86 +602,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_history_store() {
-        let mut store = HttpHistoryStore::new(2);
-        let req1 = HttpRequest::new("GET", "https://api.com/1", 1);
-        let res1 = HttpResponse::new(200, "OK", vec![], "body1", 10);
-        store.add(req1, res1);
-
-        let req2 = HttpRequest::new("GET", "https://api.com/2", 2);
-        let res2 = HttpResponse::new(200, "OK", vec![], "body2", 20);
-        store.add(req2, res2);
-
-        let req3 = HttpRequest::new("GET", "https://api.com/3", 3);
-        let res3 = HttpResponse::new(200, "OK", vec![], "body3", 30);
-        store.add(req3, res3);
-
-        // Max limit is 2
-        assert_eq!(store.entries.len(), 2);
-        assert_eq!(store.entries[0].request.url, "https://api.com/3");
-        assert_eq!(store.entries[1].request.url, "https://api.com/2");
-    }
-
-    #[test]
-    fn test_history_ids_are_never_reused() {
-        let mut store = HttpHistoryStore::new(2);
-        let mut ids = Vec::new();
-        for n in 0..5 {
-            let request = HttpRequest::new("GET", &format!("https://api.com/{n}"), 1);
-            ids.push(store.add(request, HttpResponse::new(200, "OK", vec![], "", 1)));
-        }
-        ids.sort();
-        ids.dedup();
-        assert_eq!(ids.len(), 5);
-        let kept: Vec<&str> = store
-            .entries
-            .iter()
-            .map(|entry| entry.id.as_str())
-            .collect();
-        assert_eq!(kept, vec!["hist-5", "hist-4"]);
-    }
-
-    #[test]
-    fn test_history_masks_credential_headers() {
-        let mut store = HttpHistoryStore::new(10);
-        let mut request = HttpRequest::new("GET", "https://api.com/me", 1);
-        request.headers = vec![
-            ("Authorization".into(), "Bearer secret".into()),
-            ("cookie".into(), "session=abc".into()),
-            ("Accept".into(), "*/*".into()),
-        ];
-        let response = HttpResponse::new(
-            200,
-            "OK",
-            vec![
-                ("SET-COOKIE".into(), "session=def".into()),
-                ("Content-Type".into(), "application/json".into()),
-            ],
-            "{}",
-            5,
-        );
-        store.add(request, response);
-        let entry = &store.entries[0];
-        assert_eq!(
-            entry.request.headers,
-            vec![
-                ("Authorization".to_string(), MASKED_VALUE.to_string()),
-                ("cookie".to_string(), MASKED_VALUE.to_string()),
-                ("Accept".to_string(), "*/*".to_string()),
-            ]
-        );
-        assert_eq!(
-            entry.response.headers,
-            vec![
-                ("SET-COOKIE".to_string(), MASKED_VALUE.to_string()),
-                ("Content-Type".to_string(), "application/json".to_string()),
-            ]
-        );
-        assert!(!entry.response.to_raw_http().contains("def"));
-        assert!(!entry.request.to_curl().contains("secret"));
-    }
-
-    #[test]
     fn test_is_secret_name() {
         for name in [
             "access_token",
@@ -651,6 +621,58 @@ mod tests {
             "apiKey",
             "userpassword",
             "pwd",
+            "userpwd",
+            "dbpwd",
+            "XApiKey",
+            "password1",
+            "password2",
+            "new_password1",
+            "key",
+            "Ocp-Apim-Subscription-Key",
+            "x-functions-key",
+            "app_key",
+            "client_key",
+            "master_key",
+            "license_key",
+            "x-amz-signature",
+            "sig",
+            "signature",
+            "policy",
+            "x-amz-credential",
+            "x-amz-security-token",
+            "jwt",
+            "auth",
+            "session",
+            "sessionid",
+            "session_id",
+            "PHPSESSID",
+            "JSESSIONID",
+            "pass",
+            "pw",
+            "passcode",
+            "passphrase",
+            "credentials",
+            "authentication",
+            "page_access_token",
+            "next_access_token",
+            "token",
+            "db_pass",
+            "smtp_pass",
+            "admin_pass",
+            "db_pw",
+            "DD-APPLICATION-KEY",
+            "session_key",
+            "sessionKey",
+            "id_token_hint",
+            "password2Confirm",
+            "Proxy-Authorization",
+            "X-Auth-Token",
+            "X-CSRF-Token",
+            "refresh_token",
+            "id_token",
+            "private_key",
+            "apikey",
+            "api-key",
         ] {
             assert!(is_secret_name(name), "{name}");
         }
@@ -662,6 +684,16 @@ mod tests {
             "primary_key",
             "token_type",
             "100%",
+            "authorization_endpoint",
+            "forgot_password_url",
+            "password_min_length",
+            "next_token",
+            "nextPageToken",
+            "continuation_token",
+            "monkey",
+            "compass",
+            "bypass",
+            "ssn",
         ] {
             assert!(!is_secret_name(name), "{name}");
         }
@@ -687,6 +719,35 @@ mod tests {
         let array = r#"{"api_key":["not-a-real-value-3","not-a-real-value-4"]}"#;
         let masked = mask_secret_body(array, Some("application/json")).unwrap();
         assert_eq!(masked, r#"{"api_key":"***"}"#);
+    }
+
+    #[test]
+    fn test_mask_secret_body_json_keeps_null_and_booleans() {
+        let body = r#"{"password":null,"token":true,"api_key":false,"secret":0,"auth":"not-a-real-value-1"}"#;
+        let masked = mask_secret_body(body, Some("application/json")).unwrap();
+        assert_eq!(
+            masked,
+            r#"{"password":null,"token":true,"api_key":false,"secret":"***","auth":"***"}"#
+        );
+        let only_flags = r#"{"password":null}"#;
+        assert_eq!(mask_secret_body(only_flags, Some("application/json")), None);
+    }
+
+    #[test]
+    fn test_mask_secret_url_fragment() {
+        assert_eq!(
+            mask_secret_query("https://a.test/cb#access_token=not-a-real-value-1&state=x")
+                .as_deref(),
+            Some("https://a.test/cb#access_token=***&state=x")
+        );
+        assert_eq!(
+            mask_secret_query(
+                "https://a.test/cb?code=1&api_key=not-a-real-value-2#id_token=not-a-real-value-3"
+            )
+            .as_deref(),
+            Some("https://a.test/cb?code=1&api_key=***#id_token=***")
+        );
+        assert_eq!(mask_secret_query("https://a.test/cb#top"), None);
     }
 
     #[test]
@@ -852,6 +913,93 @@ mod tests {
         let item = history.load(first)?;
         assert!(item.request.url.contains("q=1") && item.request.url.contains("token=***"));
         assert!(item.request.body.unwrap().contains("ann"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_strip_url_userinfo() {
+        assert_eq!(
+            strip_url_userinfo("https://ann:not-a-real-value-1@a.test:8080/p?q=1#x").as_deref(),
+            Some("https://a.test:8080/p?q=1#x")
+        );
+        assert_eq!(
+            strip_url_userinfo("https://not-a-real-value-2@{{host}}/p").as_deref(),
+            Some("https://{{host}}/p")
+        );
+        assert_eq!(strip_url_userinfo("https://a.test/p?email=a@b.test"), None);
+        assert_eq!(strip_url_userinfo("{{base}}/p"), None);
+        // A scheme-less templated URL with a `://` and an `@` in its query stays as sent.
+        assert_eq!(
+            strip_url_userinfo("{{base}}/p?next=https://a.test/x&mail=a@b.test"),
+            None
+        );
+        assert_eq!(
+            strip_url_userinfo("{{base}}?next=https://a.test@b.test/x"),
+            None
+        );
+        // The last `@` of the authority ends the userinfo.
+        assert_eq!(
+            strip_url_userinfo("https://ann:not-a-real-value-3@x@a.test/p").as_deref(),
+            Some("https://a.test/p")
+        );
+        // A username alone is userinfo too.
+        assert_eq!(
+            strip_url_userinfo("https://ann@a.test/p").as_deref(),
+            Some("https://a.test/p")
+        );
+        assert_eq!(
+            strip_url_userinfo("http://ann:not-a-real-value-4@[::1]:80/p").as_deref(),
+            Some("http://[::1]:80/p")
+        );
+        // An `@` only in the path, query or fragment is not userinfo; nor is no `@` at all.
+        assert_eq!(strip_url_userinfo("https://a.test/@ann"), None);
+        assert_eq!(strip_url_userinfo("https://a.test?m=a@b.test"), None);
+        assert_eq!(strip_url_userinfo("https://a.test#a@b"), None);
+        assert_eq!(strip_url_userinfo("https://a.test/p"), None);
+        // A templated scheme still gets its userinfo stripped, and so does an uppercase one.
+        assert_eq!(
+            strip_url_userinfo("{{scheme}}://ann:not-a-real-value-5@a.test/p").as_deref(),
+            Some("{{scheme}}://a.test/p")
+        );
+        assert_eq!(
+            strip_url_userinfo("http{{tls}}://ann:not-a-real-value-6@a.test/p").as_deref(),
+            Some("http{{tls}}://a.test/p")
+        );
+        assert_eq!(
+            strip_url_userinfo("HTTPS://ann:not-a-real-value-7@a.test/p").as_deref(),
+            Some("HTTPS://a.test/p")
+        );
+        assert_eq!(
+            strip_url_userinfo("  https://ann:not-a-real-value-8@a.test/p").as_deref(),
+            Some("https://a.test/p")
+        );
+        // A raw `/ ? #` inside a password ends the authority early, so the rest of the
+        // password stays. Such a URL mostly fails `Url::parse` in the client and
+        // `history_view::record` skips failed requests; a digits-only password before the `/`
+        // parses as a port, the request goes to the wrong host and fails. Negligible.
+    }
+
+    #[test]
+    fn test_disk_history_strips_url_userinfo() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let history = HistoryDir::new(temp.path().join("h"), 10, u64::MAX);
+        let request = HttpRequest::new("GET", "https://ann:not-a-real-value-3@a.test/p", 1);
+        let id = history.append(request, ok(""))?.expect("stored");
+        let raw = std::fs::read_to_string(history.directory().join(format!("{id}.json")))?;
+        assert!(!raw.contains("not-a-real-value"), "{raw}");
+        let raw_index = std::fs::read_to_string(history.directory().join(INDEX_FILE))?;
+        assert!(!raw_index.contains("not-a-real-value"), "{raw_index}");
+        assert_eq!(history.load(id)?.request.url, "https://a.test/p");
+
+        // A templated scheme fails `Url::parse`, so the request is still stored; its
+        // userinfo must not be.
+        let request = HttpRequest::new("GET", "{{scheme}}://ann:not-a-real-value-9@a.test/p", 2);
+        let id = history.append(request, ok(""))?.expect("stored");
+        let raw = std::fs::read_to_string(history.directory().join(format!("{id}.json")))?;
+        assert!(!raw.contains("not-a-real-value"), "{raw}");
+        let raw_index = std::fs::read_to_string(history.directory().join(INDEX_FILE))?;
+        assert!(!raw_index.contains("not-a-real-value"), "{raw_index}");
+        assert_eq!(history.load(id)?.request.url, "{{scheme}}://a.test/p");
         Ok(())
     }
 

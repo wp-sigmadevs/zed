@@ -751,8 +751,9 @@ mod tests {
         });
     }
 
-    /// With the node turned off, rows drawn before stay until the next rebuild (the store worktree
-    /// itself is removed at once). Rename on the "Scratches" row is still refused.
+    /// With the node turned off, rows drawn before stay until the next rebuild. This fixture has
+    /// no `ScratchesPanel`, so the store worktree stays open here; the real panel removes it at
+    /// once (see `zenith_scratches`' tests). Rename on the "Scratches" row is still refused.
     #[gpui::test]
     async fn test_stale_scratch_rows_cannot_rename_the_store_folder(cx: &mut TestAppContext) {
         let mut opened = open(cx, json!({ "src": { "main.php": "" } })).await;
