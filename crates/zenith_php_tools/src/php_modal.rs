@@ -69,7 +69,17 @@ pub struct PhpModal {
     error: Option<SharedString>,
     _load: Task<()>,
     _write: Task<()>,
+    /// Counts clicks, so a finished write knows whether a newer click exists (levels can repeat).
+    clicks: u64,
     _settings: Subscription,
+}
+
+impl Drop for PhpModal {
+    /// Esc right after a click must still save: let the queued writes finish (they hold no
+    /// reference to the modal).
+    fn drop(&mut self) {
+        std::mem::replace(&mut self._write, Task::ready(())).detach();
+    }
 }
 
 impl PhpModal {
@@ -135,6 +145,7 @@ impl PhpModal {
             error: None,
             _load: load,
             _write: Task::ready(()),
+            clicks: 0,
             _settings: cx.observe_global::<SettingsStore>(|_, cx| cx.notify()),
         }
     }
@@ -155,19 +166,29 @@ impl PhpModal {
         // Writes run one after the other, in click order: dropping an in-flight write would not
         // stop its rename, which could land after a newer write and leave the older level on disk.
         let previous = std::mem::replace(&mut self._write, Task::ready(()));
+        self.clicks += 1;
+        let click = self.clicks;
+        let project = self.project.clone();
         self._write = cx.spawn(async move |this, cx| {
             previous.await;
             let result =
                 php_config::write_language_level(fs.as_ref(), &root, level.as_deref()).await;
+            if result.is_ok() {
+                // Not through `this`: the modal may be closed by now, and the file still changed.
+                cx.update(|cx| php_config::restart_phpantom(&project, cx));
+            }
             this.update(cx, |this, cx| {
+                let latest = this.clicks == click;
                 match result {
                     Ok(()) => {
-                        this.saved_level = level;
+                        this.saved_level = level.clone();
                         this.error = None;
-                        php_config::restart_phpantom(&this.project, cx);
+                        if latest {
+                            this.level = level;
+                        }
                     }
                     // A newer click is queued behind this one and reports for itself.
-                    Err(error) if this.level == level => {
+                    Err(error) if latest => {
                         this.level = this.saved_level.clone();
                         this.error = Some(error.to_string().into());
                     }
@@ -175,7 +196,7 @@ impl PhpModal {
                 }
                 cx.notify();
             })
-            .log_err();
+            .ok();
         });
         cx.notify();
     }
@@ -643,6 +664,27 @@ mod tests {
         modal.read_with(cx, |modal, _| {
             assert_eq!(modal.level.as_deref(), Some("8.2"), "not the cancelled 8.4")
         });
+    }
+
+    #[gpui::test]
+    async fn test_closing_the_modal_still_saves_the_last_click(cx: &mut TestAppContext) {
+        let (fixture, cx) = setup(cx, json!({ "composer.json": "{}" })).await;
+        let modal = open(&fixture, Vec::new(), cx);
+        modal.update(cx, |modal, cx| {
+            modal.set_language_level(Some("8.4".into()), cx);
+            modal.set_language_level(Some("8.5".into()), cx);
+        });
+        fixture
+            .workspace
+            .update_in(cx, |workspace, window, cx| workspace.hide_modal(window, cx));
+        drop(modal);
+        cx.run_until_parked();
+        let text = fixture
+            .fs
+            .load(Path::new("/p/.phpantom.toml"))
+            .await
+            .unwrap();
+        assert!(text.contains("version = \"8.5\""), "{text}");
     }
 
     #[gpui::test]

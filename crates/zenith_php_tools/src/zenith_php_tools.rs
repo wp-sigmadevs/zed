@@ -274,20 +274,28 @@ pub async fn find_php(
     executor: &BackgroundExecutor,
     candidates: &[PathBuf],
 ) -> Option<(PathBuf, String)> {
-    find_first(executor, candidates, |path| async move {
-        php_config::probe_php(&path).await
-    })
+    find_first(
+        executor,
+        php_config::PROBE_TIMEOUT,
+        candidates,
+        probe_version,
+    )
     .await
+}
+
+async fn probe_version(path: PathBuf) -> Option<String> {
+    php_config::probe_php(&path).await
 }
 
 async fn find_first<F: Future<Output = Option<String>>>(
     executor: &BackgroundExecutor,
+    timeout: std::time::Duration,
     candidates: &[PathBuf],
     probe: impl Fn(PathBuf) -> F,
 ) -> Option<(PathBuf, String)> {
     for candidate in candidates {
         if let Some(version) =
-            php_config::within_probe_timeout(executor, probe(candidate.clone())).await
+            php_config::within_probe_timeout(executor, timeout, probe(candidate.clone())).await
         {
             return Some((candidate.clone(), version));
         }
@@ -295,12 +303,25 @@ async fn find_first<F: Future<Output = Option<String>>>(
     None
 }
 
+/// [`find_first`], and once more with the longer wait when nothing answered: a PHP whose first
+/// run is slow must not read as "not found" until the next refresh.
+async fn find_with_retry<F: Future<Output = Option<String>>>(
+    executor: &BackgroundExecutor,
+    candidates: &[PathBuf],
+    probe: impl Fn(PathBuf) -> F,
+) -> Option<(PathBuf, String)> {
+    if let Some(found) = find_first(executor, php_config::PROBE_TIMEOUT, candidates, &probe).await {
+        return Some(found);
+    }
+    find_first(executor, php_config::SLOW_PROBE_TIMEOUT, candidates, &probe).await
+}
+
 pub async fn detect_php(
     executor: &BackgroundExecutor,
     root: &Path,
     candidates: &[PathBuf],
 ) -> PhpInfo {
-    let found = find_php(executor, candidates).await;
+    let found = find_with_retry(executor, candidates, probe_version).await;
     PhpInfo {
         kind: detect_project(root),
         version: found.as_ref().map(|(_, version)| version.clone()),
@@ -584,11 +605,14 @@ pub fn init(cx: &mut App) {
         let project = workspace.project().clone();
         let this_workspace = cx.entity().downgrade();
         let item = cx.new(|cx| PhpStatus::new(project, this_workspace, cx));
+        let status_item = item.downgrade();
         workspace
             .status_bar()
             .update(cx, |bar, cx| bar.add_right_item(item, window, cx));
-        workspace.register_action(|workspace, _: &Status, window, cx| {
-            show_status(workspace, window, cx)
+        workspace.register_action(move |workspace, _: &Status, window, cx| {
+            show_status(workspace, window, cx);
+            // The status bar may still read "not found" from a slow first run.
+            status_item.update(cx, |status, cx| status.refresh(cx)).ok();
         });
         workspace.register_action(|workspace, _: &Update, window, cx| {
             manage(workspace, Manage::Update, window, cx)
@@ -1469,12 +1493,17 @@ mod tests {
             async move {
                 find_first(
                     &executor,
+                    php_config::PROBE_TIMEOUT,
                     &[PathBuf::from("/hangs/php"), PathBuf::from("/fine/php")],
                     |path| {
-                        let killed = Killed(dropped.clone());
+                        // Only the hanging probe carries the flag: the fine one's drop must
+                        // not be able to satisfy the assertion below.
+                        let killed = path
+                            .to_string_lossy()
+                            .contains("hangs")
+                            .then(|| Killed(dropped.clone()));
                         async move {
-                            if path.to_string_lossy().contains("hangs") {
-                                let _killed = killed;
+                            if let Some(_killed) = killed {
                                 futures::future::pending().await
                             } else {
                                 Some("8.4.1".to_string())
@@ -1498,6 +1527,38 @@ mod tests {
         assert!(
             dropped.load(std::sync::atomic::Ordering::SeqCst),
             "the timed-out probe is dropped, which kills its child"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_a_slow_first_php_run_is_found_by_the_retry(cx: &mut gpui::TestAppContext) {
+        use std::time::Duration;
+        let executor = cx.executor();
+        let mut task = cx.background_spawn({
+            let executor = executor.clone();
+            async move {
+                // Every run of this php takes 5 s: past the first wait, inside the second.
+                find_with_retry(&executor, &[PathBuf::from("/slow/php")], |_| {
+                    let executor = executor.clone();
+                    async move {
+                        executor.timer(Duration::from_secs(5)).await;
+                        Some("8.5.0".to_string())
+                    }
+                })
+                .await
+            }
+        });
+        cx.run_until_parked();
+        executor.advance_clock(php_config::PROBE_TIMEOUT + Duration::from_millis(1));
+        cx.run_until_parked();
+        assert!(
+            futures::poll!(&mut task).is_pending(),
+            "the retry is running"
+        );
+        executor.advance_clock(Duration::from_secs(5));
+        assert_eq!(
+            task.await,
+            Some((PathBuf::from("/slow/php"), "8.5.0".to_string()))
         );
     }
 

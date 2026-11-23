@@ -12,12 +12,25 @@ use settings::SettingsStore;
 use std::{
     io::ErrorKind,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 use toml_edit::{Array, DocumentMut, Item, Table};
 
 /// Two windows may sync at once; the file is read, edited and written as one step.
 static SYNC_LOCK: Mutex<()> = Mutex::new(());
+
+/// Each `sync` takes a ticket on the main thread; the background writes of Zenith's own config
+/// run in any order, so [`write_own_config`] drops a write older than one already done.
+static NEXT_TICKET: AtomicU64 = AtomicU64::new(1);
+/// The newest ticket written; the lock also makes the read-compare-write one step.
+static OWN_CONFIG: Mutex<u64> = Mutex::new(0);
+
+fn next_ticket() -> u64 {
+    NEXT_TICKET.fetch_add(1, Ordering::SeqCst)
+}
 
 /// `~/.local/share/zenith/tools/phpantom/current/phpantom_lsp`: the binary the owner or lead
 /// built from `main` and symlinked as `current`.
@@ -32,8 +45,13 @@ fn own_config_home(home: &Path) -> PathBuf {
 }
 
 /// Writes Zenith's own `.phpantom.toml` (a file only Zenith owns) when its content changes;
-/// `true` when it wrote.
-fn write_own_config(home: &Path, include: &[String]) -> Result<bool, String> {
+/// `true` when it wrote. A write whose `ticket` is older than one already written is dropped
+/// (`Ok(false)`): the file keeps the newest list.
+fn write_own_config(home: &Path, include: &[String], ticket: u64) -> Result<bool, String> {
+    let mut newest = OWN_CONFIG.lock().unwrap_or_else(|e| e.into_inner());
+    if ticket < *newest {
+        return Ok(false);
+    }
     let config = config_file(home, Some(own_config_home(home)));
     let mut doc = DocumentMut::new();
     let mut indexing = Table::new();
@@ -44,12 +62,15 @@ fn write_own_config(home: &Path, include: &[String]) -> Result<bool, String> {
     doc.insert("indexing", Item::Table(indexing));
     let text = doc.to_string();
     if std::fs::read_to_string(&config).ok().as_deref() == Some(text.as_str()) {
+        *newest = ticket;
         return Ok(false);
     }
     if let Some(dir) = config.parent() {
         std::fs::create_dir_all(dir).map_err(|error| format!("{}: {error}", dir.display()))?;
     }
-    write_atomic(&config, &text).map(|()| true)
+    write_atomic(&config, &text)?;
+    *newest = ticket;
+    Ok(true)
 }
 
 /// Entries Zenith added to the config file: `{"include": [...]}`. Older versions also
@@ -107,7 +128,13 @@ fn write_atomic(path: &Path, text: &str) -> Result<(), String> {
     std::fs::create_dir_all(parent)
         .map_err(|error| format!("creating {}: {error}", parent.display()))?;
     let mut name = path.file_name().unwrap_or_default().to_os_string();
-    name.push(format!(".{}.tmp", std::process::id()));
+    // Unique per call: every window of this process writes here.
+    static TEMP: AtomicU64 = AtomicU64::new(0);
+    name.push(format!(
+        ".{}.{}.tmp",
+        std::process::id(),
+        TEMP.fetch_add(1, Ordering::Relaxed)
+    ));
     let temp = parent.join(name);
     std::fs::write(&temp, text)
         .and_then(|()| std::fs::rename(&temp, path))
@@ -327,6 +354,7 @@ pub(crate) fn sync(project: &Entity<Project>, applied: &mut AppliedInclude, cx: 
         .and_then(|binary| binary.env.as_ref())
         .is_none_or(|env| !env.contains_key("XDG_CONFIG_HOME"));
     let previous = applied.record(&include);
+    let ticket = next_ticket();
     let applied = applied.clone();
     let applied_include = include.clone();
     let fs = project.read(cx).fs().clone();
@@ -341,7 +369,7 @@ pub(crate) fn sync(project: &Entity<Project>, applied: &mut AppliedInclude, cx: 
                 if let Err(error) = sync_config(&home, xdg, &[]) {
                     log::warn!("phpantom config: {error}");
                 }
-                let write = write_own_config(&home, &applied_include)
+                let write = write_own_config(&home, &applied_include, ticket)
                     .map_err(|error| log::warn!("phpantom config: {error}"));
                 let own = own_config_home(&home).display().to_string();
                 let set_binary = ((binary_unset || env_unset) && binary.is_file())
@@ -376,7 +404,9 @@ pub(crate) fn sync(project: &Entity<Project>, applied: &mut AppliedInclude, cx: 
 
 #[cfg(all(test, unix))]
 mod tests {
-    use super::{AppliedInclude, config_file, own_config_home, sync_config, write_own_config};
+    use super::{
+        AppliedInclude, config_file, next_ticket, own_config_home, sync_config, write_own_config,
+    };
 
     #[test]
     fn test_each_project_restarts_for_a_changed_list() {
@@ -429,12 +459,52 @@ mod tests {
     }
 
     #[test]
+    fn test_concurrent_own_config_writes_all_succeed_and_the_newest_list_wins() {
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path();
+        let handles: Vec<_> = (0..16)
+            .map(|_| {
+                let ticket = next_ticket();
+                let home = home.to_path_buf();
+                (
+                    ticket,
+                    std::thread::spawn(move || {
+                        (0..20).all(|_| {
+                            write_own_config(&home, &[format!("/libs/{ticket}")], ticket).is_ok()
+                        })
+                    }),
+                )
+            })
+            .collect();
+        let newest = handles.iter().map(|(ticket, _)| *ticket).max().unwrap();
+        for (_, handle) in handles {
+            assert!(handle.join().unwrap(), "a concurrent write failed");
+        }
+        let text = std::fs::read_to_string(config_file(home, Some(own_config_home(home)))).unwrap();
+        assert!(text.contains(&format!("/libs/{newest}")), "{text}");
+    }
+
+    #[test]
+    fn test_an_older_own_config_write_never_replaces_a_newer_one() {
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path();
+        let (older, newer) = (next_ticket(), next_ticket());
+        assert!(write_own_config(home, &["/libs/new".into()], newer).unwrap());
+        assert!(!write_own_config(home, &["/libs/old".into()], older).unwrap());
+        let text = std::fs::read_to_string(config_file(home, Some(own_config_home(home)))).unwrap();
+        assert!(
+            text.contains("/libs/new") && !text.contains("/libs/old"),
+            "{text}"
+        );
+    }
+
+    #[test]
     fn test_own_config_is_separate_from_the_global_one() {
         let home = tempfile::tempdir().unwrap();
         let home = home.path();
-        assert!(write_own_config(home, &["/libs/wp".into()]).unwrap());
+        assert!(write_own_config(home, &["/libs/wp".into()], next_ticket()).unwrap());
         assert!(
-            !write_own_config(home, &["/libs/wp".into()]).unwrap(),
+            !write_own_config(home, &["/libs/wp".into()], next_ticket()).unwrap(),
             "an unchanged list is not written, so PHPantom is not restarted"
         );
         let own = config_file(home, Some(own_config_home(home)));

@@ -81,13 +81,18 @@ pub async fn probe_interpreters(
     .await
 }
 
-/// `probe`'s answer, or `None` when it has not finished after [`PROBE_TIMEOUT`]. The probe is
+/// The second, longer wait for the status bar: the first `php -v` after an install or a reboot
+/// can take longer than [`PROBE_TIMEOUT`] (Gatekeeper scans the binary).
+pub(crate) const SLOW_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// `probe`'s answer, or `None` when it has not finished after `timeout`. The probe is
 /// dropped then, which kills its child (`kill_on_drop`).
 pub(crate) async fn within_probe_timeout(
     executor: &BackgroundExecutor,
+    timeout: Duration,
     probe: impl Future<Output = Option<String>>,
 ) -> Option<String> {
-    match futures::future::select(Box::pin(probe), executor.timer(PROBE_TIMEOUT)).await {
+    match futures::future::select(Box::pin(probe), executor.timer(timeout)).await {
         Either::Left((version, _)) => version,
         Either::Right(_) => None,
     }
@@ -101,7 +106,7 @@ async fn probe_all<F: Future<Output = Option<String>>>(
     let versions = join_all(
         candidates
             .iter()
-            .map(|path| within_probe_timeout(executor, probe(path.clone()))),
+            .map(|path| within_probe_timeout(executor, PROBE_TIMEOUT, probe(path.clone()))),
     )
     .await;
     candidates
@@ -317,7 +322,9 @@ fn remove_version(doc: &mut DocumentMut) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `path` with links followed; an error when that lands outside `root`.
+/// `path` with links followed; an error when that lands outside `root`. A hard link to an
+/// outside file is not caught (it canonicalizes inside); git never creates hard links, so a
+/// cloned repo cannot plant one.
 async fn resolve_inside_project(fs: &dyn Fs, root: &Path, path: &Path) -> anyhow::Result<PathBuf> {
     let Ok(target) = fs.canonicalize(path).await else {
         return Ok(path.to_path_buf());
