@@ -72,26 +72,66 @@ impl HttpHistoryStore {
 /// What a masked header value is replaced with.
 pub const MASKED_VALUE: &str = "***";
 
-/// Names whose values history never keeps: header names, JSON keys, form and query fields.
-/// A name is percent-decoded and split into lowercase segments on anything that is not a letter
-/// or digit and on camelCase humps, so `X-Api-Key`, `user[password]`, `user%5Bpassword%5D`,
-/// `password_confirmation` and `aws_secret_access_key` are caught. `token` counts only as the
-/// last segment (`access_token`, not `total_tokens`), and the words below only as a whole
-/// segment or its ending (`userpassword`, not `secretary`).
+/// Names whose values history never keeps: header names, JSON keys, form, query and fragment
+/// fields. A name is percent-decoded and split into lowercase segments on anything that is not a
+/// letter or digit and on camelCase humps; trailing digits of a segment are dropped
+/// (`password1`). So `X-Api-Key`, `XApiKey`, `user[password]`, `user%5Bpassword%5D`,
+/// `new_password1` and `aws_secret_access_key` are caught. `token` counts only as the last
+/// segment (`access_token`, not `total_tokens`), and the words below only as a whole segment
+/// or its ending (`userpassword`, not `secretary`). Weak words (`key`, `policy`, `session`)
+/// count only as the whole name.
+// shortcut: a descriptor ending (`password_min_length`, `forgot_password_url`) or a paging
+// token (`next_token`) stays readable, so a secret hidden behind such a name is not caught;
+// drop the exemptions if that bites.
 fn is_secret_name(name: &str) -> bool {
-    const ENDINGS: [&str; 9] = [
+    const ENDINGS: [&str; 6] = [
         "password",
         "passwd",
+        "pwd",
         "secret",
-        "apikey",
-        "accesskey",
-        "secretkey",
-        "privatekey",
         "authorization",
         "cookie",
     ];
-    // The word before `key` that makes it a credential: `api_key`, `X-Auth-Key`.
-    const KEY_PREFIXES: [&str; 5] = ["api", "access", "secret", "private", "auth"];
+    // The word before `key` that makes it a credential: `api_key`, `X-Auth-Key`, `XApiKey`.
+    const KEY_PREFIXES: [&str; 11] = [
+        "api",
+        "app",
+        "client",
+        "master",
+        "license",
+        "subscription",
+        "functions",
+        "access",
+        "secret",
+        "private",
+        "auth",
+    ];
+    const WHOLE_NAMES: [&str; 8] = [
+        "key",
+        "sig",
+        "policy",
+        "auth",
+        "session",
+        "sessionid",
+        "pass",
+        "pw",
+    ];
+    const LAST_SEGMENTS: [&str; 10] = [
+        "signature",
+        "credential",
+        "credentials",
+        "phpsessid",
+        "jsessionid",
+        "sessionid",
+        "passphrase",
+        "passcode",
+        "authentication",
+        "jwt",
+    ];
+    const DESCRIPTORS: [&str; 8] = [
+        "url", "uri", "endpoint", "length", "type", "min", "max", "required",
+    ];
+    const PAGING: [&str; 3] = ["next", "continuation", "page"];
 
     let name = percent_decode(name);
     let mut segments: Vec<String> = Vec::new();
@@ -114,15 +154,36 @@ fn is_secret_name(name: &str) -> bool {
             .expect("pushed above")
             .extend(character.to_lowercase());
     }
+    for segment in &mut segments {
+        segment.truncate(segment.trim_end_matches(|c: char| c.is_ascii_digit()).len());
+    }
     segments.retain(|segment| !segment.is_empty());
+    let Some(last) = segments.last() else {
+        return false;
+    };
+    if segments.len() > 1 && DESCRIPTORS.contains(&last.as_str()) {
+        return false;
+    }
 
-    segments
-        .iter()
-        .any(|segment| segment == "pwd" || ENDINGS.iter().any(|word| segment.ends_with(word)))
-        || segments.last().is_some_and(|last| last.ends_with("token"))
+    WHOLE_NAMES.contains(&segments.concat().as_str())
+        || LAST_SEGMENTS.contains(&last.as_str())
         || segments
-            .windows(2)
-            .any(|pair| pair[1] == "key" && KEY_PREFIXES.contains(&pair[0].as_str()))
+            .iter()
+            .any(|segment| ENDINGS.iter().any(|word| segment.ends_with(word)))
+        || (last.ends_with("token")
+            && !segments
+                .iter()
+                .any(|segment| PAGING.contains(&segment.as_str())))
+        || segments.iter().enumerate().any(|(ix, segment)| {
+            let word = match segment.strip_suffix("key") {
+                Some("") => ix.checked_sub(1).and_then(|before| segments.get(before)),
+                Some(_) => Some(segment),
+                None => None,
+            };
+            let Some(word) = word else { return false };
+            let word = word.strip_suffix("key").unwrap_or(word);
+            KEY_PREFIXES.iter().any(|prefix| word.ends_with(prefix))
+        })
 }
 
 /// Decodes `%XX` escapes; anything malformed is kept as written.
@@ -194,8 +255,11 @@ fn mask_secret_json(value: &mut serde_json::Value) -> bool {
         serde_json::Value::Object(map) => {
             for (key, value) in map.iter_mut() {
                 if is_secret_name(key) {
-                    *value = MASKED_VALUE.into();
-                    masked = true;
+                    // null and booleans carry no secret; keep them readable.
+                    if !matches!(value, serde_json::Value::Null | serde_json::Value::Bool(_)) {
+                        *value = MASKED_VALUE.into();
+                        masked = true;
+                    }
                 } else {
                     masked |= mask_secret_json(value);
                 }
@@ -228,18 +292,32 @@ fn mask_secret_pairs(pairs: &str) -> Option<String> {
     masked.then_some(joined)
 }
 
-/// Masks the query of `url`, leaving its fragment and everything before the `?` untouched.
+/// Masks the query and the fragment (`#access_token=...`) of `url` like pairs; everything
+/// before the `?` is left untouched.
 fn mask_secret_query(url: &str) -> Option<String> {
-    let (base, rest) = url.split_once('?')?;
-    let (query, fragment) = match rest.split_once('#') {
-        Some((query, fragment)) => (query, Some(fragment)),
+    let (rest, fragment) = match url.split_once('#') {
+        Some((rest, fragment)) => (rest, Some(fragment)),
+        None => (url, None),
+    };
+    let (base, query) = match rest.split_once('?') {
+        Some((base, query)) => (base, Some(query)),
         None => (rest, None),
     };
-    let query = mask_secret_pairs(query)?;
-    Some(match fragment {
-        Some(fragment) => format!("{base}?{query}#{fragment}"),
-        None => format!("{base}?{query}"),
-    })
+    let masked_query = query.and_then(mask_secret_pairs);
+    let masked_fragment = fragment.and_then(mask_secret_pairs);
+    if masked_query.is_none() && masked_fragment.is_none() {
+        return None;
+    }
+    let mut masked = base.to_string();
+    if let Some(query) = masked_query.as_deref().or(query) {
+        masked.push('?');
+        masked.push_str(query);
+    }
+    if let Some(fragment) = masked_fragment.as_deref().or(fragment) {
+        masked.push('#');
+        masked.push_str(fragment);
+    }
+    Some(masked)
 }
 
 /// Masks the content of form fields with a secret name. File parts (with a `filename`, or a
@@ -651,6 +729,38 @@ mod tests {
             "apiKey",
             "userpassword",
             "pwd",
+            "userpwd",
+            "dbpwd",
+            "XApiKey",
+            "password1",
+            "password2",
+            "new_password1",
+            "key",
+            "Ocp-Apim-Subscription-Key",
+            "x-functions-key",
+            "app_key",
+            "client_key",
+            "master_key",
+            "license_key",
+            "x-amz-signature",
+            "sig",
+            "signature",
+            "policy",
+            "x-amz-credential",
+            "x-amz-security-token",
+            "jwt",
+            "auth",
+            "session",
+            "sessionid",
+            "session_id",
+            "PHPSESSID",
+            "JSESSIONID",
+            "pass",
+            "pw",
+            "passcode",
+            "passphrase",
+            "credentials",
+            "authentication",
         ] {
             assert!(is_secret_name(name), "{name}");
         }
@@ -662,6 +772,14 @@ mod tests {
             "primary_key",
             "token_type",
             "100%",
+            "authorization_endpoint",
+            "forgot_password_url",
+            "password_min_length",
+            "next_token",
+            "nextPageToken",
+            "continuation_token",
+            "monkey",
+            "ssn",
         ] {
             assert!(!is_secret_name(name), "{name}");
         }
@@ -687,6 +805,35 @@ mod tests {
         let array = r#"{"api_key":["not-a-real-value-3","not-a-real-value-4"]}"#;
         let masked = mask_secret_body(array, Some("application/json")).unwrap();
         assert_eq!(masked, r#"{"api_key":"***"}"#);
+    }
+
+    #[test]
+    fn test_mask_secret_body_json_keeps_null_and_booleans() {
+        let body = r#"{"password":null,"token":true,"api_key":false,"secret":0,"auth":"not-a-real-value-1"}"#;
+        let masked = mask_secret_body(body, Some("application/json")).unwrap();
+        assert_eq!(
+            masked,
+            r#"{"password":null,"token":true,"api_key":false,"secret":"***","auth":"***"}"#
+        );
+        let only_flags = r#"{"password":null}"#;
+        assert_eq!(mask_secret_body(only_flags, Some("application/json")), None);
+    }
+
+    #[test]
+    fn test_mask_secret_url_fragment() {
+        assert_eq!(
+            mask_secret_query("https://a.test/cb#access_token=not-a-real-value-1&state=x")
+                .as_deref(),
+            Some("https://a.test/cb#access_token=***&state=x")
+        );
+        assert_eq!(
+            mask_secret_query(
+                "https://a.test/cb?code=1&api_key=not-a-real-value-2#id_token=not-a-real-value-3"
+            )
+            .as_deref(),
+            Some("https://a.test/cb?code=1&api_key=***#id_token=***")
+        );
+        assert_eq!(mask_secret_query("https://a.test/cb#top"), None);
     }
 
     #[test]
