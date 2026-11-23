@@ -464,6 +464,7 @@ impl Render for PhpModal {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use futures::StreamExt as _;
     use gpui::{Modifiers, TestAppContext, UpdateGlobal as _, VisualTestContext};
     use project::{FakeFs, Fs as _};
     use serde_json::json;
@@ -652,6 +653,11 @@ mod tests {
             r#"{ "zenith": { "external_libraries": { "paths": ["/libs/a", "/libs/b"] } } }"#;
         fixture
             .fs
+            .create_dir(paths::settings_file().parent().unwrap())
+            .await
+            .unwrap();
+        fixture
+            .fs
             .insert_file(paths::settings_file(), settings.as_bytes().to_vec())
             .await;
         cx.update(|_, cx| {
@@ -681,5 +687,52 @@ mod tests {
         let text = user_settings_text(&fixture, cx);
         assert!(!text.contains("/libs/a"), "{text}");
         assert!(text.contains("/libs/b"), "{text}");
+    }
+
+    #[gpui::test]
+    async fn test_a_saved_language_level_restarts_phpantom(cx: &mut TestAppContext) {
+        use language::{FakeLspAdapter, Language, LanguageConfig, LanguageMatcher};
+        let (fixture, cx) = setup(cx, json!({ "composer.json": "{}", "a.php": "<?php\n" })).await;
+        let project = fixture
+            .workspace
+            .read_with(cx, |workspace, _| workspace.project().clone());
+        let registry = project.read_with(cx, |project, _| project.languages().clone());
+        registry.add(Arc::new(Language::new(
+            LanguageConfig {
+                name: "PHP".into(),
+                matcher: LanguageMatcher {
+                    path_suffixes: vec!["php".into()],
+                    ..Default::default()
+                }
+                .into(),
+                ..Default::default()
+            },
+            None,
+        )));
+        let mut servers = registry.register_fake_lsp(
+            "PHP",
+            FakeLspAdapter {
+                name: "phpantom",
+                ..Default::default()
+            },
+        );
+        let (_buffer, _handle) = project
+            .update(cx, |project, cx| {
+                project.open_local_buffer_with_lsp(Path::new("/p/a.php"), cx)
+            })
+            .await
+            .unwrap();
+        let server = servers.next().await.expect("phpantom starts");
+        let mut shutdown =
+            server.set_request_handler::<lsp::request::Shutdown, _, _>(|_, _| async { Ok(()) });
+        let modal = open(&fixture, Vec::new(), cx);
+        modal.update(cx, |modal, cx| {
+            modal.set_language_level(Some("8.2".into()), cx)
+        });
+        cx.run_until_parked();
+        shutdown
+            .next()
+            .await
+            .expect("the new level restarts PHPantom");
     }
 }

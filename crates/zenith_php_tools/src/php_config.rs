@@ -306,8 +306,7 @@ pub async fn write_language_level(
 
 /// Restarts PHPantom for the project's open PHP buffers so it re-reads `.phpantom.toml`.
 /// A project without an open PHP buffer has nothing to restart: the server reads the file when
-/// it starts. Not covered by a gpui test: it needs a fake language server named `phpantom`;
-/// [`phpantom_selector`] and the buffer filter are unit-tested instead.
+/// it starts.
 pub fn restart_phpantom(project: &Entity<Project>, cx: &mut App) {
     project.update(cx, |project, cx| {
         let buffers: Vec<_> = project
@@ -640,6 +639,66 @@ mod tests {
             phpantom_selector(),
             LanguageServerSelector::Name("phpantom".into())
         );
+    }
+
+    #[gpui::test]
+    async fn test_restart_restarts_phpantom_only(cx: &mut TestAppContext) {
+        use language::{FakeLspAdapter, Language, LanguageConfig, LanguageMatcher};
+        cx.update(|cx| {
+            workspace::AppState::test(cx);
+        });
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/p", json!({ "a.php": "<?php\n" })).await;
+        let project = Project::test(fs, [Path::new("/p")], cx).await;
+        let registry = project.read_with(cx, |project, _| project.languages().clone());
+        registry.add(std::sync::Arc::new(Language::new(
+            LanguageConfig {
+                name: "PHP".into(),
+                matcher: LanguageMatcher {
+                    path_suffixes: vec!["php".into()],
+                    ..Default::default()
+                }
+                .into(),
+                ..Default::default()
+            },
+            None,
+        )));
+        let mut phpantom = registry.register_fake_lsp(
+            "PHP",
+            FakeLspAdapter {
+                name: "phpantom",
+                ..Default::default()
+            },
+        );
+        let mut other = registry.register_fake_lsp(
+            "PHP",
+            FakeLspAdapter {
+                name: "other-php-server",
+                ..Default::default()
+            },
+        );
+        let (_buffer, _handle) = project
+            .update(cx, |project, cx| {
+                project.open_local_buffer_with_lsp(Path::new("/p/a.php"), cx)
+            })
+            .await
+            .unwrap();
+        let first = phpantom.next().await.expect("phpantom starts");
+        let other_server = other.next().await.expect("the other server starts");
+        let mut phpantom_shutdown =
+            first.set_request_handler::<lsp::request::Shutdown, _, _>(|_, _| async { Ok(()) });
+        let mut other_shutdown = other_server
+            .set_request_handler::<lsp::request::Shutdown, _, _>(|_, _| async { Ok(()) });
+
+        cx.update(|cx| restart_phpantom(&project, cx));
+        phpantom_shutdown.next().await.expect("phpantom is stopped");
+        phpantom.next().await.expect("and started again");
+        cx.run_until_parked();
+        assert!(
+            other_shutdown.try_recv().is_err(),
+            "other PHP servers keep running"
+        );
+        assert!(other.try_recv().is_err(), "and are not started again");
     }
 
     fn init_user_settings(cx: &mut TestAppContext, php_binary: Option<&str>) {
