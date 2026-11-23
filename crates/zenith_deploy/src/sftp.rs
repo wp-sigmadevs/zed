@@ -243,6 +243,10 @@ impl Transport for SftpTransport {
         retain_listable(parse_ls(&output, path), self.hidden_files)
     }
 
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "runs under spawn_operation on a background thread with a real clock; this crate has no GPUI executor in the transport layer"
+    )]
     async fn download_file(&mut self, remote_path: &str, local_path: &Path) -> Result<()> {
         let batch = get_batch(remote_path, local_path)?;
         // sftp writes the file itself, so its size is watched; losing the race drops the run,

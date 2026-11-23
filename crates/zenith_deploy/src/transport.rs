@@ -333,6 +333,10 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the stalled transfer writes the real file system, so the test needs a real clock"
+    )]
     fn a_cancelled_download_leaves_no_partial_file() {
         let directory = tempfile::tempdir().expect("tempdir");
         let mut transport = FakeTransport {

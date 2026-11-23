@@ -245,7 +245,7 @@ impl DeploymentDialog {
             (&self.fields.username, server.username.clone()),
             (&self.fields.password, password),
             (&self.fields.root_path, server.root_path.clone()),
-            (&self.fields.web_url, server.web_url.clone()),
+            (&self.fields.web_url, server.web_url),
         ];
         for (editor, text) in texts {
             editor.update(cx, |editor, cx| editor.set_text(text, window, cx));
