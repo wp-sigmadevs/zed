@@ -73,35 +73,81 @@ impl HttpHistoryStore {
 pub const MASKED_VALUE: &str = "***";
 
 /// Names whose values history never keeps: header names, JSON keys, form and query fields.
-/// Matched case-insensitively and ignoring `-` and `_`, against any name that contains one,
-/// so `X-Api-Key`, `user_password` and `Set-Cookie` are all caught.
-const SECRET_NAMES: [&str; 13] = [
-    "password",
-    "passwd",
-    "pwd",
-    "secret",
-    "token",
-    "access_token",
-    "refresh_token",
-    "api_key",
-    "apikey",
-    "client_secret",
-    "authorization",
-    "private_key",
-    "cookie",
-];
-
+/// A name is percent-decoded and split into lowercase segments on anything that is not a letter
+/// or digit and on camelCase humps, so `X-Api-Key`, `user[password]`, `user%5Bpassword%5D`,
+/// `password_confirmation` and `aws_secret_access_key` are caught. `token` counts only as the
+/// last segment (`access_token`, not `total_tokens`), and the words below only as a whole
+/// segment or its ending (`userpassword`, not `secretary`).
 fn is_secret_name(name: &str) -> bool {
-    let normalize = |text: &str| {
-        text.chars()
-            .filter(|character| !matches!(character, '-' | '_'))
-            .flat_map(char::to_lowercase)
-            .collect::<String>()
-    };
-    let name = normalize(name);
-    SECRET_NAMES
+    const ENDINGS: [&str; 9] = [
+        "password",
+        "passwd",
+        "secret",
+        "apikey",
+        "accesskey",
+        "secretkey",
+        "privatekey",
+        "authorization",
+        "cookie",
+    ];
+    // The word before `key` that makes it a credential: `api_key`, `X-Auth-Key`.
+    const KEY_PREFIXES: [&str; 5] = ["api", "access", "secret", "private", "auth"];
+
+    let name = percent_decode(name);
+    let mut segments: Vec<String> = Vec::new();
+    let mut previous_lower = false;
+    for character in name.chars() {
+        if !character.is_alphanumeric() {
+            segments.push(String::new());
+            previous_lower = false;
+            continue;
+        }
+        if character.is_uppercase() && previous_lower {
+            segments.push(String::new());
+        }
+        previous_lower = character.is_lowercase();
+        if segments.is_empty() {
+            segments.push(String::new());
+        }
+        segments
+            .last_mut()
+            .expect("pushed above")
+            .extend(character.to_lowercase());
+    }
+    segments.retain(|segment| !segment.is_empty());
+
+    segments
         .iter()
-        .any(|secret| name.ends_with(&normalize(secret)))
+        .any(|segment| segment == "pwd" || ENDINGS.iter().any(|word| segment.ends_with(word)))
+        || segments.last().is_some_and(|last| last.ends_with("token"))
+        || segments
+            .windows(2)
+            .any(|pair| pair[1] == "key" && KEY_PREFIXES.contains(&pair[0].as_str()))
+}
+
+/// Decodes `%XX` escapes; anything malformed is kept as written.
+fn percent_decode(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut ix = 0;
+    while ix < bytes.len() {
+        let hex = |byte: u8| (byte as char).to_digit(16);
+        match (
+            bytes[ix],
+            bytes.get(ix + 1).and_then(|b| hex(*b)),
+            bytes.get(ix + 2).and_then(|b| hex(*b)),
+        ) {
+            (b'%', Some(high), Some(low)) => {
+                decoded.push((high * 16 + low) as u8);
+                ix += 3;
+            }
+            (byte, ..) => {
+                decoded.push(byte);
+                ix += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&decoded).into_owned()
 }
 
 fn mask_secret_headers(headers: &mut [(String, String)]) {
@@ -147,7 +193,7 @@ fn mask_secret_json(value: &mut serde_json::Value) -> bool {
     match value {
         serde_json::Value::Object(map) => {
             for (key, value) in map.iter_mut() {
-                if is_secret_name(key) && (value.is_string() || value.is_number()) {
+                if is_secret_name(key) {
                     *value = MASKED_VALUE.into();
                     masked = true;
                 } else {
@@ -166,7 +212,6 @@ fn mask_secret_json(value: &mut serde_json::Value) -> bool {
 }
 
 /// Masks `name=value` pairs separated by `&`, as in a form body or a URL query.
-/// shortcut: names are compared as written, so a percent-encoded name (`api%5Fkey`) is missed.
 fn mask_secret_pairs(pairs: &str) -> Option<String> {
     let mut masked = false;
     let joined = pairs
@@ -594,10 +639,30 @@ mod tests {
             "X-Api-Key",
             "user_password",
             "Set-Cookie",
+            "password_confirmation",
+            "user[password]",
+            "user%5Bpassword%5D",
+            "user%5bpassword%5d",
+            "secret_key",
+            "aws_secret_access_key",
+            "access_key",
+            "X-Auth-Key",
+            "accessToken",
+            "apiKey",
+            "userpassword",
+            "pwd",
         ] {
             assert!(is_secret_name(name), "{name}");
         }
-        for name in ["total_tokens", "secretary", "username", "Accept"] {
+        for name in [
+            "total_tokens",
+            "secretary",
+            "username",
+            "Accept",
+            "primary_key",
+            "token_type",
+            "100%",
+        ] {
             assert!(!is_secret_name(name), "{name}");
         }
     }
@@ -611,6 +676,17 @@ mod tests {
         let clean = r#"{"user":"ann"}"#;
         assert_eq!(mask_secret_body(clean, Some("application/json")), None);
         assert_eq!(mask_secret_body("not json", None), None);
+    }
+
+    #[test]
+    fn test_mask_secret_body_json_nested_values() {
+        let object =
+            r#"{"password":{"old":"not-a-real-value-1","new":"not-a-real-value-2"},"ok":1}"#;
+        let masked = mask_secret_body(object, Some("application/json")).unwrap();
+        assert_eq!(masked, r#"{"password":"***","ok":1}"#);
+        let array = r#"{"api_key":["not-a-real-value-3","not-a-real-value-4"]}"#;
+        let masked = mask_secret_body(array, Some("application/json")).unwrap();
+        assert_eq!(masked, r#"{"api_key":"***"}"#);
     }
 
     #[test]
@@ -736,6 +812,46 @@ mod tests {
         let item = history.load(id)?;
         assert_eq!(item.request.headers[0].1, MASKED_VALUE);
         assert_eq!(item.response.headers[0].1, MASKED_VALUE);
+        Ok(())
+    }
+
+    #[test]
+    fn test_disk_history_append_masks_bodies_and_query_on_disk() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let history = HistoryDir::new(temp.path().join("h"), 10, u64::MAX);
+        let json_headers = vec![("Content-Type".to_string(), "application/json".to_string())];
+        let mut json = HttpRequest::new(
+            "POST",
+            "https://a.test/login?token=not-a-real-value-1&q=1",
+            1,
+        );
+        json.headers = json_headers.clone();
+        json.body = Some(r#"{"user":"ann","password":"not-a-real-value-2"}"#.into());
+        let response = HttpResponse::new(
+            200,
+            "OK",
+            json_headers,
+            r#"{"access_token":"not-a-real-value-3"}"#,
+            1,
+        );
+        let mut form = HttpRequest::new("POST", "https://a.test/form", 2);
+        form.headers = vec![(
+            "Content-Type".into(),
+            "application/x-www-form-urlencoded".into(),
+        )];
+        form.body = Some("user=ann&user%5Bpassword%5D=not-a-real-value-4".into());
+        let first = history.append(json, response)?.expect("stored");
+        let second = history.append(form, ok(""))?.expect("stored");
+
+        for id in [first, second] {
+            let raw = std::fs::read_to_string(history.directory().join(format!("{id}.json")))?;
+            assert!(!raw.contains("not-a-real-value"), "{raw}");
+        }
+        let raw_index = std::fs::read_to_string(history.directory().join(INDEX_FILE))?;
+        assert!(!raw_index.contains("not-a-real-value"), "{raw_index}");
+        let item = history.load(first)?;
+        assert!(item.request.url.contains("q=1") && item.request.url.contains("token=***"));
+        assert!(item.request.body.unwrap().contains("ann"));
         Ok(())
     }
 
