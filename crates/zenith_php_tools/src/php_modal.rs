@@ -71,7 +71,20 @@ pub struct PhpModal {
     _write: Task<()>,
     /// Counts clicks, so a finished write knows whether a newer click exists (levels can repeat).
     clicks: u64,
+    /// A write that a newer click replaced landed, and PHPantom has not restarted for it.
+    restart_pending: bool,
     _settings: Subscription,
+}
+
+/// Whether a finished write restarts PHPantom. A write a newer click replaced does not (the
+/// newest one will), but remembers that the file changed: if the newest write then fails, the
+/// restart still happens, because the file holds the older level.
+fn should_restart(pending: &mut bool, superseded: bool, ok: bool) -> bool {
+    if superseded {
+        *pending |= ok;
+        return false;
+    }
+    std::mem::take(pending) || ok
 }
 
 impl Drop for PhpModal {
@@ -146,6 +159,7 @@ impl PhpModal {
             _load: load,
             _write: Task::ready(()),
             clicks: 0,
+            restart_pending: false,
             _settings: cx.observe_global::<SettingsStore>(|_, cx| cx.notify()),
         }
     }
@@ -174,11 +188,17 @@ impl PhpModal {
             let result =
                 php_config::write_language_level(fs.as_ref(), &root, level.as_deref()).await;
             // Not through `this` for the restart itself: the modal may be closed by now, and the
-            // file still changed. A write a newer click already replaced does not restart.
-            let superseded = this
-                .update(cx, |this, _| this.clicks != click)
-                .unwrap_or(false);
-            if result.is_ok() && !superseded {
+            // file still changed (a closed modal restarts for every write).
+            let restart = this
+                .update(cx, |this, _| {
+                    should_restart(
+                        &mut this.restart_pending,
+                        this.clicks != click,
+                        result.is_ok(),
+                    )
+                })
+                .unwrap_or(result.is_ok());
+            if restart {
                 cx.update(|cx| php_config::restart_phpantom(&project, cx));
             }
             this.update(cx, |this, cx| {
@@ -850,6 +870,29 @@ mod tests {
             .next()
             .await
             .expect("the new level restarts PHPantom");
+    }
+
+    #[test]
+    fn test_a_failed_newest_write_still_restarts_for_a_landed_older_one() {
+        let mut pending = false;
+        assert!(
+            !should_restart(&mut pending, true, true),
+            "A landed, B is queued"
+        );
+        assert!(
+            should_restart(&mut pending, false, false),
+            "B failed; the file holds A"
+        );
+        assert!(
+            !should_restart(&mut pending, false, false),
+            "nothing is pending any more"
+        );
+        assert!(should_restart(&mut pending, false, true));
+        assert!(
+            !should_restart(&mut pending, true, false),
+            "a failed older write is nothing"
+        );
+        assert!(!should_restart(&mut pending, false, false));
     }
 
     #[gpui::test]

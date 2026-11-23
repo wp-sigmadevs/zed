@@ -24,7 +24,7 @@ use toml_edit::{Array, DocumentMut, Item, Table};
 static SYNC_LOCK: Mutex<()> = Mutex::new(());
 
 /// Each `sync` takes a ticket on the main thread; the background writes of Zenith's own config
-/// run in any order, so [`write_own_config`] drops a write older than one already done.
+/// run in any order, so [`write_own_config`] drops a write older than one already attempted.
 static NEXT_TICKET: AtomicU64 = AtomicU64::new(1);
 /// The newest ticket attempted per config file (a failed newer write must not let an older list
 /// land afterwards); the lock also makes the read-compare-write one step.
@@ -512,6 +512,12 @@ mod tests {
         std::fs::remove_file(config.parent().unwrap()).unwrap();
         assert!(!write_own_config(home, &["/libs/old".into()], older).unwrap());
         assert!(!config.exists(), "the older list must not land");
+        assert!(write_own_config(home, &["/libs/newest".into()], next_ticket()).unwrap());
+        assert!(
+            std::fs::read_to_string(&config)
+                .unwrap()
+                .contains("/libs/newest")
+        );
     }
 
     #[test]
