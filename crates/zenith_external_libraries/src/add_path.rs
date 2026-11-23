@@ -10,7 +10,9 @@ actions!(
     [
         /// Picks folders to treat as external libraries: they are added to
         /// `zenith.external_libraries.paths` and opened in the project.
-        AddLibraryPath
+        AddLibraryPath,
+        /// Opens the PHP settings: language level, CLI interpreter and include paths.
+        ConfigurePhpIncludePaths,
     ]
 );
 

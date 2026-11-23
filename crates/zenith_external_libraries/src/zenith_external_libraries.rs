@@ -336,7 +336,7 @@ pub fn append_children_recursive(
 
 mod add_path;
 mod banner;
-pub use add_path::AddLibraryPath;
+pub use add_path::{AddLibraryPath, ConfigurePhpIncludePaths};
 pub use banner::{LibraryFileBanner, init};
 
 /// Whether `path` is a file the soft "external library" banner applies to: inside a detected

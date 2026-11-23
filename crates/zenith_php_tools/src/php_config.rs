@@ -7,17 +7,24 @@
 //! the key is `[php] version` (a string such as `"8.3"`) and `[indexing] include` (an array
 //! of strings); the project file and the global one are merged by `merge_toml`: tables merge
 //! key by key, every other value (scalars and arrays) from the project replaces the global one.
-//! So a project `include` array replaces Zenith's whole library list.
+//! So a project `include` array replaces Zenith's whole library list. Checked against the
+//! `b759b41da6` binary with `phpantom_lsp analyze` (2026-11-23): a project file with only
+//! `[php] version` keeps the global `include`; one with `include = [..]` or `[]` drops it.
 
-use futures::{StreamExt as _, future::join_all};
-use gpui::{App, AppContext as _, Entity, Task};
+use futures::{
+    StreamExt as _,
+    future::{Either, join_all},
+};
+use gpui::{App, AppContext as _, BackgroundExecutor, Entity, Task};
 use language::LanguageServerName;
 use lsp::LanguageServerSelector;
 use project::{Fs, Project};
 use settings::{RegisterSetting, Settings, SettingsContent, SettingsStore};
 use std::{
+    future::Future,
     path::{Path, PathBuf},
     sync::Mutex,
+    time::Duration,
 };
 use toml_edit::{DocumentMut, Item, Table, Value};
 use util::ResultExt as _;
@@ -59,17 +66,42 @@ pub(crate) async fn probe_php(candidate: &Path) -> Option<String> {
     crate::parse_php_version(&String::from_utf8_lossy(&output.stdout))
 }
 
-/// Every candidate that answers `php -v`, in the order given. Probes run side by side; call it
-/// from a background task.
-pub async fn probe_interpreters(candidates: &[PathBuf]) -> Vec<PhpInterpreter> {
-    let versions = join_all(candidates.iter().map(|path| probe_php(path))).await;
+/// A `php -v` that has not answered after this long is dropped from the list.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Every candidate that answers `php -v` within [`PROBE_TIMEOUT`], in the order given. Probes
+/// run side by side; call it from a background task.
+pub async fn probe_interpreters(
+    executor: &BackgroundExecutor,
+    candidates: &[PathBuf],
+) -> Vec<PhpInterpreter> {
+    probe_all(executor, candidates, |path| async move {
+        probe_php(&path).await
+    })
+    .await
+}
+
+async fn probe_all<F: Future<Output = Option<String>>>(
+    executor: &BackgroundExecutor,
+    candidates: &[PathBuf],
+    probe: impl Fn(PathBuf) -> F,
+) -> Vec<PhpInterpreter> {
+    let versions = join_all(candidates.iter().map(|path| {
+        let probe = Box::pin(probe(path.clone()));
+        // A dropped probe kills its child (`kill_on_drop`).
+        futures::future::select(probe, executor.timer(PROBE_TIMEOUT))
+    }))
+    .await;
     candidates
         .iter()
         .zip(versions)
-        .filter_map(|(path, version)| {
+        .filter_map(|(path, result)| {
             Some(PhpInterpreter {
                 path: path.clone(),
-                version: version?,
+                version: match result {
+                    Either::Left((version, _)) => version?,
+                    Either::Right(_) => return None,
+                },
             })
         })
         .collect()
@@ -78,7 +110,22 @@ pub async fn probe_interpreters(candidates: &[PathBuf]) -> Vec<PhpInterpreter> {
 /// The interpreters for the modal's dropdown: the user's override first, then Herd, Homebrew
 /// and the `PATH` (the same list the tools use). Runs on the background executor.
 pub fn list_interpreters(cx: &App) -> Task<Vec<PhpInterpreter>> {
-    cx.background_spawn(async move { probe_interpreters(&crate::environment().0).await })
+    let executor = cx.background_executor().clone();
+    #[cfg(test)]
+    let test_candidates = TEST_CANDIDATES.with(|candidates| candidates.borrow().clone());
+    cx.background_spawn(async move {
+        #[cfg(test)]
+        if let Some(candidates) = test_candidates {
+            return probe_interpreters(&executor, &candidates).await;
+        }
+        probe_interpreters(&executor, &crate::environment().0).await
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Replaces the machine's candidates in [`list_interpreters`] (per test thread).
+    pub(crate) static TEST_CANDIDATES: std::cell::RefCell<Option<Vec<PathBuf>>> = Default::default();
 }
 
 /// `binary` first in `candidates`, when it is absolute and executable; otherwise unchanged.
@@ -297,15 +344,31 @@ pub async fn write_language_level(
     if edited == text {
         return Ok(());
     }
-    // A symlinked file (dotfiles) is written at its target, so the link survives.
-    let target = fs.canonicalize(&path).await.unwrap_or(path);
+    // A symlinked file (dotfiles) is written at its target, so the link survives; a target
+    // outside the project is refused (a cloned repo must not make us write elsewhere). A
+    // dangling link does not canonicalize and is replaced.
+    let target = match fs.canonicalize(&path).await {
+        Ok(target) => {
+            let root = fs
+                .canonicalize(root)
+                .await
+                .unwrap_or_else(|_| root.to_path_buf());
+            anyhow::ensure!(
+                target.starts_with(&root),
+                "{} is a link to {}, outside the project; not writing it",
+                path.display(),
+                target.display()
+            );
+            target
+        }
+        Err(_) => path,
+    };
     fs.atomic_write(target, edited).await
 }
 
 /// Restarts PHPantom for the project's open PHP buffers so it re-reads `.phpantom.toml`.
 /// A project without an open PHP buffer has nothing to restart: the server reads the file when
-/// it starts. Not covered by a gpui test: it needs a fake language server named `phpantom`;
-/// [`phpantom_selector`] and the buffer filter are unit-tested instead.
+/// it starts.
 pub fn restart_phpantom(project: &Entity<Project>, cx: &mut App) {
     project.update(cx, |project, cx| {
         let buffers: Vec<_> = project
@@ -474,6 +537,45 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_symlink_out_of_the_project_is_not_written(cx: &mut TestAppContext) {
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            "/dot",
+            json!({ "outside.toml": "[indexing]\nexclude = [\"x\"]\n", "inside": {} }),
+        )
+        .await;
+        fs.insert_tree("/p", json!({ "composer.json": "{}", "real.toml": "" }))
+            .await;
+        fs.insert_symlink("/p/.phpantom.toml", PathBuf::from("/dot/outside.toml"))
+            .await;
+        let error = write_language_level(fs.as_ref(), Path::new("/p"), Some("8.3"))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("outside the project"), "{error}");
+        assert_eq!(
+            fs.load(Path::new("/dot/outside.toml")).await.unwrap(),
+            "[indexing]\nexclude = [\"x\"]\n"
+        );
+
+        // A link that stays inside the project is followed and survives.
+        fs.remove_file(Path::new("/p/.phpantom.toml"), Default::default())
+            .await
+            .unwrap();
+        fs.insert_symlink("/p/.phpantom.toml", PathBuf::from("real.toml"))
+            .await;
+        write_language_level(fs.as_ref(), Path::new("/p"), Some("8.3"))
+            .await
+            .unwrap();
+        assert!(
+            fs.load(Path::new("/p/real.toml"))
+                .await
+                .unwrap()
+                .contains("8.3")
+        );
+        assert!(fs.read_link(Path::new("/p/.phpantom.toml")).await.is_ok());
+    }
+
+    #[gpui::test]
     async fn test_write_round_trips_through_the_file(cx: &mut TestAppContext) {
         let fs = FakeFs::new(cx.executor());
         fs.insert_tree("/p", json!({ "composer.json": "{}" })).await;
@@ -603,20 +705,26 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_probe_keeps_only_candidates_that_answer() {
+    #[gpui::test]
+    async fn test_probe_keeps_only_candidates_that_answer(cx: &mut TestAppContext) {
+        // Real processes run on real threads.
+        cx.executor().allow_parking();
         let dir = tempfile::tempdir().unwrap();
         let good = php_stub(dir.path(), "php84", "8.4.1", 0o755);
         let older = php_stub(dir.path(), "php74", "7.4.33", 0o755);
         let broken = dir.path().join("broken");
         std::fs::write(&broken, "#!/bin/sh\necho 'not php'\n").unwrap();
         std::fs::set_permissions(&broken, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let found = futures::executor::block_on(probe_interpreters(&[
-            good.clone(),
-            dir.path().join("missing"),
-            broken,
-            older.clone(),
-        ]));
+        let found = probe_interpreters(
+            &cx.executor(),
+            &[
+                good.clone(),
+                dir.path().join("missing"),
+                broken,
+                older.clone(),
+            ],
+        )
+        .await;
         assert_eq!(
             found,
             [
@@ -632,12 +740,107 @@ mod tests {
         );
     }
 
+    #[gpui::test]
+    async fn test_a_hanging_probe_is_dropped_after_the_timeout(cx: &mut TestAppContext) {
+        let candidates = [
+            PathBuf::from("/hangs/php"),
+            PathBuf::from("/fine/php"),
+            PathBuf::from("/also-hangs/php"),
+        ];
+        let executor = cx.executor();
+        let task = cx.background_spawn({
+            let executor = executor.clone();
+            async move {
+                probe_all(&executor, &candidates, |path| {
+                    let hangs = path.to_string_lossy().contains("hangs");
+                    async move {
+                        if hangs {
+                            futures::future::pending().await
+                        } else {
+                            Some("8.4.1".to_string())
+                        }
+                    }
+                })
+                .await
+            }
+        });
+        cx.run_until_parked();
+        executor.advance_clock(PROBE_TIMEOUT + Duration::from_millis(1));
+        assert_eq!(
+            task.await,
+            [PhpInterpreter {
+                path: PathBuf::from("/fine/php"),
+                version: "8.4.1".into()
+            }]
+        );
+    }
+
     #[test]
     fn test_restart_selects_phpantom_by_name() {
         assert_eq!(
             phpantom_selector(),
             LanguageServerSelector::Name("phpantom".into())
         );
+    }
+
+    #[gpui::test]
+    async fn test_restart_restarts_phpantom_only(cx: &mut TestAppContext) {
+        use language::{FakeLspAdapter, Language, LanguageConfig, LanguageMatcher};
+        cx.update(|cx| {
+            workspace::AppState::test(cx);
+        });
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/p", json!({ "a.php": "<?php\n" })).await;
+        let project = Project::test(fs, [Path::new("/p")], cx).await;
+        let registry = project.read_with(cx, |project, _| project.languages().clone());
+        registry.add(std::sync::Arc::new(Language::new(
+            LanguageConfig {
+                name: "PHP".into(),
+                matcher: LanguageMatcher {
+                    path_suffixes: vec!["php".into()],
+                    ..Default::default()
+                }
+                .into(),
+                ..Default::default()
+            },
+            None,
+        )));
+        let mut phpantom = registry.register_fake_lsp(
+            "PHP",
+            FakeLspAdapter {
+                name: "phpantom",
+                ..Default::default()
+            },
+        );
+        let mut other = registry.register_fake_lsp(
+            "PHP",
+            FakeLspAdapter {
+                name: "other-php-server",
+                ..Default::default()
+            },
+        );
+        let (_buffer, _handle) = project
+            .update(cx, |project, cx| {
+                project.open_local_buffer_with_lsp(Path::new("/p/a.php"), cx)
+            })
+            .await
+            .unwrap();
+        let first = phpantom.next().await.expect("phpantom starts");
+        let other_server = other.next().await.expect("the other server starts");
+        let mut phpantom_shutdown =
+            first.set_request_handler::<lsp::request::Shutdown, _, _>(|_, _| async { Ok(()) });
+        let mut other_shutdown = other_server
+            .set_request_handler::<lsp::request::Shutdown, _, _>(|_, _| async { Ok(()) });
+
+        cx.update(|cx| restart_phpantom(&project, cx));
+        phpantom_shutdown.next().await.expect("phpantom is stopped");
+        phpantom.next().await.expect("and started again");
+        cx.run_until_parked();
+        assert!(
+            other_shutdown.try_recv().is_err(),
+            "other PHP servers keep running"
+        );
+        assert!(other.try_recv().is_err(), "and are not started again");
     }
 
     fn init_user_settings(cx: &mut TestAppContext, php_binary: Option<&str>) {

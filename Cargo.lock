@@ -23372,6 +23372,8 @@ dependencies = [
  "libc",
  "log",
  "lsp",
+ "menu",
+ "paths",
  "project",
  "serde_json",
  "settings",
@@ -23383,6 +23385,7 @@ dependencies = [
  "ui",
  "util",
  "workspace",
+ "zenith_external_libraries",
 ]
 
 [[package]]
