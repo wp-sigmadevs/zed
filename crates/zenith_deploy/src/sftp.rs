@@ -1,15 +1,21 @@
-use std::{ffi::OsString, path::Path};
+use std::{ffi::OsString, path::Path, pin::pin, time::Duration};
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use async_trait::async_trait;
-use futures::AsyncWriteExt as _;
+use futures::{AsyncRead, AsyncReadExt as _, AsyncWriteExt as _, future::Either};
 use util::command::{Stdio, new_command};
 
 use crate::{
     config::ServerConfig,
     remote_path::validate_remote_path,
-    transport::{EntryKind, RemoteEntry, Transport, retain_listable},
+    transport::{
+        EntryKind, MAX_DOWNLOAD_BYTES, MAX_LISTING_BYTES, RemoteEntry, Transport, retain_listable,
+    },
 };
+
+/// OpenSSH sftp reads batch lines into a fixed buffer; a longer line could be split and its
+/// tail run as a second command, so such lines are never sent.
+const MAX_BATCH_LINE: usize = 1024;
 
 /// SFTP through the system `sftp` binary, one process per operation (key or agent auth only;
 /// password auth is M2). Commands go in on stdin; `-b -` makes sftp read a batch from it.
@@ -23,6 +29,7 @@ pub struct SftpTransport {
 }
 
 impl SftpTransport {
+    /// Call the [`Transport`] methods through [`crate::spawn_operation`].
     pub fn new(server: &ServerConfig) -> Result<Self> {
         Self::with_program("sftp", server)
     }
@@ -38,10 +45,13 @@ impl SftpTransport {
     }
 
     async fn run(&self, batch: &str) -> Result<String> {
+        // A private, empty working directory: a relative local path or `lcd` in a batch can
+        // never reach the project or another user's files in the shared temp directory.
+        let working_directory = tempfile::tempdir().context("creating a working directory")?;
         let mut command = new_command(&self.program);
         command
             .args(&self.args)
-            .current_dir(std::env::temp_dir())
+            .current_dir(working_directory.path())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -50,12 +60,18 @@ impl SftpTransport {
         if let Some(mut stdin) = child.stdin.take() {
             stdin.write_all(batch.as_bytes()).await?;
         }
-        let output = child.output().await?;
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if !output.status.success() {
+        let stdout = child.stdout.take().context("sftp has no stdout")?;
+        let stderr = child.stderr.take().context("sftp has no stderr")?;
+        // try_join returns on the first error, so a flood on one stream stops the read at once;
+        // dropping `child` kills it.
+        let (stdout, stderr) =
+            futures::future::try_join(read_capped(stdout), read_capped(stderr)).await?;
+        let status = child.status().await?;
+        let stderr = String::from_utf8_lossy(&stderr);
+        if !status.success() {
             return Err(self.failure(&stderr));
         }
-        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+        Ok(String::from_utf8_lossy(&stdout).into_owned())
     }
 
     fn failure(&self, stderr: &str) -> anyhow::Error {
@@ -74,6 +90,25 @@ impl SftpTransport {
         let detail: String = stderr.trim().chars().take(500).collect();
         anyhow!("sftp failed: {detail}")
     }
+}
+
+async fn read_capped(stream: impl AsyncRead + Unpin) -> Result<Vec<u8>> {
+    let mut data = Vec::new();
+    stream
+        .take(MAX_LISTING_BYTES + 1)
+        .read_to_end(&mut data)
+        .await?;
+    if data.len() as u64 > MAX_LISTING_BYTES {
+        bail!(
+            "sftp printed more than {} MiB",
+            MAX_LISTING_BYTES / 1024 / 1024
+        );
+    }
+    Ok(data)
+}
+
+fn too_big(path: &Path) -> bool {
+    std::fs::metadata(path).is_ok_and(|metadata| metadata.len() > MAX_DOWNLOAD_BYTES)
 }
 
 fn is_plain(value: &str, extra: &[char]) -> bool {
@@ -126,9 +161,16 @@ fn quote(argument: &str, remote: bool) -> Result<String> {
     Ok(format!("\"{}\"", argument.replace('"', "\\\"")))
 }
 
+fn batch_line(line: String) -> Result<String> {
+    if line.len() >= MAX_BATCH_LINE {
+        bail!("the sftp command is longer than {MAX_BATCH_LINE} bytes");
+    }
+    Ok(format!("{line}\n"))
+}
+
 fn list_batch(path: &str) -> Result<String> {
-    Ok(format!(
-        "ls -la {}\n",
+    batch_line(format!(
+        "ls -la {}",
         quote(validate_remote_path(path)?, true)?
     ))
 }
@@ -138,8 +180,8 @@ fn get_batch(remote_path: &str, local_path: &Path) -> Result<String> {
     if !local_path.is_absolute() {
         bail!("local path {local:?} is not absolute");
     }
-    Ok(format!(
-        "get {} {}\n",
+    batch_line(format!(
+        "get {} {}",
         quote(validate_remote_path(remote_path)?, true)?,
         quote(local, false)?
     ))
@@ -198,11 +240,33 @@ impl Transport for SftpTransport {
 
     async fn list_dir(&mut self, path: &str) -> Result<Vec<RemoteEntry>> {
         let output = self.run(&list_batch(path)?).await?;
-        Ok(retain_listable(parse_ls(&output, path), self.hidden_files))
+        retain_listable(parse_ls(&output, path), self.hidden_files)
     }
 
     async fn download_file(&mut self, remote_path: &str, local_path: &Path) -> Result<()> {
-        self.run(&get_batch(remote_path, local_path)?).await?;
+        let batch = get_batch(remote_path, local_path)?;
+        // sftp writes the file itself, so its size is watched; losing the race drops the run,
+        // which kills the child.
+        let watch = async {
+            loop {
+                smol::Timer::after(Duration::from_millis(100)).await;
+                if too_big(local_path) {
+                    break;
+                }
+            }
+        };
+        match futures::future::select(pin!(self.run(&batch)), pin!(watch)).await {
+            Either::Left((result, _)) => {
+                result?;
+            }
+            Either::Right(_) => {}
+        }
+        if too_big(local_path) {
+            bail!(
+                "the server sent more than {} MiB",
+                MAX_DOWNLOAD_BYTES / 1024 / 1024
+            );
+        }
         Ok(())
     }
 
@@ -304,7 +368,7 @@ drwxr-xr-x    ? u   g          64 Nov 22 23:48 /www/sub
 -rw-r--r--    ? u   g           1 Nov 22 23:48 /www/x
 !touch pwned
 ";
-        let entries = retain_listable(parse_ls(output, "/www"), true);
+        let entries = retain_listable(parse_ls(output, "/www"), true).expect("listable");
         let summary: Vec<_> = entries
             .iter()
             .map(|entry| (entry.name.as_str(), entry.kind, entry.size))
@@ -441,5 +505,93 @@ drwxr-xr-x    ? u   g          64 Nov 22 23:48 /www/sub
             );
             assert!(!local.join("evil").exists(), "the link target was fetched");
         });
+    }
+
+    #[test]
+    fn batch_lines_of_1024_bytes_or_more_are_never_sent() {
+        let directory = format!("/{}", "d".repeat(MAX_BATCH_LINE));
+        assert!(list_batch(&directory).is_err());
+        assert!(get_batch(&format!("{directory}/f"), Path::new("/tmp/o")).is_err());
+        let local = format!("/{}", "l".repeat(MAX_BATCH_LINE));
+        assert!(get_batch("/www/f", Path::new(&local)).is_err());
+
+        // "ls -la \"" + path + "\"" is 9 bytes plus the path; the newline does not count.
+        let longest = format!("/{}", "d".repeat(MAX_BATCH_LINE - 11));
+        let batch = list_batch(&longest).expect("1023-byte line");
+        assert_eq!(batch.len(), MAX_BATCH_LINE);
+        assert!(list_batch(&format!("{longest}d")).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sftp_runs_in_a_private_working_directory() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let recorded = directory.path().join("cwd");
+        let program = write_script(
+            directory.path(),
+            "sftp",
+            &format!(
+                "pwd -P > '{}'; ls -A >> '{}'; cat >/dev/null; echo 'Remote working directory: /w'",
+                recorded.display(),
+                recorded.display()
+            ),
+        );
+        let mut transport = SftpTransport::with_program(program, &server()).expect("transport");
+        assert_eq!(smol::block_on(transport.pwd()).expect("pwd"), "/w");
+        let output = std::fs::read_to_string(&recorded).expect("recorded");
+        let mut lines = output.lines();
+        let working_directory = Path::new(lines.next().expect("cwd")).to_path_buf();
+        assert_eq!(lines.next(), None, "the working directory was not empty");
+        let shared = std::env::temp_dir().canonicalize().expect("temp dir");
+        assert_ne!(working_directory, shared, "sftp ran in the shared temp dir");
+        assert!(
+            !working_directory.exists(),
+            "{} outlived the operation",
+            working_directory.display()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn oversized_sftp_output_is_refused() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let program = write_script(
+            directory.path(),
+            "sftp",
+            &format!(
+                "cat >/dev/null; head -c {} /dev/zero",
+                MAX_LISTING_BYTES + 1
+            ),
+        );
+        let mut transport = SftpTransport::with_program(program, &server()).expect("transport");
+        let error = smol::block_on(transport.list_dir("/www")).expect_err("too big");
+        assert!(error.to_string().contains("more than"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_oversized_sftp_download_is_stopped_while_it_runs() {
+        use std::time::{Duration, Instant};
+        let directory = tempfile::tempdir().expect("tempdir");
+        let target = directory.path().join("out");
+        let program = write_script(
+            directory.path(),
+            "sftp",
+            &format!(
+                "cat >/dev/null; head -c {} /dev/zero > '{}'; exec sleep 30",
+                MAX_DOWNLOAD_BYTES + 1,
+                target.display()
+            ),
+        );
+        let mut transport = SftpTransport::with_program(program, &server()).expect("transport");
+        let started = Instant::now();
+        let error =
+            smol::block_on(transport.download_file("/www/f", &target)).expect_err("too big");
+        assert!(error.to_string().contains("more than"), "{error}");
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "the transfer ran to the end: {:?}",
+            started.elapsed()
+        );
     }
 }

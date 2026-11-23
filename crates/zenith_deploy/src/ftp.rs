@@ -2,21 +2,30 @@ use std::{path::Path, sync::Arc, time::Duration};
 
 use anyhow::{Context as _, Result, bail};
 use async_trait::async_trait;
-use futures::AsyncWriteExt as _;
+use futures::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 use suppaftp::{
+    Status,
     list::{File as ListedFile, ListParser},
     smol::{
         AsyncFtpStream, AsyncRustlsConnector, AsyncRustlsFtpStream, ImplAsyncFtpStream,
-        SmolTlsStream,
+        SmolTlsStream, TransferStream,
     },
     types::FileType,
 };
+use util::ResultExt as _;
 
 use crate::{
     config::{ServerConfig, ServerType},
     remote_path::validate_remote_path,
-    transport::{EntryKind, RemoteEntry, Transport, login_credentials, retain_listable},
+    transport::{
+        EntryKind, MAX_DOWNLOAD_BYTES, MAX_LISTING_BYTES, RemoteEntry, Transport,
+        login_credentials, retain_listable,
+    },
 };
+
+/// suppaftp logs every control command at trace level under this target, `PASS <password>`
+/// included (its `control.rs`).
+const SUPPAFTP_CONTROL_TARGET: &str = "suppaftp::async_ftp::smol_ftp::control";
 
 struct FtpSession<T: SmolTlsStream + Send> {
     stream: ImplAsyncFtpStream<T>,
@@ -25,8 +34,38 @@ struct FtpSession<T: SmolTlsStream + Send> {
 }
 
 /// FTPS (explicit TLS) or plain FTP. FTPS verifies the certificate with the platform verifier
-/// via `http_client_tls::tls_config()`; there is no switch to turn verification off.
+/// via `http_client_tls::tls_config()`; there is no switch to turn verification off. Call it
+/// through [`crate::spawn_operation`].
 pub async fn connect(server: &ServerConfig) -> Result<Box<dyn Transport>> {
+    connect_with_logger(server, log::logger(), log::max_level()).await
+}
+
+/// Refuses to log in while trace logging could reach suppaftp: it would write the password.
+fn refuse_if_password_would_be_logged(
+    logger: &dyn log::Log,
+    max_level: log::LevelFilter,
+) -> Result<()> {
+    let metadata = log::Metadata::builder()
+        .level(log::Level::Trace)
+        .target(SUPPAFTP_CONTROL_TARGET)
+        .build();
+    if log::STATIC_MAX_LEVEL >= log::LevelFilter::Trace
+        && max_level >= log::LevelFilter::Trace
+        && logger.enabled(&metadata)
+    {
+        bail!(
+            "trace logging is on, and it would record the FTP password; turn trace logging off and connect again"
+        );
+    }
+    Ok(())
+}
+
+async fn connect_with_logger(
+    server: &ServerConfig,
+    logger: &dyn log::Log,
+    max_level: log::LevelFilter,
+) -> Result<Box<dyn Transport>> {
+    refuse_if_password_would_be_logged(logger, max_level)?;
     if server.host.trim().is_empty() {
         bail!("{} has no host", server.name);
     }
@@ -65,6 +104,9 @@ async fn open<T: SmolTlsStream + Send + 'static>(
     if !server.advanced.passive {
         stream = stream.active_mode(Duration::from_secs(30));
     }
+    // The PASV reply names an address; a hostile or misconfigured server could point the data
+    // connection anywhere (FTP bounce). Always connect back to the control connection's host.
+    stream.set_passive_nat_workaround(true);
     stream.login(user, password).await?;
     // The default transfer type is ASCII, which rewrites line endings of downloads.
     stream.transfer_type(FileType::Binary).await?;
@@ -130,6 +172,28 @@ pub(crate) fn parse_listing(lines: &[String], use_list: bool) -> Vec<RemoteEntry
         .collect()
 }
 
+impl<T: SmolTlsStream + Send + 'static> FtpSession<T> {
+    /// Copies at most `limit` bytes of `transfer` into `sink`; a longer transfer is aborted
+    /// (a server can stream forever) and is an error.
+    async fn receive(
+        &mut self,
+        mut transfer: TransferStream<T>,
+        limit: u64,
+        sink: &mut (impl AsyncWrite + Unpin),
+    ) -> Result<()>
+    where
+        TransferStream<T>: AsyncRead + Unpin,
+    {
+        let copied = futures::io::copy((&mut transfer).take(limit + 1), sink).await?;
+        if copied > limit {
+            self.stream.abort(transfer).await.log_err();
+            bail!("the server sent more than {} MiB", limit / 1024 / 1024);
+        }
+        transfer.finish().await?;
+        Ok(())
+    }
+}
+
 #[async_trait]
 impl<T: SmolTlsStream + Send + 'static> Transport for FtpSession<T> {
     async fn pwd(&mut self) -> Result<String> {
@@ -138,20 +202,25 @@ impl<T: SmolTlsStream + Send + 'static> Transport for FtpSession<T> {
 
     async fn list_dir(&mut self, path: &str) -> Result<Vec<RemoteEntry>> {
         let path = validate_remote_path(path)?;
-        let lines = if self.use_list {
-            let argument = if self.hidden_files {
-                format!("-a {path}")
-            } else {
-                path.to_string()
-            };
-            self.stream.list(Some(&argument)).await?
-        } else {
-            self.stream.mlsd(Some(path)).await?
+        let command = match (self.use_list, self.hidden_files) {
+            (true, true) => format!("LIST -a {path}"),
+            (true, false) => format!("LIST {path}"),
+            (false, _) => format!("MLSD {path}"),
         };
-        Ok(retain_listable(
-            parse_listing(&lines, self.use_list),
-            self.hidden_files,
-        ))
+        let (_, transfer) = self
+            .stream
+            .custom_data_command(command, &[Status::AboutToSend, Status::AlreadyOpen])
+            .await?;
+        let mut listing = Vec::new();
+        self.receive(transfer, MAX_LISTING_BYTES, &mut listing)
+            .await
+            .context("listing the directory")?;
+        let lines: Vec<String> = String::from_utf8_lossy(&listing)
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(String::from)
+            .collect();
+        retain_listable(parse_listing(&lines, self.use_list), self.hidden_files)
     }
 
     async fn download_file(&mut self, remote_path: &str, local_path: &Path) -> Result<()> {
@@ -163,9 +232,10 @@ impl<T: SmolTlsStream + Send + 'static> Transport for FtpSession<T> {
             .open(local_path)
             .await
             .with_context(|| format!("creating {}", local_path.display()))?;
-        let mut transfer = self.stream.retr_as_stream(remote_path).await?;
-        smol::io::copy(&mut transfer, &mut file).await?;
-        transfer.finish().await?;
+        let transfer = self.stream.retr_as_stream(remote_path).await?;
+        self.receive(transfer, MAX_DOWNLOAD_BYTES, &mut file)
+            .await
+            .context("downloading")?;
         file.flush().await?;
         Ok(())
     }
@@ -192,7 +262,7 @@ mod tests {
         ]
         .map(String::from)
         .to_vec();
-        let entries = retain_listable(parse_listing(&lines, false), true);
+        let entries = retain_listable(parse_listing(&lines, false), true).expect("listable");
         let by_name = |name: &str| entries.iter().find(|entry| entry.name == name);
         for link in ["evil-link", "hosts-link", "plain-link"] {
             assert_eq!(
@@ -231,8 +301,32 @@ mod tests {
         );
     }
 
-    /// A scripted plain-FTP server on a thread; returns its port and the commands it received.
+    const LISTING: &str = "type=file;size=12;modify=20250101120000; index.php\r\n\
+                           type=OS.unix=slink:/etc/passwd;modify=20250101120000; evil\r\n\
+                           type=dir;modify=20250101120000; sub\r\n";
+
+    struct FakeFtp {
+        listing: Vec<u8>,
+        file: Vec<u8>,
+    }
+
+    impl Default for FakeFtp {
+        fn default() -> Self {
+            Self {
+                listing: LISTING.as_bytes().to_vec(),
+                file: b"file-contents".to_vec(),
+            }
+        }
+    }
+
     fn fake_ftp_server() -> (u16, std::thread::JoinHandle<Vec<String>>) {
+        fake_ftp_server_with(FakeFtp::default())
+    }
+
+    /// A scripted plain-FTP server on a thread; returns its port and the commands it received.
+    /// Its PASV reply names an unroutable address (0.0.0.1): only a client that connects back to
+    /// the control host reaches the data listener.
+    fn fake_ftp_server_with(script: FakeFtp) -> (u16, std::thread::JoinHandle<Vec<String>>) {
         use std::io::{BufRead as _, BufReader, Write as _};
         use std::net::TcpListener;
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -266,7 +360,7 @@ mod tests {
                         let listener = TcpListener::bind("127.0.0.1:0").expect("bind data");
                         let data_port = listener.local_addr().expect("addr").port();
                         reply(&format!(
-                            "227 Entering Passive Mode (127,0,0,1,{},{})\r\n",
+                            "227 Entering Passive Mode (0,0,0,1,{},{})\r\n",
                             data_port / 256,
                             data_port % 256
                         ));
@@ -277,16 +371,19 @@ mod tests {
                         let (mut stream, _) =
                             data.take().expect("PASV first").accept().expect("data");
                         let body = if verb == "MLSD" {
-                            "type=file;size=12;modify=20250101120000; index.php\r\n\
-                             type=OS.unix=slink:/etc/passwd;modify=20250101120000; evil\r\n\
-                             type=dir;modify=20250101120000; sub\r\n"
+                            &script.listing
                         } else {
-                            "file-contents"
+                            &script.file
                         };
-                        stream.write_all(body.as_bytes()).expect("data write");
-                        drop(stream);
-                        reply("226 done\r\n");
+                        // The client hangs up mid-transfer when the body is over its limit.
+                        if stream.write_all(body).is_ok() {
+                            drop(stream);
+                            reply("226 done\r\n");
+                        } else {
+                            reply("426 aborted\r\n");
+                        }
                     }
+                    "ABOR" => reply("226 abort ok\r\n"),
                     "QUIT" => {
                         reply("221 bye\r\n");
                         break;
@@ -372,5 +469,105 @@ mod tests {
             "{commands:?}"
         );
         assert!(!commands.iter().any(|c| c.contains("..")), "{commands:?}");
+    }
+
+    fn plain_server(port: u16) -> ServerConfig {
+        let mut server = ServerConfig::new();
+        server.server_type = ServerType::Ftp;
+        server.host = "127.0.0.1".into();
+        server.port = port;
+        server.username = "deploy".into();
+        server.password = Some(crate::config::Password("pw".into()));
+        server
+    }
+
+    struct TraceLogger(log::Level);
+
+    impl log::Log for TraceLogger {
+        fn enabled(&self, metadata: &log::Metadata) -> bool {
+            metadata.level() <= self.0
+        }
+        fn log(&self, _record: &log::Record) {}
+        fn flush(&self) {}
+    }
+
+    #[test]
+    fn refuses_to_log_in_while_trace_logging_would_record_the_password() {
+        // Port 9 on loopback is never contacted: the refusal comes before connecting.
+        let server = plain_server(9);
+        let result = smol::block_on(connect_with_logger(
+            &server,
+            &TraceLogger(log::Level::Trace),
+            log::LevelFilter::Trace,
+        ));
+        let error = result.err().expect("must refuse").to_string();
+        assert!(error.contains("trace logging is on"), "{error}");
+
+        assert!(
+            refuse_if_password_would_be_logged(
+                &TraceLogger(log::Level::Debug),
+                log::LevelFilter::Trace
+            )
+            .is_ok()
+        );
+        assert!(
+            refuse_if_password_would_be_logged(
+                &TraceLogger(log::Level::Trace),
+                log::LevelFilter::Debug
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn an_oversized_listing_is_aborted_and_the_session_still_works() {
+        let mut listing = Vec::new();
+        // Far past the cap, so the server is still sending when the client gives up.
+        while (listing.len() as u64) <= MAX_LISTING_BYTES + 16 * 1024 * 1024 {
+            listing.extend_from_slice(b"type=file;size=1;modify=20250101120000; a\r\n");
+        }
+        let (port, server_thread) = fake_ftp_server_with(FakeFtp {
+            listing,
+            ..FakeFtp::default()
+        });
+        smol::block_on(async {
+            let mut transport = connect(&plain_server(port)).await.expect("connect");
+            let error = transport.list_dir("/www").await.expect_err("too big");
+            assert!(format!("{error:#}").contains("more than"), "{error:#}");
+            assert_eq!(transport.pwd().await.expect("pwd after abort"), "/www");
+            transport.disconnect().await.expect("quit");
+        });
+        let commands = server_thread.join().expect("server thread");
+        assert!(commands.contains(&"ABOR".to_string()), "{commands:?}");
+    }
+
+    #[test]
+    fn an_oversized_download_is_aborted_and_leaves_no_file() {
+        let (port, server_thread) = fake_ftp_server_with(FakeFtp {
+            file: vec![b'x'; MAX_DOWNLOAD_BYTES as usize + 16 * 1024 * 1024],
+            ..FakeFtp::default()
+        });
+        let directory = tempfile::tempdir().expect("tempdir");
+        smol::block_on(async {
+            let mut transport = connect(&plain_server(port)).await.expect("connect");
+            let entries = transport.list_dir("/www").await.expect("list");
+            // The listing says 12 bytes; the server then sends far more.
+            let file = entries.first().expect("index.php").clone();
+            let error = crate::transport::download_entry(
+                transport.as_mut(),
+                "/www",
+                &file,
+                directory.path(),
+            )
+            .await
+            .expect_err("too big");
+            assert!(format!("{error:#}").contains("more than"), "{error:#}");
+            transport.disconnect().await.expect("quit");
+        });
+        server_thread.join().expect("server thread");
+        let left: Vec<_> = std::fs::read_dir(directory.path())
+            .expect("read_dir")
+            .collect();
+        assert!(left.is_empty(), "{left:?}");
     }
 }
