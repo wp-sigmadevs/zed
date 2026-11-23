@@ -508,6 +508,7 @@ mod tests {
                 .collect::<Vec<_>>()
         });
         for (name, drag_and_drop) in &allowed {
+            // "Scratches" appears twice: the node row and the store-root folder row.
             let is_scratch_row =
                 ["Scratches", "Scratches", "notes.md", "rest-api.http"].contains(&name.as_str());
             assert_eq!(*drag_and_drop, !is_scratch_row, "{name}: {allowed:?}");
@@ -651,8 +652,9 @@ mod tests {
                     .await
             );
         }
-        let shown = names(&mut opened);
-        assert!(shown.contains(&"Scratches".to_string()), "{shown:?}");
+        // The folder row (depth 1) survives, not just the node row (depth 0).
+        let shown = rows(&mut opened);
+        assert!(shown.contains(&("Scratches".to_string(), 1)), "{shown:?}");
     }
 
     #[gpui::test]
@@ -851,14 +853,14 @@ mod tests {
             panel.update_in(cx, |panel, window, cx| {
                 let mut rows = Vec::new();
                 panel.for_each_visible_entry(0..200, window, cx, &mut |id, details, _, _| {
-                    rows.push((id, details.filename));
+                    rows.push((id, details.filename, details.depth));
                 });
                 rows
             })
         };
         let node = names(&panel, cx)
             .into_iter()
-            .find(|(_, name)| name == "Scratches")
+            .find(|(_, name, depth)| name == "Scratches" && *depth == 0)
             .expect("the node is listed")
             .0;
         panel.update_in(cx, |panel, window, cx| {
@@ -866,13 +868,14 @@ mod tests {
         });
         cx.run_until_parked();
         let rows = names(&panel, cx);
-        let row = |label: &str| {
+        let row = |label: &str, depth: usize| {
             rows.iter()
-                .find(|(_, name)| name == label)
-                .unwrap_or_else(|| panic!("no row {label:?} in {rows:?}"))
+                .find(|(_, name, d)| name == label && *d == depth)
+                .unwrap_or_else(|| panic!("no row {label:?} at depth {depth} in {rows:?}"))
                 .0
         };
-        let (scratch_row, root_row) = (row(&name), row("Scratches"));
+        // The node (depth 0) and the store-root folder (depth 1) share the label "Scratches".
+        let (scratch_row, root_row) = (row(&name, 2), row("Scratches", 1));
 
         panel.update(cx, |panel, _| {
             panel.selection = Some(SelectedEntry {
