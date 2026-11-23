@@ -11,15 +11,20 @@
 //! `b759b41da6` binary with `phpantom_lsp analyze` (2026-11-23): a project file with only
 //! `[php] version` keeps the global `include`; one with `include = [..]` or `[]` drops it.
 
-use futures::{StreamExt as _, future::join_all};
-use gpui::{App, AppContext as _, Entity, Task};
+use futures::{
+    StreamExt as _,
+    future::{Either, join_all},
+};
+use gpui::{App, AppContext as _, BackgroundExecutor, Entity, Task};
 use language::LanguageServerName;
 use lsp::LanguageServerSelector;
 use project::{Fs, Project};
 use settings::{RegisterSetting, Settings, SettingsContent, SettingsStore};
 use std::{
+    future::Future,
     path::{Path, PathBuf},
     sync::Mutex,
+    time::Duration,
 };
 use toml_edit::{DocumentMut, Item, Table, Value};
 use util::ResultExt as _;
@@ -61,17 +66,42 @@ pub(crate) async fn probe_php(candidate: &Path) -> Option<String> {
     crate::parse_php_version(&String::from_utf8_lossy(&output.stdout))
 }
 
-/// Every candidate that answers `php -v`, in the order given. Probes run side by side; call it
-/// from a background task.
-pub async fn probe_interpreters(candidates: &[PathBuf]) -> Vec<PhpInterpreter> {
-    let versions = join_all(candidates.iter().map(|path| probe_php(path))).await;
+/// A `php -v` that has not answered after this long is dropped from the list.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Every candidate that answers `php -v` within [`PROBE_TIMEOUT`], in the order given. Probes
+/// run side by side; call it from a background task.
+pub async fn probe_interpreters(
+    executor: &BackgroundExecutor,
+    candidates: &[PathBuf],
+) -> Vec<PhpInterpreter> {
+    probe_all(executor, candidates, |path| async move {
+        probe_php(&path).await
+    })
+    .await
+}
+
+async fn probe_all<F: Future<Output = Option<String>>>(
+    executor: &BackgroundExecutor,
+    candidates: &[PathBuf],
+    probe: impl Fn(PathBuf) -> F,
+) -> Vec<PhpInterpreter> {
+    let versions = join_all(candidates.iter().map(|path| {
+        let probe = Box::pin(probe(path.clone()));
+        // A dropped probe kills its child (`kill_on_drop`).
+        futures::future::select(probe, executor.timer(PROBE_TIMEOUT))
+    }))
+    .await;
     candidates
         .iter()
         .zip(versions)
-        .filter_map(|(path, version)| {
+        .filter_map(|(path, result)| {
             Some(PhpInterpreter {
                 path: path.clone(),
-                version: version?,
+                version: match result {
+                    Either::Left((version, _)) => version?,
+                    Either::Right(_) => return None,
+                },
             })
         })
         .collect()
@@ -80,7 +110,8 @@ pub async fn probe_interpreters(candidates: &[PathBuf]) -> Vec<PhpInterpreter> {
 /// The interpreters for the modal's dropdown: the user's override first, then Herd, Homebrew
 /// and the `PATH` (the same list the tools use). Runs on the background executor.
 pub fn list_interpreters(cx: &App) -> Task<Vec<PhpInterpreter>> {
-    cx.background_spawn(async move { probe_interpreters(&crate::environment().0).await })
+    let executor = cx.background_executor().clone();
+    cx.background_spawn(async move { probe_interpreters(&executor, &crate::environment().0).await })
 }
 
 /// `binary` first in `candidates`, when it is absolute and executable; otherwise unchanged.
@@ -304,7 +335,10 @@ pub async fn write_language_level(
     // dangling link does not canonicalize and is replaced.
     let target = match fs.canonicalize(&path).await {
         Ok(target) => {
-            let root = fs.canonicalize(root).await.unwrap_or_else(|_| root.to_path_buf());
+            let root = fs
+                .canonicalize(root)
+                .await
+                .unwrap_or_else(|_| root.to_path_buf());
             anyhow::ensure!(
                 target.starts_with(&root),
                 "{} is a link to {}, outside the project; not writing it",
@@ -657,20 +691,26 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_probe_keeps_only_candidates_that_answer() {
+    #[gpui::test]
+    async fn test_probe_keeps_only_candidates_that_answer(cx: &mut TestAppContext) {
+        // Real processes run on real threads.
+        cx.executor().allow_parking();
         let dir = tempfile::tempdir().unwrap();
         let good = php_stub(dir.path(), "php84", "8.4.1", 0o755);
         let older = php_stub(dir.path(), "php74", "7.4.33", 0o755);
         let broken = dir.path().join("broken");
         std::fs::write(&broken, "#!/bin/sh\necho 'not php'\n").unwrap();
         std::fs::set_permissions(&broken, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let found = futures::executor::block_on(probe_interpreters(&[
-            good.clone(),
-            dir.path().join("missing"),
-            broken,
-            older.clone(),
-        ]));
+        let found = probe_interpreters(
+            &cx.executor(),
+            &[
+                good.clone(),
+                dir.path().join("missing"),
+                broken,
+                older.clone(),
+            ],
+        )
+        .await;
         assert_eq!(
             found,
             [
@@ -683,6 +723,41 @@ mod tests {
                     version: "7.4.33".into()
                 },
             ]
+        );
+    }
+
+    #[gpui::test]
+    async fn test_a_hanging_probe_is_dropped_after_the_timeout(cx: &mut TestAppContext) {
+        let candidates = [
+            PathBuf::from("/hangs/php"),
+            PathBuf::from("/fine/php"),
+            PathBuf::from("/also-hangs/php"),
+        ];
+        let executor = cx.executor();
+        let task = cx.background_spawn({
+            let executor = executor.clone();
+            async move {
+                probe_all(&executor, &candidates, |path| {
+                    let hangs = path.to_string_lossy().contains("hangs");
+                    async move {
+                        if hangs {
+                            futures::future::pending().await
+                        } else {
+                            Some("8.4.1".to_string())
+                        }
+                    }
+                })
+                .await
+            }
+        });
+        cx.run_until_parked();
+        executor.advance_clock(PROBE_TIMEOUT + Duration::from_millis(1));
+        assert_eq!(
+            task.await,
+            [PhpInterpreter {
+                path: PathBuf::from("/fine/php"),
+                version: "8.4.1".into()
+            }]
         );
     }
 
