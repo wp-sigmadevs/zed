@@ -132,10 +132,15 @@ impl ProjectPanel {
         Some(worktree.read(cx).root_name_str().to_string())
     }
 
-    /// Whether a visible worktree is a PHP project: `composer.json` or a `.php` file at its root,
-    /// the rule of `zenith_php_tools::looks_like_php`, read from the scanned tree.
+    /// Whether the project is PHP: `composer.json` or a `.php` file at the root of its first
+    /// visible folder that is not a library, the rule and the folder of
+    /// `zenith_php_tools::looks_like_php` and its `first_root`, read from the scanned tree.
     fn zenith_is_php_project(&self, cx: &App) -> bool {
-        self.project.read(cx).visible_worktrees(cx).any(|worktree| {
+        let project = self.project.read(cx);
+        let mut roots = project
+            .visible_worktrees(cx)
+            .filter(|worktree| !is_library_worktree(&worktree.read(cx).abs_path(), cx));
+        roots.next().is_some_and(|worktree| {
             worktree
                 .read(cx)
                 .child_entries(RelPath::empty())
@@ -689,6 +694,33 @@ mod tests {
                 panel.read_with(&mut window_cx, |panel, cx| panel.zenith_is_php_project(cx)),
                 expected,
                 "{root}: composer.json or a root .php file makes it PHP; npm-only does not"
+            );
+        }
+    }
+
+    #[gpui::test]
+    async fn test_php_gate_uses_the_first_folder_that_is_not_a_library(cx: &mut TestAppContext) {
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/site", composer_tree()).await;
+        fs.insert_tree("/web", json!({ "package.json": "{}" }))
+            .await;
+        fs.insert_tree("/libs/pkg", json!({ "composer.json": "{}" }))
+            .await;
+        init_test(cx);
+        set_library_paths(cx, &["/libs/pkg"]);
+        // The PHP settings write to the first folder, so the gate asks about the same one.
+        for (roots, expected) in [
+            (&["/web", "/site"][..], false),
+            (&["/site", "/web"][..], true),
+            (&["/web", "/libs/pkg"][..], false),
+            (&["/libs/pkg", "/site"][..], true),
+            (&["/libs/pkg", "/web"][..], false),
+        ] {
+            let (panel, mut window_cx) = open_panel_inited(cx, fs.clone(), roots).await;
+            assert_eq!(
+                panel.read_with(&mut window_cx, |panel, cx| panel.zenith_is_php_project(cx)),
+                expected,
+                "{roots:?}"
             );
         }
     }

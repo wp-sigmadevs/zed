@@ -598,12 +598,14 @@ pub fn environment() -> (Vec<PathBuf>, Vec<PathBuf>) {
     (candidates, path_dirs)
 }
 
+/// The first visible folder that is not a library (added with "Add Library Path…"): the project
+/// the PHP settings belong to. The project panel's menu gate picks the same one.
 fn first_root(project: &Entity<Project>, cx: &App) -> Option<PathBuf> {
     project
         .read(cx)
         .visible_worktrees(cx)
-        .next()
         .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
+        .find(|root| !zenith_external_libraries::is_library_worktree(root, cx))
 }
 
 fn show_status(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
@@ -1431,6 +1433,38 @@ mod tests {
         assert!(report.starts_with("Project: Laravel\nPHP 8.4.1: /opt/homebrew/bin/php"));
         assert!(report.contains("phpstan: project,"));
         assert!(report.contains("pint: not found"));
+    }
+
+    #[gpui::test]
+    async fn test_first_root_is_the_first_folder_that_is_not_a_library(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use settings::settings_content::{
+            ZenithExternalLibrariesSettingsContent, ZenithSettingsContent,
+        };
+        cx.update(|cx| {
+            workspace::AppState::test(cx);
+            cx.update_global::<settings::SettingsStore, _>(|store, cx| {
+                store.update_user_settings(cx, |content| {
+                    content.zenith = Some(ZenithSettingsContent {
+                        external_libraries: Some(ZenithExternalLibrariesSettingsContent {
+                            paths: Some(vec!["/libs/pkg".to_string()]),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    });
+                });
+            });
+        });
+        let fs = project::FakeFs::new(cx.executor());
+        fs.insert_tree("/libs/pkg", serde_json::json!({ "composer.json": "{}" }))
+            .await;
+        fs.insert_tree("/site", serde_json::json!({ "composer.json": "{}" }))
+            .await;
+        let project = Project::test(fs, [Path::new("/libs/pkg"), Path::new("/site")], cx).await;
+        cx.update(|cx| {
+            assert_eq!(first_root(&project, cx), Some(PathBuf::from("/site")));
+        });
     }
 
     #[test]
