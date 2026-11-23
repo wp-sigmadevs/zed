@@ -10,14 +10,29 @@ use gpui::{App, AppContext as _, ReadGlobal as _};
 use project::Project;
 use settings::SettingsStore;
 use std::{
+    collections::BTreeMap,
     io::ErrorKind,
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 use toml_edit::{Array, DocumentMut, Item, Table};
 
 /// Two windows may sync at once; the file is read, edited and written as one step.
 static SYNC_LOCK: Mutex<()> = Mutex::new(());
+
+/// Each `sync` takes a ticket on the main thread; the background writes of Zenith's own config
+/// run in any order, so [`write_own_config`] drops a write older than one already done.
+static NEXT_TICKET: AtomicU64 = AtomicU64::new(1);
+/// The newest ticket attempted per config file (a failed newer write must not let an older list
+/// land afterwards); the lock also makes the read-compare-write one step.
+static OWN_CONFIG: Mutex<BTreeMap<PathBuf, u64>> = Mutex::new(BTreeMap::new());
+
+fn next_ticket() -> u64 {
+    NEXT_TICKET.fetch_add(1, Ordering::SeqCst)
+}
 
 /// `~/.local/share/zenith/tools/phpantom/current/phpantom_lsp`: the binary the owner or lead
 /// built from `main` and symlinked as `current`.
@@ -32,9 +47,16 @@ fn own_config_home(home: &Path) -> PathBuf {
 }
 
 /// Writes Zenith's own `.phpantom.toml` (a file only Zenith owns) when its content changes;
-/// `true` when it wrote.
-fn write_own_config(home: &Path, include: &[String]) -> Result<bool, String> {
+/// `true` when it wrote. A write whose `ticket` is older than one already attempted is dropped
+/// (`Ok(false)`), even if that newer attempt failed: the file never goes back to an older list.
+fn write_own_config(home: &Path, include: &[String], ticket: u64) -> Result<bool, String> {
     let config = config_file(home, Some(own_config_home(home)));
+    let mut tickets = OWN_CONFIG.lock().unwrap_or_else(|e| e.into_inner());
+    let newest = tickets.entry(config.clone()).or_insert(0);
+    if ticket < *newest {
+        return Ok(false);
+    }
+    *newest = ticket;
     let mut doc = DocumentMut::new();
     let mut indexing = Table::new();
     indexing.insert(
@@ -107,7 +129,13 @@ fn write_atomic(path: &Path, text: &str) -> Result<(), String> {
     std::fs::create_dir_all(parent)
         .map_err(|error| format!("creating {}: {error}", parent.display()))?;
     let mut name = path.file_name().unwrap_or_default().to_os_string();
-    name.push(format!(".{}.tmp", std::process::id()));
+    // Unique per call: every window of this process writes here.
+    static TEMP: AtomicU64 = AtomicU64::new(0);
+    name.push(format!(
+        ".{}.{}.tmp",
+        std::process::id(),
+        TEMP.fetch_add(1, Ordering::Relaxed)
+    ));
     let temp = parent.join(name);
     std::fs::write(&temp, text)
         .and_then(|()| std::fs::rename(&temp, path))
@@ -250,16 +278,44 @@ fn sync_config(home: &Path, xdg: Option<PathBuf>, include: &[String]) -> Result<
 /// The include list this project's PHPantom was last given, so each project decides on its own
 /// whether a change needs a restart (the file is shared, so "the file changed" is only true for
 /// the first project to look).
-#[derive(Default)]
-pub(crate) struct AppliedInclude(Option<Vec<String>>);
+#[derive(Default, Clone)]
+pub(crate) struct AppliedInclude(Arc<Mutex<Option<Vec<String>>>>);
 
 impl AppliedInclude {
     /// Records `include`; `true` when it differs from the previous one. The first call only
-    /// records: PHPantom reads the file when it starts.
-    fn changed(&mut self, include: &[String]) -> bool {
-        let changed = self.0.as_deref().is_some_and(|old| old != include);
-        self.0 = Some(include.to_vec());
-        changed
+    /// records.
+    #[cfg(test)]
+    fn changed(&self, include: &[String]) -> bool {
+        self.record(include).is_some_and(|old| old != include)
+    }
+
+    /// Records `include` and returns what was recorded before.
+    fn record(&self, include: &[String]) -> Option<Vec<String>> {
+        let mut applied = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        applied.replace(include.to_vec())
+    }
+
+    /// Whether PHPantom must restart once the list is written. `previous` is what
+    /// [`record`](Self::record) returned. `write` is what `write_own_config` said: `Ok(true)`
+    /// when the file changed (so a PHPantom that started before the write, e.g. after the list
+    /// was edited while Zenith was closed, has a stale list), `Err` when it failed. A failed
+    /// write puts `previous` back, so the retry still sees the change and restarts.
+    fn restart_after_write(
+        &self,
+        include: &[String],
+        previous: Option<Vec<String>>,
+        write: Result<bool, ()>,
+    ) -> bool {
+        match write {
+            Ok(file_changed) => previous.is_some_and(|old| old != include) || file_changed,
+            Err(()) => {
+                let mut applied = self.0.lock().unwrap_or_else(|e| e.into_inner());
+                if applied.as_deref() == Some(include) {
+                    *applied = previous;
+                }
+                false
+            }
+        }
     }
 }
 
@@ -298,30 +354,33 @@ pub(crate) fn sync(project: &Entity<Project>, applied: &mut AppliedInclude, cx: 
     let env_unset = user_binary
         .and_then(|binary| binary.env.as_ref())
         .is_none_or(|env| !env.contains_key("XDG_CONFIG_HOME"));
-    let include_changed = applied.changed(&include);
+    let previous = applied.record(&include);
+    let ticket = next_ticket();
+    let applied = applied.clone();
+    let applied_include = include.clone();
     let fs = project.read(cx).fs().clone();
     let home = crate::home_dir();
     let xdg = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from);
     let project = project.clone();
     cx.spawn(async move |cx| {
         let binary = binary_path(&home);
-        let set_binary = cx
+        let (write, set_binary) = cx
             .background_spawn(async move {
                 // Take back what older Zenith versions added to the global (shared) file.
                 if let Err(error) = sync_config(&home, xdg, &[]) {
                     log::warn!("phpantom config: {error}");
                 }
-                write_own_config(&home, &include)
-                    .map_err(|error| log::warn!("phpantom config: {error}"))
-                    .ok();
+                let write = write_own_config(&home, &applied_include, ticket)
+                    .map_err(|error| log::warn!("phpantom config: {error}"));
                 let own = own_config_home(&home).display().to_string();
-                ((binary_unset || env_unset) && binary.is_file())
-                    .then(|| (binary.display().to_string(), own))
+                let set_binary = ((binary_unset || env_unset) && binary.is_file())
+                    .then(|| (binary.display().to_string(), own));
+                (write, set_binary)
             })
             .await;
         // The library list changed since this project last saw it (the PHP modal or a settings
         // edit): PHPantom re-reads it on start. Every window restarts its own PHPantom.
-        if include_changed {
+        if applied.restart_after_write(&include, previous, write) {
             cx.update(|cx| crate::php_config::restart_phpantom(&project, cx));
         }
         if let Some((path, own)) = set_binary {
@@ -346,13 +405,15 @@ pub(crate) fn sync(project: &Entity<Project>, applied: &mut AppliedInclude, cx: 
 
 #[cfg(all(test, unix))]
 mod tests {
-    use super::{AppliedInclude, config_file, own_config_home, sync_config, write_own_config};
+    use super::{
+        AppliedInclude, config_file, next_ticket, own_config_home, sync_config, write_own_config,
+    };
 
     #[test]
     fn test_each_project_restarts_for_a_changed_list() {
         let a_list = vec!["/libs/a".to_string()];
         let b_list = vec!["/libs/a".to_string(), "/libs/b".to_string()];
-        let (mut one, mut two) = (AppliedInclude::default(), AppliedInclude::default());
+        let (one, two) = (AppliedInclude::default(), AppliedInclude::default());
         assert!(!one.changed(&a_list) && !two.changed(&a_list), "first run");
         assert!(!one.changed(&a_list), "unchanged");
         // The shared file is rewritten once, but both projects see the new list.
@@ -366,12 +427,100 @@ mod tests {
     }
 
     #[test]
+    fn test_restart_when_the_file_changed_under_a_running_phpantom() {
+        let list = vec!["/libs/a".to_string()];
+        let applied = AppliedInclude::default();
+        let previous = applied.record(&list);
+        assert!(previous.is_none(), "first call only records");
+        // Edited while Zenith was closed: the write changed the file, PHPantom may be stale.
+        assert!(applied.restart_after_write(&list, previous, Ok(true)));
+        let previous = applied.record(&list);
+        assert!(!applied.restart_after_write(&list, previous, Ok(false)));
+        let previous = applied.record(&["/libs/b".to_string()]);
+        assert!(applied.restart_after_write(&["/libs/b".to_string()], previous, Ok(false)));
+    }
+
+    #[test]
+    fn test_a_failed_write_is_not_recorded_so_a_retry_restarts() {
+        let (old, new) = (vec!["/libs/a".to_string()], vec!["/libs/b".to_string()]);
+        let applied = AppliedInclude::default();
+        applied.record(&old);
+        let previous = applied.record(&new);
+        assert!(!applied.restart_after_write(&new, previous, Err(())));
+        // The file did not change meanwhile (another window wrote it): only the recorded
+        // list tells this project its PHPantom is behind.
+        let previous = applied.record(&new);
+        assert!(applied.restart_after_write(&new, previous, Ok(false)));
+        // A newer list recorded meanwhile is not rolled back.
+        let newest = vec!["/libs/c".to_string()];
+        let previous = applied.record(&new);
+        applied.record(&newest);
+        applied.restart_after_write(&new, previous, Err(()));
+        assert!(!applied.changed(&newest));
+    }
+
+    #[test]
+    fn test_concurrent_own_config_writes_all_succeed_and_the_newest_list_wins() {
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path();
+        let handles: Vec<_> = (0..16)
+            .map(|_| {
+                let ticket = next_ticket();
+                let home = home.to_path_buf();
+                (
+                    ticket,
+                    std::thread::spawn(move || {
+                        (0..20).all(|_| {
+                            write_own_config(&home, &[format!("/libs/{ticket}")], ticket).is_ok()
+                        })
+                    }),
+                )
+            })
+            .collect();
+        let newest = handles.iter().map(|(ticket, _)| *ticket).max().unwrap();
+        for (_, handle) in handles {
+            assert!(handle.join().unwrap(), "a concurrent write failed");
+        }
+        let text = std::fs::read_to_string(config_file(home, Some(own_config_home(home)))).unwrap();
+        assert!(text.contains(&format!("/libs/{newest}")), "{text}");
+    }
+
+    #[test]
+    fn test_an_older_own_config_write_never_replaces_a_newer_one() {
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path();
+        let (older, newer) = (next_ticket(), next_ticket());
+        assert!(write_own_config(home, &["/libs/new".into()], newer).unwrap());
+        assert!(!write_own_config(home, &["/libs/old".into()], older).unwrap());
+        let text = std::fs::read_to_string(config_file(home, Some(own_config_home(home)))).unwrap();
+        assert!(
+            text.contains("/libs/new") && !text.contains("/libs/old"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn test_a_failed_newer_write_does_not_let_an_older_list_land() {
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path();
+        let (older, newer) = (next_ticket(), next_ticket());
+        let config = config_file(home, Some(own_config_home(home)));
+        // A file where the config directory should be makes the newer write fail.
+        std::fs::create_dir_all(config.parent().unwrap().parent().unwrap()).unwrap();
+        std::fs::write(config.parent().unwrap(), "").unwrap();
+        assert!(write_own_config(home, &["/libs/new".into()], newer).is_err());
+        std::fs::remove_file(config.parent().unwrap()).unwrap();
+        assert!(!write_own_config(home, &["/libs/old".into()], older).unwrap());
+        assert!(!config.exists(), "the older list must not land");
+    }
+
+    #[test]
     fn test_own_config_is_separate_from_the_global_one() {
         let home = tempfile::tempdir().unwrap();
         let home = home.path();
-        assert!(write_own_config(home, &["/libs/wp".into()]).unwrap());
+        assert!(write_own_config(home, &["/libs/wp".into()], next_ticket()).unwrap());
         assert!(
-            !write_own_config(home, &["/libs/wp".into()]).unwrap(),
+            !write_own_config(home, &["/libs/wp".into()], next_ticket()).unwrap(),
             "an unchanged list is not written, so PHPantom is not restarted"
         );
         let own = config_file(home, Some(own_config_home(home)));

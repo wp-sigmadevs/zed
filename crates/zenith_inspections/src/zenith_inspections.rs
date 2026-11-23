@@ -1179,13 +1179,14 @@ fn fix_current_file(
     let root = worktree_folder(&worktree, cx);
     let environment = tool_environment(cx);
     cx.spawn_in(window, async move |workspace, cx| {
+        let executor = cx.background_executor().clone();
         let result = cx
             .background_spawn({
                 let (root, abs_path) = (root.clone(), abs_path.clone());
                 async move {
                     let path_dirs = environment.path_dirs;
                     let Some((php, _)) =
-                        zenith_php_tools::find_php(&environment.php_candidates).await
+                        zenith_php_tools::find_php(&executor, &environment.php_candidates).await
                     else {
                         anyhow::bail!("PHP was not found");
                     };
@@ -1443,10 +1444,12 @@ fn inspect_path_with(
     let analyzers = InspectionSettings::get_global(cx).analyzers();
     let generation = next_generation(&abs_path, cx);
     cx.spawn(async move |cx| {
+        let executor = cx.background_executor().clone();
         let results = cx
             .background_spawn(async move {
                 let path_dirs = environment.path_dirs;
-                let Some((php, _)) = zenith_php_tools::find_php(&environment.php_candidates).await
+                let Some((php, _)) =
+                    zenith_php_tools::find_php(&executor, &environment.php_candidates).await
                 else {
                     return Err(abs_path);
                 };

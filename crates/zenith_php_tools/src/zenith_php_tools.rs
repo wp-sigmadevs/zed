@@ -9,9 +9,11 @@ mod string_completions;
 
 pub use string_completions::{StringCompletionSource, add_string_completions};
 
+use gpui::{BackgroundExecutor, Task};
 use http_client::HttpClient;
 use std::{
     fs,
+    future::Future,
     path::{Component, Path, PathBuf},
     sync::Arc,
 };
@@ -266,18 +268,60 @@ pub struct PhpInfo {
     pub php_path: Option<PathBuf>,
 }
 
-/// The first candidate whose `php -v` answers.
-pub async fn find_php(candidates: &[PathBuf]) -> Option<(PathBuf, String)> {
+/// The first candidate whose `php -v` answers within the probe timeout, with one longer retry
+/// when none did; one that hangs is dropped (and killed). Call it from a background task.
+pub async fn find_php(
+    executor: &BackgroundExecutor,
+    candidates: &[PathBuf],
+) -> Option<(PathBuf, String)> {
+    find_first(
+        executor,
+        php_config::PROBE_TIMEOUT,
+        candidates,
+        probe_version,
+    )
+    .await
+}
+
+async fn probe_version(path: PathBuf) -> Option<String> {
+    php_config::probe_php(&path).await
+}
+
+async fn find_first<F: Future<Output = Option<String>>>(
+    executor: &BackgroundExecutor,
+    timeout: std::time::Duration,
+    candidates: &[PathBuf],
+    probe: impl Fn(PathBuf) -> F,
+) -> Option<(PathBuf, String)> {
     for candidate in candidates {
-        if let Some(version) = php_config::probe_php(candidate).await {
+        if let Some(version) =
+            php_config::within_probe_timeout(executor, timeout, probe(candidate.clone())).await
+        {
             return Some((candidate.clone(), version));
         }
     }
     None
 }
 
-pub async fn detect_php(root: &Path, candidates: &[PathBuf]) -> PhpInfo {
-    let found = find_php(candidates).await;
+/// [`find_first`], and once more with the longer wait when nothing answered: a PHP whose first
+/// run is slow must not read as "not found" until the next refresh.
+async fn find_with_retry<F: Future<Output = Option<String>>>(
+    executor: &BackgroundExecutor,
+    candidates: &[PathBuf],
+    probe: impl Fn(PathBuf) -> F,
+) -> Option<(PathBuf, String)> {
+    if let Some(found) = find_first(executor, php_config::PROBE_TIMEOUT, candidates, &probe).await {
+        return Some(found);
+    }
+    find_first(executor, php_config::SLOW_PROBE_TIMEOUT, candidates, &probe).await
+}
+
+pub async fn detect_php(
+    executor: &BackgroundExecutor,
+    root: &Path,
+    candidates: &[PathBuf],
+) -> PhpInfo {
+    let found = find_with_retry(executor, candidates, probe_version).await;
     PhpInfo {
         kind: detect_project(root),
         version: found.as_ref().map(|(_, version)| version.clone()),
@@ -561,11 +605,16 @@ pub fn init(cx: &mut App) {
         let project = workspace.project().clone();
         let this_workspace = cx.entity().downgrade();
         let item = cx.new(|cx| PhpStatus::new(project, this_workspace, cx));
+        let status_item = item.downgrade();
         workspace
             .status_bar()
             .update(cx, |bar, cx| bar.add_right_item(item, window, cx));
-        workspace.register_action(|workspace, _: &Status, window, cx| {
-            show_status(workspace, window, cx)
+        workspace.register_action(move |workspace, _: &Status, window, cx| {
+            show_status(workspace, window, cx);
+            // The status bar may still read "not found" from a slow first run.
+            status_item
+                .update(cx, |status, cx| status.refresh_info(false, cx))
+                .ok();
         });
         workspace.register_action(|workspace, _: &Update, window, cx| {
             manage(workspace, Manage::Update, window, cx)
@@ -613,10 +662,11 @@ fn show_status(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<
         return;
     };
     cx.spawn_in(window, async move |workspace, cx| {
+        let executor = cx.background_executor().clone();
         let report = cx
             .background_spawn(async move {
                 let (candidates, path_dirs) = environment();
-                let info = detect_php(&root, &candidates).await;
+                let info = detect_php(&executor, &root, &candidates).await;
                 let managed = std::env::var_os("HOME")
                     .map(|home| managed_bin(Path::new(&home), Profile::for_project(info.kind)));
                 status_report(&root, &info, managed.as_deref(), &path_dirs)
@@ -639,6 +689,8 @@ pub struct PhpStatus {
     workspace: WeakEntity<Workspace>,
     info: Option<PhpInfo>,
     applied_include: phpantom::AppliedInclude,
+    /// The running lookup; a newer one replaces it, which kills a hanging `php -v`.
+    _refresh: Task<()>,
 }
 
 impl PhpStatus {
@@ -667,6 +719,7 @@ impl PhpStatus {
             workspace,
             info: None,
             applied_include: Default::default(),
+            _refresh: Task::ready(()),
         };
         this.refresh(cx);
         this
@@ -674,37 +727,60 @@ impl PhpStatus {
 
     fn refresh(&mut self, cx: &mut Context<Self>) {
         phpantom::sync(&self.project, &mut self.applied_include, cx);
+        self.refresh_info(true, cx);
+    }
+
+    /// Looks PHP up again. `offer`: also offer the tool install; a click on the status item
+    /// must not, or a closed banner would come back on every click.
+    fn refresh_info(&mut self, offer: bool, cx: &mut Context<Self>) {
         let Some(root) = first_root(&self.project, cx) else {
             self.info = None;
+            self._refresh = Task::ready(());
             cx.notify();
             return;
         };
-        cx.spawn(async move |this, cx| {
+        #[cfg(test)]
+        let test_candidates = TEST_CANDIDATES.with(|candidates| candidates.borrow().clone());
+        self._refresh = cx.spawn(async move |this, cx| {
+            let executor = cx.background_executor().clone();
             let info = cx
                 .background_spawn({
                     let root = root.clone();
                     async move {
-                        if looks_like_php(&root) {
-                            Some(detect_php(&root, &environment().0).await)
-                        } else {
-                            None
+                        if !looks_like_php(&root) {
+                            return None;
                         }
+                        #[cfg(test)]
+                        if let Some(candidates) = test_candidates {
+                            return Some(detect_php(&executor, &root, &candidates).await);
+                        }
+                        Some(detect_php(&executor, &root, &environment().0).await)
                     }
                 })
                 .await;
             this.update(cx, |this, cx| {
                 this.info = info.clone();
                 cx.notify();
-                if let Some(info) = info {
+                if let (true, Some(info)) = (offer, info) {
                     this.workspace
                         .update(cx, |workspace, cx| maybe_offer(workspace, &root, &info, cx))
                         .ok();
                 }
+                #[cfg(test)]
+                REFRESHES.with(|count| count.set(count.get() + 1));
             })
             .ok();
-        })
-        .detach();
+        });
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Replaces the machine's PHP candidates in the status lookup (per test thread).
+    static TEST_CANDIDATES: std::cell::RefCell<Option<Vec<PathBuf>>> = Default::default();
+    /// Status lookups finished, and offers considered (per test thread).
+    static REFRESHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static OFFERS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 impl StatusItemView for PhpStatus {
@@ -864,6 +940,8 @@ fn maybe_offer(
     info: &PhpInfo,
     cx: &mut Context<Workspace>,
 ) {
+    #[cfg(test)]
+    OFFERS.with(|count| count.set(count.get() + 1));
     let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
         return;
     };
@@ -1104,6 +1182,7 @@ fn manage(
         {
             return anyhow::Ok(());
         }
+        let executor = cx.background_executor().clone();
         let (profile, php, composer) = cx
             .background_spawn({
                 let home = home.clone();
@@ -1113,7 +1192,7 @@ fn manage(
                         return (profile, None, None);
                     }
                     let (candidates, path_dirs) = environment();
-                    let php = find_php(&candidates).await.map(|(php, _)| php);
+                    let php = find_php(&executor, &candidates).await.map(|(php, _)| php);
                     (profile, php, find_composer(&home, &path_dirs))
                 }
             })
@@ -1396,8 +1475,10 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn test_detect_php_runs_the_first_working_candidate() {
+    #[gpui::test]
+    async fn test_detect_php_runs_the_first_working_candidate(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let executor = cx.executor();
         let broken = tempfile::tempdir().unwrap();
         let working = tempfile::tempdir().unwrap();
         let broken_php = fake_php(broken.path(), "not php at all");
@@ -1405,23 +1486,109 @@ mod tests {
         let project = tempfile::tempdir().unwrap();
         write(project.path(), "composer.json", "{}");
 
-        let info = futures::executor::block_on(detect_php(
+        let info = detect_php(
+            &executor,
             project.path(),
             &[
                 PathBuf::from("/nonexistent/php"),
                 broken_php,
                 working_php.clone(),
             ],
-        ));
+        )
+        .await;
         assert_eq!(info.version.as_deref(), Some("8.5.0"));
         assert_eq!(info.php_path, Some(working_php));
         assert!(looks_like_php(project.path()));
 
-        let none = futures::executor::block_on(detect_php(project.path(), &[]));
+        let none = detect_php(&executor, project.path(), &[]).await;
         assert_eq!(none.version, None);
         let report = status_report(project.path(), &none, None, &[]);
         assert!(report.contains("PHP: not found"));
         assert!(report.contains("phpcs: not found"));
+    }
+
+    #[gpui::test]
+    async fn test_find_php_drops_a_hanging_probe_and_kills_it(cx: &mut gpui::TestAppContext) {
+        struct Killed(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Killed {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let executor = cx.executor();
+        let mut task = cx.background_spawn({
+            let (executor, dropped) = (executor.clone(), dropped.clone());
+            async move {
+                find_first(
+                    &executor,
+                    php_config::PROBE_TIMEOUT,
+                    &[PathBuf::from("/hangs/php"), PathBuf::from("/fine/php")],
+                    |path| {
+                        // Only the hanging probe carries the flag: the fine one's drop must
+                        // not be able to satisfy the assertion below.
+                        let killed = path
+                            .to_string_lossy()
+                            .contains("hangs")
+                            .then(|| Killed(dropped.clone()));
+                        async move {
+                            if let Some(_killed) = killed {
+                                futures::future::pending().await
+                            } else {
+                                Some("8.4.1".to_string())
+                            }
+                        }
+                    },
+                )
+                .await
+            }
+        });
+        cx.run_until_parked();
+        executor.advance_clock(php_config::PROBE_TIMEOUT - std::time::Duration::from_millis(1));
+        cx.run_until_parked();
+        assert!(futures::poll!(&mut task).is_pending());
+        assert!(!dropped.load(std::sync::atomic::Ordering::SeqCst));
+        executor.advance_clock(std::time::Duration::from_millis(2));
+        assert_eq!(
+            task.await,
+            Some((PathBuf::from("/fine/php"), "8.4.1".to_string()))
+        );
+        assert!(
+            dropped.load(std::sync::atomic::Ordering::SeqCst),
+            "the timed-out probe is dropped, which kills its child"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_a_slow_first_php_run_is_found_by_the_retry(cx: &mut gpui::TestAppContext) {
+        use std::time::Duration;
+        let executor = cx.executor();
+        let mut task = cx.background_spawn({
+            let executor = executor.clone();
+            async move {
+                // Every run of this php takes 5 s: past the first wait, inside the second.
+                find_with_retry(&executor, &[PathBuf::from("/slow/php")], |_| {
+                    let executor = executor.clone();
+                    async move {
+                        executor.timer(Duration::from_secs(5)).await;
+                        Some("8.5.0".to_string())
+                    }
+                })
+                .await
+            }
+        });
+        cx.run_until_parked();
+        executor.advance_clock(php_config::PROBE_TIMEOUT + Duration::from_millis(1));
+        cx.run_until_parked();
+        assert!(
+            futures::poll!(&mut task).is_pending(),
+            "the retry is running"
+        );
+        executor.advance_clock(Duration::from_secs(5));
+        assert_eq!(
+            task.await,
+            Some((PathBuf::from("/slow/php"), "8.5.0".to_string()))
+        );
     }
 
     #[test]
@@ -1475,6 +1642,117 @@ mod tests {
     fn test_empty_folder_is_not_a_php_project() {
         let empty = tempfile::tempdir().unwrap();
         assert!(!looks_like_php(empty.path()));
+    }
+
+    /// A window on a real temp project with `composer.json`; the status item looks up PHP in
+    /// `candidates` instead of on this machine.
+    #[cfg(unix)]
+    async fn php_window(
+        cx: &mut gpui::TestAppContext,
+        candidates: Vec<PathBuf>,
+    ) -> (
+        tempfile::TempDir,
+        gpui::Entity<PhpStatus>,
+        &mut gpui::VisualTestContext,
+    ) {
+        TEST_CANDIDATES.with(|slot| *slot.borrow_mut() = Some(candidates));
+        let app_state = cx.update(|cx| {
+            let app_state = workspace::AppState::test(cx);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            workspace::init(app_state.clone(), cx);
+            init(cx);
+            app_state
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap().to_string();
+        fs::write(dir.path().join("composer.json"), "{}").unwrap();
+        app_state
+            .fs
+            .as_fake()
+            .insert_tree(&root, serde_json::json!({ "composer.json": "{}" }))
+            .await;
+        let project = Project::test(app_state.fs.clone(), [Path::new(&root)], cx).await;
+        let (multi, cx) = cx
+            .add_window_view(|window, cx| workspace::MultiWorkspace::test_new(project, window, cx));
+        cx.executor().allow_parking();
+        let status = multi.read_with(cx, |multi, cx| {
+            multi
+                .workspace()
+                .read(cx)
+                .status_bar()
+                .read(cx)
+                .item_of_type::<PhpStatus>()
+                .expect("the status item is added")
+        });
+        (dir, status, cx)
+    }
+
+    /// Runs the executor until `done`, giving real threads a moment.
+    #[cfg(unix)]
+    fn wait_for(cx: &mut gpui::VisualTestContext, done: impl Fn() -> bool) {
+        for _ in 0..150 {
+            cx.run_until_parked();
+            if done() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        panic!("timed out waiting");
+    }
+
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn test_clicking_the_status_does_not_offer_the_install_again(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (_dir, status, cx) = php_window(cx, Vec::new()).await;
+        wait_for(cx, || REFRESHES.with(|n| n.get()) >= 1);
+        let offers = OFFERS.with(|n| n.get());
+        assert!(offers >= 1, "a refresh from a worktree change does offer");
+        status.update(cx, |status, cx| status.refresh_info(false, cx));
+        wait_for(cx, || REFRESHES.with(|n| n.get()) >= 2);
+        assert_eq!(
+            OFFERS.with(|n| n.get()),
+            offers,
+            "a click only updates the label"
+        );
+    }
+
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn test_a_newer_lookup_kills_the_hanging_php_of_the_older_one(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tools = tempfile::tempdir().unwrap();
+        let pid_file = tools.path().join("pid");
+        let php = tools.path().join("php");
+        fs::write(
+            &php,
+            format!(
+                "#!/bin/sh\necho $$ > '{}'\nexec sleep 60\n",
+                pid_file.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&php, fs::Permissions::from_mode(0o755)).unwrap();
+        let (_dir, status, cx) = php_window(cx, vec![php]).await;
+        wait_for(cx, || {
+            pid_file.exists() && !fs::read_to_string(&pid_file).unwrap().is_empty()
+        });
+        let pid = fs::read_to_string(&pid_file).unwrap().trim().to_string();
+        #[allow(clippy::disallowed_methods, reason = "signal 0 has no std API")]
+        let alive = |pid: &str| {
+            std::process::Command::new("kill")
+                .args(["-0", pid])
+                .stderr(std::process::Stdio::null())
+                .status()
+                .unwrap()
+                .success()
+        };
+        assert!(alive(&pid), "the first lookup is hanging in php -v");
+        status.update(cx, |status, cx| status.refresh_info(false, cx));
+        wait_for(cx, || !alive(&pid));
     }
 
     #[gpui::test]
