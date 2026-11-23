@@ -246,7 +246,15 @@ fn mask_secret_pairs(pairs: &str) -> Option<String> {
 
 /// `url` without its `user:password@` part, or `None` when it has none.
 fn strip_url_userinfo(url: &str) -> Option<String> {
-    let (scheme, rest) = url.split_once("://")?;
+    let (scheme, rest) = url.trim_start().split_once("://")?;
+    // A templated URL has no scheme of its own; a `://` further in (a query value) is not one.
+    let is_scheme = scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+        && scheme
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "+-.".contains(c));
+    if !is_scheme {
+        return None;
+    }
     let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
     let (_, host) = rest[..authority_end].rsplit_once('@')?;
     Some(format!("{scheme}://{host}{}", &rest[authority_end..]))
@@ -919,6 +927,37 @@ mod tests {
         );
         assert_eq!(strip_url_userinfo("https://a.test/p?email=a@b.test"), None);
         assert_eq!(strip_url_userinfo("{{base}}/p"), None);
+        // A scheme-less templated URL with a `://` and an `@` in its query stays as sent.
+        assert_eq!(
+            strip_url_userinfo("{{base}}/p?next=https://a.test/x&mail=a@b.test"),
+            None
+        );
+        assert_eq!(
+            strip_url_userinfo("{{base}}?next=https://a.test@b.test/x"),
+            None
+        );
+        // The last `@` of the authority ends the userinfo.
+        assert_eq!(
+            strip_url_userinfo("https://ann:not-a-real-value-3@x@a.test/p").as_deref(),
+            Some("https://a.test/p")
+        );
+        // A username alone is userinfo too.
+        assert_eq!(
+            strip_url_userinfo("https://ann@a.test/p").as_deref(),
+            Some("https://a.test/p")
+        );
+        assert_eq!(
+            strip_url_userinfo("http://ann:not-a-real-value-4@[::1]:80/p").as_deref(),
+            Some("http://[::1]:80/p")
+        );
+        // An `@` only in the path, query or fragment is not userinfo; nor is no `@` at all.
+        assert_eq!(strip_url_userinfo("https://a.test/@ann"), None);
+        assert_eq!(strip_url_userinfo("https://a.test?m=a@b.test"), None);
+        assert_eq!(strip_url_userinfo("https://a.test#a@b"), None);
+        assert_eq!(strip_url_userinfo("https://a.test/p"), None);
+        // A raw `/ ? #` inside a password ends the authority early. Such a URL fails
+        // `Url::parse` in the client and `history_view::record` skips failed requests, so
+        // nothing of it reaches disk.
     }
 
     #[test]
