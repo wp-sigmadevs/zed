@@ -586,6 +586,80 @@ mod tests {
         assert!(!entry.request.to_curl().contains("secret"));
     }
 
+    #[test]
+    fn test_is_secret_name() {
+        for name in [
+            "access_token",
+            "client_secret",
+            "X-Api-Key",
+            "user_password",
+            "Set-Cookie",
+        ] {
+            assert!(is_secret_name(name), "{name}");
+        }
+        for name in ["total_tokens", "secretary", "username", "Accept"] {
+            assert!(!is_secret_name(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn test_mask_secret_body_json() {
+        let body = r#"{"user":"ann","password":"not-a-real-value-1","n":{"access_token":"not-a-real-value-2"},"total_tokens":5}"#;
+        let masked = mask_secret_body(body, Some("application/json")).unwrap();
+        assert!(!masked.contains("not-a-real-value"), "{masked}");
+        assert!(masked.contains("\"total_tokens\":5") && masked.contains("ann"));
+        let clean = r#"{"user":"ann"}"#;
+        assert_eq!(mask_secret_body(clean, Some("application/json")), None);
+        assert_eq!(mask_secret_body("not json", None), None);
+    }
+
+    #[test]
+    fn test_mask_secret_body_form_and_pairs() {
+        let form = "user=ann&password=not-a-real-value-1&flag";
+        let masked = mask_secret_body(form, Some("application/x-www-form-urlencoded"));
+        assert_eq!(masked.as_deref(), Some("user=ann&password=***&flag"));
+        assert_eq!(mask_secret_pairs("a=1&b=2"), None);
+        assert_eq!(
+            mask_secret_pairs("client_secret=not-a-real-value-1").as_deref(),
+            Some("client_secret=***")
+        );
+    }
+
+    #[test]
+    fn test_mask_secret_query() {
+        assert_eq!(
+            mask_secret_query("https://a.test/p?q=1&api_key=not-a-real-value-1#top").as_deref(),
+            Some("https://a.test/p?q=1&api_key=***#top")
+        );
+        assert_eq!(
+            mask_secret_query("https://a.test/p?token=not-a-real-value-1").as_deref(),
+            Some("https://a.test/p?token=***")
+        );
+        assert_eq!(mask_secret_query("https://a.test/p?q=1"), None);
+        assert_eq!(mask_secret_query("https://a.test/p"), None);
+    }
+
+    #[test]
+    fn test_mask_secret_multipart() {
+        let part = |disposition: &str, content: &str| {
+            format!("--XyZ\r\nContent-Disposition: form-data; {disposition}\r\n\r\n{content}\r\n")
+        };
+        let body = [
+            part("name=\"title\"", "hello"),
+            part("name=\"password\"", "not-a-real-value-1"),
+            part("name=\"token\"; filename=\"t.txt\"", "not-a-real-value-2"),
+            "--XyZ--\r\n".to_string(),
+        ]
+        .concat();
+        let content_type = Some("multipart/form-data; boundary=XyZ");
+        let masked = mask_secret_body(&body, content_type).unwrap();
+        assert!(!masked.contains("not-a-real-value-1"), "{masked}");
+        assert!(masked.contains("not-a-real-value-2"), "a file part is kept");
+        assert!(masked.contains("hello") && masked.contains("\r\n***\r\n--XyZ"));
+        let plain = [part("name=\"title\"", "hello"), "--XyZ--\r\n".to_string()].concat();
+        assert_eq!(mask_secret_body(&plain, content_type), None);
+    }
+
     fn get(url: &str) -> HttpRequest {
         HttpRequest::new("GET", url, 1)
     }
