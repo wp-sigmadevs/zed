@@ -7,11 +7,11 @@ use std::collections::HashMap;
 use editor::{Editor, EditorEvent};
 use gpui::{
     App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, SharedString,
-    Subscription, Task, Window, actions,
+    Subscription, Task, WeakEntity, Window, actions,
 };
 use ui::{Callout, Checkbox, Disclosure, IconButton, ListItem, Tooltip, prelude::*};
 use util::ResultExt as _;
-use workspace::{ModalView, Workspace};
+use workspace::{ModalView, Toast, Workspace, notifications::NotificationId};
 
 use crate::{Password, ServerConfig, ServerStore, ServerType, Servers, secrets, spawn_operation};
 
@@ -93,6 +93,7 @@ pub struct DeploymentDialog {
     error: Option<SharedString>,
     /// A save is running: OK does nothing until it ends.
     saving: bool,
+    workspace: WeakEntity<Workspace>,
     _test: Option<Task<()>>,
     _save: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
@@ -145,8 +146,9 @@ impl DeploymentDialog {
     ) {
         let project = project_root(workspace, cx);
         let store = ServerStore::global(cx);
+        let this_workspace = cx.weak_entity();
         workspace.toggle_modal(window, cx, move |window, cx| {
-            Self::new(store, project, server_id, window, cx)
+            Self::new(store, project, server_id, this_workspace, window, cx)
         });
     }
 
@@ -154,6 +156,7 @@ impl DeploymentDialog {
         store: Entity<ServerStore>,
         project: Option<String>,
         server_id: Option<String>,
+        workspace: WeakEntity<Workspace>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -206,6 +209,7 @@ impl DeploymentDialog {
             test_status: None,
             error: None,
             saving: false,
+            workspace,
             _test: None,
             _save: None,
             _subscriptions: subscriptions,
@@ -489,6 +493,13 @@ impl DeploymentDialog {
         }));
     }
 
+    pub(crate) fn can_save(&self, cx: &App) -> bool {
+        self.loaded
+            && !self.saving
+            && !self.port_invalid
+            && self.store.read(cx).load_error().is_none()
+    }
+
     fn confirm(&mut self, _: &menu::Confirm, _: &mut Window, cx: &mut Context<Self>) {
         self.save(cx);
     }
@@ -538,6 +549,7 @@ impl DeploymentDialog {
         }
         let servers = self.servers.clone();
         let store = self.store.clone();
+        let workspace = self.workspace.clone();
         self.saving = true;
         self._save = Some(cx.spawn(async move |this, cx| {
             // Deletes first, then writes, and the new servers last: a failure leaves the saved
@@ -569,8 +581,16 @@ impl DeploymentDialog {
                     })?;
                     applied += 1;
                 }
-                let save = store.update(cx, |store, cx| store.save(servers, session_changes, cx));
-                save.await
+                let save = store.update(cx, |store, cx| {
+                    store.save(previous, servers, session_changes, cx)
+                });
+                save.await.map_err(|error| {
+                    if applied == 0 {
+                        error
+                    } else {
+                        keychain_error(applied, "the servers could not be saved", error)
+                    }
+                })
             }
             .await;
             let shown = this.update(cx, |this, cx| {
@@ -591,8 +611,21 @@ impl DeploymentDialog {
                 }
             });
             if shown.is_err() {
-                // The dialog was closed while saving: nobody is left to show the error.
-                result.log_err();
+                // The dialog was closed while saving: tell the user in the workspace.
+                if let Err(error) = result {
+                    log::error!("deploy: saving the servers after the dialog closed: {error:#}");
+                    workspace
+                        .update(cx, |workspace, cx| {
+                            workspace.show_toast(
+                                Toast::new(
+                                    NotificationId::unique::<DeploymentDialog>(),
+                                    format!("Deployment: saving failed: {error:#}"),
+                                ),
+                                cx,
+                            )
+                        })
+                        .log_err();
+                }
             }
         }));
     }
@@ -871,8 +904,7 @@ impl DeploymentDialog {
                 Some((IconName::Warning, Color::Error, message.clone()))
             }
         };
-        let can_save =
-            self.loaded && !self.port_invalid && self.store.read(cx).load_error().is_none();
+        let can_save = self.can_save(cx);
         v_flex()
             .gap_1()
             .when_some(status, |footer, (icon, color, message)| {
@@ -885,6 +917,13 @@ impl DeploymentDialog {
             })
             .when_some(self.error.clone(), |footer, error| {
                 footer.child(Label::new(error).color(Color::Error))
+            })
+            .when(self.saving, |footer| {
+                footer.child(
+                    div()
+                        .debug_selector(|| "zenith-deploy-saving".to_string())
+                        .child(Label::new("Saving…").color(Color::Muted)),
+                )
             })
             .child(
                 h_flex()
@@ -1552,7 +1591,9 @@ mod tests {
             ..Servers::default()
         };
         let result = store
-            .update(cx, |store, cx| store.save(servers, Vec::new(), cx))
+            .update(cx, |store, cx| {
+                store.save(Servers::default(), servers, Vec::new(), cx)
+            })
             .await;
         let error = result.expect_err("saving over a damaged file must fail");
         assert!(error.to_string().contains("not overwritten"), "{error}");
@@ -1714,10 +1755,11 @@ mod tests {
         });
         cx.run_until_parked();
 
+        let message = error_text(&dialog, cx);
+        assert!(message.contains("Saving failed"), "{message}");
         assert!(
-            error_text(&dialog, cx).contains("Saving failed"),
-            "{}",
-            error_text(&dialog, cx)
+            message.contains("1 Keychain change(s) were already made"),
+            "the user learns the Keychain already changed: {message}"
         );
         assert!(is_open(&workspace, cx), "the dialog stays open to retry");
         store.read_with(cx, |store, _| {
@@ -1883,5 +1925,144 @@ mod tests {
         assert!(!is_open(&workspace, cx), "Esc closed the dialog");
         let on_disk = Servers::load(&path).expect("servers.json written after Esc");
         assert_eq!(on_disk.servers[0].name, "Renamed");
+    }
+
+    /// A store with one saved server `Live` that writes to `path`.
+    fn store_with_live(
+        path: std::path::PathBuf,
+        cx: &mut TestAppContext,
+    ) -> (Entity<ServerStore>, Servers) {
+        let saved = Servers {
+            servers: vec![server("Live", None)],
+            ..Servers::default()
+        };
+        let store = cx.new(store_at(saved.clone(), path));
+        (store, saved)
+    }
+
+    fn renamed(servers: &Servers, name: &str) -> Servers {
+        let mut servers = servers.clone();
+        servers.servers[0].name = name.into();
+        servers
+    }
+
+    #[gpui::test]
+    async fn a_save_from_an_outdated_list_is_refused_and_the_newer_one_survives(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("servers.json");
+        let (store, start) = store_with_live(path.clone(), cx);
+
+        // Both saves started from `start`; B finishes first, then the stale A arrives.
+        store
+            .update(cx, |store, cx| {
+                store.save(start.clone(), renamed(&start, "B"), Vec::new(), cx)
+            })
+            .await
+            .expect("B saves");
+        let error = store
+            .update(cx, |store, cx| {
+                store.save(start.clone(), renamed(&start, "A"), Vec::new(), cx)
+            })
+            .await
+            .expect_err("A started from a list that is no longer the saved one");
+        assert!(error.to_string().contains("changed while"), "{error}");
+
+        store.read_with(cx, |store, _| {
+            assert_eq!(store.servers().servers[0].name, "B");
+        });
+        assert_eq!(Servers::load(&path).expect("load").servers[0].name, "B");
+    }
+
+    #[gpui::test]
+    async fn a_second_save_is_refused_while_the_first_is_writing(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("servers.json");
+        let (store, start) = store_with_live(path.clone(), cx);
+
+        let first = store.update(cx, |store, cx| {
+            store.save(start.clone(), renamed(&start, "First"), Vec::new(), cx)
+        });
+        let second = store.update(cx, |store, cx| {
+            store.save(start.clone(), renamed(&start, "Second"), Vec::new(), cx)
+        });
+        let error = second.await.expect_err("the first write is still running");
+        assert!(error.to_string().contains("another save"), "{error}");
+        first.await.expect("the first save is not harmed");
+        assert_eq!(Servers::load(&path).expect("load").servers[0].name, "First");
+        store.read_with(cx, |store, _| {
+            assert_eq!(store.servers().servers[0].name, "First");
+        });
+    }
+
+    #[gpui::test]
+    async fn a_save_that_outlives_its_closed_dialog_cannot_overwrite_a_newer_save(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("servers.json");
+        let (workspace, dialog_a, store, _, keychain, cx) =
+            rename_and_type_a_password(true, path.clone(), cx).await;
+        let (release, gate) = futures::channel::oneshot::channel();
+        *keychain.write_gate.lock().expect("lock") = Some(gate);
+
+        // A: Save waits on the Keychain, then Esc.
+        dialog_a.update(cx, |dialog, cx| {
+            dialog.update_selected(cx, |server| server.name = "From A".into());
+            dialog.save(cx);
+        });
+        cx.run_until_parked();
+        dialog_a.read_with(cx, |dialog, cx| {
+            assert!(dialog.saving);
+            assert!(!dialog.can_save(cx), "OK is off while saving");
+        });
+        assert!(
+            cx.debug_bounds("zenith-deploy-saving").is_some(),
+            "a visible Saving label"
+        );
+        dialog_a.update_in(cx, |dialog, window, cx| {
+            dialog.cancel(&menu::Cancel, window, cx)
+        });
+        drop(dialog_a);
+        cx.run_until_parked();
+        assert!(!is_open(&workspace, cx));
+
+        // B: reopen, edit, OK.
+        cx.dispatch_action(OpenDeployment);
+        cx.run_until_parked();
+        let dialog_b = workspace
+            .read_with(cx, |workspace, cx| {
+                workspace.active_modal::<DeploymentDialog>(cx)
+            })
+            .expect("the dialog opens again");
+        dialog_b.update(cx, |dialog, cx| {
+            dialog.update_selected(cx, |server| server.name = "From B".into());
+            dialog.save(cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            Servers::load(&path).expect("load").servers[0].name,
+            "From B"
+        );
+
+        // A's Keychain wait ends: its stale servers must not replace B's.
+        release.send(()).ok();
+        cx.run_until_parked();
+        assert_eq!(
+            Servers::load(&path).expect("load").servers[0].name,
+            "From B",
+            "disk keeps B"
+        );
+        store.read_with(cx, |store, _| {
+            assert_eq!(store.servers().servers[0].name, "From B", "memory keeps B");
+        });
+        workspace.read_with(cx, |workspace, _| {
+            assert_eq!(
+                workspace.notification_ids().len(),
+                1,
+                "A's failure reaches the user as a toast, its dialog being gone"
+            );
+        });
     }
 }

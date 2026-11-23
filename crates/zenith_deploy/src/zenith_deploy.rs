@@ -70,6 +70,8 @@ pub struct ServerStore {
     /// Where opened remote files are cached, one folder per server.
     cache_dir: PathBuf,
     loaded: bool,
+    /// servers.json is being written; see [`Self::save`].
+    writing: bool,
     /// A damaged servers.json is never overwritten: saving stays off until the user fixes it.
     load_error: Option<String>,
     /// Passwords of servers with "Save password" off: memory only, gone on quit. Each is kept
@@ -132,6 +134,7 @@ impl ServerStore {
             path: Some(path),
             cache_dir,
             loaded: false,
+            writing: false,
             load_error: None,
             session_passwords: HashMap::new(),
             keychain: Arc::new(secrets::SystemKeychain),
@@ -147,6 +150,7 @@ impl ServerStore {
             path: None,
             cache_dir,
             loaded: true,
+            writing: false,
             load_error: None,
             session_passwords: HashMap::new(),
             keychain: Arc::new(secrets::SystemKeychain),
@@ -196,8 +200,15 @@ impl ServerStore {
     /// Writes servers.json (0600, atomically) off the main thread, and only when that worked
     /// replaces every server and applies the session password changes: a failed write changes
     /// nothing here.
+    ///
+    /// `previous` is the saved list the caller started from. A save whose starting point is no
+    /// longer the saved list (another save finished meanwhile, e.g. a dialog closed with Esc
+    /// while its save waited on the Keychain) is refused, never merged: it would overwrite the
+    /// newer servers with its stale copy. Only one write runs at a time, so the list cannot
+    /// change between this check and `apply` (nothing else replaces `servers`).
     fn save(
         &mut self,
+        previous: Servers,
         servers: Servers,
         session_changes: Vec<(ServerConfig, Option<Password>)>,
         cx: &mut Context<Self>,
@@ -207,15 +218,30 @@ impl ServerStore {
                 "the saved servers could not be read, so they are not overwritten: {error}"
             )));
         }
+        if self.writing {
+            return Task::ready(Err(anyhow!(
+                "another save is still running; wait for it and try again"
+            )));
+        }
+        if self.servers != previous {
+            return Task::ready(Err(anyhow!(
+                "the saved servers changed while this was saving, so they are not overwritten; reopen Deployment settings and try again"
+            )));
+        }
         let Some(path) = self.path.clone() else {
             self.apply(servers, session_changes, cx);
             return Task::ready(Ok(()));
         };
+        self.writing = true;
         let to_write = servers.clone();
         cx.spawn(async move |this, cx| {
-            cx.background_spawn(async move { to_write.save(&path) })
-                .await?;
-            this.update(cx, |this, cx| this.apply(servers, session_changes, cx))
+            let written = cx
+                .background_spawn(async move { to_write.save(&path) })
+                .await;
+            this.update(cx, |this, cx| {
+                this.writing = false;
+                written.map(|()| this.apply(servers, session_changes, cx))
+            })?
         })
     }
 

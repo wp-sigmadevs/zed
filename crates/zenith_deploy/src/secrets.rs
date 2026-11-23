@@ -133,6 +133,8 @@ pub(crate) mod fake {
         pub fail_write: Mutex<bool>,
         /// Keys whose delete fails while other deletes work.
         pub failing_delete_keys: Mutex<Vec<String>>,
+        /// The next write finishes only when this resolves (a Keychain prompt waiting).
+        pub write_gate: Mutex<Option<futures::channel::oneshot::Receiver<()>>>,
     }
 
     impl FakeKeychain {
@@ -164,7 +166,7 @@ pub(crate) mod fake {
             Task::ready(Ok(self.entries.lock().expect("lock").get(key).cloned()))
         }
 
-        fn write(&self, key: &str, account: &str, secret: &[u8], _: &App) -> Task<Result<()>> {
+        fn write(&self, key: &str, account: &str, secret: &[u8], cx: &App) -> Task<Result<()>> {
             if *self.fail_write.lock().expect("lock") {
                 return Task::ready(Err(anyhow!("the Keychain is locked")));
             }
@@ -172,7 +174,13 @@ pub(crate) mod fake {
                 .lock()
                 .expect("lock")
                 .insert(key.to_string(), (account.to_string(), secret.to_vec()));
-            Task::ready(Ok(()))
+            match self.write_gate.lock().expect("lock").take() {
+                Some(gate) => cx.background_spawn(async move {
+                    gate.await.ok();
+                    Ok(())
+                }),
+                None => Task::ready(Ok(())),
+            }
         }
 
         fn delete(&self, key: &str, _: &App) -> Task<Result<()>> {
