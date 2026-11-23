@@ -10,6 +10,7 @@ use gpui::{App, AppContext as _, ReadGlobal as _};
 use project::Project;
 use settings::SettingsStore;
 use std::{
+    collections::BTreeMap,
     io::ErrorKind,
     path::{Path, PathBuf},
     sync::{
@@ -25,8 +26,9 @@ static SYNC_LOCK: Mutex<()> = Mutex::new(());
 /// Each `sync` takes a ticket on the main thread; the background writes of Zenith's own config
 /// run in any order, so [`write_own_config`] drops a write older than one already done.
 static NEXT_TICKET: AtomicU64 = AtomicU64::new(1);
-/// The newest ticket written; the lock also makes the read-compare-write one step.
-static OWN_CONFIG: Mutex<u64> = Mutex::new(0);
+/// The newest ticket attempted per config file (a failed newer write must not let an older list
+/// land afterwards); the lock also makes the read-compare-write one step.
+static OWN_CONFIG: Mutex<BTreeMap<PathBuf, u64>> = Mutex::new(BTreeMap::new());
 
 fn next_ticket() -> u64 {
     NEXT_TICKET.fetch_add(1, Ordering::SeqCst)
@@ -45,14 +47,16 @@ fn own_config_home(home: &Path) -> PathBuf {
 }
 
 /// Writes Zenith's own `.phpantom.toml` (a file only Zenith owns) when its content changes;
-/// `true` when it wrote. A write whose `ticket` is older than one already written is dropped
-/// (`Ok(false)`): the file keeps the newest list.
+/// `true` when it wrote. A write whose `ticket` is older than one already attempted is dropped
+/// (`Ok(false)`), even if that newer attempt failed: the file never goes back to an older list.
 fn write_own_config(home: &Path, include: &[String], ticket: u64) -> Result<bool, String> {
-    let mut newest = OWN_CONFIG.lock().unwrap_or_else(|e| e.into_inner());
+    let config = config_file(home, Some(own_config_home(home)));
+    let mut tickets = OWN_CONFIG.lock().unwrap_or_else(|e| e.into_inner());
+    let newest = tickets.entry(config.clone()).or_insert(0);
     if ticket < *newest {
         return Ok(false);
     }
-    let config = config_file(home, Some(own_config_home(home)));
+    *newest = ticket;
     let mut doc = DocumentMut::new();
     let mut indexing = Table::new();
     indexing.insert(
@@ -62,15 +66,12 @@ fn write_own_config(home: &Path, include: &[String], ticket: u64) -> Result<bool
     doc.insert("indexing", Item::Table(indexing));
     let text = doc.to_string();
     if std::fs::read_to_string(&config).ok().as_deref() == Some(text.as_str()) {
-        *newest = ticket;
         return Ok(false);
     }
     if let Some(dir) = config.parent() {
         std::fs::create_dir_all(dir).map_err(|error| format!("{}: {error}", dir.display()))?;
     }
-    write_atomic(&config, &text)?;
-    *newest = ticket;
-    Ok(true)
+    write_atomic(&config, &text).map(|()| true)
 }
 
 /// Entries Zenith added to the config file: `{"include": [...]}`. Older versions also
@@ -496,6 +497,21 @@ mod tests {
             text.contains("/libs/new") && !text.contains("/libs/old"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn test_a_failed_newer_write_does_not_let_an_older_list_land() {
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path();
+        let (older, newer) = (next_ticket(), next_ticket());
+        let config = config_file(home, Some(own_config_home(home)));
+        // A file where the config directory should be makes the newer write fail.
+        std::fs::create_dir_all(config.parent().unwrap().parent().unwrap()).unwrap();
+        std::fs::write(config.parent().unwrap(), "").unwrap();
+        assert!(write_own_config(home, &["/libs/new".into()], newer).is_err());
+        std::fs::remove_file(config.parent().unwrap()).unwrap();
+        assert!(!write_own_config(home, &["/libs/old".into()], older).unwrap());
+        assert!(!config.exists(), "the older list must not land");
     }
 
     #[test]

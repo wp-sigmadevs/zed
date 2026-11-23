@@ -173,8 +173,12 @@ impl PhpModal {
             previous.await;
             let result =
                 php_config::write_language_level(fs.as_ref(), &root, level.as_deref()).await;
-            if result.is_ok() {
-                // Not through `this`: the modal may be closed by now, and the file still changed.
+            // Not through `this` for the restart itself: the modal may be closed by now, and the
+            // file still changed. A write a newer click already replaced does not restart.
+            let superseded = this
+                .update(cx, |this, _| this.clicks != click)
+                .unwrap_or(false);
+            if result.is_ok() && !superseded {
                 cx.update(|cx| php_config::restart_phpantom(&project, cx));
             }
             this.update(cx, |this, cx| {
@@ -846,5 +850,54 @@ mod tests {
             .next()
             .await
             .expect("the new level restarts PHPantom");
+    }
+
+    #[gpui::test]
+    async fn test_a_superseded_write_does_not_restart_phpantom(cx: &mut TestAppContext) {
+        use language::{FakeLspAdapter, Language, LanguageConfig, LanguageMatcher};
+        let (fixture, cx) = setup(cx, json!({ "composer.json": "{}", "a.php": "<?php\n" })).await;
+        let project = fixture
+            .workspace
+            .read_with(cx, |workspace, _| workspace.project().clone());
+        let registry = project.read_with(cx, |project, _| project.languages().clone());
+        registry.add(Arc::new(Language::new(
+            LanguageConfig {
+                name: "PHP".into(),
+                matcher: LanguageMatcher {
+                    path_suffixes: vec!["php".into()],
+                    ..Default::default()
+                }
+                .into(),
+                ..Default::default()
+            },
+            None,
+        )));
+        let mut servers = registry.register_fake_lsp(
+            "PHP",
+            FakeLspAdapter {
+                name: "phpantom",
+                ..Default::default()
+            },
+        );
+        let (_buffer, _handle) = project
+            .update(cx, |project, cx| {
+                project.open_local_buffer_with_lsp(Path::new("/p/a.php"), cx)
+            })
+            .await
+            .unwrap();
+        let server = servers.next().await.expect("phpantom starts");
+        let _shutdown =
+            server.set_request_handler::<lsp::request::Shutdown, _, _>(|_, _| async { Ok(()) });
+        let modal = open(&fixture, Vec::new(), cx);
+        modal.update(cx, |modal, cx| {
+            modal.set_language_level(Some("8.4".into()), cx);
+            modal.set_language_level(Some("8.5".into()), cx);
+        });
+        cx.run_until_parked();
+        let mut restarts = 0;
+        while servers.try_recv().is_ok() {
+            restarts += 1;
+        }
+        assert_eq!(restarts, 1, "only the last click restarts PHPantom");
     }
 }
