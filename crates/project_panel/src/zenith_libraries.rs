@@ -52,6 +52,11 @@ impl ProjectPanel {
         self.zenith_scratch_rows(cx);
     }
 
+    /// Whether New File / New Directory must do nothing on a row of `worktree_id`.
+    pub(super) fn zenith_refuses_new_entry(&self, worktree_id: WorktreeId, cx: &App) -> bool {
+        self.zenith_scratch_refuses_new_entry(worktree_id, cx)
+    }
+
     /// Moves every library row below all project roots, under one "External Libraries" node:
     /// each worktree's library folders and every user-added library worktree. The rows keep
     /// their worktree's group (several groups may share a worktree id), the node row heads the

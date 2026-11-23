@@ -86,9 +86,52 @@ impl ProjectPanel {
                 .is_some_and(|worktree| zenith_scratches::is_store_worktree(worktree.read(cx), cx))
     }
 
+    /// Whether `worktree_id` is the store folder, by path and whatever the node setting: a row
+    /// left over from before the setting went off still reaches it.
+    fn zenith_is_store_folder(&self, worktree_id: WorktreeId, cx: &App) -> bool {
+        self.project
+            .read(cx)
+            .worktree_for_id(worktree_id, cx)
+            .is_some_and(|worktree| zenith_scratches::is_store_folder(worktree.read(cx), cx))
+    }
+
+    /// New File / New Directory on a store row: upstream draws the name editor only for visible
+    /// worktrees, so it would take focus unseen. Scratches are made with New Scratch File.
+    pub(super) fn zenith_scratch_refuses_new_entry(
+        &self,
+        worktree_id: WorktreeId,
+        cx: &App,
+    ) -> bool {
+        self.zenith_is_store_folder(worktree_id, cx)
+    }
+
+    /// Renaming the store's root row would rename the store folder itself and strand
+    /// `store_dir`. Trash, delete and cut already skip worktree roots; rename does not, and
+    /// `rename_impl` has no hook, so the edit it just started is dropped here (before the
+    /// rebuild focuses the name editor). By path, so it holds with the node turned off.
+    fn zenith_drop_store_root_edit(&mut self, cx: &App) {
+        let Some(edit) = self.state.edit_state.as_ref() else {
+            return;
+        };
+        if !self.zenith_is_store_folder(edit.worktree_id, cx) {
+            return;
+        }
+        let is_root = self
+            .project
+            .read(cx)
+            .worktree_for_id(edit.worktree_id, cx)
+            .and_then(|worktree| worktree.read(cx).root_entry().map(|root| root.id))
+            == Some(edit.entry_id);
+        if edit.is_new_entry() || is_root {
+            self.state.edit_state = None;
+            self.update_visible_entries_task.focus_filename_editor = false;
+        }
+    }
+
     /// Appends the node's rows after every project root and library row: the node, and while it
     /// is expanded the "Scratches" folder with its files. Runs on the freshly derived state.
     pub(super) fn zenith_scratch_rows(&mut self, cx: &mut Context<Self>) {
+        self.zenith_drop_store_root_edit(cx);
         let Some(worktree) = self.zenith_scratch_worktree(cx) else {
             return;
         };
@@ -98,16 +141,6 @@ impl ProjectPanel {
         let Some(root) = worktree.root_entry() else {
             return;
         };
-        // Renaming the "Scratches" row would rename the store folder itself and strand
-        // `store_dir`. Trash, delete and cut already skip worktree roots; rename does not, and
-        // `rename_impl` has no hook, so the edit it just started is dropped here (before the
-        // rebuild focuses the name editor).
-        if self.state.edit_state.as_ref().is_some_and(|edit| {
-            edit.worktree_id == worktree_id && edit.entry_id == root.id && !edit.is_new_entry()
-        }) {
-            self.state.edit_state = None;
-            self.update_visible_entries_task.focus_filename_editor = false;
-        }
         let settings = ProjectPanelSettings::get_global(cx);
         let expanded_dir_ids = self
             .state
@@ -654,5 +687,231 @@ mod tests {
         });
         opened.cx.run_until_parked();
         assert!(names(&mut opened).contains(&"Scratches and Consoles".to_string()));
+    }
+
+    fn store_root(opened: &mut Opened) -> ProjectEntryId {
+        let worktree_id = scratch_worktree_id(opened);
+        opened.panel.read_with(&opened.cx, |panel, cx| {
+            let worktree = panel.project.read(cx).worktree_for_id(worktree_id, cx);
+            worktree.unwrap().read(cx).root_entry().unwrap().id
+        })
+    }
+
+    fn select(opened: &mut Opened, worktree_id: WorktreeId, entry_id: ProjectEntryId) {
+        opened.panel.update(&mut opened.cx, |panel, _| {
+            panel.selection = Some(SelectedEntry {
+                worktree_id,
+                entry_id,
+            });
+        });
+    }
+
+    /// Upstream draws the new-entry name editor only for visible worktrees: on a scratch row it
+    /// would take focus unseen, so New File and New Directory do nothing there.
+    #[gpui::test]
+    async fn test_new_file_and_directory_do_nothing_on_scratch_rows(cx: &mut TestAppContext) {
+        let mut opened = open(cx, json!({ "src": { "main.php": "" } })).await;
+        toggle(&mut opened, "Scratches and Consoles");
+        let worktree_id = scratch_worktree_id(&mut opened);
+        let root = store_root(&mut opened);
+        for entry_id in [None, Some(root)] {
+            match entry_id {
+                Some(entry_id) => select(&mut opened, worktree_id, entry_id),
+                None => select_scratch(&mut opened, "notes.md"),
+            }
+            let selected = opened
+                .panel
+                .read_with(&opened.cx, |panel, _| panel.selection);
+            opened.panel.update_in(&mut opened.cx, |panel, window, cx| {
+                panel.new_file(&NewFile, window, cx);
+                panel.new_directory(&NewDirectory, window, cx);
+            });
+            opened.cx.run_until_parked();
+            opened.panel.update_in(&mut opened.cx, |panel, window, cx| {
+                assert!(panel.state.edit_state.is_none(), "{entry_id:?}");
+                assert_eq!(panel.selection, selected, "the selection stays");
+                assert!(
+                    !panel.filename_editor.focus_handle(cx).is_focused(window),
+                    "no hidden name editor takes focus"
+                );
+            });
+        }
+
+        // A project folder still gets its placeholder row.
+        let site = opened.panel.read_with(&opened.cx, |panel, cx| {
+            let worktree = panel.project.read(cx).visible_worktrees(cx).next().unwrap();
+            let worktree = worktree.read(cx);
+            (worktree.id(), worktree.root_entry().unwrap().id)
+        });
+        select(&mut opened, site.0, site.1);
+        opened.panel.update_in(&mut opened.cx, |panel, window, cx| {
+            panel.new_file(&NewFile, window, cx)
+        });
+        opened.cx.run_until_parked();
+        opened.panel.read_with(&opened.cx, |panel, _| {
+            assert!(
+                panel
+                    .state
+                    .edit_state
+                    .as_ref()
+                    .is_some_and(|edit| edit.is_new_entry())
+            )
+        });
+    }
+
+    /// With the node turned off, rows drawn before stay until the next rebuild, and the store
+    /// worktree stays open while a scratch is. Rename on the "Scratches" row is still refused.
+    #[gpui::test]
+    async fn test_stale_scratch_rows_cannot_rename_the_store_folder(cx: &mut TestAppContext) {
+        let mut opened = open(cx, json!({ "src": { "main.php": "" } })).await;
+        toggle(&mut opened, "Scratches and Consoles");
+        let worktree_id = scratch_worktree_id(&mut opened);
+        let root = store_root(&mut opened);
+        select_scratch(&mut opened, "notes.md");
+        let notes = opened
+            .panel
+            .read_with(&opened.cx, |panel, _| panel.selection.unwrap().entry_id);
+        set_node_setting(&mut opened, false);
+        select(&mut opened, worktree_id, root);
+        opened.panel.update_in(&mut opened.cx, |panel, window, cx| {
+            panel.rename(&Rename, window, cx)
+        });
+        opened.cx.run_until_parked();
+        let rename = opened.panel.update_in(&mut opened.cx, |panel, window, cx| {
+            assert!(panel.state.edit_state.is_none(), "no rename starts");
+            panel
+                .filename_editor
+                .update(cx, |editor, cx| editor.set_text("stolen", window, cx));
+            panel.confirm_edit(true, window, cx)
+        });
+        if let Some(rename) = rename {
+            rename.await.ok();
+        }
+        opened.cx.run_until_parked();
+        assert!(opened.fs.is_dir(&opened.store).await);
+        assert!(
+            !opened
+                .fs
+                .is_dir(&opened.store.with_file_name("stolen"))
+                .await
+        );
+
+        // A scratch below the root can still be renamed.
+        select(&mut opened, worktree_id, notes);
+        opened.panel.update_in(&mut opened.cx, |panel, window, cx| {
+            panel.rename(&Rename, window, cx)
+        });
+        opened.cx.run_until_parked();
+        opened.panel.read_with(&opened.cx, |panel, _| {
+            assert!(panel.state.edit_state.is_some())
+        });
+    }
+
+    /// The real wiring: `zenith_scratches` holds the store, its panel creates a scratch, the
+    /// node lists it, the panel opens it, and the "Scratches" row cannot be renamed.
+    #[gpui::test]
+    async fn test_scratches_panel_and_project_panel_end_to_end(cx: &mut TestAppContext) {
+        init_editor_test(cx);
+        cx.update(|cx| {
+            zenith_scratches::init(cx);
+            cx.bind_keys([
+                gpui::KeyBinding::new("down", menu::SelectNext, None),
+                gpui::KeyBinding::new("enter", menu::Confirm, None),
+                gpui::KeyBinding::new("escape", menu::Cancel, None),
+            ]);
+        });
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/site", json!({ "src": { "main.php": "" } }))
+            .await;
+        let store = cx.update(|cx| zenith_scratches::store_dir(cx));
+        let project = Project::test(fs.clone(), [Path::new("/site")], cx).await;
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .read_with(cx, |multi, _| multi.workspace().clone())
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(window.into(), cx);
+        let panel = workspace.update_in(cx, ProjectPanel::new);
+        cx.run_until_parked();
+        let store_id = panel.read_with(cx, |panel, cx| {
+            panel.zenith_scratch_worktree(cx).map(|w| w.read(cx).id())
+        });
+        let store_id = store_id.expect("zenith_scratches holds the store for the project");
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.focus_panel::<zenith_scratches::ScratchesPanel>(window, cx);
+        });
+        cx.run_until_parked();
+        cx.dispatch_action(zenith_scratches::NewScratchFile);
+        cx.run_until_parked();
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        let scratch = fs
+            .files()
+            .into_iter()
+            .find(|path| path.parent() == Some(store.as_path()))
+            .expect("a scratch was created");
+        let name = scratch.file_name().unwrap().to_string_lossy().into_owned();
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.close_all_items_and_panes(&Default::default(), window, cx)
+        });
+        cx.run_until_parked();
+
+        let names = |panel: &Entity<ProjectPanel>, cx: &mut VisualTestContext| {
+            panel.update_in(cx, |panel, window, cx| {
+                let mut rows = Vec::new();
+                panel.for_each_visible_entry(0..200, window, cx, &mut |id, details, _, _| {
+                    rows.push((id, details.filename));
+                });
+                rows
+            })
+        };
+        let node = names(&panel, cx)
+            .into_iter()
+            .find(|(_, name)| name == "Scratches and Consoles")
+            .expect("the node is listed")
+            .0;
+        panel.update_in(cx, |panel, window, cx| {
+            panel.toggle_expanded(node, window, cx)
+        });
+        cx.run_until_parked();
+        let rows = names(&panel, cx);
+        let row = |label: &str| {
+            rows.iter()
+                .find(|(_, name)| name == label)
+                .unwrap_or_else(|| panic!("no row {label:?} in {rows:?}"))
+                .0
+        };
+        let (scratch_row, root_row) = (row(&name), row("Scratches"));
+
+        panel.update(cx, |panel, _| {
+            panel.selection = Some(SelectedEntry {
+                worktree_id: store_id,
+                entry_id: scratch_row,
+            })
+        });
+        panel.update_in(cx, |panel, window, cx| panel.open(&Open, window, cx));
+        cx.run_until_parked();
+        let active = workspace.read_with(cx, |workspace, cx| {
+            let path = workspace.active_item(cx)?.project_path(cx)?;
+            Some((path.worktree_id, path.path.as_unix_str().to_string()))
+        });
+        assert_eq!(active, Some((store_id, name.clone())));
+
+        panel.update(cx, |panel, _| {
+            panel.selection = Some(SelectedEntry {
+                worktree_id: store_id,
+                entry_id: root_row,
+            })
+        });
+        panel.update_in(cx, |panel, window, cx| panel.rename(&Rename, window, cx));
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert!(
+                panel.state.edit_state.is_none(),
+                "the store folder is not renamed"
+            )
+        });
+        assert!(fs.is_file(&scratch).await);
     }
 }

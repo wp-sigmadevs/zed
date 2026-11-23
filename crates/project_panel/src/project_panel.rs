@@ -2537,6 +2537,9 @@ impl ProjectPanel {
         else {
             return;
         };
+        if self.zenith_refuses_new_entry(worktree_id, cx) {
+            return;
+        }
 
         let directory_id;
         let new_entry_id = self.resolve_entry(entry_id);

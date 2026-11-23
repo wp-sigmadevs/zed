@@ -1,7 +1,9 @@
 //! The scratch store as an invisible worktree of every local project, so the project panel can
 //! list it under "Scratches and Consoles". An invisible worktree stays out of project search,
 //! the file finder, trust and the window's root paths, and it is not scanned for git
-//! repositories.
+//! repositories. It is not invisible everywhere, though: an empty window counts any worktree
+//! (`Workspace::open_workspace_for_paths`) and a collab share sends invisible worktrees too, so
+//! the store is held only while the project has a folder of its own and is not shared.
 
 use super::*;
 
@@ -10,12 +12,16 @@ fn node_enabled(cx: &App) -> bool {
     ScratchesSettings::try_get(cx).is_some_and(|s| s.enabled && s.project_panel_node)
 }
 
-/// Whether `worktree` is the scratch store held open for the project panel. A visible worktree
-/// is the project's own folder (the store setting may point inside one), never the store.
+/// Whether `worktree` is the scratch store folder opened invisibly, whatever the node setting:
+/// edits on its root would move the store itself. A visible worktree is the project's own folder
+/// (the store setting may point inside one), never the store.
+pub fn is_store_folder(worktree: &Worktree, cx: &App) -> bool {
+    !worktree.is_visible() && worktree.abs_path().as_ref() == store_dir(cx).as_path()
+}
+
+/// Whether `worktree` is the scratch store held open for the project panel.
 pub fn is_store_worktree(worktree: &Worktree, cx: &App) -> bool {
-    !worktree.is_visible()
-        && node_enabled(cx)
-        && worktree.abs_path().as_ref() == store_dir(cx).as_path()
+    node_enabled(cx) && is_store_folder(worktree, cx)
 }
 
 /// The store's worktree in `project`, while the project panel node is on. Local projects only:
@@ -33,12 +39,23 @@ pub fn store_worktree(project: &Project, cx: &App) -> Option<Entity<Worktree>> {
 
 impl ScratchesPanel {
     /// Opens the store as an invisible worktree of the project, or lets it go when the node is
-    /// off or the project is not local. Safe to call on every settings change.
+    /// off, the project is not local, is shared, or has no visible folder. Safe to call on every
+    /// settings change and worktree or share event.
     pub(crate) fn sync_store_worktree(&mut self, cx: &mut Context<Self>) {
-        if !node_enabled(cx) || !self.project.read(cx).is_local() {
-            self.store_worktree = None;
+        let project = self.project.read(cx);
+        let wanted = node_enabled(cx)
+            && project.is_local()
+            && !project.is_shared()
+            && project.visible_worktrees(cx).next().is_some();
+        if !wanted {
             self.store_worktree_dir = None;
             self.store_worktree_task = Task::ready(());
+            // Removed, not just dropped: an open scratch (or a share) holds it strongly.
+            if let Some(worktree) = self.store_worktree.take() {
+                let id = worktree.read(cx).id();
+                self.project
+                    .update(cx, |project, cx| project.remove_worktree(id, cx));
+            }
             return;
         }
         if self.store_worktree_dir.as_ref() == Some(&self.dir) {
