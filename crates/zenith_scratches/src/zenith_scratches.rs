@@ -2,7 +2,7 @@
 //! folder under the data dir, listed in a "Scratches" panel and opened as ordinary files.
 //! They work with no project open: the file is opened through an invisible worktree, so the
 //! scratches folder never shows up as a project root. `project_node` also keeps that folder open
-//! as an invisible worktree, which the project panel lists under "Scratches and Consoles".
+//! as an invisible worktree, which the project panel lists under "Scratches".
 
 mod project_node;
 pub use project_node::{is_store_folder, is_store_worktree, store_worktree};
@@ -95,7 +95,7 @@ pub struct ScratchesSettings {
     pub directory: Option<PathBuf>,
     pub runners: HashMap<String, Vec<String>>,
     pub use_project_cwd: bool,
-    /// List the scratches under a "Scratches and Consoles" node in the project panel.
+    /// List the scratches under a "Scratches" node in the project panel.
     pub project_panel_node: bool,
 }
 

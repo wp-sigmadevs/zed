@@ -1,5 +1,5 @@
 //! The scratch store as an invisible worktree of every local project, so the project panel can
-//! list it under "Scratches and Consoles". An invisible worktree stays out of project search,
+//! list it under "Scratches". An invisible worktree stays out of project search,
 //! the file finder, trust and the window's root paths, and it is not scanned for git
 //! repositories. It is not invisible everywhere, though: an empty window counts any worktree
 //! (`Workspace::open_workspace_for_paths`) and a collab share sends invisible worktrees too, so
