@@ -247,12 +247,13 @@ fn mask_secret_pairs(pairs: &str) -> Option<String> {
 /// `url` without its `user:password@` part, or `None` when it has none.
 fn strip_url_userinfo(url: &str) -> Option<String> {
     let (scheme, rest) = url.trim_start().split_once("://")?;
-    // A templated URL has no scheme of its own; a `://` further in (a query value) is not one.
-    let is_scheme = scheme.starts_with(|c: char| c.is_ascii_alphabetic())
-        && scheme
+    // The scheme may be a template (`{{scheme}}`), but a `://` further in, after a path or a
+    // query, is not the URL's own.
+    if scheme.is_empty()
+        || scheme
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || "+-.".contains(c));
-    if !is_scheme {
+            .any(|c| c.is_whitespace() || "/?#@:".contains(c))
+    {
         return None;
     }
     let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
@@ -955,9 +956,27 @@ mod tests {
         assert_eq!(strip_url_userinfo("https://a.test?m=a@b.test"), None);
         assert_eq!(strip_url_userinfo("https://a.test#a@b"), None);
         assert_eq!(strip_url_userinfo("https://a.test/p"), None);
-        // A raw `/ ? #` inside a password ends the authority early. Such a URL fails
-        // `Url::parse` in the client and `history_view::record` skips failed requests, so
-        // nothing of it reaches disk.
+        // A templated scheme still gets its userinfo stripped, and so does an uppercase one.
+        assert_eq!(
+            strip_url_userinfo("{{scheme}}://ann:not-a-real-value-5@a.test/p").as_deref(),
+            Some("{{scheme}}://a.test/p")
+        );
+        assert_eq!(
+            strip_url_userinfo("http{{tls}}://ann:not-a-real-value-6@a.test/p").as_deref(),
+            Some("http{{tls}}://a.test/p")
+        );
+        assert_eq!(
+            strip_url_userinfo("HTTPS://ann:not-a-real-value-7@a.test/p").as_deref(),
+            Some("HTTPS://a.test/p")
+        );
+        assert_eq!(
+            strip_url_userinfo("  https://ann:not-a-real-value-8@a.test/p").as_deref(),
+            Some("https://a.test/p")
+        );
+        // A raw `/ ? #` inside a password ends the authority early, so the rest of the
+        // password stays. Such a URL mostly fails `Url::parse` in the client and
+        // `history_view::record` skips failed requests; a digits-only password before the `/`
+        // parses as a port, the request goes to the wrong host and fails. Negligible.
     }
 
     #[test]
@@ -971,6 +990,16 @@ mod tests {
         let raw_index = std::fs::read_to_string(history.directory().join(INDEX_FILE))?;
         assert!(!raw_index.contains("not-a-real-value"), "{raw_index}");
         assert_eq!(history.load(id)?.request.url, "https://a.test/p");
+
+        // A templated scheme fails `Url::parse`, so the request is still stored; its
+        // userinfo must not be.
+        let request = HttpRequest::new("GET", "{{scheme}}://ann:not-a-real-value-9@a.test/p", 2);
+        let id = history.append(request, ok(""))?.expect("stored");
+        let raw = std::fs::read_to_string(history.directory().join(format!("{id}.json")))?;
+        assert!(!raw.contains("not-a-real-value"), "{raw}");
+        let raw_index = std::fs::read_to_string(history.directory().join(INDEX_FILE))?;
+        assert!(!raw_index.contains("not-a-real-value"), "{raw_index}");
+        assert_eq!(history.load(id)?.request.url, "{{scheme}}://a.test/p");
         Ok(())
     }
 
