@@ -15,6 +15,10 @@ impl ProjectPanel {
 
     pub(super) fn zenith_libraries(&mut self, _cx: &mut Context<Self>) {}
 
+    pub(super) fn zenith_refuses_new_entry(&self, _worktree_id: WorktreeId, _cx: &App) -> bool {
+        false
+    }
+
     pub(super) fn zenith_depth(&self, _entry: &Entry, depth: usize, _cx: &App) -> usize {
         depth
     }

@@ -5,7 +5,7 @@
 //! as an invisible worktree, which the project panel lists under "Scratches and Consoles".
 
 mod project_node;
-pub use project_node::{is_store_worktree, store_worktree};
+pub use project_node::{is_store_folder, is_store_worktree, store_worktree};
 
 use std::{
     collections::HashSet,
@@ -534,17 +534,22 @@ impl ScratchesPanel {
             this.sync_store_worktree(cx);
         });
         let project = workspace.project().clone();
-        let project_subscription = cx.subscribe(&project, |this, _, event, cx| {
-            if let project::Event::WorktreeRemoved(id) = event
-                && this
+        let project_subscription = cx.subscribe(&project, |this, _, event, cx| match event {
+            project::Event::WorktreeRemoved(id)
+                if this
                     .store_worktree
                     .as_ref()
-                    .is_some_and(|worktree| worktree.read(cx).id() == *id)
+                    .is_some_and(|worktree| worktree.read(cx).id() == *id) =>
             {
                 this.store_worktree = None;
                 this.store_worktree_dir = None;
                 this.sync_store_worktree(cx);
             }
+            // A folder came or went, or the project was shared or unshared.
+            project::Event::WorktreeAdded(_)
+            | project::Event::WorktreeRemoved(_)
+            | project::Event::RemoteIdChanged(_) => this.sync_store_worktree(cx),
+            _ => {}
         });
         let mut this = Self {
             fs: workspace.app_state().fs.clone(),
@@ -1666,7 +1671,7 @@ mod tests {
     async fn the_store_is_an_invisible_worktree_the_file_finder_never_lists(
         cx: &mut TestAppContext,
     ) {
-        let (fixture, cx) = fixture(cx).await;
+        let (fixture, cx) = fixture_with(cx, &["/proj"], None).await;
         cx.run_until_parked();
         let store = default_store_dir();
         assert!(
@@ -1700,16 +1705,15 @@ mod tests {
                 )
             });
         assert!(held, "the panel opened the store: {all:?}");
-        assert_eq!(all, [(store, false)]);
-        assert!(
-            visible.is_empty() && finder_candidates.is_empty(),
-            "{visible:?} {finder_candidates:?}"
-        );
+        let proj = (PathBuf::from("/proj"), true);
+        assert_eq!(all, [proj.clone(), (store, false)]);
+        assert_eq!(visible, std::slice::from_ref(&proj));
+        assert_eq!(finder_candidates, [proj]);
     }
 
     #[gpui::test]
     async fn the_setting_off_releases_the_worktree_and_on_reopens_it(cx: &mut TestAppContext) {
-        let (fixture, cx) = fixture(cx).await;
+        let (fixture, cx) = fixture_with(cx, &["/proj"], None).await;
         cx.run_until_parked();
         assert!(store_worktree_of(&fixture, cx).is_some());
 
@@ -1727,7 +1731,7 @@ mod tests {
         let remaining = fixture.workspace.read_with(cx, |workspace, cx| {
             workspace.project().read(cx).worktrees(cx).count()
         });
-        assert_eq!(remaining, 0, "nothing holds the worktree any more");
+        assert_eq!(remaining, 1, "only the project's folder is left");
 
         cx.update(|_, cx| set_scratches(cx, ZenithScratchesSettingsContent::default()));
         cx.run_until_parked();
@@ -1747,5 +1751,149 @@ mod tests {
                 .panel
                 .read_with(cx, |panel, _| panel.store_worktree.is_none())
         );
+    }
+
+    fn worktree_count(fixture: &Fixture, cx: &mut VisualTestContext) -> usize {
+        fixture.workspace.read_with(cx, |workspace, cx| {
+            workspace.project().read(cx).worktrees(cx).count()
+        })
+    }
+
+    /// An empty window counts any worktree (`Workspace::open_workspace_for_paths`), so the store
+    /// must not make a folderless window look taken.
+    #[gpui::test]
+    async fn the_store_is_held_only_while_the_project_has_a_folder(cx: &mut TestAppContext) {
+        let (fixture, cx) = fixture(cx).await;
+        cx.run_until_parked();
+        assert!(store_worktree_of(&fixture, cx).is_none());
+        assert_eq!(
+            worktree_count(&fixture, cx),
+            0,
+            "the empty window stays empty"
+        );
+
+        fixture.fs.create_dir(Path::new("/proj")).await.unwrap();
+        let project = fixture
+            .workspace
+            .read_with(cx, |workspace, _| workspace.project().clone());
+        let (folder, _) = project
+            .update(cx, |project, cx| {
+                project.find_or_create_worktree("/proj", true, cx)
+            })
+            .await
+            .unwrap();
+        cx.run_until_parked();
+        assert!(store_worktree_of(&fixture, cx).is_some());
+
+        let folder_id = folder.read_with(cx, |folder, _| folder.id());
+        project.update(cx, |project, cx| project.remove_worktree(folder_id, cx));
+        cx.run_until_parked();
+        assert!(store_worktree_of(&fixture, cx).is_none());
+        assert_eq!(
+            worktree_count(&fixture, cx),
+            0,
+            "the store goes with the last folder"
+        );
+    }
+
+    /// A store open still in flight when the project is shared lands as a strong handle the
+    /// panel never held; it is removed when it arrives.
+    #[gpui::test]
+    async fn a_store_open_in_flight_during_a_share_is_removed(cx: &mut TestAppContext) {
+        let (fixture, cx) = fixture_with(cx, &["/proj"], None).await;
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            set_scratches(
+                cx,
+                ZenithScratchesSettingsContent {
+                    project_panel_node: Some(false),
+                    ..Default::default()
+                },
+            )
+        });
+        cx.run_until_parked();
+        assert!(store_worktree_of(&fixture, cx).is_none());
+
+        let project = fixture
+            .workspace
+            .read_with(cx, |workspace, _| workspace.project().clone());
+        let store = default_store_dir();
+        cx.update(|_, cx| set_scratches(cx, ZenithScratchesSettingsContent::default()));
+        let open = project.update(cx, |project, cx| {
+            project.find_or_create_worktree(&store, false, cx)
+        });
+        project.update(cx, |project, cx| project.shared(1, cx).unwrap());
+        open.await.unwrap();
+        cx.run_until_parked();
+        let paths = project.read_with(cx, |project, cx| {
+            project
+                .worktrees(cx)
+                .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(paths, [PathBuf::from("/proj")], "the store is not shared");
+    }
+
+    /// A tab holding the old store worktree keeps it alive; it must still leave the project.
+    #[gpui::test]
+    async fn moving_the_store_removes_the_old_worktree_even_when_held(cx: &mut TestAppContext) {
+        let (fixture, cx) = fixture_with(cx, &["/proj"], None).await;
+        cx.run_until_parked();
+        let held = fixture
+            .workspace
+            .read_with(cx, |workspace, cx| {
+                store_worktree(workspace.project().read(cx), cx)
+            })
+            .expect("the store is open");
+        fixture
+            .fs
+            .create_dir(Path::new("/elsewhere"))
+            .await
+            .unwrap();
+        set_directory("/elsewhere", cx);
+        let paths = fixture.workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .project()
+                .read(cx)
+                .worktrees(cx)
+                .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(
+            paths,
+            [PathBuf::from("/proj"), PathBuf::from("/elsewhere")],
+            "only the new store is open"
+        );
+        drop(held);
+    }
+
+    /// A collab share sends invisible worktrees to guests: the store is let go while shared.
+    #[gpui::test]
+    async fn sharing_the_project_releases_the_store(cx: &mut TestAppContext) {
+        let (fixture, cx) = fixture_with(cx, &["/proj"], None).await;
+        cx.run_until_parked();
+        assert!(store_worktree_of(&fixture, cx).is_some());
+
+        let project = fixture
+            .workspace
+            .read_with(cx, |workspace, _| workspace.project().clone());
+        project.update(cx, |project, cx| project.shared(1, cx).unwrap());
+        cx.run_until_parked();
+        let shared = project.read_with(cx, |project, cx| {
+            project
+                .worktrees(cx)
+                .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(shared, [PathBuf::from("/proj")], "the store is not shared");
+        assert!(
+            fixture
+                .panel
+                .read_with(cx, |panel, _| panel.store_worktree.is_none())
+        );
+
+        project.update(cx, |project, cx| project.unshare(cx).unwrap());
+        cx.run_until_parked();
+        assert!(store_worktree_of(&fixture, cx).is_some());
     }
 }

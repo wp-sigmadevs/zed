@@ -13,6 +13,14 @@ impl ProjectPanel {
 
     pub(super) fn zenith_scratch_rows(&mut self, _cx: &mut Context<Self>) {}
 
+    pub(super) fn zenith_scratch_refuses_new_entry(
+        &self,
+        _worktree_id: WorktreeId,
+        _cx: &App,
+    ) -> bool {
+        false
+    }
+
     pub(super) fn zenith_scratch_decorate(
         &self,
         _entry: &Entry,
