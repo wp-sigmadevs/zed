@@ -98,20 +98,22 @@ pub fn load_password(
 }
 
 /// Deleting nothing is a success (an SFTP server or one without a stored password): the
-/// Keychain reports a missing item as an error, so look first.
+/// Keychain reports a missing item as an error, so look first. Resolves to whether an entry
+/// was actually removed.
 pub fn delete_password(
     keychain: &Arc<dyn Keychain>,
     server_id: &str,
     cx: &App,
-) -> Task<Result<()>> {
+) -> Task<Result<bool>> {
     let key = keychain_key(server_id);
     let read = keychain.read(&key, cx);
     let keychain = keychain.clone();
     cx.spawn(async move |cx| {
         if read.await?.is_none() {
-            return Ok(());
+            return Ok(false);
         }
-        cx.update(|cx| keychain.delete(&key, cx)).await
+        cx.update(|cx| keychain.delete(&key, cx)).await?;
+        Ok(true)
     })
 }
 
@@ -123,11 +125,14 @@ pub(crate) mod fake {
 
     use super::*;
 
-    /// An in-memory Keychain whose deletes can be made to fail.
+    /// An in-memory Keychain whose writes and deletes can be made to fail.
     #[derive(Default)]
     pub struct FakeKeychain {
         pub entries: Mutex<HashMap<String, (String, Vec<u8>)>>,
         pub fail_delete: Mutex<bool>,
+        pub fail_write: Mutex<bool>,
+        /// Keys whose delete fails while other deletes work.
+        pub failing_delete_keys: Mutex<Vec<String>>,
     }
 
     impl FakeKeychain {
@@ -136,6 +141,13 @@ pub(crate) mod fake {
                 keychain_key(&server.id),
                 (target_account(server), secret.as_bytes().to_vec()),
             );
+        }
+
+        pub fn fail_delete_of(&self, server: &ServerConfig) {
+            self.failing_delete_keys
+                .lock()
+                .expect("lock")
+                .push(keychain_key(&server.id));
         }
 
         pub fn account_of(&self, server: &ServerConfig) -> Option<String> {
@@ -153,6 +165,9 @@ pub(crate) mod fake {
         }
 
         fn write(&self, key: &str, account: &str, secret: &[u8], _: &App) -> Task<Result<()>> {
+            if *self.fail_write.lock().expect("lock") {
+                return Task::ready(Err(anyhow!("the Keychain is locked")));
+            }
             self.entries
                 .lock()
                 .expect("lock")
@@ -161,7 +176,13 @@ pub(crate) mod fake {
         }
 
         fn delete(&self, key: &str, _: &App) -> Task<Result<()>> {
-            if *self.fail_delete.lock().expect("lock") {
+            let failing_key = self
+                .failing_delete_keys
+                .lock()
+                .expect("lock")
+                .iter()
+                .any(|failing| failing == key);
+            if *self.fail_delete.lock().expect("lock") || failing_key {
                 return Task::ready(Err(anyhow!("the user denied the Keychain prompt")));
             }
             let removed = self.entries.lock().expect("lock").remove(key);

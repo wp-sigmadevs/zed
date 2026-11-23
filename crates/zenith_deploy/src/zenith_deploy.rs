@@ -193,12 +193,40 @@ impl ServerStore {
             .map(String::as_str)
     }
 
-    /// Replaces every server and writes servers.json (0600, atomically) off the main thread.
-    fn save(&mut self, servers: Servers, cx: &mut Context<Self>) -> Task<Result<()>> {
+    /// Writes servers.json (0600, atomically) off the main thread, and only when that worked
+    /// replaces every server and applies the session password changes: a failed write changes
+    /// nothing here.
+    fn save(
+        &mut self,
+        servers: Servers,
+        session_changes: Vec<(ServerConfig, Option<Password>)>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
         if let Some(error) = &self.load_error {
             return Task::ready(Err(anyhow!(
                 "the saved servers could not be read, so they are not overwritten: {error}"
             )));
+        }
+        let Some(path) = self.path.clone() else {
+            self.apply(servers, session_changes, cx);
+            return Task::ready(Ok(()));
+        };
+        let to_write = servers.clone();
+        cx.spawn(async move |this, cx| {
+            cx.background_spawn(async move { to_write.save(&path) })
+                .await?;
+            this.update(cx, |this, cx| this.apply(servers, session_changes, cx))
+        })
+    }
+
+    fn apply(
+        &mut self,
+        servers: Servers,
+        session_changes: Vec<(ServerConfig, Option<Password>)>,
+        cx: &mut Context<Self>,
+    ) {
+        for (server, password) in session_changes {
+            self.set_session_password(&server, password);
         }
         let kept: std::collections::HashSet<_> =
             servers.servers.iter().map(|server| &server.id).collect();
@@ -208,12 +236,8 @@ impl ServerStore {
                 self.clear_cache(&server.id, cx);
             }
         }
-        self.servers = servers.clone();
+        self.servers = servers;
         cx.notify();
-        let Some(path) = self.path.clone() else {
-            return Task::ready(Ok(()));
-        };
-        cx.background_spawn(async move { servers.save(&path) })
     }
 
     /// Deletes the cached copies of a server's remote files (maybe `wp-config.php`) off the
