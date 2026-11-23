@@ -25,7 +25,10 @@ pub(crate) fn init(cx: &mut App) {
             let project = workspace.project().clone();
             let interpreters = php_config::list_interpreters(cx);
             workspace.toggle_modal(window, cx, |window, cx| {
-                PhpModal::new(project, interpreters, window, cx)
+                // Launched from "Configure PHP Include Paths…": land on that tab.
+                let mut modal = PhpModal::new(project, interpreters, window, cx);
+                modal.tab = PhpTab::IncludePath;
+                modal
             });
         });
     })
@@ -58,6 +61,9 @@ pub struct PhpModal {
     /// `None` while the interpreters are being probed.
     interpreters: Option<Vec<PhpInterpreter>>,
     level: Option<String>,
+    /// The level in the file as far as we know: what a failed write goes back to, however many
+    /// writes were started (a newer write drops the older task).
+    saved_level: Option<String>,
     project_include: Option<Vec<String>>,
     packages: Vec<String>,
     error: Option<SharedString>,
@@ -98,6 +104,7 @@ impl PhpModal {
                 this.update(cx, |this, cx| {
                     match config {
                         Ok(config) => {
+                            this.saved_level = config.version.clone();
                             this.level = config.version;
                             this.project_include = config.include;
                         }
@@ -122,6 +129,7 @@ impl PhpModal {
             tab: PhpTab::Php,
             interpreters: None,
             level: None,
+            saved_level: None,
             project_include: None,
             packages: Vec::new(),
             error: None,
@@ -142,7 +150,7 @@ impl PhpModal {
         let Some(root) = self.root.clone() else {
             return;
         };
-        let previous = std::mem::replace(&mut self.level, level.clone());
+        self.level = level.clone();
         let fs = self.project.read(cx).fs().clone();
         self._write = cx.spawn(async move |this, cx| {
             let result =
@@ -150,11 +158,12 @@ impl PhpModal {
             this.update(cx, |this, cx| {
                 match result {
                     Ok(()) => {
+                        this.saved_level = level;
                         this.error = None;
                         php_config::restart_phpantom(&this.project, cx);
                     }
                     Err(error) => {
-                        this.level = previous;
+                        this.level = this.saved_level.clone();
                         this.error = Some(error.to_string().into());
                     }
                 }
@@ -498,7 +507,7 @@ mod tests {
         (Fixture { workspace, fs }, cx)
     }
 
-    /// Opens the modal with a fixed interpreter list (the action probes the real machine).
+    /// Opens the modal with a fixed interpreter list (the action would probe the real machine).
     fn open(
         fixture: &Fixture,
         interpreters: Vec<PhpInterpreter>,
@@ -525,8 +534,8 @@ mod tests {
     #[gpui::test]
     async fn test_action_opens_modal_with_only_the_built_tabs(cx: &mut TestAppContext) {
         let (fixture, cx) = setup(cx, json!({ "composer.json": "{}" })).await;
-        // The action probes the PHPs on this machine; that runs on a real thread.
-        cx.executor().allow_parking();
+        // No candidates: the action must not run the `php` of the machine the tests run on.
+        php_config::TEST_CANDIDATES.with(|candidates| *candidates.borrow_mut() = Some(Vec::new()));
         cx.dispatch_action(ConfigurePhpIncludePaths);
         cx.run_until_parked();
         let modal = fixture
@@ -534,22 +543,26 @@ mod tests {
             .read_with(cx, |workspace, cx| workspace.active_modal::<PhpModal>(cx));
         assert!(modal.is_some(), "the action opens the PHP modal");
 
-        assert_eq!(
-            TABS.map(|(_, label, _)| label),
-            ["PHP", "Include Path"],
-            "PHP Runtime, Analysis and Composer Files stay hidden until built"
-        );
-        for (id, _, _) in TABS {
-            assert!(cx.debug_bounds(id).is_some(), "{id} is shown");
-        }
-        assert!(cx.debug_bounds("zenith-php-level-row").is_some());
-        assert!(cx.debug_bounds("zenith-php-include-header").is_none());
-
-        let tab = cx.debug_bounds("zenith-php-tab-include").unwrap();
-        cx.simulate_click(tab.center(), Modifiers::none());
-        cx.run_until_parked();
+        // Opened from "Configure PHP Include Paths…": on the Include Path tab.
         assert!(cx.debug_bounds("zenith-php-include-header").is_some());
         assert!(cx.debug_bounds("zenith-php-level-row").is_none());
+        // The built tabs only; PHP Runtime, Analysis and Composer Files wait for M3.
+        for id in ["zenith-php-tab-php", "zenith-php-tab-include"] {
+            assert!(cx.debug_bounds(id).is_some(), "{id} is shown");
+        }
+        for id in [
+            "zenith-php-tab-runtime",
+            "zenith-php-tab-analysis",
+            "zenith-php-tab-composer",
+        ] {
+            assert!(cx.debug_bounds(id).is_none(), "{id} is not built");
+        }
+
+        let tab = cx.debug_bounds("zenith-php-tab-php").unwrap();
+        cx.simulate_click(tab.center(), Modifiers::none());
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("zenith-php-level-row").is_some());
+        assert!(cx.debug_bounds("zenith-php-include-header").is_none());
 
         cx.dispatch_action(menu::Cancel);
         cx.run_until_parked();
@@ -599,17 +612,31 @@ mod tests {
             "[indexing]\nexclude = [\"build\"]\n"
         );
 
-        // An unparsable file is left alone; the old level stays and the error shows.
+        // An unparsable file is left alone; the old level comes back and the error shows.
+        modal.update(cx, |modal, cx| {
+            modal.set_language_level(Some("8.2".into()), cx)
+        });
+        cx.run_until_parked();
         fixture.fs.insert_file(file, b"not = [toml".to_vec()).await;
         modal.update(cx, |modal, cx| {
             modal.set_language_level(Some("8.3".into()), cx)
         });
         cx.run_until_parked();
         modal.read_with(cx, |modal, _| {
-            assert_eq!(modal.level, None);
+            assert_eq!(modal.level.as_deref(), Some("8.2"));
             assert!(modal.error.is_some());
         });
         assert_eq!(fixture.fs.load(file).await.unwrap(), "not = [toml");
+
+        // A write that replaces a pending one still goes back to the level on disk.
+        modal.update(cx, |modal, cx| {
+            modal.set_language_level(Some("8.4".into()), cx);
+            modal.set_language_level(Some("8.5".into()), cx);
+        });
+        cx.run_until_parked();
+        modal.read_with(cx, |modal, _| {
+            assert_eq!(modal.level.as_deref(), Some("8.2"), "not the cancelled 8.4")
+        });
     }
 
     #[gpui::test]
@@ -628,10 +655,17 @@ mod tests {
             text.contains("\"php_binary\": \"/opt/php84/bin/php\""),
             "{text}"
         );
-        assert!(
-            !fixture.fs.is_file(Path::new("/p/.zed/settings.json")).await
-                && !fixture.fs.is_dir(Path::new("/p/.zed")).await,
-            "nothing is written into the project"
+        let local = Path::new("/p").join(paths::local_settings_file_relative_path().as_std_path());
+        assert!(!fixture.fs.is_file(&local).await, "{local:?}");
+        assert_eq!(
+            fixture
+                .fs
+                .paths(false)
+                .into_iter()
+                .filter(|path| path.starts_with("/p"))
+                .collect::<Vec<_>>(),
+            [Path::new("/p"), Path::new("/p/composer.json")],
+            "nothing is created in the project"
         );
 
         modal.update(cx, |modal, cx| modal.set_interpreter(None, cx));

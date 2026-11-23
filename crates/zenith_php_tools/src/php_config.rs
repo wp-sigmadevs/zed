@@ -111,7 +111,21 @@ async fn probe_all<F: Future<Output = Option<String>>>(
 /// and the `PATH` (the same list the tools use). Runs on the background executor.
 pub fn list_interpreters(cx: &App) -> Task<Vec<PhpInterpreter>> {
     let executor = cx.background_executor().clone();
-    cx.background_spawn(async move { probe_interpreters(&executor, &crate::environment().0).await })
+    #[cfg(test)]
+    let test_candidates = TEST_CANDIDATES.with(|candidates| candidates.borrow().clone());
+    cx.background_spawn(async move {
+        #[cfg(test)]
+        if let Some(candidates) = test_candidates {
+            return probe_interpreters(&executor, &candidates).await;
+        }
+        probe_interpreters(&executor, &crate::environment().0).await
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Replaces the machine's candidates in [`list_interpreters`] (per test thread).
+    pub(crate) static TEST_CANDIDATES: std::cell::RefCell<Option<Vec<PathBuf>>> = Default::default();
 }
 
 /// `binary` first in `candidates`, when it is absolute and executable; otherwise unchanged.
