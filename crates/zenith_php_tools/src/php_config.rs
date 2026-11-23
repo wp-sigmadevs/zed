@@ -7,7 +7,9 @@
 //! the key is `[php] version` (a string such as `"8.3"`) and `[indexing] include` (an array
 //! of strings); the project file and the global one are merged by `merge_toml`: tables merge
 //! key by key, every other value (scalars and arrays) from the project replaces the global one.
-//! So a project `include` array replaces Zenith's whole library list.
+//! So a project `include` array replaces Zenith's whole library list. Checked against the
+//! `b759b41da6` binary with `phpantom_lsp analyze` (2026-11-23): a project file with only
+//! `[php] version` keeps the global `include`; one with `include = [..]` or `[]` drops it.
 
 use futures::{StreamExt as _, future::join_all};
 use gpui::{App, AppContext as _, Entity, Task};
