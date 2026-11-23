@@ -3,6 +3,7 @@
 //! downloads or runs a tool.
 
 pub mod php_config;
+mod php_modal;
 mod phpantom;
 mod string_completions;
 
@@ -554,6 +555,7 @@ actions!(
 
 pub fn init(cx: &mut App) {
     php_config::init(cx);
+    php_modal::init(cx);
     cx.observe_new(|workspace: &mut Workspace, window, cx| {
         let Some(window) = window else { return };
         let project = workspace.project().clone();
