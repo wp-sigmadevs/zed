@@ -1109,10 +1109,6 @@ mod tests {
         }
     }
 
-    mod zenith_scratches {
-        gpui::actions!(zenith_scratches, [NewScratchFile]);
-    }
-
     #[gpui::test]
     async fn test_new_scratch_file_row_dispatches_the_scratches_action(cx: &mut TestAppContext) {
         let (setup, cx) = setup_with(cx, false).await;

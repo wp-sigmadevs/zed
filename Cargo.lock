@@ -23574,6 +23574,7 @@ dependencies = [
  "ui",
  "util",
  "workspace",
+ "zenith_scratches",
 ]
 
 [[package]]
