@@ -263,12 +263,18 @@ fn mask_secret_pairs(pairs: &str) -> Option<String> {
 
 /// `url` without its `user:password@` part, or `None` when it has none.
 ///
-/// A URL that parses is rebuilt from the parsed form, so every spelling the client accepts
-/// (`https:/u:p@h`, `https:u:p@h`, extra slashes, backslashes) loses its userinfo. A template that
-/// does not parse (`{{scheme}}://u:p@h`) is cut by hand: any run of `/` and `\` after the
-/// scheme's colon, then an authority ending at `/`, `\`, `?` or `#`.
+/// A template (`{{var}}`) is cut by hand, so its variables keep their spelling. Any other URL
+/// that parses is rebuilt from the parsed form, so every spelling the client accepts
+/// (`https:/u:p@h`, `https:u:p@h`, extra slashes, backslashes) loses its userinfo.
 fn strip_url_userinfo(url: &str) -> Option<String> {
     let url = url.trim_start();
+    // A template keeps its `{{var}}` spelling: `Url` would percent-encode path variables and
+    // lowercase host ones, so they would no longer resolve. Parsing is the fallback.
+    if url.contains("{{")
+        && let Some(stripped) = cut_url_userinfo(url)
+    {
+        return Some(stripped);
+    }
     if let Ok(mut parsed) = Url::parse(url.trim_end()) {
         if parsed.username().is_empty() && parsed.password().is_none() {
             return None;
@@ -278,6 +284,12 @@ fn strip_url_userinfo(url: &str) -> Option<String> {
             return Some(parsed.into());
         }
     }
+    cut_url_userinfo(url)
+}
+
+/// The cut by hand behind [`strip_url_userinfo`]: scheme up to the first `:`, any run of `/`
+/// and `\`, then an authority ending at `/`, `\`, `?` or `#`.
+fn cut_url_userinfo(url: &str) -> Option<String> {
     let (scheme, rest) = url.split_once(':')?;
     // The scheme may be a template (`{{scheme}}`), but a `:` further in, after a path or a
     // query, is not the URL's own.
@@ -991,6 +1003,12 @@ mod tests {
         );
         assert_eq!(strip_url_userinfo("https://a.test/p?email=a@b.test"), None);
         assert_eq!(strip_url_userinfo("{{base}}/p"), None);
+        // Variables keep their spelling: no percent-encoding, no lowercasing.
+        assert_eq!(
+            strip_url_userinfo("https://ann:not-a-real-value-30@{{apiHost}}/users/{{userId}}")
+                .as_deref(),
+            Some("https://{{apiHost}}/users/{{userId}}")
+        );
         // A scheme-less templated URL with a `://` and an `@` in its query stays as sent.
         assert_eq!(
             strip_url_userinfo("{{base}}/p?next=https://a.test/x&mail=a@b.test"),

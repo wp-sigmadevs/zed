@@ -81,8 +81,9 @@ pub async fn probe_interpreters(
     .await
 }
 
-/// The second, longer wait for the status bar: the first `php -v` after an install or a reboot
-/// can take longer than [`PROBE_TIMEOUT`] (Gatekeeper scans the binary).
+/// The second, longer wait `find_php` gives every candidate when none answered: the first
+/// `php -v` after an install or a reboot can take longer than [`PROBE_TIMEOUT`] (Gatekeeper
+/// scans the binary).
 pub(crate) const SLOW_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// `probe`'s answer, or `None` when it has not finished after `timeout`. The probe is
