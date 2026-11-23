@@ -74,12 +74,12 @@ impl SftpTransport {
         let status = child.status().await?;
         let stderr = String::from_utf8_lossy(&stderr);
         if !status.success() {
-            return Err(self.failure(&stderr));
+            return Err(self.failure(status.code(), &stderr));
         }
         Ok(String::from_utf8_lossy(&stdout).into_owned())
     }
 
-    fn failure(&self, stderr: &str) -> anyhow::Error {
+    fn failure(&self, exit_code: Option<i32>, stderr: &str) -> anyhow::Error {
         if stderr.contains("REMOTE HOST IDENTIFICATION HAS CHANGED") {
             return anyhow!(
                 "the host key of {} changed; check ~/.ssh/known_hosts before connecting",
@@ -93,9 +93,20 @@ impl SftpTransport {
             );
         }
         let detail: String = stderr.trim().chars().take(500).collect();
-        // Each operation is its own process, so a refusal never leaves a session half-used.
-        anyhow::Error::new(ServerRefused(format!("sftp failed: {detail}")))
+        if is_server_refusal(exit_code, &detail) {
+            // Each operation is its own process, so a refusal never leaves a session half-used.
+            anyhow::Error::new(ServerRefused(format!("sftp failed: {detail}")))
+        } else {
+            // ssh itself failed (refused, unreachable, auth): not "the server answered".
+            anyhow!("sftp could not connect: {detail}")
+        }
     }
+}
+
+/// `sftp` exits 1 when a command it sent failed (the server answered and said no) and 255 when
+/// the ssh connection itself failed; authentication failures also print `Permission denied (`.
+fn is_server_refusal(exit_code: Option<i32>, stderr: &str) -> bool {
+    exit_code == Some(1) && !stderr.contains("Permission denied (")
 }
 
 async fn read_capped(stream: impl AsyncRead + Unpin) -> Result<Vec<u8>> {
@@ -595,6 +606,23 @@ drwxr-xr-x    ? u   g          64 Nov 22 23:48 /www/sub
             "{} outlived the operation",
             working_directory.display()
         );
+    }
+
+    #[test]
+    fn only_a_failed_remote_command_counts_as_a_server_refusal() {
+        assert!(is_server_refusal(
+            Some(1),
+            "remote readdir(\"/x\"): Permission denied"
+        ));
+        assert!(!is_server_refusal(
+            Some(255),
+            "ssh: connect: Connection refused"
+        ));
+        assert!(!is_server_refusal(
+            Some(1),
+            "u@h: Permission denied (publickey)."
+        ));
+        assert!(!is_server_refusal(None, "killed by a signal"));
     }
 
     #[cfg(unix)]

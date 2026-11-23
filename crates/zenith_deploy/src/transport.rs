@@ -137,8 +137,15 @@ pub async fn download_entry(
     let remote_path = join_remote(remote_directory, &entry.name)?;
     let local_path = join_local(local_directory, &entry.name)?;
     // Dropped (removed, partial file included) on error or when the task is cancelled mid-transfer.
-    let part_directory = tempfile::Builder::new()
-        .prefix(".zenith-part-")
+    let mut part_builder = tempfile::Builder::new();
+    part_builder.prefix(".zenith-part-");
+    // Owner-only: the half-written file of a private remote must not be listable by other users.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        part_builder.permissions(std::fs::Permissions::from_mode(0o700));
+    }
+    let part_directory = part_builder
         .tempdir_in(local_directory)
         .context("creating a directory for the partial download")?;
     let part_path = join_local(part_directory.path(), &entry.name)?;
@@ -167,6 +174,8 @@ pub(crate) mod tests {
         pub downloads: Vec<String>,
         /// Writes the partial file, then never finishes (a stalled transfer).
         pub stall: bool,
+        /// Unix mode of the folder holding the partial file, seen while downloading.
+        pub part_directory_mode: Option<u32>,
     }
 
     #[async_trait]
@@ -179,6 +188,13 @@ pub(crate) mod tests {
         }
         async fn download_file(&mut self, remote_path: &str, local_path: &Path) -> Result<()> {
             self.downloads.push(remote_path.to_string());
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                self.part_directory_mode = std::fs::metadata(local_path.parent().expect("parent"))
+                    .ok()
+                    .map(|metadata| metadata.permissions().mode() & 0o777);
+            }
             smol::fs::write(local_path, b"abc").await?;
             if self.stall {
                 futures::future::pending::<()>().await;
@@ -213,6 +229,21 @@ pub(crate) mod tests {
                     .is_none()
             );
         });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_partial_download_folder_is_owner_only() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let mut transport = FakeTransport::default();
+        smol::block_on(download_entry(
+            &mut transport,
+            "/www",
+            &entry("index.php", EntryKind::File),
+            directory.path(),
+        ))
+        .expect("download");
+        assert_eq!(transport.part_directory_mode, Some(0o700));
     }
 
     #[test]

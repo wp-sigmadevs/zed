@@ -72,8 +72,10 @@ pub struct ServerStore {
     loaded: bool,
     /// A damaged servers.json is never overwritten: saving stays off until the user fixes it.
     load_error: Option<String>,
-    /// Passwords of servers with "Save password" off: memory only, gone on quit.
-    session_passwords: HashMap<String, Password>,
+    /// Passwords of servers with "Save password" off: memory only, gone on quit. Each is kept
+    /// with the target account it was typed for and only used for that target.
+    session_passwords: HashMap<String, (String, Password)>,
+    keychain: Arc<dyn secrets::Keychain>,
     connect: ConnectFn,
     _load: Task<()>,
 }
@@ -81,6 +83,26 @@ pub struct ServerStore {
 struct GlobalServerStore(Entity<ServerStore>);
 
 impl Global for GlobalServerStore {}
+
+/// Runs `remove` up to three times, 100 ms apart, while it fails for a transient reason (a
+/// cancelled download that is still creating files makes `remove_dir_all` fail with
+/// "directory not empty"). Other errors, such as a permission error, are returned at once.
+/// Known gap: a download started again within these ~200 ms (reconnect) can still recreate
+/// files after the last attempt; the next Disconnect removes them.
+fn remove_with_retry(mut remove: impl FnMut() -> std::io::Result<()>) -> std::io::Result<()> {
+    use std::io::ErrorKind::{DirectoryNotEmpty, ResourceBusy};
+    let mut result = remove();
+    for _ in 0..2 {
+        match &result {
+            Err(error) if matches!(error.kind(), DirectoryNotEmpty | ResourceBusy) => {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                result = remove();
+            }
+            _ => break,
+        }
+    }
+    result
+}
 
 impl ServerStore {
     pub fn global(cx: &App) -> Entity<Self> {
@@ -112,6 +134,7 @@ impl ServerStore {
             loaded: false,
             load_error: None,
             session_passwords: HashMap::new(),
+            keychain: Arc::new(secrets::SystemKeychain),
             connect: Arc::new(|server| Box::pin(async move { connect(&server).await })),
             _load: load,
         }
@@ -126,6 +149,7 @@ impl ServerStore {
             loaded: true,
             load_error: None,
             session_passwords: HashMap::new(),
+            keychain: Arc::new(secrets::SystemKeychain),
             connect,
             _load: Task::ready(()),
         }
@@ -193,14 +217,17 @@ impl ServerStore {
     }
 
     /// Deletes the cached copies of a server's remote files (maybe `wp-config.php`) off the
-    /// main thread.
+    /// main thread. Cancelled downloads only stop at their next await, so one can still be
+    /// writing here: the removal is retried (see [`remove_with_retry`]).
+    /// The cache is shared by every window: Disconnect in one window also deletes the files
+    /// another window has open.
     pub(crate) fn clear_cache(&self, server_id: &str, cx: &App) {
         if remote_path::validate_name(server_id).is_err() {
             return;
         }
         let directory = self.cache_dir.join(server_id);
         cx.background_spawn(async move {
-            match std::fs::remove_dir_all(&directory) {
+            match remove_with_retry(|| std::fs::remove_dir_all(&directory)) {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => log::warn!("deploy: removing {}: {error}", directory.display()),
@@ -209,33 +236,49 @@ impl ServerStore {
         .detach();
     }
 
-    fn set_session_password(&mut self, server_id: &str, password: Option<Password>) {
+    /// Remembers (or forgets) the typed password of `server` for its current target only.
+    fn set_session_password(&mut self, server: &ServerConfig, password: Option<Password>) {
         match password {
             Some(password) => {
-                self.session_passwords
-                    .insert(server_id.to_string(), password);
+                self.session_passwords.insert(
+                    server.id.clone(),
+                    (secrets::target_account(server), password),
+                );
             }
             None => {
-                self.session_passwords.remove(server_id);
+                self.session_passwords.remove(&server.id);
             }
         }
+    }
+
+    /// The session password, only when it was typed for `server`'s target as it is now.
+    fn session_password_for(&self, server: &ServerConfig) -> Option<Password> {
+        self.session_passwords
+            .get(&server.id)
+            .filter(|(account, _)| *account == secrets::target_account(server))
+            .map(|(_, password)| password.clone())
     }
 
     /// The password to log in with: none for anonymous FTP and SFTP (key or agent auth), else
     /// the session copy or the Keychain entry.
     fn password_for(&self, server: &ServerConfig, cx: &App) -> Task<Result<Option<Password>>> {
-        if server.anonymous || server.server_type == ServerType::Sftp {
+        if !server.uses_password() {
             return Task::ready(Ok(None));
         }
-        if let Some(password) = self.session_passwords.get(&server.id) {
-            return Task::ready(Ok(Some(password.clone())));
+        if let Some(password) = self.session_password_for(server) {
+            return Task::ready(Ok(Some(password)));
         }
-        let load = secrets::load_password(&server.id, cx);
+        let load = secrets::load_password(self.keychain.as_ref(), server, cx);
         let name = server.name.clone();
         cx.background_spawn(async move {
             match load.await? {
-                Some(password) => Ok(Some(Password(password))),
-                None => bail!("no password is stored for {name}; enter it in Deployment settings"),
+                secrets::Lookup::Found(password) => Ok(Some(Password(password))),
+                secrets::Lookup::Missing => {
+                    bail!("no password is stored for {name}; enter it in Deployment settings")
+                }
+                secrets::Lookup::OtherTarget => bail!(
+                    "the password stored for {name} belongs to another host, port, type or username, or was saved by an older version; enter it again in Deployment settings (a one-time step)"
+                ),
             }
         })
     }
@@ -291,6 +334,8 @@ pub(crate) mod test_support {
         pub fail_connect: bool,
         /// Folders whose listing fails like a dead connection, not a refusal.
         pub broken: Vec<String>,
+        /// Folders that refuse the listing (like a 550) even though the tree has them.
+        pub refusing: Arc<Mutex<Vec<String>>>,
     }
 
     impl FakeRemote {
@@ -349,6 +394,13 @@ pub(crate) mod test_support {
         }
         async fn list_dir(&mut self, path: &str) -> Result<Vec<RemoteEntry>> {
             self.push(format!("list {path}"));
+            if self
+                .refusing
+                .lock()
+                .is_ok_and(|refusing| refusing.iter().any(|refused| refused == path))
+            {
+                return Err(anyhow::Error::new(ServerRefused(format!("550 {path}"))));
+            }
             self.tree.get(path).cloned().ok_or_else(|| {
                 if self.broken.iter().any(|broken| broken == path) {
                     anyhow!("connection reset by peer")
@@ -420,6 +472,34 @@ pub(crate) mod test_support {
 mod tests {
     use super::*;
     use gpui::{BorrowAppContext as _, TestAppContext};
+
+    #[test]
+    fn removing_the_cache_is_retried_while_a_cancelled_download_still_writes() {
+        let mut calls = 0;
+        let result = remove_with_retry(|| {
+            calls += 1;
+            if calls == 1 {
+                Err(std::io::ErrorKind::DirectoryNotEmpty.into())
+            } else {
+                Ok(())
+            }
+        });
+        assert!(result.is_ok());
+        assert_eq!(calls, 2);
+
+        for kind in [
+            std::io::ErrorKind::NotFound,
+            std::io::ErrorKind::PermissionDenied,
+        ] {
+            let mut calls = 0;
+            let result = remove_with_retry(|| {
+                calls += 1;
+                Err(kind.into())
+            });
+            assert!(result.is_err());
+            assert_eq!(calls, 1, "{kind:?} is not transient");
+        }
+    }
     use settings::{SettingsStore, ZenithDeploySettingsContent, ZenithSettingsContent};
 
     #[gpui::test]
@@ -497,8 +577,27 @@ mod tests {
         let ftp_code: String = include_str!("ftp.rs")
             .lines()
             .filter(|line| !line.trim_start().starts_with("//"))
-            .collect();
-        assert!(ftp_code.contains("http_client_tls::tls_config()"));
+            .collect::<Vec<_>>()
+            .join("\n");
+        let ftps_branch = ftp_code
+            .split("ServerType::Ftps =>")
+            .nth(1)
+            .and_then(|rest| rest.split("ServerType::Sftp").next())
+            .expect("the FTPS branch of connect_with_logger");
+        assert!(ftps_branch.contains("tls_connector()"), "{ftps_branch}");
+        assert!(
+            ftps_branch.contains("into_secure(connector"),
+            "{ftps_branch}"
+        );
+        let connector_body = ftp_code
+            .split("fn tls_connector()")
+            .nth(1)
+            .and_then(|rest| rest.split("\nasync fn open").next())
+            .expect("tls_connector");
+        assert!(
+            connector_body.contains("http_client_tls::tls_config()"),
+            "{connector_body}"
+        );
     }
 
     /// Run with `ZENITH_DEPLOY_SELF_SIGNED_FTPS=host:port cargo test -p zenith_deploy -- --ignored`
