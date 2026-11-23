@@ -1896,4 +1896,28 @@ mod tests {
         cx.run_until_parked();
         assert!(store_worktree_of(&fixture, cx).is_some());
     }
+
+    /// In a collab guest project an invisible worktree at the local store path is the host's,
+    /// not ours: syncing must leave it alone.
+    #[gpui::test]
+    async fn a_non_local_project_keeps_its_worktrees(cx: &mut TestAppContext) {
+        let (fixture, cx) = fixture_with(cx, &["/proj"], None).await;
+        cx.run_until_parked();
+        let project = fixture
+            .workspace
+            .read_with(cx, |workspace, _| workspace.project().clone());
+        assert!(store_worktree_of(&fixture, cx).is_some());
+
+        project.update(cx, |project, _| project.mark_as_collab_for_testing());
+        fixture
+            .panel
+            .update(cx, |panel, cx| panel.sync_store_worktree(cx));
+        cx.run_until_parked();
+        assert!(
+            project.read_with(cx, |project, cx| project
+                .worktrees(cx)
+                .any(|worktree| !worktree.read(cx).is_visible())),
+            "the invisible worktree survives"
+        );
+    }
 }

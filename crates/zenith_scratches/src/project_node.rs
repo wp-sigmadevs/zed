@@ -7,8 +7,11 @@
 //!
 //! Sharing is guarded on the host only, without upstream hooks: the store is let go when the
 //! share starts, so its entries and file contents never reach guests. The share's first
-//! `ShareProject` message is built before that happens, so the store's worktree metadata (id,
-//! root name, absolute path) can reach the server and guests briefly.
+//! `ShareProject` message is built before that happens, and an open still in flight when the
+//! share goes out lands through `WorktreeStore::add` and `send_project_updates`
+//! (`UpdateProject`) before it is removed. Either way only the store's worktree metadata (id,
+//! root name, absolute path) can reach the server and guests briefly, never entries or file
+//! contents.
 //!
 //! A scratch opened from the Scratches panel while shared goes through `open_abs_path` and
 //! becomes an invisible single-file worktree, sent to guests like any file outside the project.
@@ -47,12 +50,16 @@ pub fn store_worktree(project: &Project, cx: &App) -> Option<Entity<Worktree>> {
 
 impl ScratchesPanel {
     /// Opens the store as an invisible worktree of the project, or lets it go when the node is
-    /// off, the project is not local, is shared, or has no visible folder. Safe to call on every
-    /// settings change and worktree or share event.
+    /// off, the project is shared, or has no visible folder. A project that is not local is left
+    /// alone. Safe to call on every settings change and worktree or share event.
     pub(crate) fn sync_store_worktree(&mut self, cx: &mut Context<Self>) {
         let project = self.project.read(cx);
+        // Not ours to touch: in an SSH or collab guest project an invisible worktree at the
+        // local store path is the host's own folder, never the store held here.
+        if !project.is_local() {
+            return;
+        }
         let wanted = node_enabled(cx)
-            && project.is_local()
             && !project.is_shared()
             && project.visible_worktrees(cx).next().is_some();
         if !wanted {
