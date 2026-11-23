@@ -48,6 +48,18 @@ pub struct ZenithSettingsContent {
     pub deploy: Option<ZenithDeploySettingsContent>,
     /// Settings for PHP tools.
     pub php_tools: Option<ZenithPhpToolsSettingsContent>,
+    /// Settings for the navigation bar.
+    pub navbar: Option<ZenithNavbarSettingsContent>,
+}
+
+/// Settings for the navigation bar.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+pub struct ZenithNavbarSettingsContent {
+    /// Whether the navigation bar (project › folder › file › symbol) sits at the left of the
+    /// status bar. Takes effect after a restart.
+    ///
+    /// Default: true
+    pub enabled: Option<bool>,
 }
 
 /// Settings for Deployment. Upload on save is a per-server option, never a setting.

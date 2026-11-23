@@ -3065,6 +3065,11 @@
       "enabled": true,
     },
 
+    // Navigation bar at the left of the status bar (restart to apply).
+    "navbar": {
+      "enabled": true,
+    },
+
     // WordPress Hooks tool window: hooks and listeners of a WordPress project.
     "wordpress": {
       "enabled": true,

@@ -1,9 +1,11 @@
 use std::path::Path;
 
 use editor::Editor;
+use gpui::BorrowAppContext as _;
 use gpui::{Entity, TestAppContext, VisualTestContext};
 use project::Project;
 use serde_json::json;
+use settings::{SettingsStore, ZenithNavbarSettingsContent, ZenithSettingsContent};
 use util::rel_path::RelPath;
 use workspace::{AppState, MultiWorkspace, Workspace};
 
@@ -12,8 +14,25 @@ use crate::{JumpToNavigationBar, NavBar, SelectNextSegment, SelectPreviousSegmen
 async fn setup(
     cx: &mut TestAppContext,
 ) -> (Entity<Project>, Entity<Workspace>, &mut VisualTestContext) {
+    setup_with(cx, true).await
+}
+
+async fn setup_with(
+    cx: &mut TestAppContext,
+    enabled: bool,
+) -> (Entity<Project>, Entity<Workspace>, &mut VisualTestContext) {
     let app_state = cx.update(|cx| {
         let app_state = AppState::test(cx);
+        cx.update_global::<SettingsStore, _>(|store, cx| {
+            store.update_user_settings(cx, |content| {
+                content.zenith = Some(ZenithSettingsContent {
+                    navbar: Some(ZenithNavbarSettingsContent {
+                        enabled: Some(enabled),
+                    }),
+                    ..Default::default()
+                });
+            });
+        });
         editor::init(cx);
         workspace::init(app_state.clone(), cx);
         crate::init(cx);
@@ -137,4 +156,26 @@ async fn test_folder_popup_lists_folders_first_then_files(cx: &mut TestAppContex
     };
     assert_eq!(names(false, cx), ["alpha", "Zeta", "A.txt", "b.txt"]);
     assert_eq!(names(true, cx), ["A.txt", "b.txt"]);
+}
+
+fn has_bar(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> bool {
+    workspace.read_with(cx, |workspace, cx| {
+        workspace
+            .status_bar()
+            .read(cx)
+            .item_of_type::<NavBar>()
+            .is_some()
+    })
+}
+
+#[gpui::test]
+async fn test_navbar_enabled_adds_the_bar(cx: &mut TestAppContext) {
+    let (_, workspace, cx) = setup_with(cx, true).await;
+    assert!(has_bar(&workspace, cx));
+}
+
+#[gpui::test]
+async fn test_navbar_disabled_omits_the_bar(cx: &mut TestAppContext) {
+    let (_, workspace, cx) = setup_with(cx, false).await;
+    assert!(!has_bar(&workspace, cx));
 }
