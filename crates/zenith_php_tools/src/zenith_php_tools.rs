@@ -269,19 +269,13 @@ pub struct PhpInfo {
 }
 
 /// The first candidate whose `php -v` answers within the probe timeout; one that hangs is
-/// dropped (and killed). No retry: [`detect_php`], for the status bar, waits longer once.
+/// dropped (and killed). When none answers, all are tried once more with the longer wait.
 /// Call it from a background task.
 pub async fn find_php(
     executor: &BackgroundExecutor,
     candidates: &[PathBuf],
 ) -> Option<(PathBuf, String)> {
-    find_first(
-        executor,
-        php_config::PROBE_TIMEOUT,
-        candidates,
-        probe_version,
-    )
-    .await
+    find_with_retry(executor, candidates, probe_version).await
 }
 
 async fn probe_version(path: PathBuf) -> Option<String> {
@@ -322,7 +316,7 @@ pub async fn detect_php(
     root: &Path,
     candidates: &[PathBuf],
 ) -> PhpInfo {
-    let found = find_with_retry(executor, candidates, probe_version).await;
+    let found = find_php(executor, candidates).await;
     PhpInfo {
         kind: detect_project(root),
         version: found.as_ref().map(|(_, version)| version.clone()),
