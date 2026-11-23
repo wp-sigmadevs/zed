@@ -299,8 +299,22 @@ pub async fn write_language_level(
     if edited == text {
         return Ok(());
     }
-    // A symlinked file (dotfiles) is written at its target, so the link survives.
-    let target = fs.canonicalize(&path).await.unwrap_or(path);
+    // A symlinked file (dotfiles) is written at its target, so the link survives; a target
+    // outside the project is refused (a cloned repo must not make us write elsewhere). A
+    // dangling link does not canonicalize and is replaced.
+    let target = match fs.canonicalize(&path).await {
+        Ok(target) => {
+            let root = fs.canonicalize(root).await.unwrap_or_else(|_| root.to_path_buf());
+            anyhow::ensure!(
+                target.starts_with(&root),
+                "{} is a link to {}, outside the project; not writing it",
+                path.display(),
+                target.display()
+            );
+            target
+        }
+        Err(_) => path,
+    };
     fs.atomic_write(target, edited).await
 }
 
@@ -472,6 +486,45 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[gpui::test]
+    async fn test_symlink_out_of_the_project_is_not_written(cx: &mut TestAppContext) {
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            "/dot",
+            json!({ "outside.toml": "[indexing]\nexclude = [\"x\"]\n", "inside": {} }),
+        )
+        .await;
+        fs.insert_tree("/p", json!({ "composer.json": "{}", "real.toml": "" }))
+            .await;
+        fs.insert_symlink("/p/.phpantom.toml", PathBuf::from("/dot/outside.toml"))
+            .await;
+        let error = write_language_level(fs.as_ref(), Path::new("/p"), Some("8.3"))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("outside the project"), "{error}");
+        assert_eq!(
+            fs.load(Path::new("/dot/outside.toml")).await.unwrap(),
+            "[indexing]\nexclude = [\"x\"]\n"
+        );
+
+        // A link that stays inside the project is followed and survives.
+        fs.remove_file(Path::new("/p/.phpantom.toml"), Default::default())
+            .await
+            .unwrap();
+        fs.insert_symlink("/p/.phpantom.toml", PathBuf::from("real.toml"))
+            .await;
+        write_language_level(fs.as_ref(), Path::new("/p"), Some("8.3"))
+            .await
+            .unwrap();
+        assert!(
+            fs.load(Path::new("/p/real.toml"))
+                .await
+                .unwrap()
+                .contains("8.3")
+        );
+        assert!(fs.read_link(Path::new("/p/.phpantom.toml")).await.is_ok());
     }
 
     #[gpui::test]
