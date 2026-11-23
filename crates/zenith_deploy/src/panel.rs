@@ -320,7 +320,11 @@ impl RemoteHostPanel {
                         Err(error) => {
                             this.expanded.remove(&path);
                             // A stale listing would be shown again when the folder is re-expanded.
-                            this.children.remove(&path);
+                            // The root has no row to re-expand: keep its listing and show the
+                            // error instead of blanking the tree.
+                            if this.root(cx).as_deref() != Some(path.as_str()) {
+                                this.children.remove(&path);
+                            }
                             this.rebuild_rows(cx);
                             this.fail(error, cx);
                         }
@@ -1024,17 +1028,30 @@ mod tests {
             .panel
             .update(fixture.cx, |panel, cx| panel.disconnect(cx));
         fixture.cx.run_until_parked();
-        for _ in 0..50 {
-            if !cached.exists() {
-                break;
-            }
-            fixture
-                .cx
-                .background_executor
-                .timer(std::time::Duration::from_millis(20))
-                .await;
-        }
         assert!(!cached.exists());
+    }
+
+    #[gpui::test]
+    async fn a_failed_refresh_of_the_root_keeps_the_tree_and_shows_the_error(
+        cx: &mut TestAppContext,
+    ) {
+        let remote = remote();
+        let mut fixture = fixture(&remote, cx).await;
+        let id = fixture.servers[0].id.clone();
+        fixture
+            .panel
+            .update(fixture.cx, |panel, cx| panel.select_server(Some(id), cx));
+        fixture.cx.run_until_parked();
+        remote.refusing.lock().expect("lock").push("/www".into());
+        fixture
+            .panel
+            .update(fixture.cx, |panel, cx| panel.refresh(cx));
+        fixture.cx.run_until_parked();
+        assert!(row_names(&mut fixture).contains(&("index.php".to_string(), 0)));
+        let status = fixture
+            .panel
+            .read_with(fixture.cx, |panel, _| panel.status.clone());
+        assert!(status.is_some_and(|status| status.contains("550")));
     }
 
     #[gpui::test]

@@ -82,13 +82,17 @@ struct GlobalServerStore(Entity<ServerStore>);
 
 impl Global for GlobalServerStore {}
 
-/// Runs `remove` up to three times, 100 ms apart, while it fails (a cancelled download that is
-/// still creating files makes `remove_dir_all` fail with "directory not empty").
+/// Runs `remove` up to three times, 100 ms apart, while it fails for a transient reason (a
+/// cancelled download that is still creating files makes `remove_dir_all` fail with
+/// "directory not empty"). Other errors, such as a permission error, are returned at once.
+/// Known gap: a download started again within these ~200 ms (reconnect) can still recreate
+/// files after the last attempt; the next Disconnect removes them.
 fn remove_with_retry(mut remove: impl FnMut() -> std::io::Result<()>) -> std::io::Result<()> {
+    use std::io::ErrorKind::{DirectoryNotEmpty, ResourceBusy};
     let mut result = remove();
     for _ in 0..2 {
         match &result {
-            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+            Err(error) if matches!(error.kind(), DirectoryNotEmpty | ResourceBusy) => {
                 std::thread::sleep(std::time::Duration::from_millis(100));
                 result = remove();
             }
@@ -243,13 +247,13 @@ impl ServerStore {
     /// The password to log in with: none for anonymous FTP and SFTP (key or agent auth), else
     /// the session copy or the Keychain entry.
     fn password_for(&self, server: &ServerConfig, cx: &App) -> Task<Result<Option<Password>>> {
-        if server.anonymous || server.server_type == ServerType::Sftp {
+        if !server.uses_password() {
             return Task::ready(Ok(None));
         }
         if let Some(password) = self.session_passwords.get(&server.id) {
             return Task::ready(Ok(Some(password.clone())));
         }
-        let load = secrets::load_password(&server.id, cx);
+        let load = secrets::load_password(server, cx);
         let name = server.name.clone();
         cx.background_spawn(async move {
             match load.await? {
@@ -463,13 +467,18 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(calls, 2);
 
-        let mut calls = 0;
-        let result = remove_with_retry(|| {
-            calls += 1;
-            Err(std::io::ErrorKind::NotFound.into())
-        });
-        assert!(result.is_err());
-        assert_eq!(calls, 1, "a missing folder needs no retry");
+        for kind in [
+            std::io::ErrorKind::NotFound,
+            std::io::ErrorKind::PermissionDenied,
+        ] {
+            let mut calls = 0;
+            let result = remove_with_retry(|| {
+                calls += 1;
+                Err(kind.into())
+            });
+            assert!(result.is_err());
+            assert_eq!(calls, 1, "{kind:?} is not transient");
+        }
     }
     use settings::{SettingsStore, ZenithDeploySettingsContent, ZenithSettingsContent};
 

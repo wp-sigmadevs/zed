@@ -140,6 +140,11 @@ impl ServerConfig {
         }
     }
 
+    /// False for anonymous FTP and for SFTP (key or agent auth): no password is stored or sent.
+    pub(crate) fn uses_password(&self) -> bool {
+        !self.anonymous && self.server_type != ServerType::Sftp
+    }
+
     /// True when `new` would send the credentials saved for `self` somewhere else: the
     /// Keychain and session passwords belong to this host, port, type and username only.
     pub(crate) fn credentials_target_changed(&self, new: &Self) -> bool {

@@ -385,7 +385,7 @@ impl DeploymentDialog {
         };
         let typed = self.passwords.get(&server.id).cloned();
         let store = self.store.read(cx);
-        let needs_password = !server.anonymous && server.server_type != ServerType::Sftp;
+        let needs_password = server.uses_password();
         // The stored password belongs to the saved host, port, type and username: never send it
         // to another.
         let saved_target = store
@@ -460,12 +460,7 @@ impl DeploymentDialog {
                 typed.is_none() && old.is_some_and(|old| old.credentials_target_changed(server));
             match typed {
                 Some(password) if saves_password => {
-                    keychain.push(secrets::save_password(
-                        &server.id,
-                        &server.username,
-                        &password,
-                        cx,
-                    ));
+                    keychain.push(secrets::save_password(server, &password, cx));
                     self.store
                         .update(cx, |store, _| store.set_session_password(&server.id, None));
                 }
@@ -477,7 +472,8 @@ impl DeploymentDialog {
             if target_changed {
                 self.store
                     .update(cx, |store, _| store.set_session_password(&server.id, None));
-                cleared_credentials = true;
+                // Only a server that uses a password has anything to tell the user about.
+                cleared_credentials |= server.uses_password();
             }
             if was_saved && (!saves_password || target_changed) {
                 keychain.push(secrets::delete_password(&server.id, cx));
@@ -486,16 +482,28 @@ impl DeploymentDialog {
         for id in &self.removed {
             keychain.push(secrets::delete_password(id, cx));
         }
-        let save = self
-            .store
-            .update(cx, |store, cx| store.save(self.servers.clone(), cx));
+        let servers = self.servers.clone();
         self._save = Some(cx.spawn(async move |this, cx| {
-            let mut result = save.await;
-            for task in keychain {
-                if let Err(error) = task.await {
-                    result = result.and(Err(error.context("updating the Keychain")));
+            // The new target is only saved once the Keychain agrees; a failed delete aborts the
+            // save, so Save can be tried again.
+            let keychain_result = futures::future::join_all(keychain)
+                .await
+                .into_iter()
+                .collect::<anyhow::Result<Vec<()>>>()
+                .map(drop)
+                .map_err(|error| error.context("updating the Keychain"));
+            let result = match keychain_result {
+                Ok(()) => {
+                    let save = this.update(cx, |this, cx| {
+                        this.store.update(cx, |store, cx| store.save(servers, cx))
+                    });
+                    match save {
+                        Ok(save) => save.await,
+                        Err(error) => Err(error),
+                    }
                 }
-            }
+                Err(error) => Err(error),
+            };
             this.update(cx, |this, cx| match result {
                 Ok(()) if cleared_credentials => {
                     this.error = Some(
@@ -1077,8 +1085,36 @@ mod tests {
         cx.run_until_parked();
         assert!(!store.read_with(cx, |store, _| store.session_passwords.contains_key(&id)));
         dialog.read_with(cx, |dialog, _| {
-            assert!(dialog.error.is_some(), "the user is told why");
+            let message = dialog.error.as_ref().map(|error| error.to_string());
+            assert!(
+                message.is_some_and(|message| message.contains("password was removed")),
+                "the user is told why"
+            );
         });
+    }
+
+    #[gpui::test]
+    async fn changing_the_target_of_a_passwordless_server_saves_quietly(cx: &mut TestAppContext) {
+        let mut anonymous = server("Live", None);
+        anonymous.anonymous = true;
+        let servers = Servers {
+            servers: vec![anonymous],
+            ..Servers::default()
+        };
+        let (workspace, dialog, cx) = open_dialog(servers, &FakeRemote::default(), cx).await;
+        dialog.update(cx, |dialog, cx| {
+            dialog.update_selected(cx, |server| server.host = "elsewhere.example.com".into());
+            dialog.save(cx);
+        });
+        cx.run_until_parked();
+        dialog.read_with(cx, |dialog, _| assert!(dialog.error.is_none()));
+        assert!(
+            workspace
+                .read_with(cx, |workspace, cx| workspace
+                    .active_modal::<DeploymentDialog>(cx))
+                .is_none(),
+            "no password was removed, so there is nothing to tell the user"
+        );
     }
 
     #[gpui::test]
@@ -1090,14 +1126,30 @@ mod tests {
             servers: vec![server("Live", None)],
             ..Servers::default()
         };
+        let id = servers.servers[0].id.clone();
         let (_, dialog, cx) = open_dialog(servers, &remote, cx).await;
-        let changes: [fn(&mut ServerConfig); 3] = [
+        let store = cx.update(|_, cx| ServerStore::global(cx));
+        store.update(cx, |store, _| {
+            store.set_session_password(&id, Some(Password(fake_secret())))
+        });
+        let original = dialog.read_with(cx, |dialog, _| dialog.selected_server().cloned().unwrap());
+
+        // Control: the saved target still gets the stored secret.
+        dialog.update(cx, |dialog, cx| dialog.test_connection(cx));
+        cx.run_until_parked();
+        assert_eq!(remote.log().len(), 2, "connect and disconnect");
+        remote.log.lock().expect("lock").clear();
+
+        let changes: [fn(&mut ServerConfig); 4] = [
             |server| server.host = "elsewhere.example.com".into(),
             |server| server.port += 1,
+            |server| server.server_type = ServerType::Ftp,
             |server| server.username = "someone-else".into(),
         ];
         for change in changes {
+            // Each case starts from the saved server: changes must not stack.
             dialog.update(cx, |dialog, cx| {
+                dialog.update_selected(cx, |server| *server = original.clone());
                 dialog.update_selected(cx, change);
                 dialog.test_connection(cx);
             });
@@ -1139,14 +1191,6 @@ mod tests {
             dialog.save(cx);
         });
         cx.run_until_parked();
-        for _ in 0..50 {
-            if !cached.exists() {
-                break;
-            }
-            cx.background_executor
-                .timer(std::time::Duration::from_millis(20))
-                .await;
-        }
         assert!(!cached.exists());
     }
 
