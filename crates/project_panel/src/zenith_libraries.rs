@@ -132,6 +132,21 @@ impl ProjectPanel {
         Some(worktree.read(cx).root_name_str().to_string())
     }
 
+    /// Whether a visible worktree is a PHP project: `composer.json` or a `.php` file at its root,
+    /// the rule of `zenith_php_tools::looks_like_php`, read from the scanned tree.
+    fn zenith_is_php_project(&self, cx: &App) -> bool {
+        self.project.read(cx).visible_worktrees(cx).any(|worktree| {
+            worktree
+                .read(cx)
+                .child_entries(RelPath::empty())
+                .any(|entry| {
+                    entry.is_file()
+                        && (entry.path.as_unix_str() == "composer.json"
+                            || entry.path.extension() == Some("php"))
+                })
+        })
+    }
+
     /// Whether `worktree_id` is a user-added library worktree (read-only, no project root).
     fn zenith_library_worktree(&self, worktree_id: WorktreeId, cx: &App) -> bool {
         is_enabled(cx)
@@ -155,7 +170,7 @@ impl ProjectPanel {
     }
 
     /// Context menu of the "External Libraries" row (a synthetic entry, so the regular menu has
-    /// nothing for it): Add Library Path… and Configure PHP Include Paths…. Does nothing for any other row.
+    /// nothing for it): Add Library Path…, and Configure PHP Include Paths… in PHP projects. Does nothing for any other row.
     pub(super) fn zenith_section_menu(
         &mut self,
         placement: ContextMenuPlacement,
@@ -172,6 +187,7 @@ impl ProjectPanel {
         });
         let focus = self.focus_handle.clone();
         let is_scratch = self.zenith_is_scratch(worktree_id, cx);
+        let is_php = self.zenith_is_php_project(cx);
         let context_menu = ContextMenu::build(window, cx, |menu, _, _| {
             let menu = menu.context(focus);
             if is_scratch {
@@ -181,10 +197,12 @@ impl ProjectPanel {
                 "Add Library Path…",
                 Box::new(zenith_external_libraries::AddLibraryPath),
             )
-            .action(
-                "Configure PHP Include Paths…",
-                Box::new(zenith_external_libraries::ConfigurePhpIncludePaths),
-            )
+            .when(is_php, |menu| {
+                menu.action(
+                    "Configure PHP Include Paths…",
+                    Box::new(zenith_external_libraries::ConfigurePhpIncludePaths),
+                )
+            })
         });
         let (position, anchor) = match placement {
             ContextMenuPlacement::AtMouse(mouse_position) => (mouse_position, None),
@@ -651,6 +669,28 @@ mod tests {
             selected
         });
         assert_eq!(selected, vec!["Composer Packages (two)".to_string()]);
+    }
+
+    #[gpui::test]
+    async fn test_php_menu_entry_only_in_php_projects(cx: &mut TestAppContext) {
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/site", composer_tree()).await;
+        fs.insert_tree(
+            "/web",
+            json!({ "package.json": "{}", "node_modules": { "left-pad": { "index.js": "" } } }),
+        )
+        .await;
+        fs.insert_tree("/plugin", json!({ "plugin.php": "<?php", "inc": {} }))
+            .await;
+        init_test(cx);
+        for (root, expected) in [("/site", true), ("/web", false), ("/plugin", true)] {
+            let (panel, mut window_cx) = open_panel_inited(cx, fs.clone(), &[root]).await;
+            assert_eq!(
+                panel.read_with(&mut window_cx, |panel, cx| panel.zenith_is_php_project(cx)),
+                expected,
+                "{root}: composer.json or a root .php file makes it PHP; npm-only does not"
+            );
+        }
     }
 
     #[gpui::test]
