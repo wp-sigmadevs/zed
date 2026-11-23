@@ -72,8 +72,10 @@ pub struct ServerStore {
     loaded: bool,
     /// A damaged servers.json is never overwritten: saving stays off until the user fixes it.
     load_error: Option<String>,
-    /// Passwords of servers with "Save password" off: memory only, gone on quit.
-    session_passwords: HashMap<String, Password>,
+    /// Passwords of servers with "Save password" off: memory only, gone on quit. Each is kept
+    /// with the target account it was typed for and only used for that target.
+    session_passwords: HashMap<String, (String, Password)>,
+    keychain: Arc<dyn secrets::Keychain>,
     connect: ConnectFn,
     _load: Task<()>,
 }
@@ -132,6 +134,7 @@ impl ServerStore {
             loaded: false,
             load_error: None,
             session_passwords: HashMap::new(),
+            keychain: Arc::new(secrets::SystemKeychain),
             connect: Arc::new(|server| Box::pin(async move { connect(&server).await })),
             _load: load,
         }
@@ -146,6 +149,7 @@ impl ServerStore {
             loaded: true,
             load_error: None,
             session_passwords: HashMap::new(),
+            keychain: Arc::new(secrets::SystemKeychain),
             connect,
             _load: Task::ready(()),
         }
@@ -232,16 +236,27 @@ impl ServerStore {
         .detach();
     }
 
-    fn set_session_password(&mut self, server_id: &str, password: Option<Password>) {
+    /// Remembers (or forgets) the typed password of `server` for its current target only.
+    fn set_session_password(&mut self, server: &ServerConfig, password: Option<Password>) {
         match password {
             Some(password) => {
-                self.session_passwords
-                    .insert(server_id.to_string(), password);
+                self.session_passwords.insert(
+                    server.id.clone(),
+                    (secrets::target_account(server), password),
+                );
             }
             None => {
-                self.session_passwords.remove(server_id);
+                self.session_passwords.remove(&server.id);
             }
         }
+    }
+
+    /// The session password, only when it was typed for `server`'s target as it is now.
+    fn session_password_for(&self, server: &ServerConfig) -> Option<Password> {
+        self.session_passwords
+            .get(&server.id)
+            .filter(|(account, _)| *account == secrets::target_account(server))
+            .map(|(_, password)| password.clone())
     }
 
     /// The password to log in with: none for anonymous FTP and SFTP (key or agent auth), else
@@ -250,15 +265,20 @@ impl ServerStore {
         if !server.uses_password() {
             return Task::ready(Ok(None));
         }
-        if let Some(password) = self.session_passwords.get(&server.id) {
-            return Task::ready(Ok(Some(password.clone())));
+        if let Some(password) = self.session_password_for(server) {
+            return Task::ready(Ok(Some(password)));
         }
-        let load = secrets::load_password(server, cx);
+        let load = secrets::load_password(self.keychain.as_ref(), server, cx);
         let name = server.name.clone();
         cx.background_spawn(async move {
             match load.await? {
-                Some(password) => Ok(Some(Password(password))),
-                None => bail!("no password is stored for {name}; enter it in Deployment settings"),
+                secrets::Lookup::Found(password) => Ok(Some(Password(password))),
+                secrets::Lookup::Missing => {
+                    bail!("no password is stored for {name}; enter it in Deployment settings")
+                }
+                secrets::Lookup::OtherTarget => bail!(
+                    "the password stored for {name} belongs to another host, port, type or username, or was saved by an older version; enter it again in Deployment settings (a one-time step)"
+                ),
             }
         })
     }

@@ -402,7 +402,7 @@ impl DeploymentDialog {
             return;
         }
         let session = match typed {
-            Some(password) if !server.anonymous && server.server_type != ServerType::Sftp => {
+            Some(password) if server.uses_password() => {
                 let mut server = server;
                 server.password = Some(Password(password));
                 spawn_operation(cx, (store.connect)(server))
@@ -447,63 +447,73 @@ impl DeploymentDialog {
         if !self.loaded || self.port_invalid || self.store.read(cx).load_error().is_some() {
             return;
         }
-        let mut keychain: Vec<Task<anyhow::Result<()>>> = Vec::new();
+        let keychain = self.store.read(cx).keychain.clone();
+        let mut deletes: Vec<Task<anyhow::Result<()>>> = Vec::new();
+        let mut writes: Vec<(ServerConfig, String)> = Vec::new();
+        let mut session_changes: Vec<(ServerConfig, Option<Password>)> = Vec::new();
         let previous = self.store.read(cx).servers().clone();
         let mut cleared_credentials = false;
         for server in &self.servers.servers {
             let typed = self.passwords.get(&server.id).cloned();
-            let saves_password = server.save_password && !server.anonymous;
+            let saves_password = server.save_password && server.uses_password();
             let old = previous.servers.iter().find(|old| old.id == server.id);
-            let was_saved = old.is_some_and(|old| old.save_password && !old.anonymous);
+            let was_saved = old.is_some_and(|old| old.save_password && old.uses_password());
             // Nothing typed for a new target: the old password must not follow the server there.
             let target_changed =
                 typed.is_none() && old.is_some_and(|old| old.credentials_target_changed(server));
             match typed {
                 Some(password) if saves_password => {
-                    keychain.push(secrets::save_password(server, &password, cx));
-                    self.store
-                        .update(cx, |store, _| store.set_session_password(&server.id, None));
+                    writes.push((server.clone(), password));
+                    session_changes.push((server.clone(), None));
                 }
-                Some(password) => self.store.update(cx, |store, _| {
-                    store.set_session_password(&server.id, Some(Password(password)))
-                }),
+                Some(password) => session_changes.push((server.clone(), Some(Password(password)))),
                 None => {}
             }
-            if target_changed {
-                self.store
-                    .update(cx, |store, _| store.set_session_password(&server.id, None));
-                // Only a server that uses a password has anything to tell the user about.
-                cleared_credentials |= server.uses_password();
+            if target_changed && server.uses_password() {
+                // Only tell the user when a password was actually there to lose.
+                let had_session =
+                    old.is_some_and(|old| self.store.read(cx).session_password_for(old).is_some());
+                cleared_credentials |= was_saved || had_session;
             }
             if was_saved && (!saves_password || target_changed) {
-                keychain.push(secrets::delete_password(&server.id, cx));
+                deletes.push(secrets::delete_password(&keychain, &server.id, cx));
             }
         }
         for id in &self.removed {
-            keychain.push(secrets::delete_password(id, cx));
+            deletes.push(secrets::delete_password(&keychain, id, cx));
         }
         let servers = self.servers.clone();
         self._save = Some(cx.spawn(async move |this, cx| {
-            // The new target is only saved once the Keychain agrees; a failed delete aborts the
-            // save, so Save can be tried again.
-            let keychain_result = futures::future::join_all(keychain)
-                .await
-                .into_iter()
-                .collect::<anyhow::Result<Vec<()>>>()
-                .map(drop)
-                .map_err(|error| error.context("updating the Keychain"));
-            let result = match keychain_result {
-                Ok(()) => {
-                    let save = this.update(cx, |this, cx| {
-                        this.store.update(cx, |store, cx| store.save(servers, cx))
-                    });
-                    match save {
-                        Ok(save) => save.await,
-                        Err(error) => Err(error),
-                    }
+            // Deletes first, then writes, and the new servers last: a failure leaves the saved
+            // servers as they were and the saved password (if its delete did not run) intact.
+            // The session passwords change together with the servers, never before.
+            let result: anyhow::Result<()> = async {
+                for delete in futures::future::join_all(deletes).await {
+                    delete.map_err(|error| {
+                        error.context(
+                            "Nothing was saved: the Keychain could not remove a saved password (others may already be removed)",
+                        )
+                    })?;
                 }
-                Err(error) => Err(error),
-            };
+                for (server, password) in writes {
+                    let write = cx.update(|cx| {
+                        secrets::save_password(keychain.as_ref(), &server, &password, cx)
+                    });
+                    write.await.map_err(|error| {
+                        error.context("Nothing was saved: the Keychain could not store the password")
+                    })?;
+                }
+                let save = this.update(cx, |this, cx| {
+                    this.store.update(cx, |store, cx| {
+                        for (server, password) in session_changes {
+                            store.set_session_password(&server, password);
+                        }
+                        store.save(servers, cx)
+                    })
+                })?;
+                save.await
+            }
+            .await;
             this.update(cx, |this, cx| match result {
                 Ok(()) if cleared_credentials => {
                     this.error = Some(
@@ -1059,7 +1069,7 @@ mod tests {
     ) {
         let mut saved = server("Live", None);
         saved.save_password = false;
-        let id = saved.id.clone();
+        let saved_server = saved.clone();
         let servers = Servers {
             servers: vec![saved],
             ..Servers::default()
@@ -1067,8 +1077,13 @@ mod tests {
         let (_, dialog, cx) = open_dialog(servers, &FakeRemote::default(), cx).await;
         let store = cx.update(|_, cx| ServerStore::global(cx));
         store.update(cx, |store, _| {
-            store.set_session_password(&id, Some(Password(fake_secret())))
+            store.set_session_password(&saved_server, Some(Password(fake_secret())))
         });
+        let usable = |cx: &mut VisualTestContext| {
+            store.read_with(cx, |store, _| {
+                store.session_password_for(&store.servers().servers[0])
+            })
+        };
 
         // A rename keeps the target: the secret stays.
         dialog.update(cx, |dialog, cx| {
@@ -1076,14 +1091,17 @@ mod tests {
             dialog.save(cx);
         });
         cx.run_until_parked();
-        assert!(store.read_with(cx, |store, _| store.session_passwords.contains_key(&id)));
+        assert!(usable(cx).is_some());
 
         dialog.update(cx, |dialog, cx| {
             dialog.update_selected(cx, |server| server.host = "elsewhere.example.com".into());
             dialog.save(cx);
         });
         cx.run_until_parked();
-        assert!(!store.read_with(cx, |store, _| store.session_passwords.contains_key(&id)));
+        assert!(
+            usable(cx).is_none(),
+            "the secret typed for the old host is not usable at the new one"
+        );
         dialog.read_with(cx, |dialog, _| {
             let message = dialog.error.as_ref().map(|error| error.to_string());
             assert!(
@@ -1091,6 +1109,102 @@ mod tests {
                 "the user is told why"
             );
         });
+    }
+
+    /// Two saved servers: `edited` (host changed, a password typed, saved with the given
+    /// `save_password`) and `removed`, whose Keychain delete fails. Returns the Save outcome.
+    async fn aborted_save(
+        save_password: bool,
+        cx: &mut TestAppContext,
+    ) -> (
+        Entity<DeploymentDialog>,
+        Entity<ServerStore>,
+        std::sync::Arc<crate::secrets::fake::FakeKeychain>,
+        ServerConfig,
+        &mut VisualTestContext,
+    ) {
+        let mut edited = server("Live", None);
+        edited.save_password = save_password;
+        let doomed = server("Doomed", None);
+        let servers = Servers {
+            servers: vec![edited.clone(), doomed.clone()],
+            ..Servers::default()
+        };
+        let keychain = std::sync::Arc::new(crate::secrets::fake::FakeKeychain::default());
+        keychain.put(&edited, "not-a-real-value-0");
+        keychain.put(&doomed, "not-a-real-value-0");
+        *keychain.fail_delete.lock().expect("lock") = true;
+        let (_, dialog, cx) = open_dialog(servers, &FakeRemote::default(), cx).await;
+        let store = cx.update(|_, cx| ServerStore::global(cx));
+        store.update(cx, |store, _| store.keychain = keychain.clone());
+        dialog.update(cx, |dialog, cx| {
+            dialog
+                .servers
+                .servers
+                .retain(|server| server.id != doomed.id);
+            dialog.removed.push(doomed.id.clone());
+            dialog.servers.servers[0].host = "elsewhere.example.com".into();
+            dialog.passwords.insert(edited.id.clone(), fake_secret());
+            dialog.save(cx);
+        });
+        cx.run_until_parked();
+        (dialog, store, keychain, edited, cx)
+    }
+
+    #[gpui::test]
+    async fn an_aborted_save_leaves_the_old_target_without_a_secret_for_the_new_one(
+        cx: &mut TestAppContext,
+    ) {
+        let (dialog, store, _, edited, cx) = aborted_save(false, cx).await;
+        let (host, usable) = store.read_with(cx, |store, _| {
+            let saved = &store.servers().servers[0];
+            (saved.host.clone(), store.session_password_for(saved))
+        });
+        assert_eq!(host, edited.host, "the old target is still the saved one");
+        assert!(
+            usable.is_none(),
+            "the new target's secret is not used at the old one"
+        );
+        dialog.read_with(cx, |dialog, _| {
+            let message = dialog.error.as_ref().map(|error| error.to_string());
+            assert!(
+                message.is_some_and(|message| message.contains("Nothing was saved")),
+                "the user is told the save was aborted"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn an_aborted_save_leaves_the_saved_keychain_entry_alone(cx: &mut TestAppContext) {
+        let (_, _, keychain, edited, _) = aborted_save(true, cx).await;
+        assert_eq!(
+            keychain.account_of(&edited),
+            Some(crate::secrets::target_account(&edited)),
+            "the working saved password still belongs to the saved target"
+        );
+    }
+
+    #[gpui::test]
+    async fn no_note_is_shown_when_there_was_no_password_to_remove(cx: &mut TestAppContext) {
+        let mut unsaved = server("Live", None);
+        unsaved.save_password = false;
+        let servers = Servers {
+            servers: vec![unsaved],
+            ..Servers::default()
+        };
+        let (workspace, dialog, cx) = open_dialog(servers, &FakeRemote::default(), cx).await;
+        dialog.update(cx, |dialog, cx| {
+            dialog.update_selected(cx, |server| server.host = "elsewhere.example.com".into());
+            dialog.save(cx);
+        });
+        cx.run_until_parked();
+        dialog.read_with(cx, |dialog, _| assert!(dialog.error.is_none()));
+        assert!(
+            workspace
+                .read_with(cx, |workspace, cx| workspace
+                    .active_modal::<DeploymentDialog>(cx))
+                .is_none()
+        );
     }
 
     #[gpui::test]
@@ -1126,18 +1240,23 @@ mod tests {
             servers: vec![server("Live", None)],
             ..Servers::default()
         };
-        let id = servers.servers[0].id.clone();
+        let saved_server = servers.servers[0].clone();
         let (_, dialog, cx) = open_dialog(servers, &remote, cx).await;
         let store = cx.update(|_, cx| ServerStore::global(cx));
         store.update(cx, |store, _| {
-            store.set_session_password(&id, Some(Password(fake_secret())))
+            store.set_session_password(&saved_server, Some(Password(fake_secret())))
         });
         let original = dialog.read_with(cx, |dialog, _| dialog.selected_server().cloned().unwrap());
 
         // Control: the saved target still gets the stored secret.
         dialog.update(cx, |dialog, cx| dialog.test_connection(cx));
         cx.run_until_parked();
-        assert_eq!(remote.log().len(), 2, "connect and disconnect");
+        let log = remote.log();
+        assert_eq!(log.len(), 2, "connect and disconnect");
+        assert!(
+            log[0].contains(&fake_secret()),
+            "the connect carried the secret: {log:?}"
+        );
         remote.log.lock().expect("lock").clear();
 
         let changes: [fn(&mut ServerConfig); 4] = [
