@@ -612,8 +612,8 @@
   },
   // Toolbar related settings
   "toolbar": {
-    // Whether to show breadcrumbs.
-    "breadcrumbs": true,
+    // Whether to show breadcrumbs. Off by default in Zenith: the path lives in the bottom navigation bar.
+    "breadcrumbs": false,
     // Whether to show quick action buttons.
     "quick_actions": true,
     // Whether to show the Selections menu in the editor toolbar.
