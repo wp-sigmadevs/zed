@@ -20,7 +20,7 @@ use settings::{DockPosition, RegisterSetting, Settings, SettingsContent};
 pub use config::{Password, ServerConfig, ServerType, Servers};
 pub use dialog::{DeploymentDialog, OpenDeployment};
 pub use panel::{RemoteHostPanel, ToggleFocus};
-pub use transport::{EntryKind, RemoteEntry, Transport, connect, download_entry};
+pub use transport::{EntryKind, RemoteEntry, ServerRefused, Transport, connect, download_entry};
 
 /// Every network operation gives up after this long.
 pub const OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
@@ -148,9 +148,18 @@ impl ServerStore {
         self.servers
             .servers
             .iter()
-            .filter(|server| server.project.is_none() || server.project.as_deref() == project)
+            .filter(|server| server.is_visible_in(project))
             .cloned()
             .collect()
+    }
+
+    /// One of [`Self::servers_for`], cloning only that server.
+    pub fn server_for(&self, project: Option<&str>, id: &str) -> Option<ServerConfig> {
+        self.servers
+            .servers
+            .iter()
+            .find(|server| server.id == id && server.is_visible_in(project))
+            .cloned()
     }
 
     pub fn default_for(&self, project: &str) -> Option<&str> {
@@ -170,12 +179,34 @@ impl ServerStore {
         let kept: std::collections::HashSet<_> =
             servers.servers.iter().map(|server| &server.id).collect();
         self.session_passwords.retain(|id, _| kept.contains(id));
+        for server in &self.servers.servers {
+            if !kept.contains(&server.id) {
+                self.clear_cache(&server.id, cx);
+            }
+        }
         self.servers = servers.clone();
         cx.notify();
         let Some(path) = self.path.clone() else {
             return Task::ready(Ok(()));
         };
         cx.background_spawn(async move { servers.save(&path) })
+    }
+
+    /// Deletes the cached copies of a server's remote files (maybe `wp-config.php`) off the
+    /// main thread.
+    pub(crate) fn clear_cache(&self, server_id: &str, cx: &App) {
+        if remote_path::validate_name(server_id).is_err() {
+            return;
+        }
+        let directory = self.cache_dir.join(server_id);
+        cx.background_spawn(async move {
+            match std::fs::remove_dir_all(&directory) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => log::warn!("deploy: removing {}: {error}", directory.display()),
+            }
+        })
+        .detach();
     }
 
     fn set_session_password(&mut self, server_id: &str, password: Option<Password>) {
@@ -258,6 +289,8 @@ pub(crate) mod test_support {
         pub tree: Arc<HashMap<String, Vec<RemoteEntry>>>,
         pub log: Arc<Mutex<Vec<String>>>,
         pub fail_connect: bool,
+        /// Folders whose listing fails like a dead connection, not a refusal.
+        pub broken: Vec<String>,
     }
 
     impl FakeRemote {
@@ -316,10 +349,13 @@ pub(crate) mod test_support {
         }
         async fn list_dir(&mut self, path: &str) -> Result<Vec<RemoteEntry>> {
             self.push(format!("list {path}"));
-            self.tree
-                .get(path)
-                .cloned()
-                .ok_or_else(|| anyhow!("550 {path}: no such directory"))
+            self.tree.get(path).cloned().ok_or_else(|| {
+                if self.broken.iter().any(|broken| broken == path) {
+                    anyhow!("connection reset by peer")
+                } else {
+                    anyhow::Error::new(ServerRefused(format!("550 {path}: permission denied")))
+                }
+            })
         }
         async fn download_file(&mut self, remote_path: &str, local_path: &Path) -> Result<()> {
             self.push(format!("get {remote_path}"));
@@ -457,8 +493,12 @@ mod tests {
                 assert!(!source.contains(word), "{file} contains {word}");
             }
         }
-        let ftp = include_str!("ftp.rs");
-        assert!(ftp.contains("http_client_tls::tls_config()"));
+        // Code only: the doc comments also name the verifier.
+        let ftp_code: String = include_str!("ftp.rs")
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect();
+        assert!(ftp_code.contains("http_client_tls::tls_config()"));
     }
 
     /// Run with `ZENITH_DEPLOY_SELF_SIGNED_FTPS=host:port cargo test -p zenith_deploy -- --ignored`

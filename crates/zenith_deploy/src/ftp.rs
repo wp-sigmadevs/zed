@@ -18,8 +18,8 @@ use crate::{
     config::{ServerConfig, ServerType},
     remote_path::validate_remote_path,
     transport::{
-        EntryKind, MAX_DOWNLOAD_BYTES, MAX_LISTING_BYTES, RemoteEntry, Transport,
-        login_credentials, retain_listable,
+        EntryKind, MAX_DOWNLOAD_BYTES, MAX_LISTING_BYTES, MAX_LISTING_ENTRIES, RemoteEntry,
+        ServerRefused, Transport, login_credentials, retain_listable,
     },
 };
 
@@ -81,9 +81,7 @@ async fn connect_with_logger(
             Ok(Box::new(open(stream, server, &user, &password).await?))
         }
         ServerType::Ftps => {
-            let connector = AsyncRustlsConnector::from(futures_rustls::TlsConnector::from(
-                Arc::new(http_client_tls::tls_config()),
-            ));
+            let connector = tls_connector();
             let stream = AsyncRustlsFtpStream::connect(address)
                 .await?
                 .into_secure(connector, &server.host)
@@ -93,6 +91,12 @@ async fn connect_with_logger(
         }
         ServerType::Sftp => bail!("{} is an SFTP server", server.name),
     }
+}
+
+fn tls_connector() -> AsyncRustlsConnector {
+    AsyncRustlsConnector::from(futures_rustls::TlsConnector::from(Arc::new(
+        http_client_tls::tls_config(),
+    )))
 }
 
 async fn open<T: SmolTlsStream + Send + 'static>(
@@ -147,9 +151,12 @@ fn mlsd_symlink(line: &str) -> Option<RemoteEntry> {
     })
 }
 
-pub(crate) fn parse_listing(lines: &[String], use_list: bool) -> Vec<RemoteEntry> {
-    lines
-        .iter()
+/// Parses at most [`MAX_LISTING_ENTRIES`] + 1 entries (one over the limit, so
+/// [`retain_listable`] still refuses the directory) instead of the whole 8 MiB.
+pub(crate) fn parse_listing(listing: &str, use_list: bool) -> Vec<RemoteEntry> {
+    listing
+        .lines()
+        .filter(|line| !line.is_empty())
         .filter_map(|line| {
             if !use_list {
                 if let Some(link) = mlsd_symlink(line) {
@@ -169,7 +176,18 @@ pub(crate) fn parse_listing(lines: &[String], use_list: bool) -> Vec<RemoteEntry
                 }
             }
         })
+        .take(MAX_LISTING_ENTRIES + 1)
         .collect()
+}
+
+/// A reply code the server chose (`550 Permission denied`) leaves the control connection usable.
+fn refusal(error: suppaftp::FtpError) -> anyhow::Error {
+    match error {
+        suppaftp::FtpError::UnexpectedResponse(_) => {
+            anyhow::Error::new(ServerRefused(error.to_string()))
+        }
+        error => error.into(),
+    }
 }
 
 impl<T: SmolTlsStream + Send + 'static> FtpSession<T> {
@@ -210,17 +228,14 @@ impl<T: SmolTlsStream + Send + 'static> Transport for FtpSession<T> {
         let (_, transfer) = self
             .stream
             .custom_data_command(command, &[Status::AboutToSend, Status::AlreadyOpen])
-            .await?;
+            .await
+            .map_err(refusal)?;
         let mut listing = Vec::new();
         self.receive(transfer, MAX_LISTING_BYTES, &mut listing)
             .await
             .context("listing the directory")?;
-        let lines: Vec<String> = String::from_utf8_lossy(&listing)
-            .lines()
-            .filter(|line| !line.is_empty())
-            .map(String::from)
-            .collect();
-        retain_listable(parse_listing(&lines, self.use_list), self.hidden_files)
+        let listing = String::from_utf8_lossy(&listing);
+        retain_listable(parse_listing(&listing, self.use_list), self.hidden_files)
     }
 
     async fn download_file(&mut self, remote_path: &str, local_path: &Path) -> Result<()> {
@@ -232,7 +247,11 @@ impl<T: SmolTlsStream + Send + 'static> Transport for FtpSession<T> {
             .open(local_path)
             .await
             .with_context(|| format!("creating {}", local_path.display()))?;
-        let transfer = self.stream.retr_as_stream(remote_path).await?;
+        let transfer = self
+            .stream
+            .retr_as_stream(remote_path)
+            .await
+            .map_err(refusal)?;
         self.receive(transfer, MAX_DOWNLOAD_BYTES, &mut file)
             .await
             .context("downloading")?;
@@ -251,7 +270,7 @@ mod tests {
 
     #[test]
     fn mlsd_listing_marks_symlinks_and_skips_dot_entries() {
-        let lines: Vec<String> = [
+        let lines = [
             "type=cdir;modify=20250101120000; .",
             "type=pdir;modify=20250101120000; ..",
             "type=dir;modify=20250101120000; wp-content",
@@ -260,8 +279,7 @@ mod tests {
             "type=file;unix.slink=/etc/hosts;modify=20250101120000; hosts-link",
             "type=link;modify=20250101120000; plain-link",
         ]
-        .map(String::from)
-        .to_vec();
+        .join("\n");
         let entries = retain_listable(parse_listing(&lines, false), true).expect("listable");
         let by_name = |name: &str| entries.iter().find(|entry| entry.name == name);
         for link in ["evil-link", "hosts-link", "plain-link"] {
@@ -287,8 +305,7 @@ mod tests {
             "-rw-r--r--   1 u g   12 Nov 22 10:00 index.php",
             "drwxr-xr-x   2 u g 4096 Nov 22 10:00 wp-content",
         ]
-        .map(String::from)
-        .to_vec();
+        .join("\n");
         let entries = parse_listing(&lines, true);
         let kinds: Vec<_> = entries.iter().map(|e| (e.name.as_str(), e.kind)).collect();
         assert_eq!(
@@ -299,6 +316,15 @@ mod tests {
                 ("wp-content", EntryKind::Directory)
             ]
         );
+    }
+
+    #[test]
+    fn parsing_stops_one_entry_past_the_limit() {
+        let line = "-rw-r--r--   1 u g   12 Nov 22 10:00 a";
+        let listing = vec![line; MAX_LISTING_ENTRIES + 5000].join("\n");
+        let parsed = parse_listing(&listing, true);
+        assert_eq!(parsed.len(), MAX_LISTING_ENTRIES + 1);
+        assert!(retain_listable(parsed, false).is_err());
     }
 
     const LISTING: &str = "type=file;size=12;modify=20250101120000; index.php\r\n\

@@ -9,7 +9,8 @@ use crate::{
     config::ServerConfig,
     remote_path::validate_remote_path,
     transport::{
-        EntryKind, MAX_DOWNLOAD_BYTES, MAX_LISTING_BYTES, RemoteEntry, Transport, retain_listable,
+        EntryKind, MAX_DOWNLOAD_BYTES, MAX_LISTING_BYTES, MAX_LISTING_ENTRIES, RemoteEntry,
+        ServerRefused, Transport, retain_listable,
     },
 };
 
@@ -58,7 +59,11 @@ impl SftpTransport {
             .kill_on_drop(true);
         let mut child = command.spawn().context("starting sftp")?;
         if let Some(mut stdin) = child.stdin.take() {
-            stdin.write_all(batch.as_bytes()).await?;
+            // A child that already exited (host-key failure) closes the pipe; its stderr says why.
+            match stdin.write_all(batch.as_bytes()).await {
+                Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => {}
+                result => result?,
+            }
         }
         let stdout = child.stdout.take().context("sftp has no stdout")?;
         let stderr = child.stderr.take().context("sftp has no stderr")?;
@@ -88,7 +93,8 @@ impl SftpTransport {
             );
         }
         let detail: String = stderr.trim().chars().take(500).collect();
-        anyhow!("sftp failed: {detail}")
+        // Each operation is its own process, so a refusal never leaves a session half-used.
+        anyhow::Error::new(ServerRefused(format!("sftp failed: {detail}")))
     }
 }
 
@@ -122,7 +128,7 @@ fn is_plain(value: &str, extra: &[char]) -> bool {
 /// Everything fixed on the command line; the password is deliberately not an input.
 /// Host keys are checked against `known_hosts` and never auto-accepted.
 pub(crate) fn build_args(server: &ServerConfig) -> Result<Vec<String>> {
-    if !is_plain(&server.host, &[':']) {
+    if !is_plain(&server.host, &[]) {
         bail!("invalid SFTP host {:?}", server.host);
     }
     if !is_plain(&server.username, &[]) {
@@ -187,7 +193,7 @@ fn get_batch(remote_path: &str, local_path: &Path) -> Result<String> {
     ))
 }
 
-/// Parses `ls -la` output. sftp prints the full path in the name column, so `directory` is
+/// Parses `ls -la` output, stopping one entry past [`MAX_LISTING_ENTRIES`] (the caller then refuses it). sftp prints the full path in the name column, so `directory` is
 /// stripped from it; lines that do not parse (including the echoed `sftp> ` commands and any
 /// fragment of a name that contained a newline) are dropped.
 pub(crate) fn parse_ls(output: &str, directory: &str) -> Vec<RemoteEntry> {
@@ -195,6 +201,7 @@ pub(crate) fn parse_ls(output: &str, directory: &str) -> Vec<RemoteEntry> {
     output
         .lines()
         .filter_map(|line| parse_ls_line(line, &prefix))
+        .take(MAX_LISTING_ENTRIES + 1)
         .collect()
 }
 
@@ -311,7 +318,15 @@ mod tests {
 
     #[test]
     fn argv_rejects_option_injection_through_host_or_user() {
-        for host in ["-oProxyCommand=touch x", "a b", "a@b", "", "h\nx", "a;b"] {
+        for host in [
+            "-oProxyCommand=touch x",
+            "a b",
+            "a@b",
+            "",
+            "h\nx",
+            "a;b",
+            "a:b",
+        ] {
             let mut bad = server();
             bad.host = host.into();
             assert!(build_args(&bad).is_err(), "host {host:?}");
@@ -357,6 +372,15 @@ mod tests {
             get_batch("/x/a \"b\".txt", Path::new("/tmp/o")).expect("get"),
             "get \"/x/a \\\"b\\\".txt\" \"/tmp/o\"\n"
         );
+    }
+
+    #[test]
+    fn ls_parsing_stops_one_entry_past_the_limit() {
+        let line = "-rw-r--r--    ? u   g           1 Nov 22 23:48 /www/x\n";
+        let output = line.repeat(MAX_LISTING_ENTRIES + 5000);
+        let parsed = parse_ls(&output, "/www");
+        assert_eq!(parsed.len(), MAX_LISTING_ENTRIES + 1);
+        assert!(retain_listable(parsed, false).is_err());
     }
 
     #[test]
@@ -414,6 +438,24 @@ drwxr-xr-x    ? u   g          64 Nov 22 23:48 /www/sub
             message.contains("run `ssh deploy@example.com` once to verify the key"),
             "{message}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_host_key_failure_survives_a_child_that_exits_before_reading() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let program = write_script(
+            directory.path(),
+            "sftp",
+            "echo 'Host key verification failed.' >&2; exit 255",
+        );
+        let transport = SftpTransport::with_program(program, &server()).expect("transport");
+        // Larger than a pipe buffer, so the write is still pending when the child exits.
+        let batch = "x".repeat(1 << 20);
+        let message = smol::block_on(transport.run(&batch))
+            .expect_err("must fail")
+            .to_string();
+        assert!(message.contains("run `ssh"), "{message}");
     }
 
     #[cfg(unix)]

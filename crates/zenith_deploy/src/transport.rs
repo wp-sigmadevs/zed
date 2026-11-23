@@ -18,6 +18,20 @@ pub const MAX_LISTING_ENTRIES: usize = 20_000;
 /// Downloads open as read-only copies in an editor; a larger file is refused.
 pub const MAX_DOWNLOAD_BYTES: u64 = 64 * 1024 * 1024;
 
+/// The server answered and said no (a 550 on one folder, an `sftp` error exit): the connection
+/// itself is still good, so the panel keeps its session. Any other error (timeout, I/O) may
+/// leave the connection mid-command.
+#[derive(Debug)]
+pub struct ServerRefused(pub String);
+
+impl std::fmt::Display for ServerRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ServerRefused {}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EntryKind {
     File,
@@ -95,26 +109,11 @@ pub(crate) fn retain_listable(
         .collect())
 }
 
-/// Deletes the partial download when dropped, so an error or a cancelled task (the future is
-/// dropped mid-transfer) never leaves a `.zenith-part` file behind.
-struct RemoveOnDrop(Option<PathBuf>);
-
-impl Drop for RemoveOnDrop {
-    fn drop(&mut self) {
-        if let Some(path) = self.0.take() {
-            match std::fs::remove_file(&path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => log::warn!("deploy: removing {}: {error}", path.display()),
-            }
-        }
-    }
-}
-
 /// Downloads one listed entry into `local_directory` and returns the local path.
 ///
 /// The only download path: it refuses symlinks and directories (the remote link target is never
-/// resolved), validates the name, writes to a fresh `.part` file and renames it into place so
+/// resolved), validates the name, writes into a fresh private directory inside `local_directory` (so no remote name can collide
+/// with it) and renames the file into place so
 /// a local symlink at the destination is replaced, not written through. Run it through
 /// [`crate::spawn_operation`].
 pub async fn download_entry(
@@ -137,19 +136,16 @@ pub async fn download_entry(
     }
     let remote_path = join_remote(remote_directory, &entry.name)?;
     let local_path = join_local(local_directory, &entry.name)?;
-    let part_path = join_local(local_directory, &format!("{}.zenith-part", entry.name))?;
-
-    match smol::fs::remove_file(&part_path).await {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error).context("removing a stale partial download"),
-    }
-    let mut part = RemoveOnDrop(Some(part_path.clone()));
+    // Dropped (removed, partial file included) on error or when the task is cancelled mid-transfer.
+    let part_directory = tempfile::Builder::new()
+        .prefix(".zenith-part-")
+        .tempdir_in(local_directory)
+        .context("creating a directory for the partial download")?;
+    let part_path = join_local(part_directory.path(), &entry.name)?;
     transport.download_file(&remote_path, &part_path).await?;
     smol::fs::rename(&part_path, &local_path)
         .await
         .with_context(|| format!("moving the download to {}", local_path.display()))?;
-    part.0 = None;
     Ok(local_path)
 }
 
@@ -235,7 +231,12 @@ pub(crate) mod tests {
             assert_eq!(path, directory.path().join("index.php"));
             assert_eq!(std::fs::read(&path).expect("read"), b"abc");
             assert_eq!(transport.downloads, ["/www/index.php"]);
-            assert!(!directory.path().join("index.php.zenith-part").exists());
+            assert_eq!(
+                std::fs::read_dir(directory.path())
+                    .expect("read_dir")
+                    .count(),
+                1
+            );
 
             for bad in ["../evil", "a/b", "x\n!touch pwned", "a\rb", ".."] {
                 let result = download_entry(
@@ -281,6 +282,38 @@ pub(crate) mod tests {
         });
         assert_eq!(std::fs::read_to_string(&victim).expect("read"), "keep");
         assert_eq!(std::fs::read(target.join("a.txt")).expect("read"), b"abc");
+    }
+
+    #[test]
+    fn a_remote_name_ending_in_zenith_part_cannot_clash_with_the_partial_file() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let keep = directory.path().join("x.zenith-part");
+        std::fs::write(&keep, "keep").expect("write");
+        smol::block_on(async {
+            let mut transport = FakeTransport::default();
+            download_entry(
+                &mut transport,
+                "/w",
+                &entry("x", EntryKind::File),
+                directory.path(),
+            )
+            .await
+            .expect("download x");
+            assert_eq!(std::fs::read(&keep).expect("keep"), b"keep");
+            download_entry(
+                &mut transport,
+                "/w",
+                &entry("x.zenith-part", EntryKind::File),
+                directory.path(),
+            )
+            .await
+            .expect("download x.zenith-part");
+        });
+        assert_eq!(
+            std::fs::read(directory.path().join("x")).expect("x"),
+            b"abc"
+        );
+        assert_eq!(std::fs::read_dir(directory.path()).expect("dir").count(), 2);
     }
 
     #[test]
@@ -352,15 +385,20 @@ pub(crate) mod tests {
                 directory.path(),
             ));
             // Poll until the partial file is written, then drop the future (a cancelled task).
-            let part = directory.path().join("index.php.zenith-part");
+            let written = || {
+                std::fs::read_dir(directory.path())
+                    .expect("read_dir")
+                    .flatten()
+                    .any(|dir| dir.path().join("index.php").exists())
+            };
             for _ in 0..500 {
                 assert!(futures::poll!(download.as_mut()).is_pending());
-                if part.exists() {
+                if written() {
                     break;
                 }
                 smol::Timer::after(std::time::Duration::from_millis(10)).await;
             }
-            assert!(part.exists());
+            assert!(written());
         });
         let left: Vec<_> = std::fs::read_dir(directory.path())
             .expect("read_dir")

@@ -139,6 +139,11 @@ impl ServerConfig {
             ..Self::default()
         }
     }
+
+    /// A server not limited to another project.
+    pub(crate) fn is_visible_in(&self, project: Option<&str>) -> bool {
+        self.project.is_none() || self.project.as_deref() == project
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
