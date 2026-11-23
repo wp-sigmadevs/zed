@@ -102,6 +102,13 @@
     },
   },
   {
+    // Refresh in the Remote Host tool window, as PhpStorm's ⌘R in tool windows.
+    "context": "RemoteHostPanel",
+    "bindings": {
+      "secondary-r": "zenith_deploy::Refresh",
+    },
+  },
+  {
     // PhpStorm's Back / Forward through the navigation history (go to definition, search
     // results, recent places). Zed binds these keys to previous/next tab in "Pane", the
     // same depth, so they are repeated here where the later-loaded keymap wins.

@@ -23062,20 +23062,27 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "editor",
  "futures 0.3.34",
  "futures-rustls",
  "gpui",
  "http_client_tls",
  "log",
+ "menu",
  "paths",
+ "project",
  "serde",
  "serde_json",
  "settings",
  "smol",
  "suppaftp",
  "tempfile",
+ "theme",
+ "theme_settings",
+ "ui",
  "util",
  "uuid",
+ "workspace",
 ]
 
 [[package]]
