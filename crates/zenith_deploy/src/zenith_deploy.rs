@@ -72,6 +72,8 @@ pub struct ServerStore {
     loaded: bool,
     /// servers.json is being written; see [`Self::save`].
     writing: bool,
+    /// A dialog save is running, Keychain phase included; see [`Self::begin_save`].
+    busy: bool,
     /// A damaged servers.json is never overwritten: saving stays off until the user fixes it.
     load_error: Option<String>,
     /// Passwords of servers with "Save password" off: memory only, gone on quit. Each is kept
@@ -135,6 +137,7 @@ impl ServerStore {
             cache_dir,
             loaded: false,
             writing: false,
+            busy: false,
             load_error: None,
             session_passwords: HashMap::new(),
             keychain: Arc::new(secrets::SystemKeychain),
@@ -151,6 +154,7 @@ impl ServerStore {
             cache_dir,
             loaded: true,
             writing: false,
+            busy: false,
             load_error: None,
             session_passwords: HashMap::new(),
             keychain: Arc::new(secrets::SystemKeychain),
@@ -243,6 +247,21 @@ impl ServerStore {
                 written.map(|()| this.apply(servers, session_changes, cx))
             })?
         })
+    }
+
+    /// Marks a dialog save as running, from OK until its task ends, because a save that waits
+    /// on the Keychain must not be overtaken (its late write would land after a newer save's).
+    /// Refused while another one runs. Pair with [`Self::end_save`].
+    fn begin_save(&mut self) -> Result<()> {
+        if self.busy {
+            bail!("another save is still running; wait for it and try again");
+        }
+        self.busy = true;
+        Ok(())
+    }
+
+    fn end_save(&mut self) {
+        self.busy = false;
     }
 
     fn apply(

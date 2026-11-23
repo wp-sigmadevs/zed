@@ -44,6 +44,8 @@ pub(crate) const INSECURE_FTP: &str = "Insecure: plain FTP sends the password an
 pub(crate) const PASSWORD_REMOVED_NOTE: &str =
     "The password saved in the Keychain for this server will be removed when you press OK.";
 const PASSWORD_NOTE_ID: &str = "zenith-deploy-password-removed";
+const OUTDATED: &str = "The saved servers changed while this dialog was open (another save finished). Close it and reopen Deployment settings to continue from the saved list.";
+const PASSWORD_CLEARED: &str = "Saved. The saved password was removed because the host, port, type or username changed; type a new one.";
 pub(crate) const NO_USERNAME: &str = "Username is not specified";
 
 struct Fields {
@@ -80,6 +82,9 @@ pub struct DeploymentDialog {
     store: Entity<ServerStore>,
     /// The working copy; the store changes only on OK.
     servers: Servers,
+    /// The saved list this dialog was opened on (or last saved): OK is refused when the store
+    /// holds another one, so a dialog never undoes a save that finished after it opened.
+    base: Servers,
     loaded: bool,
     /// Passwords typed in this dialog, by server id; written on OK.
     passwords: HashMap<String, String>,
@@ -198,6 +203,7 @@ impl DeploymentDialog {
         let mut this = Self {
             store,
             servers: Servers::default(),
+            base: Servers::default(),
             loaded: false,
             passwords: HashMap::new(),
             removed: Vec::new(),
@@ -228,6 +234,7 @@ impl DeploymentDialog {
     ) {
         let store = self.store.read(cx);
         self.servers = store.servers().clone();
+        self.base = self.servers.clone();
         self.error = store.load_error().map(|error| {
             SharedString::from(format!("The saved servers could not be read: {error}"))
         });
@@ -512,6 +519,19 @@ impl DeploymentDialog {
         {
             return;
         }
+        // Before any Keychain work: a dialog on an outdated list must not change the Keychain.
+        if self.store.read(cx).servers() != &self.base {
+            self.error = Some(OUTDATED.into());
+            cx.notify();
+            return;
+        }
+        // Held until the task ends, so a save cannot start while another one is still on the
+        // Keychain (see `ServerStore::begin_save`).
+        if let Err(error) = self.store.update(cx, |store, _| store.begin_save()) {
+            self.error = Some(format!("Saving failed: {error:#}").into());
+            cx.notify();
+            return;
+        }
         let keychain = self.store.read(cx).keychain.clone();
         let mut deletes: Vec<Task<anyhow::Result<bool>>> = Vec::new();
         let mut writes: Vec<(ServerConfig, String)> = Vec::new();
@@ -549,6 +569,7 @@ impl DeploymentDialog {
         }
         let servers = self.servers.clone();
         let store = self.store.clone();
+        let base = self.base.clone();
         let workspace = self.workspace.clone();
         self.saving = true;
         self._save = Some(cx.spawn(async move |this, cx| {
@@ -582,7 +603,7 @@ impl DeploymentDialog {
                     applied += 1;
                 }
                 let save = store.update(cx, |store, cx| {
-                    store.save(previous, servers, session_changes, cx)
+                    store.save(base, servers, session_changes, cx)
                 });
                 save.await.map_err(|error| {
                     if applied == 0 {
@@ -593,14 +614,16 @@ impl DeploymentDialog {
                 })
             }
             .await;
+            // On every path, whatever became of the dialog.
+            store.update(cx, |store, _| store.end_save());
             let shown = this.update(cx, |this, cx| {
                 this.saving = false;
+                if result.is_ok() {
+                    this.base = this.store.read(cx).servers().clone();
+                }
                 match &result {
                     Ok(()) if cleared_credentials => {
-                        this.error = Some(
-                            "Saved. The saved password was removed because the host, port, type or username changed; type a new one."
-                                .into(),
-                        );
+                        this.error = Some(PASSWORD_CLEARED.into());
                         cx.notify();
                     }
                     Ok(()) => cx.emit(DismissEvent),
@@ -612,15 +635,23 @@ impl DeploymentDialog {
             });
             if shown.is_err() {
                 // The dialog was closed while saving: tell the user in the workspace.
-                if let Err(error) = result {
-                    log::error!("deploy: saving the servers after the dialog closed: {error:#}");
+                let message = match result {
+                    Err(error) => {
+                        log::error!(
+                            "deploy: saving the servers after the dialog closed: {error:#}"
+                        );
+                        Some(format!("Deployment: saving failed: {error:#}"))
+                    }
+                    Ok(()) if cleared_credentials => {
+                        Some(format!("Deployment: {PASSWORD_CLEARED}"))
+                    }
+                    Ok(()) => None,
+                };
+                if let Some(message) = message {
                     workspace
                         .update(cx, |workspace, cx| {
                             workspace.show_toast(
-                                Toast::new(
-                                    NotificationId::unique::<DeploymentDialog>(),
-                                    format!("Deployment: saving failed: {error:#}"),
-                                ),
+                                Toast::new(NotificationId::unique::<DeploymentDialog>(), message),
                                 cx,
                             )
                         })
@@ -1925,6 +1956,12 @@ mod tests {
         assert!(!is_open(&workspace, cx), "Esc closed the dialog");
         let on_disk = Servers::load(&path).expect("servers.json written after Esc");
         assert_eq!(on_disk.servers[0].name, "Renamed");
+        workspace.read_with(cx, |workspace, _| {
+            assert!(
+                workspace.notification_ids().is_empty(),
+                "no toast for a plain save"
+            );
+        });
     }
 
     /// A store with one saved server `Live` that writes to `path`.
@@ -1996,8 +2033,22 @@ mod tests {
         });
     }
 
+    /// Opens the dialog again (after Esc) and returns it.
+    fn reopen(
+        workspace: &Entity<Workspace>,
+        cx: &mut VisualTestContext,
+    ) -> Entity<DeploymentDialog> {
+        cx.dispatch_action(OpenDeployment);
+        cx.run_until_parked();
+        workspace
+            .read_with(cx, |workspace, cx| {
+                workspace.active_modal::<DeploymentDialog>(cx)
+            })
+            .expect("the dialog opens again")
+    }
+
     #[gpui::test]
-    async fn a_save_that_outlives_its_closed_dialog_cannot_overwrite_a_newer_save(
+    async fn a_save_is_refused_while_an_earlier_one_still_waits_on_the_keychain(
         cx: &mut TestAppContext,
     ) {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2028,40 +2079,147 @@ mod tests {
         cx.run_until_parked();
         assert!(!is_open(&workspace, cx));
 
-        // B: reopen, edit, OK.
-        cx.dispatch_action(OpenDeployment);
-        cx.run_until_parked();
-        let dialog_b = workspace
-            .read_with(cx, |workspace, cx| {
-                workspace.active_modal::<DeploymentDialog>(cx)
-            })
-            .expect("the dialog opens again");
+        // B opens on the same list and presses OK while A is still on the Keychain.
+        let dialog_b = reopen(&workspace, cx);
         dialog_b.update(cx, |dialog, cx| {
             dialog.update_selected(cx, |server| server.name = "From B".into());
             dialog.save(cx);
         });
         cx.run_until_parked();
-        assert_eq!(
-            Servers::load(&path).expect("load").servers[0].name,
-            "From B"
+        assert!(
+            error_text(&dialog_b, cx).contains("another save is still running"),
+            "{}",
+            error_text(&dialog_b, cx)
         );
+        assert!(is_open(&workspace, cx), "B stays open");
+        assert!(!path.exists(), "B wrote nothing");
 
-        // A's Keychain wait ends: its stale servers must not replace B's.
+        // A's Keychain wait ends: A saves, and B may not undo it.
         release.send(()).ok();
         cx.run_until_parked();
         assert_eq!(
             Servers::load(&path).expect("load").servers[0].name,
-            "From B",
-            "disk keeps B"
+            "From A"
         );
         store.read_with(cx, |store, _| {
-            assert_eq!(store.servers().servers[0].name, "From B", "memory keeps B");
+            assert_eq!(store.servers().servers[0].name, "From A");
         });
+        workspace.read_with(cx, |workspace, _| {
+            assert!(
+                workspace.notification_ids().is_empty(),
+                "A succeeded quietly"
+            );
+        });
+
+        // A new dialog on the saved list can save once A is done.
+        dialog_b.update_in(cx, |dialog, window, cx| {
+            dialog.cancel(&menu::Cancel, window, cx)
+        });
+        drop(dialog_b);
+        cx.run_until_parked();
+        let dialog_c = reopen(&workspace, cx);
+        dialog_c.update(cx, |dialog, cx| {
+            dialog.update_selected(cx, |server| server.name = "From C".into());
+            dialog.save(cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            Servers::load(&path).expect("load").servers[0].name,
+            "From C"
+        );
+    }
+
+    #[gpui::test]
+    async fn a_dialog_opened_before_another_save_finished_cannot_undo_it(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("servers.json");
+        let (workspace, dialog_a, store, saved, keychain, cx) =
+            rename_and_type_a_password(true, path.clone(), cx).await;
+        let (release, gate) = futures::channel::oneshot::channel();
+        *keychain.write_gate.lock().expect("lock") = Some(gate);
+
+        dialog_a.update(cx, |dialog, cx| {
+            dialog.update_selected(cx, |server| server.name = "From A".into());
+            dialog.save(cx);
+        });
+        cx.run_until_parked();
+        dialog_a.update_in(cx, |dialog, window, cx| {
+            dialog.cancel(&menu::Cancel, window, cx)
+        });
+        drop(dialog_a);
+        cx.run_until_parked();
+
+        // B opens on the old list; A finishes; only then B presses OK.
+        let dialog_b = reopen(&workspace, cx);
+        release.send(()).ok();
+        cx.run_until_parked();
+        assert_eq!(
+            Servers::load(&path).expect("load").servers[0].name,
+            "From A"
+        );
+        dialog_b.update(cx, |dialog, cx| {
+            // Turning the password option off would delete A's Keychain entry.
+            dialog.update_selected(cx, |server| {
+                server.name = "From B".into();
+                server.save_password = false;
+            });
+            dialog.save(cx);
+        });
+        cx.run_until_parked();
+
+        assert!(
+            error_text(&dialog_b, cx).contains("this dialog was open"),
+            "{}",
+            error_text(&dialog_b, cx)
+        );
+        assert!(is_open(&workspace, cx), "B stays open");
+        assert_eq!(
+            Servers::load(&path).expect("load").servers[0].name,
+            "From A",
+            "disk keeps A"
+        );
+        store.read_with(cx, |store, _| {
+            let kept = &store.servers().servers[0];
+            assert_eq!(kept.name, "From A", "memory keeps A");
+            assert!(kept.save_password);
+        });
+        assert!(
+            keychain.account_of(&saved).is_some(),
+            "B changed nothing in the Keychain"
+        );
+    }
+
+    #[gpui::test]
+    async fn a_save_that_clears_a_password_after_its_dialog_closed_is_toasted(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("servers.json");
+        let (workspace, dialog, _, saved, keychain, cx) =
+            rename_and_type_a_password(true, path.clone(), cx).await;
+        keychain.put(&saved, "not-a-real-value-0");
+        dialog.update_in(cx, |dialog, window, cx| {
+            dialog.passwords.clear();
+            dialog.update_selected(cx, |server| server.host = "elsewhere.example.com".into());
+            dialog.save(cx);
+            dialog.cancel(&menu::Cancel, window, cx);
+        });
+        drop(dialog);
+        cx.run_until_parked();
+
+        assert_eq!(
+            Servers::load(&path).expect("load").servers[0].host,
+            "elsewhere.example.com"
+        );
+        assert!(
+            keychain.account_of(&saved).is_none(),
+            "the password is gone"
+        );
         workspace.read_with(cx, |workspace, _| {
             assert_eq!(
                 workspace.notification_ids().len(),
                 1,
-                "A's failure reaches the user as a toast, its dialog being gone"
+                "the user is told the saved password was removed"
             );
         });
     }
