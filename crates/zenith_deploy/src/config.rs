@@ -95,8 +95,9 @@ pub struct ServerConfig {
     pub mappings: Vec<Mapping>,
     pub excluded_local: Vec<String>,
     pub excluded_remote: Vec<String>,
-    /// Per server, never a global setting. Nothing here enforces the confirmation: the M1b
-    /// prompt must set `upload_on_save_confirmed`, and the uploader must require both.
+    /// Per server, never a global setting. Nothing here enforces the confirmation: the M4
+    /// prompt must set `upload_on_save_confirmed`, and the uploader must require both. The M1b
+    /// dialog does not offer the switch at all.
     pub upload_on_save: bool,
     pub upload_on_save_confirmed: bool,
     #[serde(skip)]
@@ -137,6 +138,11 @@ impl ServerConfig {
             id: uuid::Uuid::new_v4().to_string(),
             ..Self::default()
         }
+    }
+
+    /// A server not limited to another project.
+    pub(crate) fn is_visible_in(&self, project: Option<&str>) -> bool {
+        self.project.is_none() || self.project.as_deref() == project
     }
 }
 
