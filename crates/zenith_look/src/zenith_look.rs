@@ -17,6 +17,7 @@ mod bulb;
 mod hints;
 mod hover_card;
 mod indent;
+mod palette;
 pub use indent::{IndentIndicator, indent_label};
 
 pub const ICONS_PREFIX: &str = "icon_themes/archipelago-icons/";
@@ -44,6 +45,7 @@ pub fn init(cx: &mut App) {
     if !<LookSettings as settings::Settings>::get_global(cx).enabled {
         return;
     }
+    palette::init(cx);
     bulb::init(cx);
     hints::init(cx);
     hover_card::init(cx);
