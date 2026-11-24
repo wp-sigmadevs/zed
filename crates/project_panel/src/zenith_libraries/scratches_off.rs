@@ -7,7 +7,7 @@ pub(super) fn scratch_node_menu(menu: ContextMenu) -> ContextMenu {
 }
 
 impl ProjectPanel {
-    pub(super) fn zenith_is_scratch(&self, _worktree_id: WorktreeId, _cx: &App) -> bool {
+    pub(crate) fn zenith_is_scratch(&self, _worktree_id: WorktreeId, _cx: &App) -> bool {
         false
     }
 

@@ -8546,7 +8546,10 @@ mod tests;
 // Zenith: the project root shows where it lives ("~/Sites/…"), as in PhpStorm.
 impl ProjectPanel {
     fn zenith_root_path(&self, details: &EntryDetails, cx: &App) -> Option<String> {
-        if !cx.has_global::<workspace::IslandsActive>() || !details.path.is_empty() {
+        if !cx.has_global::<workspace::IslandsActive>()
+            || !details.path.is_empty()
+            || self.zenith_is_scratch(details.worktree_id, cx)
+        {
             return None;
         }
         let worktree = self

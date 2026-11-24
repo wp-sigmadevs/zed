@@ -45,7 +45,7 @@ impl ProjectPanel {
         }
     }
 
-    /// Appends the nodes after the project roots: "External Libraries", then "Scratches".
+    /// Appends the nodes after the project roots: "External Libraries", then "Scratches and Consoles".
     /// Runs on the freshly derived state, before the panel repaints.
     pub(super) fn zenith_libraries(&mut self, cx: &mut Context<Self>) {
         self.zenith_external_libraries(cx);

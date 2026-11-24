@@ -19,6 +19,10 @@ impl ProjectPanel {
         false
     }
 
+    pub(super) fn zenith_is_scratch(&self, _worktree_id: WorktreeId, _cx: &App) -> bool {
+        false
+    }
+
     pub(super) fn zenith_depth(&self, _entry: &Entry, depth: usize, _cx: &App) -> usize {
         depth
     }
