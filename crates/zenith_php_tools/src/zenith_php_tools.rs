@@ -9,6 +9,25 @@ mod string_completions;
 
 pub use string_completions::{StringCompletionSource, add_string_completions};
 
+/// A shell script that answers `-v` like PHP `version`, with permission bits `mode`.
+#[cfg(all(test, unix))]
+pub(crate) fn php_stub(
+    dir: &std::path::Path,
+    name: &str,
+    version: &str,
+    mode: u32,
+) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt as _;
+    let path = dir.join(name);
+    std::fs::write(
+        &path,
+        format!("#!/bin/sh\necho 'PHP {version} (cli) (built: Nov 1 2026)'\n"),
+    )
+    .unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+    path
+}
+
 use gpui::{BackgroundExecutor, Task};
 use http_client::HttpClient;
 use std::{

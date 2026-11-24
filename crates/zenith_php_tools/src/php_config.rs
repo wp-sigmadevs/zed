@@ -37,6 +37,25 @@ pub const LANGUAGE_LEVELS: &[&str] = &[
     "7.0", "7.1", "7.2", "7.3", "7.4", "8.0", "8.1", "8.2", "8.3", "8.4", "8.5",
 ];
 
+/// What a language level adds, shown next to it in the dropdown. `None` for a level we do not
+/// list.
+pub fn level_features(level: &str) -> Option<&'static str> {
+    Some(match level {
+        "7.0" => "scalar and return types",
+        "7.1" => "nullable types, void",
+        "7.2" => "object type",
+        "7.3" => "flexible heredoc, trailing comma in calls",
+        "7.4" => "typed properties, short closures, ??=",
+        "8.0" => "union types, named arguments, attributes, match",
+        "8.1" => "enums, readonly properties, never",
+        "8.2" => "readonly classes, DNF types",
+        "8.3" => "typed class constants, #[\\Override]",
+        "8.4" => "property hooks, asymmetric visibility",
+        "8.5" => "pipe operator, clone with",
+        _ => return None,
+    })
+}
+
 /// The name PHPantom's language server registers under (`lsp.phpantom` in settings).
 const PHPANTOM_SERVER: &str = "phpantom";
 
@@ -462,6 +481,7 @@ mod tests {
     use gpui::{TestAppContext, UpdateGlobal as _};
     use project::FakeFs;
     use serde_json::json;
+    use crate::php_stub;
     use std::os::unix::fs::PermissionsExt as _;
 
     const USER_FILE: &str = "# my notes\n[diagnostics]\nunused = false # keep\n\n[php]\n# pinned for CI\nversion = \"8.1\" # was 8.0\n\n[indexing]\nexclude = [\"build\"]\n";
@@ -705,15 +725,15 @@ mod tests {
         );
     }
 
-    fn php_stub(dir: &Path, name: &str, version: &str, mode: u32) -> PathBuf {
-        let path = dir.join(name);
-        std::fs::write(
-            &path,
-            format!("#!/bin/sh\necho 'PHP {version} (cli) (built: Nov 1 2026)'\n"),
-        )
-        .unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
-        path
+    #[test]
+    fn test_every_language_level_has_feature_text() {
+        for level in LANGUAGE_LEVELS {
+            assert!(
+                level_features(level).is_some_and(|text| !text.is_empty()),
+                "{level} has no feature text"
+            );
+        }
+        assert_eq!(level_features("9.9"), None);
     }
 
     #[test]
