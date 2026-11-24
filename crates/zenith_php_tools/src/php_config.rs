@@ -478,10 +478,10 @@ pub async fn vendor_packages(fs: &dyn Fs, root: &Path) -> Vec<String> {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use crate::php_stub;
     use gpui::{TestAppContext, UpdateGlobal as _};
     use project::FakeFs;
     use serde_json::json;
-    use crate::php_stub;
     use std::os::unix::fs::PermissionsExt as _;
 
     const USER_FILE: &str = "# my notes\n[diagnostics]\nunused = false # keep\n\n[php]\n# pinned for CI\nversion = \"8.1\" # was 8.0\n\n[indexing]\nexclude = [\"build\"]\n";
