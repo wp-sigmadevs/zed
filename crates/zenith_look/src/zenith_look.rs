@@ -42,10 +42,11 @@ impl settings::Settings for LookSettings {
 }
 
 pub fn init(cx: &mut App) {
+    // Branding hiding is fork-wide, not part of the optional look.
+    palette::init(cx);
     if !<LookSettings as settings::Settings>::get_global(cx).enabled {
         return;
     }
-    palette::init(cx);
     bulb::init(cx);
     hints::init(cx);
     hover_card::init(cx);

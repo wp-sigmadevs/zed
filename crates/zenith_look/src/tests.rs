@@ -382,6 +382,7 @@ async fn test_look_setting_off_installs_nothing(cx: &mut gpui::TestAppContext) {
         theme_settings::init(theme::LoadThemes::JustBase, cx);
         editor::init(cx);
         workspace::init(app_state.clone(), cx);
+        command_palette_hooks::init(cx);
         init(cx);
         app_state
     });
