@@ -445,9 +445,9 @@ fn drill_entry(
 impl Render for NavBar {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let segments = self.segments(cx);
-        // shortcut: ~7 px per small-label character and half the window for the bar; measure
+        // shortcut: ~8 px per default-label character and half the window for the bar; measure
         // the labels if long paths cut too early or too late.
-        let budget = (f32::from(window.viewport_size().width) / 2. / 7.) as usize;
+        let budget = (f32::from(window.viewport_size().width) / 2. / 8.) as usize;
         let lens: Vec<_> = segments.iter().map(|s| s.label.chars().count()).collect();
         let slots = fit(&lens, budget.max(24));
         let open = self.open_segment();
@@ -467,7 +467,7 @@ impl Render for NavBar {
         let slot_elements = slots.into_iter().enumerate().map(|(slot, shown)| {
             let content = match shown {
                 None => Label::new("…")
-                    .size(LabelSize::Small)
+                    .size(LabelSize::Default)
                     .color(Color::Muted)
                     .into_any_element(),
                 Some(ix) => {
@@ -488,7 +488,7 @@ impl Render for NavBar {
                                             .color(Color::Muted),
                                     )
                                 })
-                                .child(Label::new(segment.label.clone()).size(LabelSize::Small)),
+                                .child(Label::new(segment.label.clone()).size(LabelSize::Default)),
                         )
                         .on_click(cx.listener(move |this, _, window, cx| {
                             this.open_menu(ix, None, window, cx)
@@ -499,7 +499,7 @@ impl Render for NavBar {
             h_flex()
                 .gap_1()
                 .when(slot > 0, |this| {
-                    this.child(Label::new("›").size(LabelSize::Small).color(Color::Muted))
+                    this.child(Label::new("›").size(LabelSize::Default).color(Color::Muted))
                 })
                 .child(content)
         });
