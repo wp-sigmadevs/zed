@@ -326,6 +326,7 @@ pub enum IconName {
     ZenithMoreVertical,
     ZenithColumns,
     ZenithLightbulb,
+    ZenithResizeGrip,
 }
 
 impl IconName {
