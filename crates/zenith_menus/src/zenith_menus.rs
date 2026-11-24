@@ -23,7 +23,7 @@ use tools::{Feature, changed_restart_features, feature, feature_states, set_feat
 /// the `enabled` setting under `zenith` of the same name (`islands` is `zenith.ui.islands`):
 /// `agent_review`, `local_history`, `scratches`, `todo`, `inspections`, `deploy`, `wordpress`,
 /// `laravel`, `nextjs`, `search`, `navbar`, `rails`, `look`, `islands`, `templates`,
-/// `external_libraries`, `title_bar`, `hover_card`, `welcome`. An unknown key does nothing.
+/// `external_libraries`, `title_bar`, `hover_card`, `welcome`, `editor_menu`. An unknown key does nothing.
 #[derive(Clone, PartialEq, Deserialize, JsonSchema, gpui::Action)]
 #[action(namespace = zenith_menus)]
 #[serde(deny_unknown_fields)]

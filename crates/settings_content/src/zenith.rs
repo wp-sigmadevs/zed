@@ -50,6 +50,18 @@ pub struct ZenithSettingsContent {
     pub php_tools: Option<ZenithPhpToolsSettingsContent>,
     /// Settings for the navigation bar.
     pub navbar: Option<ZenithNavbarSettingsContent>,
+    /// Settings for the editor's right-click menu.
+    pub editor_menu: Option<ZenithEditorMenuSettingsContent>,
+}
+
+/// Settings for the editor's right-click menu.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+pub struct ZenithEditorMenuSettingsContent {
+    /// Whether the editor's right-click menu uses Zenith's layout (Go To, Folding, Refactor
+    /// and so on) instead of the upstream list. Takes effect after a restart.
+    ///
+    /// Default: true
+    pub enabled: Option<bool>,
 }
 
 /// Settings for the navigation bar.
