@@ -16,10 +16,12 @@ use gpui::{
     actions,
 };
 use markdown_preview::{CloseAndReturnToEditor, markdown_preview_view::MarkdownPreviewView};
+use settings::SettingsStore;
 pub use split_view::MarkdownSplitView;
 use ui::{Tooltip, prelude::*};
 use workspace::{
     ItemHandle, Pane, ToolbarItemEvent, ToolbarItemLocation, ToolbarItemView, Workspace,
+    dock::RailsActive,
 };
 
 actions!(
@@ -66,9 +68,19 @@ fn attach(pane: &Entity<Pane>, window: &mut Window, cx: &mut Context<Workspace>)
     let weak_pane = pane.downgrade();
     pane.update(cx, |pane, cx| {
         pane.toolbar().update(cx, |toolbar, cx| {
-            let switcher = cx.new(|_| MarkdownViewSwitcher::new(workspace, weak_pane));
-            zenith_rails::tab_bar_end(switcher.clone(), 0, cx);
+            let switcher = cx.new(|cx| MarkdownViewSwitcher::new(workspace, weak_pane, cx));
+            zenith_rails::tab_bar_end(
+                switcher.clone(),
+                0,
+                |pane, cx| {
+                    pane.active_item()
+                        .is_some_and(|item| markdown_editor(item.as_ref(), cx).is_some())
+                },
+                cx,
+            );
             toolbar.add_item(switcher, window, cx);
+            let spacer = cx.new(|_| PreviewToolbarSpacer);
+            toolbar.add_item(spacer, window, cx);
         });
     });
 }
@@ -103,6 +115,8 @@ pub struct MarkdownViewSwitcher {
     workspace: WeakEntity<Workspace>,
     pane: WeakEntity<Pane>,
     active_item: Option<Box<dyn ItemHandle>>,
+    location: ToolbarItemLocation,
+    _settings_subscription: Subscription,
     // The language of a freshly opened buffer can arrive after the item is
     // activated, so the editor is watched until the file is known to be Markdown.
     _editor_subscription: Option<Subscription>,
@@ -303,13 +317,42 @@ fn return_to_editor(preview: &Entity<MarkdownPreviewView>, window: &mut Window, 
 }
 
 impl MarkdownViewSwitcher {
-    pub fn new(workspace: WeakEntity<Workspace>, pane: WeakEntity<Pane>) -> Self {
+    pub fn new(
+        workspace: WeakEntity<Workspace>,
+        pane: WeakEntity<Pane>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         Self {
             workspace,
             pane,
             active_item: None,
+            location: ToolbarItemLocation::Hidden,
+            // The tab bar settings decide where the buttons go.
+            _settings_subscription: cx
+                .observe_global::<SettingsStore>(|this, cx| this.update_location(cx)),
             _editor_subscription: None,
         }
+    }
+
+    /// The toolbar row only stands in while the rails cannot draw the tab bar's end.
+    fn location_for(item: Option<&dyn ItemHandle>, cx: &App) -> ToolbarItemLocation {
+        if cx.has_global::<RailsActive>()
+            && !zenith_rails::draws_tab_bar_end(cx)
+            && item.is_some_and(|item| markdown_editor(item, cx).is_some())
+        {
+            ToolbarItemLocation::PrimaryRight
+        } else {
+            ToolbarItemLocation::Hidden
+        }
+    }
+
+    fn update_location(&mut self, cx: &mut Context<Self>) {
+        let location = Self::location_for(self.active_item.as_deref(), cx);
+        if location != self.location {
+            self.location = location;
+            cx.emit(ToolbarItemEvent::ChangeLocation(location));
+        }
+        cx.notify();
     }
 
     fn target(&self) -> Option<Target> {
@@ -335,10 +378,10 @@ impl ToolbarItemView for MarkdownViewSwitcher {
         self.active_item = active_pane_item.map(ItemHandle::boxed_clone);
         self._editor_subscription = active_pane_item
             .and_then(|item| item.act_as::<Editor>(cx))
-            .map(|editor| cx.observe(&editor, |_, _, cx| cx.notify()));
+            .map(|editor| cx.observe(&editor, |this, _, cx| this.update_location(cx)));
+        self.location = Self::location_for(active_pane_item, cx);
         cx.notify();
-        // The buttons are drawn in the tab bar, never in a toolbar row.
-        ToolbarItemLocation::Hidden
+        self.location
     }
 }
 
@@ -380,6 +423,44 @@ impl Render for MarkdownViewSwitcher {
                 Mode::Preview,
             ))
             .into_any_element()
+    }
+}
+
+/// An empty left-hand toolbar item shown over a preview tab while the buttons sit in the
+/// toolbar (the tab bar cannot hold them).
+///
+/// `Toolbar::render` lays its two groups out with `justify_between`, and a
+/// preview has no breadcrumbs, so the right-hand group (our buttons) is the only
+/// child and lands at the left edge. Any left item makes the left group claim
+/// the free width and pushes the buttons to the right, where they sit over an
+/// editor. The clean fix is `.ml_auto()` on the right group in
+/// `crates/workspace/src/toolbar.rs`; this keeps the change out of upstream.
+pub struct PreviewToolbarSpacer;
+
+impl EventEmitter<ToolbarItemEvent> for PreviewToolbarSpacer {}
+
+impl ToolbarItemView for PreviewToolbarSpacer {
+    fn set_active_pane_item(
+        &mut self,
+        active_pane_item: Option<&dyn ItemHandle>,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> ToolbarItemLocation {
+        let over_preview = cx.has_global::<RailsActive>()
+            && !zenith_rails::draws_tab_bar_end(cx)
+            && active_pane_item
+                .is_some_and(|item| is_preview(item) && markdown_editor(item, cx).is_some());
+        if over_preview {
+            ToolbarItemLocation::PrimaryLeft
+        } else {
+            ToolbarItemLocation::Hidden
+        }
+    }
+}
+
+impl Render for PreviewToolbarSpacer {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
     }
 }
 
@@ -649,6 +730,10 @@ mod tests {
         assert_eq!(fixture.location(cx), ToolbarItemLocation::Hidden);
         assert_eq!(fixture.mode(cx), None);
         assert!(fixture.bounds("zenith-markdown-switcher", cx).is_none());
+        assert!(
+            fixture.bounds("zenith-tab-bar-end", cx).is_none(),
+            "no empty end slot beside a Rust file"
+        );
         fixture.open("b.md", cx).await;
         // Never a toolbar row: the buttons live in the tab bar.
         assert_eq!(fixture.location(cx), ToolbarItemLocation::Hidden);
@@ -663,6 +748,44 @@ mod tests {
         // Back on the Rust tab they are gone again.
         fixture.activate(0, cx);
         assert!(fixture.bounds("zenith-markdown-switcher", cx).is_none());
+        assert!(fixture.bounds("zenith-tab-bar-end", cx).is_none());
+    }
+
+    fn set_tab_bar(cx: &mut TestAppContext, show: bool, buttons: bool) {
+        cx.update(|cx| {
+            cx.update_global::<SettingsStore, _>(|store, cx| {
+                store.update_user_settings(cx, |content| {
+                    let tab_bar = content.tab_bar.get_or_insert_default();
+                    tab_bar.show = Some(show);
+                    tab_bar.show_tab_bar_buttons = Some(buttons);
+                });
+            });
+        });
+    }
+
+    #[gpui::test]
+    async fn buttons_stay_in_the_toolbar_when_the_tab_bar_cannot_hold_them(
+        cx: &mut TestAppContext,
+    ) {
+        for (show, buttons) in [(true, false), (false, true)] {
+            let fixture = fixture(cx).await;
+            fixture.open("b.md", cx).await;
+            assert_eq!(fixture.location(cx), ToolbarItemLocation::Hidden);
+            set_tab_bar(cx, show, buttons);
+            cx.run_until_parked();
+            assert_eq!(
+                fixture.location(cx),
+                ToolbarItemLocation::PrimaryRight,
+                "show {show}, buttons {buttons}"
+            );
+            // Not in a tab bar end, drawn in the toolbar row.
+            assert!(fixture.bounds("zenith-tab-bar-end", cx).is_none());
+            assert!(fixture.bounds("zenith-markdown-switcher", cx).is_some());
+            set_tab_bar(cx, true, true);
+            cx.run_until_parked();
+            assert_eq!(fixture.location(cx), ToolbarItemLocation::Hidden);
+            assert!(fixture.bounds("zenith-tab-bar-end", cx).is_some());
+        }
     }
 
     #[gpui::test]

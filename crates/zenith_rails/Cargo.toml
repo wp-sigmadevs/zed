@@ -13,6 +13,7 @@ path = "src/zenith_rails.rs"
 doctest = false
 
 [dependencies]
+editor.workspace = true
 gpui.workspace = true
 settings.workspace = true
 theme.workspace = true
@@ -20,6 +21,7 @@ ui.workspace = true
 workspace.workspace = true
 
 [dev-dependencies]
+editor = { workspace = true, features = ["test-support"] }
 gpui = { workspace = true, features = ["test-support"] }
 project = { workspace = true, features = ["test-support"] }
 settings.workspace = true

@@ -80,15 +80,28 @@ pub fn app_menus(upstream: fn(&mut App) -> Vec<gpui::Menu>, cx: &mut App) -> Vec
     }
 }
 
-/// Draws `view` at the right end of the tab bar of the pane that owns this toolbar (the
-/// Zenith rails replace the editor toolbar's right-hand items); lower `order` sits further left.
-pub fn tab_bar_end(
+/// Whether the editor toolbar's right-hand items are drawn at the tab bar's end (the rails are
+/// on and the tab bar and its buttons are shown) instead of in the toolbar.
+pub fn draws_tab_bar_end(cx: &App) -> bool {
+    #[cfg(feature = "rails")]
+    {
+        zenith_rails::draws_tab_bar_end(cx)
+    }
+    #[cfg(not(feature = "rails"))]
+    {
+        let _ = cx;
+        false
+    }
+}
+
+/// Draws the editor's quick-action menu at the right end of its pane's tab bar, while the
+/// `quick_actions` setting is on and the active tab is an editor.
+pub fn quick_actions_tab_bar_end(
     view: impl Into<gpui::AnyView>,
-    order: i32,
     cx: &mut gpui::Context<workspace::Toolbar>,
 ) {
     #[cfg(feature = "rails")]
-    zenith_rails::tab_bar_end(view, order, cx);
+    zenith_rails::quick_actions_tab_bar_end(view, cx);
     #[cfg(not(feature = "rails"))]
-    let _ = (view, order, cx);
+    let _ = (view, cx);
 }

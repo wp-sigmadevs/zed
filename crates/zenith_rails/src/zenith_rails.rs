@@ -5,7 +5,7 @@
 
 mod tab_bar_end;
 
-pub use tab_bar_end::tab_bar_end;
+pub use tab_bar_end::{draws_tab_bar_end, quick_actions_tab_bar_end, tab_bar_end};
 
 use gpui::{AnyElement, App, Context, Entity, IntoElement, Render, Window};
 use settings::{RegisterSetting, Settings, SettingsContent};
@@ -159,13 +159,16 @@ mod tests {
     use super::*;
     use gpui::TestAppContext;
     use project::Project;
+    use std::{cell::Cell, rc::Rc};
     use workspace::{AppState, MultiWorkspace};
 
     async fn open_window(cx: &mut TestAppContext, with_rails: bool) -> gpui::VisualTestContext {
         let app_state = cx.update(|cx| {
             let app_state = AppState::test(cx);
+            AppState::set_global(app_state.clone(), cx);
             theme_settings::init(theme::LoadThemes::JustBase, cx);
             workspace::init(app_state.clone(), cx);
+            editor::init(cx);
             if with_rails {
                 init(cx);
             }
@@ -271,14 +274,16 @@ mod tests {
         cx: &mut gpui::VisualTestContext,
         name: &'static str,
         order: i32,
+        visible: Rc<Cell<bool>>,
     ) -> Entity<workspace::Pane> {
         cx.update(|window, cx| {
             let multi = window.root::<MultiWorkspace>().flatten().unwrap();
             let pane = multi.read(cx).workspace().read(cx).active_pane().clone();
             let probe = cx.new(|_| Probe(name));
             pane.update(cx, |pane, cx| {
-                pane.toolbar()
-                    .update(cx, |_, cx| tab_bar_end(probe, order, cx))
+                pane.toolbar().update(cx, |_, cx| {
+                    tab_bar_end(probe, order, move |_, _| visible.get(), cx)
+                })
             });
             pane
         })
@@ -287,8 +292,8 @@ mod tests {
     #[gpui::test]
     async fn test_tab_bar_end_draws_contributions_in_order(cx: &mut TestAppContext) {
         let cx = &mut open_window(cx, true).await;
-        add_probe(cx, "probe-right", 1);
-        add_probe(cx, "probe-left", 0);
+        add_probe(cx, "probe-right", 1, Rc::new(Cell::new(true)));
+        add_probe(cx, "probe-left", 0, Rc::new(Cell::new(true)));
         cx.update(|window, cx| window.draw(cx).clear(cx));
         let end = cx.debug_bounds("zenith-tab-bar-end").expect("tab bar end");
         let left = cx.debug_bounds("probe-left").expect("left probe");
@@ -300,10 +305,113 @@ mod tests {
     #[gpui::test]
     async fn test_tab_bar_end_is_empty_without_rails(cx: &mut TestAppContext) {
         let cx = &mut open_window(cx, false).await;
-        add_probe(cx, "probe", 0);
+        add_probe(cx, "probe", 0, Rc::new(Cell::new(true)));
         cx.update(|window, cx| window.draw(cx).clear(cx));
         assert!(cx.debug_bounds("probe").is_none());
         assert!(cx.debug_bounds("zenith-tab-bar-end").is_none());
+    }
+
+    fn draw(cx: &mut gpui::VisualTestContext) {
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+    }
+
+    #[gpui::test]
+    async fn test_no_end_slot_while_no_view_is_visible(cx: &mut TestAppContext) {
+        let cx = &mut open_window(cx, true).await;
+        let visible = Rc::new(Cell::new(false));
+        let pane = add_probe(cx, "probe", 0, visible.clone());
+        // What flips the state of the moment (settings, tab change) makes the pane draw again.
+        let redraw = |cx: &mut gpui::VisualTestContext| {
+            pane.update(cx, |_, cx| cx.notify());
+            draw(cx);
+        };
+        redraw(cx);
+        assert!(cx.debug_bounds("probe").is_none());
+        assert!(
+            cx.debug_bounds("zenith-tab-bar-end").is_none(),
+            "no empty strip of ours while every view is hidden"
+        );
+        // Asked at every draw, so it follows the state of the moment.
+        visible.set(true);
+        redraw(cx);
+        assert!(cx.debug_bounds("probe").is_some());
+        assert!(cx.debug_bounds("zenith-tab-bar-end").is_some());
+        visible.set(false);
+        redraw(cx);
+        assert!(cx.debug_bounds("zenith-tab-bar-end").is_none());
+    }
+
+    #[gpui::test]
+    async fn test_end_is_drawn_only_while_the_tab_bar_and_its_buttons_are_shown(
+        cx: &mut TestAppContext,
+    ) {
+        let cx = &mut open_window(cx, true).await;
+        let draws = |cx: &mut gpui::VisualTestContext| cx.update(|_, cx| draws_tab_bar_end(cx));
+        assert!(draws(cx));
+        for (show, buttons) in [(true, false), (false, true), (false, false)] {
+            cx.update(|_, cx| {
+                cx.update_global::<settings::SettingsStore, _>(|store, cx| {
+                    store.update_user_settings(cx, |content| {
+                        let tab_bar = content.tab_bar.get_or_insert_default();
+                        tab_bar.show = Some(show);
+                        tab_bar.show_tab_bar_buttons = Some(buttons);
+                    });
+                });
+            });
+            assert!(!draws(cx), "show {show}, buttons {buttons}");
+        }
+    }
+
+    #[gpui::test]
+    async fn test_no_end_without_rails(cx: &mut TestAppContext) {
+        let cx = &mut open_window(cx, false).await;
+        assert!(!cx.update(|_, cx| draws_tab_bar_end(cx)));
+    }
+
+    #[gpui::test]
+    async fn test_quick_actions_end_follows_setting_and_active_tab(cx: &mut TestAppContext) {
+        let cx = &mut open_window(cx, true).await;
+        cx.update(|window, cx| {
+            let multi = window.root::<MultiWorkspace>().flatten().unwrap();
+            let pane = multi.read(cx).workspace().read(cx).active_pane().clone();
+            let probe = cx.new(|_| Probe("quick-actions"));
+            pane.update(cx, |pane, cx| {
+                pane.toolbar()
+                    .update(cx, |_, cx| quick_actions_tab_bar_end(probe, cx))
+            });
+        });
+        let shown = |cx: &mut gpui::VisualTestContext| {
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            let shown = cx.debug_bounds("quick-actions").is_some();
+            assert_eq!(shown, cx.debug_bounds("zenith-tab-bar-end").is_some());
+            shown
+        };
+        let redraw = |cx: &mut gpui::VisualTestContext| {
+            cx.update(|window, cx| {
+                let multi = window.root::<MultiWorkspace>().flatten().unwrap();
+                let pane = multi.read(cx).workspace().read(cx).active_pane().clone();
+                pane.update(cx, |_, cx| cx.notify());
+            });
+        };
+        assert!(
+            !shown(cx),
+            "a non-editor tab has no quick actions, and no empty strip"
+        );
+        cx.dispatch_action(workspace::NewFile);
+        cx.run_until_parked();
+        assert!(shown(cx), "an editor tab has them at the tab bar's end");
+        for quick_actions in [false, true] {
+            cx.update(|_, cx| {
+                cx.update_global::<settings::SettingsStore, _>(|store, cx| {
+                    store.update_user_settings(cx, |content| {
+                        content.editor.toolbar.get_or_insert_default().quick_actions =
+                            Some(quick_actions);
+                    });
+                });
+            });
+            redraw(cx);
+            assert_eq!(shown(cx), quick_actions);
+        }
     }
 
     #[gpui::test]
@@ -311,7 +419,7 @@ mod tests {
         let cx = &mut open_window(cx, true).await;
         let probe = cx.new(|_| Probe("probe"));
         let toolbar = cx.new(|_| workspace::Toolbar::new());
-        toolbar.update(cx, |_, cx| tab_bar_end(probe, 0, cx));
+        toolbar.update(cx, |_, cx| tab_bar_end(probe, 0, |_, _| true, cx));
         let id = toolbar.entity_id();
         let held = |cx: &mut gpui::VisualTestContext| {
             cx.update(|_, cx| cx.global::<tab_bar_end::Views>().0.contains_key(&id))

@@ -1491,7 +1491,7 @@ fn initialize_pane(
             toolbar.add_item(buffer_search_bar.clone(), window, cx);
             let quick_action_bar =
                 cx.new(|cx| QuickActionBar::new(buffer_search_bar, workspace, cx));
-            zenith::tab_bar_end(quick_action_bar.clone(), 1, cx);
+            zenith::quick_actions_tab_bar_end(quick_action_bar.clone(), cx);
             toolbar.add_item(quick_action_bar, window, cx);
             let diagnostic_editor_controls = cx.new(|_| diagnostics::ToolbarControls::new());
             toolbar.add_item(diagnostic_editor_controls, window, cx);
