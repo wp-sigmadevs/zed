@@ -146,7 +146,7 @@ impl RenderOnce for Tab {
         };
         // Zenith: without the start slot the icon would sit 4 px from the tab edge.
         let left_pad = if start_slot.is_none() {
-            DynamicSpacing::Base08.px(cx)
+            DynamicSpacing::Base12.px(cx)
         } else {
             DynamicSpacing::Base04.px(cx)
         };
