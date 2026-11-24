@@ -877,17 +877,15 @@ impl FindInFilesModal {
         cx.notify();
     }
 
-    /// The splitter pressed at `y`. The preview may grow until the list has
-    /// `MIN_LIST_ROWS` left; an unsized popup grows instead, up to 40% of the window.
-    fn start_splitter_drag(&mut self, y: Pixels, window: &Window, cx: &App) {
-        let height = preview_height(cx);
-        let max = match (
-            self.frame.size(PopupKind::Find, window, cx).1,
-            self.list.get(),
-        ) {
-            (Some(_), Some(list)) => list.size.height + height - px(ROW_HEIGHT * MIN_LIST_ROWS),
-            _ => window.viewport_size().height * 0.4,
-        };
+    /// The splitter pressed at `y`. The popup is pinned at its painted height,
+    /// so the preview takes its room from the list and the handle follows the
+    /// pointer; it may grow until the list has `MIN_LIST_ROWS` left.
+    fn start_splitter_drag(&mut self, y: Pixels, window: &Window, cx: &mut App) {
+        self.frame.pin(PopupKind::Find, window, cx);
+        let height = preview_height(window, cx);
+        let max = self.list.get().map_or(height, |list| {
+            list.size.height + height - px(ROW_HEIGHT * MIN_LIST_ROWS)
+        });
         self.split_drag = Some(SplitDrag { y, height, max });
     }
 
@@ -1538,7 +1536,7 @@ impl FindInFilesModal {
             }))
     }
 
-    fn render_preview(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+    fn render_preview(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let hit = self.hits.get(self.selected);
         v_flex()
             .child(h_flex().h_8().px_4().gap_2().when_some(hit, |this, hit| {
@@ -1551,7 +1549,7 @@ impl FindInFilesModal {
             .child(
                 div()
                     .debug_selector(|| "zenith-find-preview".into())
-                    .h(preview_height(cx))
+                    .h(preview_height(window, cx))
                     .overflow_hidden()
                     .map(|this| match &self.preview {
                         Some(editor) => this.child(editor.clone()),
@@ -1616,7 +1614,7 @@ impl Render for FindInFilesModal {
         let scope = self.render_scope(window, cx);
         let results = self.render_results(height.is_some(), window, cx);
         let splitter = self.render_splitter(cx);
-        let preview = self.render_preview(cx);
+        let preview = self.render_preview(window, cx);
         let footer = self.render_footer(cx);
         let body = v_flex()
             .size_full()

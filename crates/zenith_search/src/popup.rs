@@ -11,7 +11,7 @@ use gpui::{
 };
 use ui::{Tooltip, prelude::*};
 
-use crate::style::PREVIEW_HEIGHT;
+use crate::style::{MIN_LIST_ROWS, MIN_PREVIEW_HEIGHT, PREVIEW_HEIGHT, ROW_HEIGHT, VISIBLE_ROWS};
 
 /// The card's border, both sides: its children are this much narrower than it.
 pub(crate) const BORDER: Pixels = px(2.);
@@ -85,11 +85,26 @@ impl Render for NoDragPreview {
     }
 }
 
-/// The Find in Files preview's height: what the splitter set this session.
-pub(crate) fn preview_height(cx: &gpui::App) -> Pixels {
-    cx.try_global::<PopupSizes>()
+/// The Find in Files preview's height: what the splitter set this session,
+/// held to what this window has room for. The setting is app-wide and may have
+/// been made in a bigger window, so it is clamped here, on every read: the
+/// body's minimum grows with the preview, and past the window's cap the
+/// footer and grip would leave the screen.
+pub(crate) fn preview_height(window: &Window, cx: &gpui::App) -> Pixels {
+    let sizes = cx.try_global::<PopupSizes>();
+    let stored = sizes
         .and_then(|sizes| sizes.find_preview)
-        .unwrap_or(px(PREVIEW_HEIGHT))
+        .unwrap_or(px(PREVIEW_HEIGHT));
+    let sized = sizes.is_some_and(|sizes| sizes.cards.contains_key(&PopupKind::Find));
+    // The body minimum (list rows included) was set for the default preview.
+    let mut chrome = PopupKind::Find.min_body_height() - px(PREVIEW_HEIGHT);
+    if !sized {
+        // The list shows its fixed rows, not the least it keeps, and the body
+        // grows with the preview.
+        chrome += px(ROW_HEIGHT * (VISIBLE_ROWS - MIN_LIST_ROWS));
+    }
+    let room = Frame::max_size(window.viewport_size()).height - chrome;
+    stored.min(room).max(px(MIN_PREVIEW_HEIGHT))
 }
 
 /// Remembers the preview's height for the session.
@@ -99,9 +114,9 @@ pub(crate) fn set_preview_height(height: Pixels, cx: &mut gpui::App) {
 
 /// How much taller than its default the Find in Files body must be: the body's
 /// minimum was set for the default preview, and the list needs the same room.
-fn preview_extra(kind: PopupKind, cx: &gpui::App) -> Pixels {
+fn preview_extra(kind: PopupKind, window: &Window, cx: &gpui::App) -> Pixels {
     match kind {
-        PopupKind::Find => preview_height(cx) - px(PREVIEW_HEIGHT),
+        PopupKind::Find => preview_height(window, cx) - px(PREVIEW_HEIGHT),
         _ => Pixels::ZERO,
     }
 }
@@ -164,8 +179,20 @@ impl Frame {
             stored.map_or(kind.default_width().to_pixels(rem), |size| size.width),
             stored.map_or(Pixels::ZERO, |size| size.height),
         );
-        let clamped = clamp_size(kind, preview_extra(kind, cx), wanted, max, rem);
+        let clamped = clamp_size(kind, preview_extra(kind, window, cx), wanted, max, rem);
         (clamped.width, stored.map(|_| clamped.height))
+    }
+
+    /// Fixes the popup at the height it is painted at, if the user has not sized
+    /// it. An unsized card grows with its content, and the modal layer anchors
+    /// its top, so a splitter dragged in one would run away from the pointer.
+    pub(crate) fn pin(&self, kind: PopupKind, window: &Window, cx: &mut gpui::App) {
+        if let (None, Some(body)) = (self.size(kind, window, cx).1, self.body.get()) {
+            let width = self.size(kind, window, cx).0;
+            cx.default_global::<PopupSizes>()
+                .cards
+                .insert(kind, size(width, body.size.height));
+        }
     }
 
     /// Moves the popup with the pointer, keeping it within reach of the window.
@@ -207,7 +234,7 @@ impl Frame {
                 cap.height.min(viewport.height - origin.y - margin),
             );
             let delta = position - last;
-            let extra = preview_extra(kind, cx);
+            let extra = preview_extra(kind, window, cx);
             let next = clamp_size(
                 kind,
                 extra,

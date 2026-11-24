@@ -4031,21 +4031,7 @@ mod tests {
         // Down as far as the window allows: held at the least.
         drag_splitter(cx, px(400.));
         assert_eq!(preview_height_of(cx), px(80.));
-        // Up past the window: the unsized popup caps the preview, the rest is the list's.
-        let splitter = cx.debug_bounds("zenith-find-splitter").unwrap().center();
-        let far_above = splitter - gpui::point(px(0.), px(9000.));
-        modal.update_in(cx, |m, window, cx| {
-            m.split_between(splitter, far_above, window, cx)
-        });
-        cx.run_until_parked();
-        let window = cx.update(|window, _| window.viewport_size());
-        assert_eq!(preview_height_of(cx), window.height * 0.4);
-        // A resized popup bounds the preview by the list: three rows stay.
-        let grip = cx.debug_bounds("zenith-popup-resize").unwrap().center();
-        modal.update_in(cx, |m, window, cx| {
-            m.resize_between(grip, grip + gpui::point(px(0.), px(40.)), window, cx)
-        });
-        cx.run_until_parked();
+        // Up past the window: the list keeps three rows, and the preview the rest.
         let splitter = cx.debug_bounds("zenith-find-splitter").unwrap().center();
         let room =
             cx.debug_bounds("zenith-find-results").unwrap().size.height + preview_height_of(cx);
@@ -4069,6 +4055,43 @@ mod tests {
         cx.run_until_parked();
         let list = cx.debug_bounds("zenith-find-results").unwrap().size.height;
         assert!(list >= px(3. * 26.) - px(0.5), "{list:?}");
+    }
+
+    #[gpui::test]
+    async fn test_splitter_follows_the_pointer_in_a_popup_nobody_resized(cx: &mut TestAppContext) {
+        let (_, _, cx) = open_with_hit(cx).await;
+        let before = cx.debug_bounds("zenith-find-splitter").unwrap().center();
+        drag_splitter(cx, px(-40.));
+        let after = cx.debug_bounds("zenith-find-splitter").unwrap().center();
+        // The preview took its room from the list, not from the window below.
+        assert_eq!(after.y, before.y - px(40.));
+        assert_eq!(preview_height_of(cx), px(250.));
+        drag_splitter(cx, px(25.));
+        let again = cx.debug_bounds("zenith-find-splitter").unwrap().center();
+        assert_eq!(again.y, after.y + px(25.));
+    }
+
+    #[gpui::test]
+    async fn test_a_stored_preview_height_is_held_to_a_smaller_window(cx: &mut TestAppContext) {
+        let (_, modal, cx) = open_with_hit(cx).await;
+        // Set in a roomier window, or by a bigger drag: far more than any window holds.
+        cx.update(|_, cx| popup::set_preview_height(px(5000.), cx));
+        modal.update(cx, |_, cx| cx.notify());
+        cx.run_until_parked();
+        let check = |cx: &mut VisualTestContext| {
+            let window = cx.update(|window, _| window.viewport_size());
+            let footer = cx.debug_bounds("zenith-popup-footer").expect("footer");
+            let grip = cx.debug_bounds("zenith-popup-resize").expect("grip");
+            assert!(footer.bottom() <= window.height, "{footer:?} in {window:?}");
+            assert!(grip.bottom() <= window.height, "{grip:?} in {window:?}");
+            let list = cx.debug_bounds("zenith-find-results").unwrap().size.height;
+            assert!(list >= px(3. * 26.) - px(0.5), "{list:?} in {window:?}");
+        };
+        check(cx);
+        cx.simulate_resize(gpui::size(px(1400.), px(800.)));
+        modal.update(cx, |_, cx| cx.notify());
+        cx.run_until_parked();
+        check(cx);
     }
 
     #[gpui::test]
