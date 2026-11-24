@@ -56,6 +56,16 @@
     },
   },
   {
+    // The PHP dialog. Tab and Shift-Tab move between its controls (level, interpreter, the list
+    // toolbar, the buttons). The base keymap's context-less "tab" (menu::SelectNext) would step
+    // the include list selection instead; same tie-break as the history tab above.
+    "context": "ZenithPhpModal",
+    "bindings": {
+      "tab": "zenith_php_tools::FocusNextControl",
+      "shift-tab": "zenith_php_tools::FocusPreviousControl",
+    },
+  },
+  {
     // Collapse / expand a hook in the WordPress Hooks tool window.
     "context": "WpHooksPanel",
     "bindings": {

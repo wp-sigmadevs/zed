@@ -20,6 +20,16 @@ use util::ResultExt as _;
 use workspace::{ModalView, Workspace};
 use zenith_external_libraries::{ConfigurePhpIncludePaths, open_as_libraries};
 
+gpui::actions!(
+    zenith_php_tools,
+    [
+        /// Moves focus to the next control of the PHP dialog (Tab).
+        FocusNextControl,
+        /// Moves focus to the previous control of the PHP dialog (Shift-Tab).
+        FocusPreviousControl
+    ]
+);
+
 const AUTO_LEVEL: &str = "Auto (composer.json)";
 const AUTO_INTERPRETER: &str = "Auto (first PHP found)";
 
@@ -182,6 +192,13 @@ impl PhpModal {
         }
     }
 
+    /// A pick or probe that finished while Apply was saving is not staged: say so.
+    fn busy_notice(&mut self, cx: &mut Context<Self>) {
+        self.error =
+            Some("Apply was still saving: that choice was ignored, choose it again.".into());
+        cx.notify();
+    }
+
     fn is_dirty(&self) -> bool {
         self.staged != self.base
     }
@@ -212,6 +229,7 @@ impl PhpModal {
     /// Probes `path` off the main thread; a PHP that answers `-v` joins the list and is staged.
     pub fn add_interpreter(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         if self.applying {
+            self.busy_notice(cx);
             return;
         }
         let executor = cx.background_executor().clone();
@@ -265,6 +283,7 @@ impl PhpModal {
     /// Stages include paths, skipping those already listed.
     pub fn stage_include_paths(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
         if self.applying {
+            self.busy_notice(cx);
             return;
         }
         for path in paths {
@@ -470,7 +489,8 @@ impl PhpModal {
                     this.close_after = false;
                     this.error = Some(
                         format!(
-                            "Settings were not saved: {error}. Fix the settings file and try again."
+                            "Settings were not saved: {}. Fix the settings file and try again.",
+                            error.to_string().lines().next().unwrap_or_default()
                         )
                         .into(),
                     );
@@ -492,6 +512,7 @@ impl PhpModal {
             this.update(cx, |this, cx| {
                 this.base = staged;
                 this.applying = false;
+                this.error = None;
                 if std::mem::take(&mut this.close_after) {
                     cx.emit(DismissEvent);
                 }
@@ -500,6 +521,20 @@ impl PhpModal {
             .ok();
         });
         cx.notify();
+    }
+
+    /// Tab and Shift-Tab. The tab order belongs to the window and does not stop at the dialog's
+    /// edge, so a step that leaves the dialog wraps to its first control.
+    fn move_focus(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if forward {
+            window.focus_next(cx);
+        } else {
+            window.focus_prev(cx);
+        }
+        if !self.focus_handle.contains_focused(window, cx) {
+            self.focus_handle.focus(window, cx);
+            window.focus_next(cx);
+        }
     }
 
     /// Moves the selection `delta` rows down the include list.
@@ -884,8 +919,17 @@ impl Render for PhpModal {
         v_flex()
             .id("zenith-php-modal")
             .key_context("ZenithPhpModal")
+            .tab_group()
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(|_, _: &menu::Cancel, _, cx| cx.emit(DismissEvent)))
+            // The base keymap's context-less Tab is `menu::SelectNext`: these two take it over
+            // here (`assets/keymaps/zenith.json`) so Tab moves focus, not the list selection.
+            .on_action(cx.listener(|this, _: &FocusNextControl, window, cx| {
+                this.move_focus(true, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &FocusPreviousControl, window, cx| {
+                this.move_focus(false, window, cx)
+            }))
             .on_action(cx.listener(|this, _: &menu::Confirm, _, cx| this.apply(true, cx)))
             .on_action(cx.listener(|this, _: &menu::SelectNext, _, cx| this.move_selection(1, cx)))
             .on_action(
@@ -1390,6 +1434,24 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_enter_is_ok(cx: &mut TestAppContext) {
+        let (fixture, cx) = setup(cx, json!({ "composer.json": "{}" })).await;
+        let modal = open(&fixture, Vec::new(), cx);
+        modal.update(cx, |modal, cx| {
+            modal.set_language_level(Some("8.3".into()), cx)
+        });
+        cx.dispatch_action(menu::Confirm);
+        cx.run_until_parked();
+        assert!(!is_open(&fixture, cx));
+        let text = fixture
+            .fs
+            .load(Path::new("/p/.phpantom.toml"))
+            .await
+            .unwrap();
+        assert!(text.contains("version = \"8.3\""), "{text}");
+    }
+
+    #[gpui::test]
     async fn test_ok_while_apply_runs_closes_when_it_finishes(cx: &mut TestAppContext) {
         let (fixture, cx) = setup(cx, json!({ "composer.json": "{}" })).await;
         let modal = open(&fixture, Vec::new(), cx);
@@ -1433,6 +1495,68 @@ mod tests {
         );
         cx.dispatch_action(menu::SelectPrevious);
         assert_eq!(selected(cx), Some(Row::User("/libs/a".into())));
+    }
+
+    #[gpui::test]
+    async fn test_tab_moves_focus_not_the_list_selection(cx: &mut TestAppContext) {
+        let (fixture, cx) = setup(
+            cx,
+            json!({ "composer.json": "{}", "vendor": { "acme": { "one": {} } } }),
+        )
+        .await;
+        // The base keymap binds a context-less `tab` to `menu::SelectNext`; the fork's own
+        // keymap file takes it over inside the dialog.
+        cx.update(|_, cx| {
+            for json in [
+                include_str!("../../../assets/keymaps/default-macos.json"),
+                include_str!("../../../assets/keymaps/zenith.json"),
+            ] {
+                let bindings = match settings::KeymapFile::load(json, cx) {
+                    settings::KeymapFileLoadResult::Success { key_bindings }
+                    | settings::KeymapFileLoadResult::SomeFailedToLoad { key_bindings, .. } => {
+                        key_bindings
+                    }
+                    settings::KeymapFileLoadResult::JsonParseFailure { error } => {
+                        panic!("{error:#}")
+                    }
+                };
+                cx.bind_keys(bindings);
+            }
+        });
+        let modal = open(&fixture, Vec::new(), cx);
+        click(cx, "zenith-php-row-0");
+        let selected = modal.read_with(cx, |modal, _| modal.selected.clone());
+        assert!(selected.is_some());
+        // The row click leaves focus on the dialog itself (it has no tab stop of its own).
+        let handle = modal.read_with(cx, |modal, _| modal.focus_handle.clone());
+        assert!(cx.update(|window, _| handle.is_focused(window)));
+
+        cx.simulate_keystrokes("tab");
+        cx.run_until_parked();
+        assert_eq!(
+            modal.read_with(cx, |modal, _| modal.selected.clone()),
+            selected,
+            "Tab does not move the list selection"
+        );
+        cx.update(|window, cx| {
+            assert!(!handle.is_focused(window), "focus moved to a control");
+            assert!(
+                handle.contains_focused(window, cx),
+                "and it is inside the dialog"
+            );
+        });
+        // However many steps, either way, focus stays in the dialog and the selection stays.
+        for key in ["tab"; 14].into_iter().chain(["shift-tab"; 14]) {
+            cx.simulate_keystrokes(key);
+            cx.run_until_parked();
+            cx.update(|window, cx| {
+                assert!(handle.contains_focused(window, cx), "{key} left the dialog");
+            });
+        }
+        assert_eq!(
+            modal.read_with(cx, |modal, _| modal.selected.clone()),
+            selected
+        );
     }
 
     #[gpui::test]
