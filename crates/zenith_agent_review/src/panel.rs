@@ -579,7 +579,7 @@ impl AgentReviewPanel {
                 ..
             } => item(format!("agent-review-thread-{thread_id}"))
                 .start_slot(
-                    Icon::new(IconName::ZenithBot)
+                    Icon::new(IconName::FileDiff)
                         .size(IconSize::Small)
                         .color(Color::Custom(orange)),
                 )
@@ -854,7 +854,7 @@ impl Panel for AgentReviewPanel {
 
     // Reads only this panel's own fields and settings: the dock may call these mid-update.
     fn icon(&self, _: &Window, _: &App) -> Option<IconName> {
-        Some(IconName::ZenithBot)
+        Some(IconName::FileDiff)
     }
 
     fn icon_tooltip(&self, _: &Window, _: &App) -> Option<&'static str> {
