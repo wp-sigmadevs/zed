@@ -2,6 +2,7 @@
 //! on and off (plan 44 item 14).
 
 mod app_menu;
+mod editor_menu;
 #[cfg(test)]
 mod tests;
 mod tools;
@@ -47,6 +48,7 @@ struct UpstreamMenus(fn(&mut App) -> Vec<Menu>);
 impl Global for UpstreamMenus {}
 
 pub fn init(cx: &mut App) {
+    editor_menu::init(cx);
     cx.on_action(toggle_feature);
     let mut shown = FeatureToggles::get_global(cx).clone();
     cx.observe_global::<SettingsStore>(move |cx| {

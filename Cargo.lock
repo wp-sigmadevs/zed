@@ -23322,14 +23322,18 @@ name = "zenith_menus"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "editor",
  "fs",
  "gpui",
+ "language",
  "log",
+ "multi_buffer",
  "project",
  "schemars 1.0.4",
  "serde",
  "serde_json",
  "settings",
+ "ui",
  "workspace",
 ]
 
