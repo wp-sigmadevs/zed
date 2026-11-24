@@ -71,7 +71,11 @@ pub fn init(cx: &mut App) {
 /// `upstream` wherever the bar is (re)built.
 pub fn app_menus(upstream: fn(&mut App) -> Vec<gpui::Menu>, cx: &mut App) -> Vec<gpui::Menu> {
     #[cfg(feature = "menus")]
-    return zenith_menus::app_menus(upstream, cx);
+    {
+        zenith_menus::app_menus(upstream, cx)
+    }
     #[cfg(not(feature = "menus"))]
-    upstream(cx)
+    {
+        upstream(cx)
+    }
 }
