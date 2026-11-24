@@ -10000,7 +10000,7 @@ pub struct TabMenuTarget {
     pub has_multibuffer_items: bool,
     /// "Make Tab Read-Only" or "Make Tab Editable"; `None` when the tab cannot be toggled.
     pub read_only_label: Option<&'static str>,
-    pub project: Option<Entity<Project>>,
+    pub project: Option<WeakEntity<Project>>,
     pub project_path: Option<ProjectPath>,
     pub workspace: WeakEntity<Workspace>,
     pub abs_path: Option<PathBuf>,
@@ -10011,6 +10011,19 @@ pub struct TabMenuTarget {
     pub is_remote: bool,
     pub extra_actions: Vec<(SharedString, Box<dyn Action>)>,
     pub menu_context: FocusHandle,
+}
+
+impl Workspace {
+    /// Zenith: makes `pane` the active pane now, as focusing it does at the next draw. Call it
+    /// outside an update of that pane.
+    pub fn zenith_activate_pane(
+        &mut self,
+        pane: &Entity<Pane>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.handle_pane_focused(pane.clone(), window, cx);
+    }
 }
 
 type TabMenuBuilderFn = dyn Fn(TabMenuTarget, &mut Window, &mut App) -> Option<Entity<ContextMenu>>;
@@ -10093,7 +10106,7 @@ fn zenith_tab_menu(
             .iter()
             .any(|item| item.buffer_kind(cx) == ItemBufferKind::Multibuffer),
         read_only_label,
-        project: project.clone(),
+        project: project.as_ref().map(Entity::downgrade),
         project_path,
         workspace: this.workspace.clone(),
         abs_path: entry.and_then(|entry| this.entry_abs_path(entry, cx)),

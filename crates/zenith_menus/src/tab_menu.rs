@@ -223,7 +223,8 @@ pub(crate) fn rows(f: &Facts) -> Vec<Row> {
     }
     rows.push(menu("Open In", open_in));
 
-    let history = f.abs_path.is_some().then(|| {
+    // Snapshots are recorded for local projects only (the handler returns silently otherwise).
+    let history = (f.abs_path.is_some() && f.is_local && !f.is_remote).then(|| {
         entry(
             "Show History",
             zed_actions::zenith_local_history::ShowFileHistory,
@@ -291,7 +292,7 @@ pub(crate) fn tidy(rows: Vec<Row>) -> Vec<Row> {
 /// What a menu item needs besides its own data: the clicked tab and the project it is in.
 pub(crate) struct Ctx {
     item_id: EntityId,
-    project: Option<Entity<Project>>,
+    project: Option<WeakEntity<Project>>,
     project_path: Option<ProjectPath>,
     workspace: WeakEntity<Workspace>,
 }
@@ -314,11 +315,22 @@ pub(crate) fn run(
     match cmd {
         Cmd::Dispatch(action) => {
             pane.activate_item(ix, true, false, window, cx);
-            window.focus(&gpui::Focusable::focus_handle(pane, cx), cx);
-            window.dispatch_action(action.boxed_clone(), cx);
+            let (pane, workspace, action) =
+                (cx.entity(), ctx.workspace.clone(), action.boxed_clone());
+            // Focusing a pane reaches the workspace only at the next draw, and a workspace
+            // update cannot run while this pane is being updated: do both after this handler.
+            window.defer(cx, move |window, cx| {
+                workspace
+                    .update(cx, |workspace, cx| {
+                        workspace.zenith_activate_pane(&pane, window, cx)
+                    })
+                    .ok();
+                window.focus(&gpui::Focusable::focus_handle(pane.read(cx), cx), cx);
+                window.dispatch_action(action, cx);
+            });
         }
         Cmd::Copy(text) => cx.write_to_clipboard(gpui::ClipboardItem::new_string(text.clone())),
-        Cmd::Reveal(path) => match &ctx.project {
+        Cmd::Reveal(path) => match ctx.project.as_ref().and_then(WeakEntity::upgrade) {
             Some(project) => project.update(cx, |project, cx| project.reveal_path(path, cx)),
             None => cx.reveal_path(path),
         },
@@ -328,7 +340,10 @@ pub(crate) fn run(
             }
         }
         Cmd::Permalink { copy } => {
-            if let (Some(project), Some(path)) = (ctx.project.clone(), ctx.project_path.clone()) {
+            if let (Some(project), Some(path)) = (
+                ctx.project.as_ref().and_then(WeakEntity::upgrade),
+                ctx.project_path.clone(),
+            ) {
                 let open = if *copy {
                     workspace::copy_file_permalink
                 } else {
@@ -341,11 +356,16 @@ pub(crate) fn run(
             let Some(path) = ctx.project_path.clone() else {
                 return;
             };
-            ctx.workspace
-                .update(cx, |workspace, cx| {
-                    git_ui_core::open_file_history(workspace, &path, window, cx)
-                })
-                .ok();
+            // The opener updates the workspace and, through it, this pane: run it after this
+            // handler, which holds the pane.
+            let workspace = ctx.workspace.clone();
+            window.defer(cx, move |window, cx| {
+                workspace
+                    .update(cx, |workspace, cx| {
+                        git_ui_core::open_file_history(workspace, &path, window, cx)
+                    })
+                    .ok();
+            });
         }
     }
 }
@@ -370,7 +390,10 @@ fn item(
 
 fn deploy(target: TabMenuTarget, window: &mut Window, cx: &mut App) -> Option<Entity<ContextMenu>> {
     #[cfg(test)]
-    tests::DEPLOYED.with(|n| n.set(n.get() + 1));
+    {
+        tests::DEPLOYED.with(|n| n.set(n.get() + 1));
+        tests::LAST_ITEM.with(|slot| slot.set(Some(target.item_id)));
+    }
 
     let rows = Rc::new(tidy(rows(&facts(&target))));
     let TabMenuTarget {
@@ -446,7 +469,10 @@ fn enabled(cx: &App) -> bool {
 mod tests {
     use std::cell::Cell;
 
-    use gpui::{AppContext as _, BorrowAppContext as _, Modifiers, MouseButton, TestAppContext};
+    use gpui::{
+        AppContext as _, BorrowAppContext as _, Focusable as _, Modifiers, MouseButton,
+        TestAppContext,
+    };
     use project::{FakeFs, Project};
     use workspace::{Workspace, item::test::TestItem};
 
@@ -455,6 +481,8 @@ mod tests {
     thread_local! {
         /// How many menus `deploy` built on this thread, so a test can tell the menu is ours.
         pub(crate) static DEPLOYED: Cell<usize> = const { Cell::new(0) };
+        /// The tab the last built menu was for.
+        pub(crate) static LAST_ITEM: Cell<Option<EntityId>> = const { Cell::new(None) };
     }
 
     /// Labels of the tidy menu, submenus as `Name>`, separators as `-`; `!` marks a greyed item.
@@ -583,6 +611,22 @@ mod tests {
     }
 
     #[test]
+    fn local_history_needs_a_local_project() {
+        let has = |f: &Facts| shape(f).contains(&"  Show History".to_string());
+        assert!(has(&file_facts()));
+        let remote = Facts {
+            is_remote: true,
+            ..file_facts()
+        };
+        assert!(!has(&remote));
+        let not_local = Facts {
+            is_local: false,
+            ..file_facts()
+        };
+        assert!(!has(&not_local));
+    }
+
+    #[test]
     fn tidy_drops_empty_submenus_and_stray_separators() {
         let item = |label: &str| Row::Item(entry(label.to_string(), TogglePinTab, false));
         let rows = vec![
@@ -605,8 +649,14 @@ mod tests {
         assert_eq!(kinds, ["A", "-", "B"]);
     }
 
-    async fn right_click_first_tab(cx: &mut TestAppContext, register: bool, enabled: bool) {
+    /// Right-clicks tab 0 while tab 1 is active; returns tab 0's id.
+    async fn right_click_first_tab(
+        cx: &mut TestAppContext,
+        register: bool,
+        enabled: bool,
+    ) -> EntityId {
         DEPLOYED.with(|n| n.set(0));
+        LAST_ITEM.with(|slot| slot.set(None));
         cx.update(|cx| {
             let store = settings::SettingsStore::test(cx);
             cx.set_global(store);
@@ -636,12 +686,15 @@ mod tests {
         let tab = cx.debug_bounds("TAB-0").expect("tab");
         cx.simulate_mouse_down(tab.center(), MouseButton::Right, Modifiers::default());
         cx.run_until_parked();
+        pane.read_with(cx, |pane, _| pane.items().next().unwrap().item_id())
     }
 
     #[gpui::test]
     async fn the_registered_builder_makes_the_tab_menu(cx: &mut TestAppContext) {
-        right_click_first_tab(cx, true, true).await;
+        let first = right_click_first_tab(cx, true, true).await;
         assert_eq!(DEPLOYED.with(Cell::get), 1);
+        // The menu is for the clicked tab, not the active one.
+        assert_eq!(LAST_ITEM.with(Cell::get), Some(first));
     }
 
     #[gpui::test]
@@ -669,8 +722,10 @@ mod tests {
             theme_settings::init(theme::LoadThemes::JustBase, cx);
         });
         let project = Project::test(FakeFs::new(cx.executor()), None, cx).await;
-        let (workspace, cx) =
-            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+        // A multi-workspace window, which is what attaches workspace actions in tests.
+        let (multi, cx) = cx
+            .add_window_view(|window, cx| workspace::MultiWorkspace::test_new(project, window, cx));
+        let workspace = multi.read_with(cx, |multi, _| multi.workspace().clone());
         let pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
         pane.update_in(cx, |pane, window, cx| {
             for label in ["a.php", "b.php"] {
@@ -743,7 +798,11 @@ mod tests {
         let (workspace, pane, cx) = two_tabs(cx).await;
         cx.update(|_, cx| {
             git_ui_core::set_file_history_opener(
-                |_, path, _, _| HISTORY_FOR.with(|slot| *slot.borrow_mut() = Some(path.clone())),
+                |workspace, path, _, cx| {
+                    HISTORY_FOR.with(|slot| *slot.borrow_mut() = Some(path.clone()));
+                    // As the real opener does: it opens or activates an item in the active pane.
+                    workspace.active_pane().update(cx, |_, _| {});
+                },
                 cx,
             );
         });
@@ -757,5 +816,49 @@ mod tests {
         });
         cx.run_until_parked();
         assert_eq!(HISTORY_FOR.with(|slot| slot.borrow().clone()), Some(path));
+    }
+
+    gpui::actions!(zenith_tab_menu_test, [Probe]);
+
+    thread_local! {
+        static ACTIVE_PANE_AT_PROBE: Cell<Option<EntityId>> = const { Cell::new(None) };
+    }
+
+    #[gpui::test]
+    async fn a_workspace_action_sees_the_clicked_tabs_pane_as_active(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            cx.observe_new(|workspace: &mut Workspace, _, _| {
+                workspace.register_action(|workspace, _: &Probe, _, _| {
+                    let id = workspace.active_pane().entity_id();
+                    ACTIVE_PANE_AT_PROBE.with(|slot| slot.set(Some(id)));
+                });
+            })
+            .detach();
+        });
+        let (workspace, first, cx) = two_tabs(cx).await;
+        let second = workspace.update_in(cx, |workspace, window, cx| {
+            workspace.split_pane(first.clone(), workspace::SplitDirection::Right, window, cx)
+        });
+        second.update_in(cx, |pane, window, cx| {
+            let item = Box::new(cx.new(|cx| TestItem::new(cx).with_label("c.php")));
+            pane.add_item(item, true, true, None, window, cx);
+        });
+        first.update_in(cx, |pane, window, cx| {
+            window.focus(&pane.focus_handle(cx), cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            workspace.read_with(cx, |w, _| w.active_pane().entity_id()),
+            first.entity_id()
+        );
+        // The menu was opened on the only tab of the other, inactive pane.
+        let ctx = ctx_for(&workspace, &second, 0, None, cx);
+        let probe = Cmd::Dispatch(Rc::new(Probe));
+        second.update_in(cx, |pane, window, cx| run(&probe, &ctx, pane, window, cx));
+        cx.run_until_parked();
+        assert_eq!(
+            ACTIVE_PANE_AT_PROBE.with(Cell::get),
+            Some(second.entity_id())
+        );
     }
 }
