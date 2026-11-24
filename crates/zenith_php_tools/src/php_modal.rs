@@ -6,10 +6,11 @@
 use crate::php_config::{self, PhpInterpreter, PhpToolsSettings};
 use gpui::{
     App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, PathPromptOptions,
-    ReadGlobal as _, Subscription, Task, Window, uniform_list,
+    ReadGlobal as _, ScrollStrategy, Subscription, Task, UniformListScrollHandle, Window,
+    uniform_list,
 };
 use project::Project;
-use settings::{Settings as _, SettingsStore, update_settings_file};
+use settings::{Settings as _, SettingsStore, update_settings_file_with_completion};
 use std::{
     ops::Range,
     path::{Path, PathBuf},
@@ -70,6 +71,11 @@ pub struct PhpModal {
     loaded: bool,
     selected: Option<Row>,
     applying: bool,
+    /// OK was pressed while Apply was running: close when it has finished.
+    close_after: bool,
+    list_scroll: UniformListScrollHandle,
+    /// The last probe error, so a good probe clears that one and not an Apply error.
+    probe_error: Option<SharedString>,
     packages: Vec<String>,
     /// This project's `.phpantom.toml` has `[indexing] include`, which replaces the global paths.
     project_include: Option<Vec<String>>,
@@ -162,6 +168,9 @@ impl PhpModal {
             loaded: false,
             selected: None,
             applying: false,
+            close_after: false,
+            list_scroll: UniformListScrollHandle::new(),
+            probe_error: None,
             packages: Vec::new(),
             project_include: None,
             error: None,
@@ -231,13 +240,20 @@ impl PhpModal {
                             });
                         }
                         this.staged.interpreter = Some(path);
-                        this.error = None;
+                        if this
+                            .probe_error
+                            .take()
+                            .is_some_and(|probe| this.error.as_ref() == Some(&probe))
+                        {
+                            this.error = None;
+                        }
                     }
                     None => {
-                        this.error = Some(
+                        let error: SharedString =
                             format!("{} is not a PHP binary that answers -v.", path.display())
-                                .into(),
-                        )
+                                .into();
+                        this.probe_error = Some(error.clone());
+                        this.error = Some(error);
                     }
                 }
                 cx.notify();
@@ -285,6 +301,13 @@ impl PhpModal {
             (Some(Row::Vendor(package)), Some(root)) => root.join("vendor").join(package),
             _ => return,
         };
+        if !path.is_absolute() {
+            // A hand-edited `~/lib` or relative entry: the file manager would not find it.
+            self.error =
+                Some(format!("Cannot show {} (not an absolute path).", path.display()).into());
+            cx.notify();
+            return;
+        }
         cx.reveal_path(&path);
     }
 
@@ -334,10 +357,17 @@ impl PhpModal {
         );
     }
 
-    /// Writes the staged edits, all or nothing as far as the level goes: when `.phpantom.toml`
-    /// cannot be written nothing else is, and the dialog stays open with the edits.
+    /// Writes the staged edits. The level goes first: when `.phpantom.toml` cannot be written
+    /// nothing else is, and the dialog stays open with the edits. The settings file is written
+    /// next and its result awaited: only a written include list opens worktrees, and only a
+    /// written edit becomes the new base. A dirty OK that fails stays open.
     pub fn apply(&mut self, close: bool, cx: &mut Context<Self>) {
-        if self.applying || !self.loaded {
+        if !self.loaded {
+            return;
+        }
+        if self.applying {
+            // OK while Apply is running: close when it has finished.
+            self.close_after |= close;
             return;
         }
         if !self.is_dirty() {
@@ -347,6 +377,7 @@ impl PhpModal {
             return;
         }
         self.applying = true;
+        self.close_after = close;
         self.error = None;
         // Everything the task needs is taken now: it never reads or writes through the modal
         // before it is done, because the modal may be gone (Esc) by then.
@@ -363,8 +394,11 @@ impl PhpModal {
                     php_config::write_language_level(fs.as_ref(), root, staged.level.as_deref())
                         .await
             {
+                // The modal may be gone (Esc): the error must not vanish with it.
+                log::error!("PHP level was not saved: {error:#}");
                 this.update(cx, |this, cx| {
                     this.applying = false;
+                    this.close_after = false;
                     this.error = Some(error.to_string().into());
                     cx.notify();
                 })
@@ -385,32 +419,67 @@ impl PhpModal {
                 .collect();
             let interpreter =
                 (base.interpreter != staged.interpreter).then(|| staged.interpreter.clone());
-            cx.update(|cx| {
-                if interpreter.is_some() || !removed.is_empty() || !added.is_empty() {
+            let written =
+                (interpreter.is_some() || !removed.is_empty() || !added.is_empty()).then(|| {
                     let added = added.clone();
-                    update_settings_file(fs, cx, move |content, _| {
-                        let zenith = content.zenith.get_or_insert_default();
-                        if let Some(binary) = interpreter {
-                            zenith.php_tools.get_or_insert_default().php_binary =
-                                binary.map(|binary| binary.to_string_lossy().into_owned());
-                        }
-                        if !removed.is_empty() || !added.is_empty() {
-                            // A diff on the list as it is now: edits made outside while the
-                            // dialog was open survive.
-                            let list = zenith
-                                .external_libraries
-                                .get_or_insert_default()
-                                .paths
-                                .get_or_insert_default();
-                            list.retain(|path| !removed.contains(path));
-                            for path in added {
-                                if !list.contains(&path) {
-                                    list.push(path);
+                    cx.update(|cx| {
+                        update_settings_file_with_completion(fs, cx, move |content, _| {
+                            let zenith = content.zenith.get_or_insert_default();
+                            if let Some(binary) = interpreter {
+                                zenith.php_tools.get_or_insert_default().php_binary =
+                                    binary.map(|binary| binary.to_string_lossy().into_owned());
+                            }
+                            if !removed.is_empty() || !added.is_empty() {
+                                // A diff on the list as it is now: edits made outside while the
+                                // dialog was open survive.
+                                let list = zenith
+                                    .external_libraries
+                                    .get_or_insert_default()
+                                    .paths
+                                    .get_or_insert_default();
+                                list.retain(|path| !removed.contains(path));
+                                for path in added {
+                                    if !list.contains(&path) {
+                                        list.push(path);
+                                    }
                                 }
                             }
-                        }
-                    });
-                }
+                        })
+                    })
+                });
+            // `update_settings_file` only queues the write and logs a failure (an unparsable
+            // settings file): wait for the result.
+            let settings_result = match written {
+                Some(written) => written
+                    .await
+                    .unwrap_or_else(|_| Err(anyhow::anyhow!("the settings write was cancelled"))),
+                None => Ok(()),
+            };
+            if let Err(error) = settings_result {
+                log::error!("PHP settings were not saved: {error:#}");
+                cx.update(|cx| {
+                    if level_root.is_some() {
+                        // `.phpantom.toml` was written: PHPantom still has to read it.
+                        php_config::restart_phpantom(&project, cx);
+                    }
+                });
+                this.update(cx, |this, cx| {
+                    // Only the level is saved; the interpreter and the include list stay staged.
+                    this.base.level = staged.level.clone();
+                    this.applying = false;
+                    this.close_after = false;
+                    this.error = Some(
+                        format!(
+                            "Settings were not saved: {error}. Fix the settings file and try again."
+                        )
+                        .into(),
+                    );
+                    cx.notify();
+                })
+                .ok();
+                return;
+            }
+            cx.update(|cx| {
                 let added: Vec<PathBuf> = added.into_iter().map(PathBuf::from).collect();
                 open_as_libraries(&added, &project, cx);
                 if level_root.is_some() {
@@ -423,13 +492,34 @@ impl PhpModal {
             this.update(cx, |this, cx| {
                 this.base = staged;
                 this.applying = false;
-                if close {
+                if std::mem::take(&mut this.close_after) {
                     cx.emit(DismissEvent);
                 }
                 cx.notify();
             })
             .ok();
         });
+        cx.notify();
+    }
+
+    /// Moves the selection `delta` rows down the include list.
+    fn move_selection(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let total = self.staged.include.len() + self.packages.len();
+        if total == 0 {
+            return;
+        }
+        let current = self
+            .selected
+            .as_ref()
+            .and_then(|row| (0..total).find(|&index| self.row_at(index).as_ref() == Some(row)));
+        let next = match current {
+            None if delta > 0 => 0,
+            None => total - 1,
+            Some(index) => (index as isize + delta).clamp(0, total as isize - 1) as usize,
+        };
+        self.selected = self.row_at(next);
+        self.list_scroll
+            .scroll_to_item(next, ScrollStrategy::Center);
         cx.notify();
     }
 
@@ -490,6 +580,7 @@ impl PhpModal {
                             DropdownMenu::new_with_element("zenith-php-level", label, level_menu)
                                 .full_width(true)
                                 .aria_label("PHP language level")
+                                .tab_index(1isize)
                                 .disabled(self.root.is_none() || !self.loaded),
                         ),
                     )
@@ -567,6 +658,7 @@ impl PhpModal {
                         interpreter_menu,
                     )
                     .full_width(true)
+                    .tab_index(2isize)
                     .aria_label("CLI interpreter"),
                 ),
             )
@@ -577,6 +669,7 @@ impl PhpModal {
                         IconButton::new("zenith-php-choose-interpreter", IconName::Ellipsis)
                             .icon_size(IconSize::Small)
                             .aria_label("Choose PHP binary")
+                            .tab_index(3isize)
                             .tooltip(Tooltip::text("Choose a PHP binary…"))
                             .on_click(cx.listener(|this, _, _, cx| this.choose_interpreter(cx))),
                     ),
@@ -588,14 +681,10 @@ impl PhpModal {
         v_flex()
             .gap_2()
             .child(
-                h_flex().child(
-                    div()
-                        .debug_selector(|| "zenith-php-tab-include".into())
-                        .child(
-                            Button::new("zenith-php-tab-include", "Include Path")
-                                .toggle_state(true),
-                        ),
-                ),
+                // The only tab there is: a heading, not a button that does nothing.
+                div()
+                    .debug_selector(|| "zenith-php-tab-include".into())
+                    .child(Label::new("Include Path").weight(gpui::FontWeight::SEMIBOLD)),
             )
             .when(self.project_include.is_some(), |this| {
                 this.child(
@@ -623,6 +712,7 @@ impl PhpModal {
                                 IconButton::new("zenith-php-add-include", IconName::Plus)
                                     .icon_size(IconSize::Small)
                                     .aria_label("Add include path")
+                                    .tab_index(4isize)
                                     .tooltip(Tooltip::text("Add Include Path…"))
                                     .on_click(
                                         cx.listener(|this, _, _, cx| this.choose_include_paths(cx)),
@@ -636,6 +726,7 @@ impl PhpModal {
                                 IconButton::new("zenith-php-remove-include", IconName::Dash)
                                     .icon_size(IconSize::Small)
                                     .aria_label("Remove include path")
+                                    .tab_index(5isize)
                                     .tooltip(Tooltip::text("Remove Include Path"))
                                     .disabled(!matches!(self.selected, Some(Row::User(_))))
                                     .on_click(
@@ -650,6 +741,7 @@ impl PhpModal {
                                 IconButton::new("zenith-php-reveal-include", IconName::Folder)
                                     .icon_size(IconSize::Small)
                                     .aria_label("Show in file manager")
+                                    .tab_index(6isize)
                                     .tooltip(Tooltip::text("Show in File Manager"))
                                     .disabled(self.selected.is_none())
                                     .on_click(
@@ -675,6 +767,7 @@ impl PhpModal {
                             .collect::<Vec<_>>()
                     }),
                 )
+                .track_scroll(&self.list_scroll)
                 .h(px(240.))
                 .into_any_element()
             })
@@ -732,6 +825,7 @@ impl PhpModal {
                     .child(
                         div().debug_selector(|| "zenith-php-cancel".into()).child(
                             Button::new("zenith-php-cancel", "Cancel")
+                                .tab_index(7isize)
                                 .on_click(cx.listener(|_, _, _, cx| cx.emit(DismissEvent))),
                         ),
                     )
@@ -739,6 +833,7 @@ impl PhpModal {
                         div().debug_selector(|| "zenith-php-apply".into()).child(
                             Button::new("zenith-php-apply", "Apply")
                                 .disabled(!self.can_apply())
+                                .tab_index(8isize)
                                 .on_click(cx.listener(|this, _, _, cx| this.apply(false, cx))),
                         ),
                     )
@@ -746,7 +841,8 @@ impl PhpModal {
                         div().debug_selector(|| "zenith-php-ok".into()).child(
                             Button::new("zenith-php-ok", "OK")
                                 .style(ButtonStyle::Filled)
-                                .disabled(!self.loaded || self.applying)
+                                .disabled(!self.loaded)
+                                .tab_index(9isize)
                                 .on_click(cx.listener(|this, _, _, cx| this.apply(true, cx))),
                         ),
                     ),
@@ -791,6 +887,10 @@ impl Render for PhpModal {
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(|_, _: &menu::Cancel, _, cx| cx.emit(DismissEvent)))
             .on_action(cx.listener(|this, _: &menu::Confirm, _, cx| this.apply(true, cx)))
+            .on_action(cx.listener(|this, _: &menu::SelectNext, _, cx| this.move_selection(1, cx)))
+            .on_action(
+                cx.listener(|this, _: &menu::SelectPrevious, _, cx| this.move_selection(-1, cx)),
+            )
             .elevation_3(cx)
             .w(rems(48.))
             .p_3()
@@ -1213,6 +1313,126 @@ mod tests {
             .map(|path| text.find(path).unwrap_or_else(|| panic!("{path}: {text}")))
             .collect();
         assert!(order.is_sorted(), "outside edit kept, new one last: {text}");
+    }
+
+    #[gpui::test]
+    async fn test_a_failed_settings_write_is_not_treated_as_saved(cx: &mut TestAppContext) {
+        let (fixture, cx) = setup(
+            cx,
+            json!({ "composer.json": "{}", ".phpantom.toml": "[php]\nversion = \"8.1\"\n" }),
+        )
+        .await;
+        fixture
+            .fs
+            .create_dir(paths::settings_file().parent().unwrap())
+            .await
+            .unwrap();
+        fixture
+            .fs
+            .insert_file(paths::settings_file(), b"{ not json".to_vec())
+            .await;
+        let project = fixture
+            .workspace
+            .read_with(cx, |workspace, _| workspace.project().clone());
+        let modal = open(&fixture, Vec::new(), cx);
+        modal.update(cx, |modal, cx| {
+            modal.set_language_level(Some("8.2".into()), cx);
+            modal.set_interpreter(Some(PathBuf::from("/opt/php84/bin/php")), cx);
+            modal.stage_include_paths(vec![PathBuf::from("/libs/a")], cx);
+        });
+        // OK, not Apply: a failed save must not close the dialog either.
+        click(cx, "zenith-php-ok");
+
+        assert!(is_open(&fixture, cx), "the dialog stays open");
+        assert!(cx.debug_bounds("zenith-php-error").is_some(), "error shown");
+        modal.read_with(cx, |modal, _| {
+            assert!(!modal.applying);
+            assert!(modal.error.is_some());
+            // The level was written, so it is the base now; the rest is still unsaved.
+            assert_eq!(modal.base.level.as_deref(), Some("8.2"));
+            assert_ne!(modal.base.include, modal.staged.include);
+            assert_ne!(modal.base.interpreter, modal.staged.interpreter);
+            assert_eq!(modal.staged.include, ["/libs/a"]);
+            assert!(modal.can_apply(), "can be tried again");
+        });
+        let toml = fixture
+            .fs
+            .load(Path::new("/p/.phpantom.toml"))
+            .await
+            .unwrap();
+        assert!(toml.contains("version = \"8.2\""), "{toml}");
+        let worktrees = project.read_with(cx, |project, cx| {
+            project
+                .visible_worktrees(cx)
+                .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(worktrees, [PathBuf::from("/p")], "no worktree for /libs/a");
+    }
+
+    #[gpui::test]
+    async fn test_ok_applies_and_closes(cx: &mut TestAppContext) {
+        let (fixture, cx) = setup(cx, json!({ "composer.json": "{}" })).await;
+        let modal = open(&fixture, Vec::new(), cx);
+        modal.update(cx, |modal, cx| {
+            modal.set_language_level(Some("8.3".into()), cx);
+            modal.stage_include_paths(vec![PathBuf::from("/libs/a")], cx);
+        });
+        click(cx, "zenith-php-ok");
+        assert!(!is_open(&fixture, cx), "a dirty OK closes after writing");
+        let text = fixture
+            .fs
+            .load(Path::new("/p/.phpantom.toml"))
+            .await
+            .unwrap();
+        assert!(text.contains("version = \"8.3\""), "{text}");
+        assert!(user_settings_text(&fixture, cx).contains("/libs/a"));
+    }
+
+    #[gpui::test]
+    async fn test_ok_while_apply_runs_closes_when_it_finishes(cx: &mut TestAppContext) {
+        let (fixture, cx) = setup(cx, json!({ "composer.json": "{}" })).await;
+        let modal = open(&fixture, Vec::new(), cx);
+        modal.update(cx, |modal, cx| {
+            modal.set_language_level(Some("8.3".into()), cx);
+            modal.apply(false, cx);
+            modal.apply(true, cx);
+        });
+        assert!(is_open(&fixture, cx), "still running");
+        cx.run_until_parked();
+        assert!(!is_open(&fixture, cx), "OK closed it once Apply was done");
+        let text = fixture
+            .fs
+            .load(Path::new("/p/.phpantom.toml"))
+            .await
+            .unwrap();
+        assert!(text.contains("version = \"8.3\""), "{text}");
+    }
+
+    #[gpui::test]
+    async fn test_arrow_keys_move_the_selection_over_user_and_vendor_rows(cx: &mut TestAppContext) {
+        let (fixture, cx) = setup(
+            cx,
+            json!({ "composer.json": "{}", "vendor": { "acme": { "one": {} } } }),
+        )
+        .await;
+        let modal = open(&fixture, Vec::new(), cx);
+        modal.update(cx, |modal, cx| {
+            modal.stage_include_paths(vec![PathBuf::from("/libs/a")], cx)
+        });
+        let selected = |cx: &mut VisualTestContext| modal.read_with(cx, |m, _| m.selected.clone());
+        cx.dispatch_action(menu::SelectNext);
+        assert_eq!(selected(cx), Some(Row::User("/libs/a".into())));
+        cx.dispatch_action(menu::SelectNext);
+        assert_eq!(selected(cx), Some(Row::Vendor("acme/one".into())));
+        cx.dispatch_action(menu::SelectNext);
+        assert_eq!(
+            selected(cx),
+            Some(Row::Vendor("acme/one".into())),
+            "stops at the end"
+        );
+        cx.dispatch_action(menu::SelectPrevious);
+        assert_eq!(selected(cx), Some(Row::User("/libs/a".into())));
     }
 
     #[gpui::test]
