@@ -317,24 +317,24 @@ fn set_feature_round_trip() {
     assert_eq!(islands, Some(false));
 }
 
+/// (key, checked) of every feature item; panics when a submenu nests deeper than one level.
 fn checked_flags(menu: &Menu) -> Vec<(String, bool)> {
     let mut flags = Vec::new();
     for item in &menu.items {
         match item {
-            MenuItem::Submenu(submenu) if submenu.name == "IDE Features" => {
+            MenuItem::Submenu(submenu) => {
+                assert_eq!(submenu.name, "IDE Features");
+                for inner in &submenu.items {
+                    assert!(
+                        !matches!(inner, MenuItem::Submenu(_)),
+                        "menus nest one level at most"
+                    );
+                }
                 flags.extend(checked_flags(submenu));
             }
-            MenuItem::Submenu(submenu) => {
-                let Some(MenuItem::Action {
-                    name,
-                    action,
-                    checked,
-                    ..
-                }) = submenu.items.first()
-                else {
-                    panic!("{} has no Enabled item", submenu.name);
-                };
-                assert_eq!(name, "Enabled");
+            MenuItem::Action {
+                action, checked, ..
+            } => {
                 let toggle = action
                     .as_any()
                     .downcast_ref::<ToggleFeature>()
@@ -384,18 +384,15 @@ fn navbar_checked(menus: &[OwnedMenu]) -> bool {
             _ => None,
         })
         .expect("IDE Features");
-    let navbar = ide
-        .items
+    ide.items
         .iter()
         .find_map(|item| match item {
-            OwnedMenuItem::Submenu(menu) if menu.name == "Navigation Bar" => Some(menu),
+            OwnedMenuItem::Action { name, checked, .. } if name == "Navigation Bar" => {
+                Some(*checked)
+            }
             _ => None,
         })
-        .expect("Navigation Bar");
-    match navbar.items.first() {
-        Some(OwnedMenuItem::Action { checked, .. }) => *checked,
-        _ => panic!("Navigation Bar has no Enabled item"),
-    }
+        .expect("Navigation Bar item")
 }
 
 #[gpui::test]

@@ -1,4 +1,4 @@
-//! The Tools menu: one submenu per Zenith feature with a check-marked "Enabled" item.
+//! The Tools menu: one check-marked item per Zenith feature.
 
 use gpui::{Menu, MenuItem};
 use settings::{SettingsContent, ZenithSettingsContent};
@@ -90,26 +90,24 @@ pub(crate) fn set_feature(content: &mut SettingsContent, key: &str, on: bool) ->
     true
 }
 
-/// `on` follows `FEATURES`; a missing entry counts as on.
+/// `on` follows `FEATURES`; a missing entry counts as on. Each feature is one check-marked
+/// item; the IDE ones sit in one "IDE Features" submenu (menus nest one level at most).
 pub(crate) fn tools_menu(on: &[bool]) -> Menu {
-    let submenu = |index: usize, feature: &Feature| {
-        let enabled = on.get(index).copied().unwrap_or(true);
-        MenuItem::submenu(
-            Menu::new(feature.label).items([MenuItem::action(
-                "Enabled",
-                ToggleFeature {
-                    feature: feature.key.to_string(),
-                },
-            )
-            .checked(enabled)]),
-        )
-    };
     let items_where = |ide: bool| {
         FEATURES
             .iter()
             .enumerate()
             .filter(move |(_, feature)| feature.ide == ide)
-            .map(|(index, feature)| submenu(index, feature))
+            .map(|(index, feature)| {
+                let enabled = on.get(index).copied().unwrap_or(true);
+                MenuItem::action(
+                    feature.label,
+                    ToggleFeature {
+                        feature: feature.key.to_string(),
+                    },
+                )
+                .checked(enabled)
+            })
             .collect::<Vec<_>>()
     };
     let mut items = items_where(false);
