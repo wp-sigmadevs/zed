@@ -23012,6 +23012,7 @@ dependencies = [
  "zenith_local_history",
  "zenith_look",
  "zenith_markdown",
+ "zenith_menus",
  "zenith_navbar",
  "zenith_nextjs",
  "zenith_php_tools",
@@ -23313,6 +23314,21 @@ dependencies = [
  "serde_json",
  "ui",
  "util",
+ "workspace",
+]
+
+[[package]]
+name = "zenith_menus"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "fs",
+ "gpui",
+ "log",
+ "schemars 1.0.4",
+ "serde",
+ "serde_json",
+ "settings",
  "workspace",
 ]
 

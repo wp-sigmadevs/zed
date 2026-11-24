@@ -63,4 +63,15 @@ pub fn init(cx: &mut App) {
     zenith_navbar::init(cx);
     #[cfg(feature = "deploy")]
     zenith_deploy::init(cx);
+    #[cfg(feature = "menus")]
+    zenith_menus::init(cx);
+}
+
+/// The menu bar: upstream's menus in PhpStorm order with a Tools menu. Call instead of
+/// `upstream` wherever the bar is (re)built.
+pub fn app_menus(upstream: fn(&mut App) -> Vec<gpui::Menu>, cx: &mut App) -> Vec<gpui::Menu> {
+    #[cfg(feature = "menus")]
+    return zenith_menus::app_menus(upstream, cx);
+    #[cfg(not(feature = "menus"))]
+    upstream(cx)
 }

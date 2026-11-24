@@ -68,10 +68,10 @@ pub fn app_menus(cx: &mut App) -> Vec<Menu> {
 
     vec![
         Menu {
-            name: "Zenith".into(),
+            name: "Zed".into(),
             disabled: false,
             items: vec![
-                MenuItem::action("About Zenith", zed_actions::About),
+                MenuItem::action("About Zed", zed_actions::About),
                 MenuItem::action("Check for Updates", auto_update::Check),
                 MenuItem::separator(),
                 MenuItem::submenu(Menu::new("Settings").items([
@@ -103,13 +103,13 @@ pub fn app_menus(cx: &mut App) -> Vec<Menu> {
                 MenuItem::action("Install CLI", install_cli::InstallCliBinary),
                 MenuItem::separator(),
                 #[cfg(target_os = "macos")]
-                MenuItem::action("Hide Zenith", super::Hide),
+                MenuItem::action("Hide Zed", super::Hide),
                 #[cfg(target_os = "macos")]
                 MenuItem::action("Hide Others", super::HideOthers),
                 #[cfg(target_os = "macos")]
                 MenuItem::action("Show All", super::ShowAll),
                 MenuItem::separator(),
-                MenuItem::action("Quit Zenith", Quit),
+                MenuItem::action("Quit Zed", Quit),
             ],
         },
         Menu {

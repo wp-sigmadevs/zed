@@ -858,7 +858,7 @@ fn main() {
         #[cfg(debug_assertions)]
         watch_languages(fs.clone(), app_state.languages.clone(), cx);
 
-        let menus = app_menus(cx);
+        let menus = zenith::app_menus(app_menus, cx);
         cx.set_menus(menus);
 
         if let Some(mut crash_handler) = crash_handler {

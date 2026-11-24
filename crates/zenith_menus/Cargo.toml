@@ -1,0 +1,29 @@
+[package]
+name = "zenith_menus"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/zenith_menus.rs"
+doctest = false
+
+[dependencies]
+fs.workspace = true
+gpui.workspace = true
+log.workspace = true
+schemars.workspace = true
+serde.workspace = true
+settings.workspace = true
+workspace.workspace = true
+
+[dev-dependencies]
+anyhow.workspace = true
+serde_json.workspace = true
+gpui = { workspace = true, features = ["test-support"] }
+settings = { workspace = true, features = ["test-support"] }
+workspace = { workspace = true, features = ["test-support"] }

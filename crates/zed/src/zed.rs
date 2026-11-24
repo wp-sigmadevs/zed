@@ -2340,7 +2340,7 @@ fn show_markdown_app_notification<F>(
 }
 
 fn reload_menus(cx: &mut App) {
-    let menus = app_menus(cx);
+    let menus = zenith::app_menus(app_menus, cx);
     cx.set_menus(menus);
 }
 
