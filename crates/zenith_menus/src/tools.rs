@@ -117,3 +117,14 @@ pub(crate) fn tools_menu(on: &[bool]) -> Menu {
     ));
     Menu::new("Tools").items(items)
 }
+
+/// Restart-type features whose state differs between `old` and `new` (both in `FEATURES` order).
+pub(crate) fn changed_restart_features(old: &[bool], new: &[bool]) -> Vec<&'static Feature> {
+    let state = |states: &[bool], index: usize| states.get(index).copied().unwrap_or(true);
+    FEATURES
+        .iter()
+        .enumerate()
+        .filter(|(index, feature)| feature.restart && state(old, *index) != state(new, *index))
+        .map(|(_, feature)| feature)
+        .collect()
+}

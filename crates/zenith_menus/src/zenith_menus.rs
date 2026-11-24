@@ -14,10 +14,15 @@ use workspace::notifications::{
     NotificationId, show_app_notification, simple_message_notification::MessageNotification,
 };
 
-use tools::{feature, feature_states, set_feature, tools_menu};
+use tools::{Feature, changed_restart_features, feature, feature_states, set_feature, tools_menu};
 
-/// Switches one Zenith feature on or off in the user settings. `feature` is a row key of the
-/// Tools menu, such as `navbar`.
+/// Switches one Zenith feature on or off in the user settings; the Tools menu items run it.
+///
+/// From a keymap: `["zenith_menus::ToggleFeature", {"feature": "navbar"}]`. Valid keys, each
+/// the `enabled` setting under `zenith` of the same name (`islands` is `zenith.ui.islands`):
+/// `agent_review`, `local_history`, `scratches`, `todo`, `inspections`, `deploy`, `wordpress`,
+/// `laravel`, `nextjs`, `search`, `navbar`, `rails`, `look`, `islands`, `templates`,
+/// `external_libraries`, `title_bar`, `hover_card`, `welcome`. An unknown key does nothing.
 #[derive(Clone, PartialEq, Deserialize, JsonSchema, gpui::Action)]
 #[action(namespace = zenith_menus)]
 #[serde(deny_unknown_fields)]
@@ -49,6 +54,10 @@ pub fn init(cx: &mut App) {
         if now == shown {
             return;
         }
+        // The notice follows the settings actually changing, so a failed write shows none.
+        for feature in changed_restart_features(&shown.0, &now.0) {
+            show_restart_notice(feature, cx);
+        }
         shown = now;
         if let Some(&UpstreamMenus(upstream)) = cx.try_global::<UpstreamMenus>() {
             let menus = app_menu::arrange(upstream(cx), tools_menu(&shown.0));
@@ -66,7 +75,7 @@ pub fn app_menus(upstream: fn(&mut App) -> Vec<Menu>, cx: &mut App) -> Vec<Menu>
 }
 
 fn toggle_feature(action: &ToggleFeature, cx: &mut App) {
-    let Some((index, feature)) = feature(&action.feature) else {
+    let Some((index, _)) = feature(&action.feature) else {
         log::warn!("zenith_menus: unknown feature {:?}", action.feature);
         return;
     };
@@ -79,21 +88,31 @@ fn toggle_feature(action: &ToggleFeature, cx: &mut App) {
     settings::update_settings_file(<dyn fs::Fs>::global(cx), cx, move |content, _| {
         set_feature(content, &key, on);
     });
-    if feature.restart {
-        let label = feature.label;
-        show_app_notification(
-            NotificationId::named(format!("zenith-menus-restart-{}", feature.key).into()),
-            cx,
-            move |cx| {
-                cx.new(|cx| {
-                    MessageNotification::new(format!("Restart Zenith to apply {label}"), cx)
-                        .primary_message("Restart")
-                        .primary_on_click(|_, cx| {
-                            cx.emit(DismissEvent);
-                            workspace::reload(cx);
-                        })
+}
+
+/// `workspace::Reload`, as the command palette titles it.
+const RELOAD_IN_PALETTE: &str = "workspace: reload";
+
+pub(crate) fn restart_notice_id(feature: &Feature) -> NotificationId {
+    NotificationId::named(format!("zenith-menus-restart-{}", feature.key).into())
+}
+
+pub(crate) fn restart_notice_text(feature: &Feature) -> String {
+    format!(
+        "Restart Zenith to apply {}. Command palette: \"{RELOAD_IN_PALETTE}\".",
+        feature.label
+    )
+}
+
+fn show_restart_notice(feature: &'static Feature, cx: &mut App) {
+    show_app_notification(restart_notice_id(feature), cx, move |cx| {
+        cx.new(|cx| {
+            MessageNotification::new(restart_notice_text(feature), cx)
+                .primary_message("Restart")
+                .primary_on_click(|_, cx| {
+                    cx.emit(DismissEvent);
+                    workspace::reload(cx);
                 })
-            },
-        );
-    }
+        })
+    });
 }

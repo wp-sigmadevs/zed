@@ -23325,6 +23325,7 @@ dependencies = [
  "fs",
  "gpui",
  "log",
+ "project",
  "schemars 1.0.4",
  "serde",
  "serde_json",

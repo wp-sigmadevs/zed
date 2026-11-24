@@ -1,12 +1,16 @@
 use gpui::{
     Action, App, BorrowAppContext as _, Menu, MenuItem, OwnedMenu, OwnedMenuItem, TestAppContext,
+    VisualTestContext,
 };
-use settings::{SettingsContent, SettingsStore};
+use project::Project;
+use settings::{Settings as _, SettingsContent, SettingsStore};
+use workspace::{AppState, MultiWorkspace};
 
 use crate::{
     ToggleFeature,
     app_menu::arrange,
-    tools::{FEATURES, feature_states, set_feature, tools_menu},
+    restart_notice_id, restart_notice_text, toggle_feature,
+    tools::{FEATURES, changed_restart_features, feature, feature_states, set_feature, tools_menu},
 };
 
 /// Not registered anywhere, so a name here never clashes with a real action.
@@ -416,4 +420,88 @@ fn toggle_rebuilds_menus(cx: &mut TestAppContext) {
     cx.update(|cx| {
         assert!(!navbar_checked(&cx.get_menus().expect("menus")));
     });
+}
+
+#[test]
+fn restart_features_follow_flips() {
+    let all_on = vec![true; FEATURES.len()];
+    assert!(changed_restart_features(&all_on, &all_on).is_empty());
+    let mut flipped = all_on.clone();
+    for key in ["navbar", "agent_review", "islands"] {
+        let (index, _) = feature(key).expect("feature");
+        flipped[index] = false;
+    }
+    let keys: Vec<&str> = changed_restart_features(&all_on, &flipped)
+        .iter()
+        .map(|feature| feature.key)
+        .collect();
+    // agent_review applies live, so it never asks for a restart.
+    assert_eq!(keys, ["navbar", "islands"]);
+}
+
+#[test]
+fn restart_notice_names_the_palette_command() {
+    let (_, navbar) = feature("navbar").expect("navbar");
+    let text = restart_notice_text(navbar);
+    assert_eq!(
+        text,
+        "Restart Zenith to apply Navigation Bar. Command palette: \"workspace: reload\"."
+    );
+    // The palette titles `workspace::Reload` as "workspace: reload".
+    assert_eq!(workspace::Reload.name(), "workspace::Reload");
+}
+
+fn has_notice(
+    key: &str,
+    workspace: &gpui::Entity<workspace::Workspace>,
+    cx: &mut VisualTestContext,
+) -> bool {
+    let (_, feature) = feature(key).expect("feature");
+    let id = restart_notice_id(feature);
+    workspace.read_with(cx, |workspace, _| workspace.has_notification(&id))
+}
+
+// Uses a feature no other test flips: app notifications live in a process-wide store.
+#[gpui::test]
+async fn restart_notice_follows_the_setting(cx: &mut TestAppContext) {
+    let app_state = cx.update(|cx| {
+        let app_state = AppState::test(cx);
+        workspace::init(app_state.clone(), cx);
+        crate::init(cx);
+        app_state
+    });
+    let project = Project::test(app_state.fs.clone(), [], cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let workspace = multi_workspace.read_with(cx, |multi, _| multi.workspace().clone());
+    cx.run_until_parked();
+
+    assert!(!has_notice("templates", &workspace, cx));
+
+    // The toggle only asks for a write; the notice comes when the setting has changed.
+    cx.update(|_, cx| {
+        toggle_feature(
+            &ToggleFeature {
+                feature: "templates".into(),
+            },
+            cx,
+        )
+    });
+    cx.run_until_parked();
+    let templates_off = cx.update(|_, cx| {
+        !crate::FeatureToggles::get_global(cx).0[feature("templates").expect("templates").0]
+    });
+    assert!(templates_off, "the write reached the settings");
+    assert!(has_notice("templates", &workspace, cx));
+
+    // A live feature changing shows nothing.
+    cx.update(|_, cx| {
+        cx.update_global::<SettingsStore, _>(|store, cx| {
+            store.update_user_settings(cx, |content| {
+                set_feature(content, "agent_review", false);
+            });
+        });
+    });
+    cx.run_until_parked();
+    assert!(!has_notice("agent_review", &workspace, cx));
 }
