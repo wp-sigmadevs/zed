@@ -70,7 +70,7 @@
   },
   // The name of a font to use for rendering text in the UI
   // You can set this to ".SystemUIFont" to use the system font
-  // ".ZedSans" currently aliases to "IBM Plex Sans", but this may
+  // "Inter" is bundled with Zenith; ".ZedSans" aliases to "IBM Plex Sans", but this may
   // change in the future
   "ui_font_family": "Inter",
   // Set the UI's font fallbacks, this will be merged with the platform's
@@ -84,7 +84,7 @@
   // The weight of the UI font in standard CSS units from 100 to 900.
   "ui_font_weight": 400,
   // The default font size for text in the UI
-  "ui_font_size": 13,
+  "ui_font_size": 16,
   // The font family for agent responses in the agent panel. Falls back to the UI font family if unset.
   "agent_ui_font_family": null,
   // The default font size for agent responses in the agent panel. Falls back to the UI font size if unset.
