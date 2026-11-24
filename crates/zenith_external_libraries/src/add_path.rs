@@ -1,8 +1,10 @@
 //! "Add Library Path…": pick folders, mark them as libraries (read-only banner, local settings
 //! and tasks inside never loaded) and open them in the project.
 
-use gpui::{Context, PathPromptOptions, TaskExt as _, Window, actions};
+use gpui::{App, Context, Entity, PathPromptOptions, TaskExt as _, Window, actions};
+use project::Project;
 use settings::update_settings_file;
+use std::path::PathBuf;
 use workspace::Workspace;
 
 actions!(
@@ -36,11 +38,6 @@ pub(crate) fn add_library_path(
         };
         workspace
             .update(cx, |_, cx| {
-                for path in &paths {
-                    // Immediate for this run: the settings file round trip is asynchronous and
-                    // the worktree below must already be gated when its first scan lands.
-                    zenith_local_settings_trust::add_library_root(path.as_path().into(), cx);
-                }
                 let strings: Vec<String> = paths
                     .iter()
                     .map(|path| path.to_string_lossy().into_owned())
@@ -59,15 +56,25 @@ pub(crate) fn add_library_path(
                         }
                     }
                 });
-                for path in paths {
-                    project
-                        .update(cx, |project, cx| {
-                            project.find_or_create_worktree(path, true, cx)
-                        })
-                        .detach_and_log_err(cx);
-                }
+                open_as_libraries(&paths, &project, cx);
             })
             .ok();
     })
     .detach();
+}
+
+/// Marks `paths` as library roots and opens them in `project`. The roots go first, immediately
+/// for this run: the settings file round trip is asynchronous and each worktree must already be
+/// gated when its first scan lands. The caller records the paths in the settings.
+pub fn open_as_libraries(paths: &[PathBuf], project: &Entity<Project>, cx: &mut App) {
+    for path in paths {
+        zenith_local_settings_trust::add_library_root(path.as_path().into(), cx);
+    }
+    for path in paths {
+        project
+            .update(cx, |project, cx| {
+                project.find_or_create_worktree(path, true, cx)
+            })
+            .detach_and_log_err(cx);
+    }
 }
