@@ -90,6 +90,7 @@ impl QuickActionBar {
 
     fn apply_settings(&mut self, cx: &mut Context<Self>) {
         let new_show = EditorSettings::get_global(cx).toolbar.quick_actions;
+        let new_show = new_show && !cx.has_global::<workspace::dock::RailsActive>();
         if new_show != self.show {
             self.show = new_show;
             cx.emit(ToolbarItemEvent::ChangeLocation(
@@ -109,6 +110,9 @@ impl QuickActionBar {
 
 impl Render for QuickActionBar {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if !EditorSettings::get_global(cx).toolbar.quick_actions {
+            return div().id("empty quick action bar");
+        }
         let Some(editor) = self.active_editor() else {
             return div().id("empty quick action bar");
         };

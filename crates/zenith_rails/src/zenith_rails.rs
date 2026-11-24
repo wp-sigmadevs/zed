@@ -3,6 +3,10 @@
 //! dock's at the foot; the right rail holds the right dock's panels. They reuse
 //! the status bar's panel buttons, which then stop drawing there.
 
+mod tab_bar_end;
+
+pub use tab_bar_end::tab_bar_end;
+
 use gpui::{AnyElement, App, Context, Entity, IntoElement, Render, Window};
 use settings::{RegisterSetting, Settings, SettingsContent};
 use theme::ActiveTheme as _;
@@ -44,9 +48,9 @@ pub fn init(cx: &mut App) {
     }
     cx.set_global(RailsActive);
     cx.observe_new(|workspace: &mut Workspace, window, cx| {
-        if window.is_none() {
+        let Some(window) = window else {
             return;
-        }
+        };
         let buttons = |position, workspace: &Workspace, cx: &mut Context<Workspace>| {
             let dock = workspace.dock_at_position(position).clone();
             cx.new(|cx| PanelButtons::new(dock, cx).vertical())
@@ -63,6 +67,15 @@ pub fn init(cx: &mut App) {
         };
         let (left, right) = (cx.new(|_| left), cx.new(|_| right));
         workspace.set_rails(left.into(), right.into(), cx);
+        for pane in workspace.panes() {
+            tab_bar_end::install(pane, cx);
+        }
+        cx.subscribe_in(&cx.entity(), window, |_, _, event, _, cx| {
+            if let workspace::Event::PaneAdded(pane) = event {
+                tab_bar_end::install(pane, cx);
+            }
+        })
+        .detach();
     })
     .detach();
 }
@@ -159,8 +172,15 @@ mod tests {
             app_state
         });
         let project = Project::test(app_state.fs.clone(), [], cx).await;
-        let (_, cx) =
+        let (multi, cx) =
             cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        // An empty pane draws no tab bar.
+        multi.update_in(cx, |multi, window, cx| {
+            multi.workspace().update(cx, |workspace, cx| {
+                let item = cx.new(workspace::item::test::TestItem::new);
+                workspace.add_item_to_active_pane(Box::new(item), None, true, window, cx);
+            })
+        });
         cx.run_until_parked();
         cx.clone()
     }
@@ -233,5 +253,73 @@ mod tests {
         assert!(cx.debug_bounds("zenith-left-rail").is_none());
         assert!(cx.debug_bounds("zenith-right-rail").is_none());
         assert!(cx.debug_bounds("zenith-center-island").is_none());
+    }
+
+    struct Probe(&'static str);
+
+    impl Render for Probe {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let name = self.0;
+            div()
+                .debug_selector(move || name.into())
+                .w(px(20.))
+                .h(px(10.))
+        }
+    }
+
+    fn add_probe(
+        cx: &mut gpui::VisualTestContext,
+        name: &'static str,
+        order: i32,
+    ) -> Entity<workspace::Pane> {
+        cx.update(|window, cx| {
+            let multi = window.root::<MultiWorkspace>().flatten().unwrap();
+            let pane = multi.read(cx).workspace().read(cx).active_pane().clone();
+            let probe = cx.new(|_| Probe(name));
+            pane.update(cx, |pane, cx| {
+                pane.toolbar()
+                    .update(cx, |_, cx| tab_bar_end(probe, order, cx))
+            });
+            pane
+        })
+    }
+
+    #[gpui::test]
+    async fn test_tab_bar_end_draws_contributions_in_order(cx: &mut TestAppContext) {
+        let cx = &mut open_window(cx, true).await;
+        add_probe(cx, "probe-right", 1);
+        add_probe(cx, "probe-left", 0);
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let end = cx.debug_bounds("zenith-tab-bar-end").expect("tab bar end");
+        let left = cx.debug_bounds("probe-left").expect("left probe");
+        let right = cx.debug_bounds("probe-right").expect("right probe");
+        assert!(left.right() <= right.left(), "order decides the position");
+        assert!(right.right() <= end.right() && end.left() <= left.left());
+    }
+
+    #[gpui::test]
+    async fn test_tab_bar_end_is_empty_without_rails(cx: &mut TestAppContext) {
+        let cx = &mut open_window(cx, false).await;
+        add_probe(cx, "probe", 0);
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(cx.debug_bounds("probe").is_none());
+        assert!(cx.debug_bounds("zenith-tab-bar-end").is_none());
+    }
+
+    #[gpui::test]
+    async fn test_tab_bar_end_is_dropped_with_its_toolbar(cx: &mut TestAppContext) {
+        let cx = &mut open_window(cx, true).await;
+        let probe = cx.new(|_| Probe("probe"));
+        let toolbar = cx.new(|_| workspace::Toolbar::new());
+        toolbar.update(cx, |_, cx| tab_bar_end(probe, 0, cx));
+        let id = toolbar.entity_id();
+        let held = |cx: &mut gpui::VisualTestContext| {
+            cx.update(|_, cx| cx.global::<tab_bar_end::Views>().0.contains_key(&id))
+        };
+        assert!(held(cx));
+        drop(toolbar);
+        // Dropped entities are released when an update finishes.
+        cx.update(|_, _| ());
+        assert!(!held(cx), "a closed pane leaves nothing behind");
     }
 }

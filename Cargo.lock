@@ -23002,6 +23002,7 @@ dependencies = [
  "gpui",
  "onboarding",
  "project_panel",
+ "workspace",
  "zenith_agent_review",
  "zenith_deploy",
  "zenith_external_libraries",
@@ -23315,6 +23316,7 @@ dependencies = [
  "ui",
  "util",
  "workspace",
+ "zenith_rails",
 ]
 
 [[package]]

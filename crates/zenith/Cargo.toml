@@ -44,6 +44,7 @@ menus = ["dep:zenith_menus"]
 [dependencies]
 gpui.workspace = true
 onboarding.workspace = true
+workspace.workspace = true
 project_panel.workspace = true
 zenith_agent_review = { workspace = true, optional = true }
 zenith_deploy = { workspace = true, optional = true }

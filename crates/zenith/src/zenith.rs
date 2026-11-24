@@ -79,3 +79,16 @@ pub fn app_menus(upstream: fn(&mut App) -> Vec<gpui::Menu>, cx: &mut App) -> Vec
         upstream(cx)
     }
 }
+
+/// Draws `view` at the right end of the tab bar of the pane that owns this toolbar (the
+/// Zenith rails replace the editor toolbar's right-hand items); lower `order` sits further left.
+pub fn tab_bar_end(
+    view: impl Into<gpui::AnyView>,
+    order: i32,
+    cx: &mut gpui::Context<workspace::Toolbar>,
+) {
+    #[cfg(feature = "rails")]
+    zenith_rails::tab_bar_end(view, order, cx);
+    #[cfg(not(feature = "rails"))]
+    let _ = (view, order, cx);
+}
