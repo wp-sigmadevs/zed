@@ -8,7 +8,7 @@
 use std::rc::Rc;
 
 use editor::{DisplayPoint, Editor, SelectionEffects};
-use gpui::{Action, App, AppContext as _, Context, Entity, FocusHandle, Subscription, Window};
+use gpui::{Action, App, Context, Entity, FocusHandle, Subscription, Window};
 use project::DisableAiSettings;
 use ui::ContextMenu;
 
@@ -41,13 +41,13 @@ pub(crate) fn entries<T>(
                 separator_due = !out.is_empty();
                 continue;
             }
-            Spec::Item(label, name) => resolve(name).map(|action| Entry::Item(*label, action)),
+            Spec::Item(label, name) => resolve(name).map(|action| Entry::Item(label, action)),
             Spec::Menu(label, items) => {
                 let items: Vec<_> = items
                     .iter()
                     .filter_map(|(label, name)| Some((*label, resolve(name)?)))
                     .collect();
-                (!items.is_empty()).then_some(Entry::Menu(*label, items))
+                (!items.is_empty()).then_some(Entry::Menu(label, items))
             }
         };
         if let Some(entry) = entry {
@@ -418,6 +418,7 @@ pub(crate) mod tests {
     }
 
     use editor::{EditorMode, display_map::DisplayRow};
+    use gpui::AppContext as _;
     use gpui::{Entity, TestAppContext, VisualTestContext};
     use multi_buffer::MultiBuffer;
     use project::Project;
