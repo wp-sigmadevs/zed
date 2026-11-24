@@ -33373,6 +33373,16 @@ async fn test_edits_around_expanded_deletion_hunks(
 #[gpui::test]
 async fn test_backspace_after_deletion_hunk(executor: BackgroundExecutor, cx: &mut TestAppContext) {
     init_test(cx, |_| {});
+    // Sticky scroll is on by default in Zenith; this test predates it.
+    cx.update(|cx| {
+        SettingsStore::update_global(cx, |store, cx| {
+            store.update_user_settings(cx, |settings| {
+                settings.editor.sticky_scroll = Some(settings::StickyScrollContent {
+                    enabled: Some(false),
+                })
+            });
+        });
+    });
 
     let mut cx = EditorTestContext::new(cx).await;
 
