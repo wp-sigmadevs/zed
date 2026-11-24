@@ -3971,7 +3971,145 @@ mod tests {
         });
         cx.run_until_parked();
         assert!(cx.debug_bounds("zenith-find-preview").is_some());
-        assert!(card_size(cx).height >= px(440.));
+        assert!(card_size(cx).height >= px(445.));
+    }
+
+    fn preview_height_of(cx: &mut VisualTestContext) -> Pixels {
+        cx.debug_bounds("zenith-find-preview")
+            .expect("preview painted")
+            .size
+            .height
+    }
+
+    /// Drags the splitter between the list and the preview by `by`, like a user.
+    fn drag_splitter(cx: &mut VisualTestContext, by: Pixels) {
+        let start = cx
+            .debug_bounds("zenith-find-splitter")
+            .expect("a splitter between list and preview")
+            .center();
+        let none = gpui::Modifiers::none();
+        cx.simulate_mouse_down(start, gpui::MouseButton::Left, none);
+        for step in 1..=4 {
+            cx.simulate_mouse_move(
+                start + gpui::point(px(0.), by * (step as f32 / 4.)),
+                gpui::MouseButton::Left,
+                none,
+            );
+        }
+        cx.simulate_mouse_up(
+            start + gpui::point(px(0.), by),
+            gpui::MouseButton::Left,
+            none,
+        );
+        cx.run_until_parked();
+    }
+
+    async fn open_with_hit(
+        cx: &mut TestAppContext,
+    ) -> (
+        Entity<Workspace>,
+        Entity<find_in_files::FindInFilesModal>,
+        &mut VisualTestContext,
+    ) {
+        let (workspace, modal, cx) =
+            open_find_in_files(serde_json::json!({ "a.php": "add_action();\n" }), cx).await;
+        modal.update_in(cx, |m, window, cx| m.set_query("add_action", window, cx));
+        cx.run_until_parked();
+        (workspace, modal, cx)
+    }
+
+    #[gpui::test]
+    async fn test_splitter_drag_resizes_the_preview_within_limits(cx: &mut TestAppContext) {
+        let (_, modal, cx) = open_with_hit(cx).await;
+        let default = preview_height_of(cx);
+        assert_eq!(default, px(210.));
+        // Up grows the preview, down shrinks it.
+        drag_splitter(cx, px(-40.));
+        assert_eq!(preview_height_of(cx), default + px(40.));
+        drag_splitter(cx, px(30.));
+        assert_eq!(preview_height_of(cx), default + px(10.));
+        // Down as far as the window allows: held at the least.
+        drag_splitter(cx, px(400.));
+        assert_eq!(preview_height_of(cx), px(80.));
+        // Up past the window: the unsized popup caps the preview, the rest is the list's.
+        let splitter = cx.debug_bounds("zenith-find-splitter").unwrap().center();
+        let far_above = splitter - gpui::point(px(0.), px(9000.));
+        modal.update_in(cx, |m, window, cx| {
+            m.split_between(splitter, far_above, window, cx)
+        });
+        cx.run_until_parked();
+        let window = cx.update(|window, _| window.viewport_size());
+        assert_eq!(preview_height_of(cx), window.height * 0.4);
+        // A resized popup bounds the preview by the list: three rows stay.
+        let grip = cx.debug_bounds("zenith-popup-resize").unwrap().center();
+        modal.update_in(cx, |m, window, cx| {
+            m.resize_between(grip, grip + gpui::point(px(0.), px(40.)), window, cx)
+        });
+        cx.run_until_parked();
+        let splitter = cx.debug_bounds("zenith-find-splitter").unwrap().center();
+        let room =
+            cx.debug_bounds("zenith-find-results").unwrap().size.height + preview_height_of(cx);
+        modal.update_in(cx, |m, window, cx| {
+            m.split_between(
+                splitter,
+                splitter - gpui::point(px(0.), px(9000.)),
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        assert_eq!(preview_height_of(cx), room - px(3. * 26.));
+        let list = cx.debug_bounds("zenith-find-results").unwrap().size.height;
+        assert!(list >= px(3. * 26.) - px(0.5), "{list:?}");
+        // Shrinking the popup afterwards still leaves the list its rows.
+        let grip = cx.debug_bounds("zenith-popup-resize").unwrap().center();
+        modal.update_in(cx, |m, window, cx| {
+            m.resize_between(grip, grip - gpui::point(px(0.), px(9000.)), window, cx)
+        });
+        cx.run_until_parked();
+        let list = cx.debug_bounds("zenith-find-results").unwrap().size.height;
+        assert!(list >= px(3. * 26.) - px(0.5), "{list:?}");
+    }
+
+    #[gpui::test]
+    async fn test_splitter_height_outlives_the_popup_and_double_click_resets_it(
+        cx: &mut TestAppContext,
+    ) {
+        let (workspace, _, cx) = open_with_hit(cx).await;
+        drag_splitter(cx, px(-50.));
+        assert_eq!(preview_height_of(cx), px(260.));
+        // The height is the session's: a reopened popup keeps it.
+        workspace.update_in(cx, |w, window, cx| w.hide_modal(window, cx));
+        workspace.update_in(cx, |workspace, window, cx| {
+            find_in_files::FindInFilesModal::open(workspace, false, window, cx)
+        });
+        cx.run_until_parked();
+        let modal = workspace.update(cx, |workspace, cx| {
+            workspace
+                .active_modal::<find_in_files::FindInFilesModal>(cx)
+                .expect("open")
+        });
+        modal.update_in(cx, |m, window, cx| m.set_query("add_action", window, cx));
+        cx.run_until_parked();
+        assert_eq!(preview_height_of(cx), px(260.));
+        // A double-click on the handle puts the default back.
+        let handle = cx.debug_bounds("zenith-find-splitter").unwrap().center();
+        for _ in 0..2 {
+            cx.simulate_event(gpui::MouseDownEvent {
+                position: handle,
+                modifiers: gpui::Modifiers::none(),
+                button: gpui::MouseButton::Left,
+                click_count: 2,
+                first_mouse: false,
+            });
+            cx.simulate_event(gpui::MouseUpEvent {
+                position: handle,
+                modifiers: gpui::Modifiers::none(),
+                button: gpui::MouseButton::Left,
+                click_count: 2,
+            });
+        }
+        assert_eq!(preview_height_of(cx), px(210.));
     }
 
     // zenith.json binds actions from sibling crates this test binary doesn't link.

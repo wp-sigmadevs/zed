@@ -11,6 +11,8 @@ use gpui::{
 };
 use ui::{Tooltip, prelude::*};
 
+use crate::style::PREVIEW_HEIGHT;
+
 /// The card's border, both sides: its children are this much narrower than it.
 pub(crate) const BORDER: Pixels = px(2.);
 
@@ -51,8 +53,8 @@ impl PopupKind {
         match self {
             // The search box and two rows.
             Self::Search | Self::Recent => px(120.),
-            // The query fields, three result rows, the preview and the footer.
-            Self::Find => px(440.),
+            // The query fields, three result rows, the default preview and the footer.
+            Self::Find => px(445.),
             // Three rows and the footer.
             Self::Usages => px(160.),
         }
@@ -60,9 +62,12 @@ impl PopupKind {
 }
 
 /// What the user dragged each popup to this session: the card width and the
-/// height of everything under the header.
+/// height of everything under the header, and the Find in Files preview's height.
 #[derive(Default)]
-struct PopupSizes(HashMap<PopupKind, Size<Pixels>>);
+struct PopupSizes {
+    cards: HashMap<PopupKind, Size<Pixels>>,
+    find_preview: Option<Pixels>,
+}
 
 impl Global for PopupSizes {}
 
@@ -80,17 +85,39 @@ impl Render for NoDragPreview {
     }
 }
 
-/// Limits `wanted` to what fits in `max`. The kind's minimum applies unless the
-/// window is smaller still: then the card fits the window, so its footer and
-/// grip stay on screen.
+/// The Find in Files preview's height: what the splitter set this session.
+pub(crate) fn preview_height(cx: &gpui::App) -> Pixels {
+    cx.try_global::<PopupSizes>()
+        .and_then(|sizes| sizes.find_preview)
+        .unwrap_or(px(PREVIEW_HEIGHT))
+}
+
+/// Remembers the preview's height for the session.
+pub(crate) fn set_preview_height(height: Pixels, cx: &mut gpui::App) {
+    cx.default_global::<PopupSizes>().find_preview = Some(height);
+}
+
+/// How much taller than its default the Find in Files body must be: the body's
+/// minimum was set for the default preview, and the list needs the same room.
+fn preview_extra(kind: PopupKind, cx: &gpui::App) -> Pixels {
+    match kind {
+        PopupKind::Find => preview_height(cx) - px(PREVIEW_HEIGHT),
+        _ => Pixels::ZERO,
+    }
+}
+
+/// Limits `wanted` to what fits in `max`. The kind's minimum (plus `extra`
+/// height) applies unless the window is smaller still: then the card fits the
+/// window, so its footer and grip stay on screen.
 fn clamp_size(
     kind: PopupKind,
+    extra: Pixels,
     wanted: Size<Pixels>,
     max: Size<Pixels>,
     rem: Pixels,
 ) -> Size<Pixels> {
     let min_width = kind.min_width().to_pixels(rem).min(max.width);
-    let min_height = kind.min_body_height().min(max.height);
+    let min_height = (kind.min_body_height() + extra).min(max.height);
     size(
         wanted.width.min(max.width).max(min_width),
         wanted.height.min(max.height).max(min_height),
@@ -131,13 +158,13 @@ impl Frame {
         let max = Self::max_size(viewport);
         let stored = cx
             .try_global::<PopupSizes>()
-            .and_then(|sizes| sizes.0.get(&kind))
+            .and_then(|sizes| sizes.cards.get(&kind))
             .copied();
         let wanted = size(
             stored.map_or(kind.default_width().to_pixels(rem), |size| size.width),
             stored.map_or(Pixels::ZERO, |size| size.height),
         );
-        let clamped = clamp_size(kind, wanted, max, rem);
+        let clamped = clamp_size(kind, preview_extra(kind, cx), wanted, max, rem);
         (clamped.width, stored.map(|_| clamped.height))
     }
 
@@ -180,11 +207,18 @@ impl Frame {
                 cap.height.min(viewport.height - origin.y - margin),
             );
             let delta = position - last;
-            let next = clamp_size(kind, size(width + delta.x, height + delta.y), max, rem);
+            let extra = preview_extra(kind, cx);
+            let next = clamp_size(
+                kind,
+                extra,
+                size(width + delta.x, height + delta.y),
+                max,
+                rem,
+            );
             // The modal layer centres the card: keep its left edge still, so
             // the corner follows the pointer.
             self.offset.x += (next.width - width) / 2.;
-            cx.default_global::<PopupSizes>().0.insert(kind, next);
+            cx.default_global::<PopupSizes>().cards.insert(kind, next);
         }
         self.resize_last = Some(position);
     }
@@ -291,12 +325,33 @@ mod tests {
         let rem = px(14.);
         let window = size(px(300.), px(100.));
         let max = Frame::max_size(window);
-        let card = clamp_size(PopupKind::Find, size(px(900.), px(900.)), max, rem);
+        let card = clamp_size(
+            PopupKind::Find,
+            Pixels::ZERO,
+            size(px(900.), px(900.)),
+            max,
+            rem,
+        );
         assert!(card.width <= window.width, "{card:?}");
         assert!(card.height <= window.height, "{card:?}");
         // In a roomy window the minimum holds.
         let roomy_max = Frame::max_size(size(px(1900.), px(1000.)));
-        let roomy = clamp_size(PopupKind::Find, size(px(1.), px(1.)), roomy_max, rem);
-        assert_eq!(roomy, size(rems(36.).to_pixels(rem), px(440.)));
+        let roomy = clamp_size(
+            PopupKind::Find,
+            Pixels::ZERO,
+            size(px(1.), px(1.)),
+            roomy_max,
+            rem,
+        );
+        assert_eq!(roomy, size(rems(36.).to_pixels(rem), px(445.)));
+        // A taller preview raises the floor by as much.
+        let tall = clamp_size(
+            PopupKind::Find,
+            px(100.),
+            size(px(1.), px(1.)),
+            roomy_max,
+            rem,
+        );
+        assert_eq!(tall.height, px(545.));
     }
 }

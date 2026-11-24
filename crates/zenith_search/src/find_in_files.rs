@@ -5,18 +5,21 @@
 //! the replacing.
 
 use std::{
+    cell::Cell,
     ops::Range,
     path::{Path, PathBuf},
+    rc::Rc,
 };
 
 use editor::{
     Editor, EditorEvent, SelectionEffects, display_map::HighlightKey, scroll::Autoscroll,
 };
 use gpui::{
-    App, ClickEvent, Context, DismissEvent, Div, Entity, EventEmitter, FocusHandle, Focusable,
-    HighlightStyle, IntoElement, ParentElement, Render, Role, ScrollStrategy, SharedString, Styled,
-    StyledText, Subscription, Task, UniformListScrollHandle, WeakEntity, Window, div, prelude::*,
-    px, uniform_list,
+    App, Bounds, ClickEvent, Context, DismissEvent, Div, DragMoveEvent, Entity, EventEmitter,
+    FocusHandle, Focusable, HighlightStyle, IntoElement, MouseButton, MouseDownEvent,
+    ParentElement, Pixels, Render, Role, ScrollStrategy, SharedString, Styled, StyledText,
+    Subscription, Task, UniformListScrollHandle, WeakEntity, Window, canvas, div, prelude::*, px,
+    uniform_list,
 };
 use language::{BufferEvent, BufferSnapshot, HighlightId, LanguageAwareStyling};
 use project::{
@@ -38,12 +41,31 @@ use workspace::{
 use super::{
     CycleFindContext, CycleFindScope, ToggleFileMaskHistory, ToggleFindCase, ToggleFindMask,
     ToggleFindRegex, ToggleFindWord, TogglePinFindPopup, mask_history,
-    popup::{Frame, PopupKind},
+    popup::{Frame, NoDragPreview, PopupKind, preview_height, set_preview_height},
     style::{
-        FIELD_HEIGHT, FOOTER_HEIGHT, HEADER_GAP, HEADER_HEIGHT, MASK_WIDTH, PADDING, POPUP_BAND,
-        POPUP_FOOTER, PREVIEW_HEIGHT, ROW_HEIGHT, SEARCH_BOX_HEIGHT, VISIBLE_ROWS,
+        FIELD_HEIGHT, FOOTER_HEIGHT, HEADER_GAP, HEADER_HEIGHT, MASK_WIDTH, MIN_LIST_ROWS,
+        MIN_PREVIEW_HEIGHT, PADDING, POPUP_BAND, POPUP_FOOTER, PREVIEW_HEIGHT, ROW_HEIGHT,
+        SEARCH_BOX_HEIGHT, SPLITTER_HEIGHT, VISIBLE_ROWS,
     },
 };
+
+/// Marks a splitter drag, which resizes the preview.
+struct ResizePreview;
+
+/// A splitter drag in progress: where the pointer and the preview were at
+/// mouse-down, and the tallest the preview may grow.
+#[derive(Clone, Copy)]
+struct SplitDrag {
+    y: Pixels,
+    height: Pixels,
+    max: Pixels,
+}
+
+/// The preview height `wanted`, held between the least it keeps and `max`.
+fn clamp_preview(wanted: Pixels, max: Pixels) -> Pixels {
+    let min = px(MIN_PREVIEW_HEIGHT);
+    wanted.clamp(min, max.max(min))
+}
 
 /// More hits than this say "refine the query", not "scroll".
 const MAX_HITS: usize = 300;
@@ -189,6 +211,9 @@ pub struct FindInFilesModal {
     search: Task<()>,
     /// The card: dragging the header moves it, the corner grip resizes it.
     frame: Frame,
+    /// Where the result list was last painted, to bound the preview's growth.
+    list: Rc<Cell<Option<Bounds<Pixels>>>>,
+    split_drag: Option<SplitDrag>,
     #[cfg(test)]
     previewed: Option<(ProjectPath, u32)>,
     _subscriptions: Vec<Subscription>,
@@ -343,6 +368,8 @@ impl FindInFilesModal {
             open_in_tab: false,
             search: Task::ready(()),
             frame: Frame::default(),
+            list: Rc::default(),
+            split_drag: None,
             #[cfg(test)]
             previewed: None,
             _subscriptions: subscriptions,
@@ -850,6 +877,46 @@ impl FindInFilesModal {
         cx.notify();
     }
 
+    /// The splitter pressed at `y`. The preview may grow until the list has
+    /// `MIN_LIST_ROWS` left; an unsized popup grows instead, up to 40% of the window.
+    fn start_splitter_drag(&mut self, y: Pixels, window: &Window, cx: &App) {
+        let height = preview_height(cx);
+        let max = match (
+            self.frame.size(PopupKind::Find, window, cx).1,
+            self.list.get(),
+        ) {
+            (Some(_), Some(list)) => list.size.height + height - px(ROW_HEIGHT * MIN_LIST_ROWS),
+            _ => window.viewport_size().height * 0.4,
+        };
+        self.split_drag = Some(SplitDrag { y, height, max });
+    }
+
+    /// The pointer is at `y`: moving up grows the preview. Remembered for the session.
+    fn drag_splitter(&mut self, y: Pixels, cx: &mut Context<Self>) {
+        if let Some(drag) = self.split_drag {
+            set_preview_height(clamp_preview(drag.height - (y - drag.y), drag.max), cx);
+            cx.notify();
+        }
+    }
+
+    fn reset_splitter(&mut self, cx: &mut Context<Self>) {
+        set_preview_height(px(PREVIEW_HEIGHT), cx);
+        cx.notify();
+    }
+
+    /// A splitter drag from `from` to `to`, which may be outside the window.
+    #[cfg(test)]
+    pub(crate) fn split_between(
+        &mut self,
+        from: gpui::Point<Pixels>,
+        to: gpui::Point<Pixels>,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.start_splitter_drag(from.y, window, cx);
+        self.drag_splitter(to.y, cx);
+    }
+
     /// A grip drag from `from` to `to`, which may be outside the window.
     #[cfg(test)]
     pub(crate) fn resize_between(
@@ -1327,7 +1394,21 @@ impl FindInFilesModal {
         // after, it takes whatever height the body has left.
         let list = div()
             .id("zenith-find-results")
+            .debug_selector(|| "zenith-find-results".into())
             .relative()
+            .child(
+                canvas(
+                    {
+                        let measured = self.list.clone();
+                        move |bounds, _, _| measured.set(Some(bounds))
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full(),
+            )
             .when(sized, |list| list.flex_1().min_h_0())
             .when(!sized, |list| list.h(px(ROW_HEIGHT * VISIBLE_ROWS)));
         if self.hits.is_empty() {
@@ -1415,12 +1496,51 @@ impl FindInFilesModal {
             )
     }
 
+    /// The line between the list and the preview: drag to resize the preview,
+    /// double-click to reset it.
+    fn render_splitter(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let colors = cx.theme().colors();
+        div()
+            .id("zenith-find-splitter")
+            .debug_selector(|| "zenith-find-splitter".into())
+            .role(Role::Splitter)
+            .aria_label("Resize preview")
+            .h(px(SPLITTER_HEIGHT))
+            .w_full()
+            .flex_none()
+            .border_t_1()
+            .border_color(colors.border_variant)
+            .cursor_row_resize()
+            .hover(|splitter| {
+                splitter
+                    .bg(colors.border_focused)
+                    .border_color(colors.border_focused)
+            })
+            .tooltip(Tooltip::text(
+                "Drag to resize the preview. Double-click to reset",
+            ))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                    this.start_splitter_drag(event.position.y, window, cx)
+                }),
+            )
+            .on_drag(ResizePreview, |_, _, _, cx| cx.new(|_| NoDragPreview))
+            .on_drag_move::<ResizePreview>(cx.listener(
+                |this, event: &DragMoveEvent<ResizePreview>, _, cx| {
+                    this.drag_splitter(event.event.position.y, cx)
+                },
+            ))
+            .on_click(cx.listener(|this, event: &ClickEvent, _, cx| {
+                if event.click_count() > 1 {
+                    this.reset_splitter(cx);
+                }
+            }))
+    }
+
     fn render_preview(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
-        let border = cx.theme().colors().border_variant;
         let hit = self.hits.get(self.selected);
         v_flex()
-            .border_t_1()
-            .border_color(border)
             .child(h_flex().h_8().px_4().gap_2().when_some(hit, |this, hit| {
                 this.child(Label::new(hit.file_name.clone())).child(
                     Label::new(hit.directory.clone())
@@ -1431,7 +1551,7 @@ impl FindInFilesModal {
             .child(
                 div()
                     .debug_selector(|| "zenith-find-preview".into())
-                    .h(px(PREVIEW_HEIGHT))
+                    .h(preview_height(cx))
                     .overflow_hidden()
                     .map(|this| match &self.preview {
                         Some(editor) => this.child(editor.clone()),
@@ -1495,6 +1615,7 @@ impl Render for FindInFilesModal {
         let search = self.render_search_box(window, cx);
         let scope = self.render_scope(window, cx);
         let results = self.render_results(height.is_some(), window, cx);
+        let splitter = self.render_splitter(cx);
         let preview = self.render_preview(cx);
         let footer = self.render_footer(cx);
         let body = v_flex()
@@ -1510,6 +1631,7 @@ impl Render for FindInFilesModal {
                     .child(scope),
             )
             .child(results)
+            .child(splitter)
             .child(v_flex().flex_none().child(preview))
             .child(v_flex().flex_none().child(footer));
         let root = v_flex()

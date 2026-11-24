@@ -18,8 +18,13 @@ pub(crate) const HEADER_GAP: Rems = rems(0.75);
 /// A result row, and how many the list shows before it scrolls.
 pub(crate) const ROW_HEIGHT: f32 = 26.;
 pub(crate) const VISIBLE_ROWS: f32 = 7.;
-/// About nine lines of the preview's code.
+/// About nine lines of the preview's code. The splitter changes it, within the
+/// least the preview keeps and the result rows the list keeps.
 pub(crate) const PREVIEW_HEIGHT: f32 = 210.;
+pub(crate) const MIN_PREVIEW_HEIGHT: f32 = 80.;
+pub(crate) const MIN_LIST_ROWS: f32 = 3.;
+/// The splitter's hit area, a thin line between the list and the preview.
+pub(crate) const SPLITTER_HEIGHT: f32 = 5.;
 
 /// The small boxes (mask, directory, replace) and the search box.
 pub(crate) const FIELD_HEIGHT: Pixels = px(30.);
