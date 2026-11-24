@@ -52,6 +52,18 @@ pub struct ZenithSettingsContent {
     pub navbar: Option<ZenithNavbarSettingsContent>,
     /// Settings for the editor's right-click menu.
     pub editor_menu: Option<ZenithEditorMenuSettingsContent>,
+    /// Settings for the tab right-click menu.
+    pub tab_menu: Option<ZenithTabMenuSettingsContent>,
+}
+
+/// Settings for the tab right-click menu.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+pub struct ZenithTabMenuSettingsContent {
+    /// Whether the tab right-click menu uses Zenith's layout (Close Tabs to the Left, Copy
+    /// Path/Reference, Open In and so on) instead of the upstream list.
+    ///
+    /// Default: true
+    pub enabled: Option<bool>,
 }
 
 /// Settings for the editor's right-click menu.

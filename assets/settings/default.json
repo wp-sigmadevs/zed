@@ -3070,6 +3070,11 @@
       "enabled": true,
     },
 
+    // Tab right-click menu in the PhpStorm layout (applies without a restart).
+    "tab_menu": {
+      "enabled": true,
+    },
+
     // WordPress Hooks tool window: hooks and listeners of a WordPress project.
     "wordpress": {
       "enabled": true,

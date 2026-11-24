@@ -3,6 +3,7 @@
 
 mod app_menu;
 mod editor_menu;
+mod tab_menu;
 #[cfg(test)]
 mod tests;
 mod tools;
@@ -23,7 +24,7 @@ use tools::{Feature, changed_restart_features, feature, feature_states, set_feat
 /// the `enabled` setting under `zenith` of the same name (`islands` is `zenith.ui.islands`):
 /// `agent_review`, `local_history`, `scratches`, `todo`, `inspections`, `deploy`, `wordpress`,
 /// `laravel`, `nextjs`, `search`, `navbar`, `rails`, `look`, `islands`, `templates`,
-/// `external_libraries`, `title_bar`, `hover_card`, `welcome`, `editor_menu`. An unknown key does nothing.
+/// `external_libraries`, `title_bar`, `hover_card`, `welcome`, `editor_menu`, `tab_menu`. An unknown key does nothing.
 #[derive(Clone, PartialEq, Deserialize, JsonSchema, gpui::Action)]
 #[action(namespace = zenith_menus)]
 #[serde(deny_unknown_fields)]
@@ -49,6 +50,7 @@ impl Global for UpstreamMenus {}
 
 pub fn init(cx: &mut App) {
     editor_menu::init(cx);
+    tab_menu::init(cx);
     cx.on_action(toggle_feature);
     let mut shown = FeatureToggles::get_global(cx).clone();
     cx.observe_global::<SettingsStore>(move |cx| {

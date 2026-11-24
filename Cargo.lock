@@ -23333,8 +23333,11 @@ dependencies = [
  "serde",
  "serde_json",
  "settings",
+ "theme",
+ "theme_settings",
  "ui",
  "workspace",
+ "zed_actions",
 ]
 
 [[package]]

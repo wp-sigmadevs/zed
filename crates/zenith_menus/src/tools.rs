@@ -59,6 +59,7 @@ pub(crate) static FEATURES: &[Feature] = &[
     row!(hover_card, "Hover Card", true, false),
     row!(welcome, "Welcome", true, false),
     row!(editor_menu, "Editor Context Menu", true, true),
+    row!(tab_menu, "Tab Context Menu", true, false),
 ];
 
 pub(crate) fn feature(key: &str) -> Option<(usize, &'static Feature)> {

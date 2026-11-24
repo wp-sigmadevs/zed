@@ -3123,6 +3123,9 @@ impl Pane {
         right_click_menu(ix)
             .trigger(|_, _, _| tab)
             .menu(move |window, cx| {
+                if let Some(menu) = zenith_tab_menu(&pane, ix, &menu_context, window, cx) {
+                    return menu;
+                }
                 let pane = pane.clone();
                 let menu_context = menu_context.clone();
                 let extra_actions = item_handle.tab_extra_context_menu_actions(window, cx);
@@ -9983,6 +9986,127 @@ fn zenith_active_tab_line(cx: &App) -> gpui::Div {
         .bottom_0()
         .h(px(2.))
         .bg(cx.theme().colors().text_accent)
+}
+
+/// What a replacement tab menu needs to know about the tab that was right-clicked.
+pub struct TabMenuTarget {
+    pub pane: Entity<Pane>,
+    pub ix: usize,
+    pub total_items: usize,
+    pub has_pinned: bool,
+    pub is_pinned: bool,
+    pub has_clean_items: bool,
+    pub has_multibuffer_items: bool,
+    /// "Make Tab Read-Only" or "Make Tab Editable"; `None` when the tab cannot be toggled.
+    pub read_only_label: Option<&'static str>,
+    /// The tab holds exactly one file or entry (not a multibuffer).
+    pub has_entry: bool,
+    pub abs_path: Option<PathBuf>,
+    pub relative_path: Option<String>,
+    pub has_git_repo: bool,
+    pub visible_in_project_panel: bool,
+    pub is_local: bool,
+    pub is_remote: bool,
+    pub extra_actions: Vec<(SharedString, Box<dyn Action>)>,
+    pub menu_context: FocusHandle,
+}
+
+type TabMenuBuilderFn = dyn Fn(TabMenuTarget, &mut Window, &mut App) -> Option<Entity<ContextMenu>>;
+
+struct TabMenuBuilder(Rc<TabMenuBuilderFn>);
+
+impl gpui::Global for TabMenuBuilder {}
+
+/// Zenith: registers the builder of the tab right-click menu. It returns `None` to leave the
+/// upstream menu in place.
+pub fn set_tab_menu_builder(
+    cx: &mut App,
+    builder: impl Fn(TabMenuTarget, &mut Window, &mut App) -> Option<Entity<ContextMenu>> + 'static,
+) {
+    cx.set_global(TabMenuBuilder(Rc::new(builder)));
+}
+
+fn zenith_tab_menu(
+    pane: &WeakEntity<Pane>,
+    ix: usize,
+    menu_context: &FocusHandle,
+    window: &mut Window,
+    cx: &mut App,
+) -> Option<Entity<ContextMenu>> {
+    let builder = cx.try_global::<TabMenuBuilder>()?.0.clone();
+    let pane = pane.upgrade()?;
+    let item = pane.read(cx).items.get(ix)?.boxed_clone();
+    let extra_actions = item.tab_extra_context_menu_actions(window, cx);
+    let this = pane.read(cx);
+    let project = this.project.upgrade();
+    let entry = (item.buffer_kind(cx) == ItemBufferKind::Singleton)
+        .then(|| item.project_entry_ids(cx).first().copied())
+        .flatten();
+    let project_path = entry.and_then(|_| item.project_path(cx));
+    let worktree = project_path.as_ref().and_then(|project_path| {
+        project
+            .as_ref()?
+            .read(cx)
+            .worktree_for_id(project_path.worktree_id, cx)
+    });
+    let has_relative_path = worktree
+        .as_ref()
+        .is_some_and(|worktree| worktree.read(cx).root_entry().is_some_and(|e| e.is_dir()));
+    let relative_path = project_path
+        .as_ref()
+        .filter(|_| has_relative_path)
+        .zip(project.as_ref())
+        .map(|(project_path, project)| {
+            let style = project.read(cx).path_style(cx);
+            project_path.path.display(style).to_string()
+        });
+    let has_git_repo = project_path.as_ref().is_some_and(|project_path| {
+        project.as_ref().is_some_and(|project| {
+            project
+                .read(cx)
+                .git_store()
+                .read(cx)
+                .repository_and_path_for_project_path(project_path, cx)
+                .is_some()
+        })
+    });
+    let capability = item.capability(cx);
+    let read_only_label = (item.read_only_toggle_buffer(cx).is_some()
+        && capability != Capability::ReadOnly)
+        .then_some(if capability.editable() {
+            "Make Tab Read-Only"
+        } else {
+            "Make Tab Editable"
+        });
+    let target = TabMenuTarget {
+        pane: pane.clone(),
+        ix,
+        total_items: this.items.len(),
+        has_pinned: this.pinned_tab_count > 0,
+        is_pinned: this.is_tab_pinned(ix),
+        has_clean_items: this.items.iter().any(|item| !item.is_dirty(cx)),
+        has_multibuffer_items: this
+            .items
+            .iter()
+            .any(|item| item.buffer_kind(cx) == ItemBufferKind::Multibuffer),
+        read_only_label,
+        has_entry: entry.is_some(),
+        abs_path: entry.and_then(|entry| this.entry_abs_path(entry, cx)),
+        visible_in_project_panel: relative_path.is_some()
+            && worktree.is_some_and(|worktree| worktree.read(cx).is_visible()),
+        relative_path,
+        has_git_repo,
+        is_local: project.as_ref().is_some_and(|project| {
+            let project = project.read(cx);
+            project.is_local() || project.is_via_wsl_with_host_interop(cx)
+        }),
+        is_remote: project
+            .as_ref()
+            .is_some_and(|project| project.read(cx).is_remote()),
+        extra_actions,
+        menu_context: menu_context.clone(),
+    };
+    builder(target, window, cx)
 }
 
 #[cfg(test)]
