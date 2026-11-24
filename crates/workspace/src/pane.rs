@@ -10013,19 +10013,6 @@ pub struct TabMenuTarget {
     pub menu_context: FocusHandle,
 }
 
-impl Workspace {
-    /// Zenith: makes `pane` the active pane now, as focusing it does at the next draw. Call it
-    /// outside an update of that pane.
-    pub fn zenith_activate_pane(
-        &mut self,
-        pane: &Entity<Pane>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.handle_pane_focused(pane.clone(), window, cx);
-    }
-}
-
 type TabMenuBuilderFn = dyn Fn(TabMenuTarget, &mut Window, &mut App) -> Option<Entity<ContextMenu>>;
 
 struct TabMenuBuilder(Rc<TabMenuBuilderFn>);

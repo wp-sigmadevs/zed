@@ -314,20 +314,11 @@ pub(crate) fn run(
     };
     match cmd {
         Cmd::Dispatch(action) => {
+            // `activate_item` with `activate_pane` makes the clicked tab's pane the workspace's
+            // active one (centre panes) before the deferred dispatch below runs.
             pane.activate_item(ix, true, false, window, cx);
-            let (pane, workspace, action) =
-                (cx.entity(), ctx.workspace.clone(), action.boxed_clone());
-            // Focusing a pane reaches the workspace only at the next draw, and a workspace
-            // update cannot run while this pane is being updated: do both after this handler.
-            window.defer(cx, move |window, cx| {
-                workspace
-                    .update(cx, |workspace, cx| {
-                        workspace.zenith_activate_pane(&pane, window, cx)
-                    })
-                    .ok();
-                window.focus(&gpui::Focusable::focus_handle(pane.read(cx), cx), cx);
-                window.dispatch_action(action, cx);
-            });
+            window.focus(&gpui::Focusable::focus_handle(pane, cx), cx);
+            window.dispatch_action(action.boxed_clone(), cx);
         }
         Cmd::Copy(text) => cx.write_to_clipboard(gpui::ClipboardItem::new_string(text.clone())),
         Cmd::Reveal(path) => match ctx.project.as_ref().and_then(WeakEntity::upgrade) {
