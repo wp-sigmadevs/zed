@@ -15,7 +15,9 @@ doctest = false
 [dependencies]
 editor.workspace = true
 fs.workspace = true
+git_ui_core.workspace = true
 gpui.workspace = true
+util.workspace = true
 log.workspace = true
 project.workspace = true
 schemars.workspace = true

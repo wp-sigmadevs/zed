@@ -23324,6 +23324,7 @@ dependencies = [
  "anyhow",
  "editor",
  "fs",
+ "git_ui_core",
  "gpui",
  "language",
  "log",
@@ -23336,6 +23337,7 @@ dependencies = [
  "theme",
  "theme_settings",
  "ui",
+ "util",
  "workspace",
  "zed_actions",
 ]

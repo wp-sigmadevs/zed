@@ -9,13 +9,14 @@
 
 use std::{path::PathBuf, rc::Rc};
 
-use gpui::{Action, App, Context, Entity, SharedString, Window};
+use gpui::{Action, App, Context, Entity, EntityId, SharedString, WeakEntity, Window};
+use project::{Project, ProjectPath};
 use settings::Settings as _;
 use ui::{ContextMenu, ContextMenuEntry, ContextMenuItem};
 use workspace::{
     CloseActiveItem, CloseAllItems, CloseCleanItems, CloseItemsToTheLeft, CloseItemsToTheRight,
     CloseMultibufferItems, CloseOtherItems, OpenTerminal, Pane, ReopenClosedItem,
-    RevealInProjectPanel, SplitDown, SplitRight, TabMenuTarget, TogglePinTab,
+    RevealInProjectPanel, SplitDown, SplitRight, TabMenuTarget, TogglePinTab, Workspace,
 };
 
 use crate::{FeatureToggles, tools};
@@ -28,6 +29,12 @@ pub(crate) enum Cmd {
     Copy(String),
     Reveal(PathBuf),
     ToggleReadOnly,
+    /// Open or copy the file's permalink on its git host.
+    Permalink {
+        copy: bool,
+    },
+    /// The file's git history, resolved from this tab's path, not from the active editor.
+    FileHistory,
 }
 
 #[derive(Clone)]
@@ -58,6 +65,7 @@ pub(crate) struct Facts {
     pub has_git_repo: bool,
     pub visible_in_project_panel: bool,
     pub is_local: bool,
+    pub is_remote: bool,
 }
 
 fn facts(target: &TabMenuTarget) -> Facts {
@@ -74,6 +82,7 @@ fn facts(target: &TabMenuTarget) -> Facts {
         has_git_repo: target.has_git_repo,
         visible_in_project_panel: target.visible_in_project_panel,
         is_local: target.is_local,
+        is_remote: target.is_remote,
     }
 }
 
@@ -85,26 +94,12 @@ fn entry(label: impl Into<SharedString>, action: impl Action, disabled: bool) ->
     }
 }
 
-fn named(
-    label: &'static str,
-    name: &str,
-    resolve: &dyn Fn(&str) -> Option<Box<dyn Action>>,
-) -> Option<Entry> {
-    let action: Rc<dyn Action> = resolve(name)?.into();
-    Some(Entry {
-        label: label.into(),
-        cmd: Cmd::Dispatch(action),
-        disabled: false,
-    })
-}
-
 fn menu(label: &'static str, entries: Vec<Entry>) -> Row {
     Row::Menu(label, entries)
 }
 
-/// The menu in order. `resolve` looks an action up by name (git actions live in a crate this
-/// one does not link); a name that does not resolve leaves its item out.
-pub(crate) fn rows(f: &Facts, resolve: &dyn Fn(&str) -> Option<Box<dyn Action>>) -> Vec<Row> {
+/// The menu in order.
+pub(crate) fn rows(f: &Facts) -> Vec<Row> {
     let close_all = |close_pinned| CloseAllItems {
         save_intent: None,
         close_pinned,
@@ -193,14 +188,18 @@ pub(crate) fn rows(f: &Facts, resolve: &dyn Fn(&str) -> Option<Box<dyn Action>>)
         copies.push(copy("File Name", name.to_string_lossy().into_owned()));
     }
     if f.has_git_repo {
-        copies.extend(named("File Permalink", "git::CopyFilePermalink", resolve));
+        copies.push(Entry {
+            label: "File Permalink".into(),
+            cmd: Cmd::Permalink { copy: true },
+            disabled: false,
+        });
     }
     rows.push(menu("Copy Path/Reference", copies));
 
     let mut open_in = Vec::new();
     if let (true, Some(path)) = (f.is_local, &f.abs_path) {
         open_in.push(Entry {
-            label: ui::utils::reveal_in_file_manager_label(false).into(),
+            label: ui::utils::reveal_in_file_manager_label(f.is_remote).into(),
             cmd: Cmd::Reveal(path.clone()),
             disabled: false,
         });
@@ -216,24 +215,27 @@ pub(crate) fn rows(f: &Facts, resolve: &dyn Fn(&str) -> Option<Box<dyn Action>>)
         ));
     }
     if f.has_git_repo {
-        open_in.extend(named("File Permalink", "git::OpenFilePermalink", resolve));
+        open_in.push(Entry {
+            label: "File Permalink".into(),
+            cmd: Cmd::Permalink { copy: false },
+            disabled: false,
+        });
     }
     rows.push(menu("Open In", open_in));
 
-    let history = (f.abs_path.is_some())
-        .then(|| {
-            named(
-                "Show History",
-                "zenith_local_history::ShowFileHistory",
-                resolve,
-            )
-        })
-        .flatten();
+    let history = f.abs_path.is_some().then(|| {
+        entry(
+            "Show History",
+            zed_actions::zenith_local_history::ShowFileHistory,
+            false,
+        )
+    });
     rows.push(menu("Local History", history.into_iter().collect()));
-    let git_history = f
-        .has_git_repo
-        .then(|| named("File History", "git::FileHistory", resolve))
-        .flatten();
+    let git_history = f.has_git_repo.then(|| Entry {
+        label: "File History".into(),
+        cmd: Cmd::FileHistory,
+        disabled: false,
+    });
     rows.push(menu("Git", git_history.into_iter().collect()));
 
     rows.extend([
@@ -286,7 +288,29 @@ pub(crate) fn tidy(rows: Vec<Row>) -> Vec<Row> {
     out
 }
 
-fn run(cmd: &Cmd, ix: usize, pane: &mut Pane, window: &mut Window, cx: &mut Context<Pane>) {
+/// What a menu item needs besides its own data: the clicked tab and the project it is in.
+pub(crate) struct Ctx {
+    item_id: EntityId,
+    project: Option<Entity<Project>>,
+    project_path: Option<ProjectPath>,
+    workspace: WeakEntity<Workspace>,
+}
+
+/// The clicked tab's index now; it may have moved or closed since the menu opened.
+fn tab_index(pane: &Pane, item_id: EntityId) -> Option<usize> {
+    pane.items().position(|item| item.item_id() == item_id)
+}
+
+pub(crate) fn run(
+    cmd: &Cmd,
+    ctx: &Ctx,
+    pane: &mut Pane,
+    window: &mut Window,
+    cx: &mut Context<Pane>,
+) {
+    let Some(ix) = tab_index(pane, ctx.item_id) else {
+        return;
+    };
     match cmd {
         Cmd::Dispatch(action) => {
             pane.activate_item(ix, true, false, window, cx);
@@ -294,21 +318,49 @@ fn run(cmd: &Cmd, ix: usize, pane: &mut Pane, window: &mut Window, cx: &mut Cont
             window.dispatch_action(action.boxed_clone(), cx);
         }
         Cmd::Copy(text) => cx.write_to_clipboard(gpui::ClipboardItem::new_string(text.clone())),
-        Cmd::Reveal(path) => cx.reveal_path(path),
+        Cmd::Reveal(path) => match &ctx.project {
+            Some(project) => project.update(cx, |project, cx| project.reveal_path(path, cx)),
+            None => cx.reveal_path(path),
+        },
         Cmd::ToggleReadOnly => {
             if let Some(item) = pane.item_for_index(ix) {
                 item.toggle_read_only(window, cx);
             }
         }
+        Cmd::Permalink { copy } => {
+            if let (Some(project), Some(path)) = (ctx.project.clone(), ctx.project_path.clone()) {
+                let open = if *copy {
+                    workspace::copy_file_permalink
+                } else {
+                    workspace::open_file_permalink
+                };
+                open(project, path, ctx.workspace.clone(), window, cx);
+            }
+        }
+        Cmd::FileHistory => {
+            let Some(path) = ctx.project_path.clone() else {
+                return;
+            };
+            ctx.workspace
+                .update(cx, |workspace, cx| {
+                    git_ui_core::open_file_history(workspace, &path, window, cx)
+                })
+                .ok();
+        }
     }
 }
 
-fn item(entry: &Entry, pane: &Entity<Pane>, ix: usize, window: &mut Window) -> ContextMenuEntry {
-    let cmd = entry.cmd.clone();
+fn item(
+    entry: &Entry,
+    pane: &Entity<Pane>,
+    ctx: &Rc<Ctx>,
+    window: &mut Window,
+) -> ContextMenuEntry {
+    let (cmd, ctx) = (entry.cmd.clone(), ctx.clone());
     let mut item = ContextMenuEntry::new(entry.label.clone())
         .disabled(entry.disabled)
         .handler(window.handler_for(pane, move |pane, window, cx| {
-            run(&cmd, ix, pane, window, cx)
+            run(&cmd, &ctx, pane, window, cx)
         }));
     if let Cmd::Dispatch(action) = &entry.cmd {
         item = item.action(action.boxed_clone());
@@ -320,33 +372,45 @@ fn deploy(target: TabMenuTarget, window: &mut Window, cx: &mut App) -> Option<En
     #[cfg(test)]
     tests::DEPLOYED.with(|n| n.set(n.get() + 1));
 
-    let rows = tidy(rows(&facts(&target), &|name| {
-        cx.build_action(name, None).ok()
-    }));
+    let rows = Rc::new(tidy(rows(&facts(&target))));
     let TabMenuTarget {
         pane,
-        ix,
+        item_id,
+        project,
+        project_path,
+        workspace,
         extra_actions,
         menu_context,
         ..
     } = target;
-    let rows = Rc::new(rows);
+    let ctx = Rc::new(Ctx {
+        item_id,
+        project,
+        project_path,
+        workspace,
+    });
     Some(ContextMenu::build(
         window,
         cx,
         move |mut menu, window, _| {
+            let Some(pane) = pane.upgrade() else {
+                return menu;
+            };
             for row in rows.iter() {
                 menu = match row {
                     Row::Separator => menu.separator(),
                     Row::Item(entry) => {
-                        menu.item(ContextMenuItem::Entry(item(entry, &pane, ix, window)))
+                        menu.item(ContextMenuItem::Entry(item(entry, &pane, &ctx, window)))
                     }
                     Row::Menu(label, entries) => {
-                        let (entries, pane) = (entries.clone(), pane.clone());
+                        let (entries, pane, ctx) = (entries.clone(), pane.downgrade(), ctx.clone());
                         menu.submenu(*label, move |mut sub, window, _| {
+                            let Some(pane) = pane.upgrade() else {
+                                return sub;
+                            };
                             for entry in &entries {
                                 sub = sub
-                                    .item(ContextMenuItem::Entry(item(entry, &pane, ix, window)));
+                                    .item(ContextMenuItem::Entry(item(entry, &pane, &ctx, window)));
                             }
                             sub
                         })
@@ -393,14 +457,10 @@ mod tests {
         pub(crate) static DEPLOYED: Cell<usize> = const { Cell::new(0) };
     }
 
-    fn no_names(_: &str) -> Option<Box<dyn Action>> {
-        None
-    }
-
     /// Labels of the tidy menu, submenus as `Name>`, separators as `-`; `!` marks a greyed item.
     fn shape(f: &Facts) -> Vec<String> {
         let label = |e: &Entry| format!("{}{}", e.label, if e.disabled { "!" } else { "" });
-        tidy(rows(f, &no_names))
+        tidy(rows(f))
             .iter()
             .flat_map(|row| match row {
                 Row::Separator => vec!["-".to_string()],
@@ -485,23 +545,41 @@ mod tests {
     }
 
     #[test]
-    fn git_items_need_a_repo_and_a_registered_action() {
-        let f = Facts {
+    fn git_items_need_a_repo_and_map_to_direct_calls() {
+        let cmds = |f: &Facts| -> Vec<&'static str> {
+            tidy(rows(f))
+                .into_iter()
+                .flat_map(|row| match row {
+                    Row::Menu(_, es) => es,
+                    Row::Item(e) => vec![e],
+                    Row::Separator => vec![],
+                })
+                .filter_map(|e| match e.cmd {
+                    Cmd::Permalink { copy: true } => Some("copy-permalink"),
+                    Cmd::Permalink { copy: false } => Some("open-permalink"),
+                    Cmd::FileHistory => Some("history"),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert!(cmds(&file_facts()).is_empty());
+        let repo = Facts {
             has_git_repo: true,
             ..file_facts()
         };
-        let resolve = |name: &str| -> Option<Box<dyn Action>> {
-            name.starts_with("git::")
-                .then(|| Box::new(TogglePinTab) as Box<dyn Action>)
-        };
-        let labels: Vec<_> = tidy(rows(&f, &resolve))
-            .into_iter()
-            .filter_map(|row| match row {
-                Row::Menu("Git", es) => Some(es.len()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(labels, [1]);
+        assert_eq!(cmds(&repo), ["copy-permalink", "open-permalink", "history"]);
+    }
+
+    #[test]
+    fn reveal_label_follows_remote() {
+        for is_remote in [false, true] {
+            let f = Facts {
+                is_remote,
+                ..file_facts()
+            };
+            let want = format!("  {}", ui::utils::reveal_in_file_manager_label(is_remote));
+            assert!(shape(&f).contains(&want), "{want}");
+        }
     }
 
     #[test]
@@ -576,5 +654,108 @@ mod tests {
     async fn the_setting_switches_the_menu_off(cx: &mut TestAppContext) {
         right_click_first_tab(cx, true, false).await;
         assert_eq!(DEPLOYED.with(Cell::get), 0);
+    }
+
+    async fn two_tabs(
+        cx: &mut TestAppContext,
+    ) -> (
+        Entity<Workspace>,
+        Entity<Pane>,
+        &mut gpui::VisualTestContext,
+    ) {
+        cx.update(|cx| {
+            let store = settings::SettingsStore::test(cx);
+            cx.set_global(store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+        let project = Project::test(FakeFs::new(cx.executor()), None, cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+        let pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+        pane.update_in(cx, |pane, window, cx| {
+            for label in ["a.php", "b.php"] {
+                let item = Box::new(cx.new(|cx| TestItem::new(cx).with_label(label)));
+                pane.add_item(item, true, true, None, window, cx);
+            }
+        });
+        cx.run_until_parked();
+        (workspace, pane, cx)
+    }
+
+    fn ctx_for(
+        workspace: &Entity<Workspace>,
+        pane: &Entity<Pane>,
+        ix: usize,
+        project_path: Option<ProjectPath>,
+        cx: &mut gpui::VisualTestContext,
+    ) -> Ctx {
+        Ctx {
+            item_id: pane.read_with(cx, |pane, _| pane.items().nth(ix).unwrap().item_id()),
+            project: None,
+            project_path,
+            workspace: workspace.downgrade(),
+        }
+    }
+
+    #[gpui::test]
+    async fn close_on_a_background_tab_closes_that_tab(cx: &mut TestAppContext) {
+        let (workspace, pane, cx) = two_tabs(cx).await;
+        // Tab 1 is active; the menu was opened on tab 0.
+        assert_eq!(pane.read_with(cx, |pane, _| pane.active_item_index()), 1);
+        let ctx = ctx_for(&workspace, &pane, 0, None, cx);
+        let kept = pane.read_with(cx, |pane, _| pane.items().nth(1).unwrap().item_id());
+        let close = Cmd::Dispatch(Rc::new(CloseActiveItem {
+            save_intent: Some(workspace::SaveIntent::Skip),
+            close_pinned: true,
+        }));
+        pane.update_in(cx, |pane, window, cx| run(&close, &ctx, pane, window, cx));
+        cx.run_until_parked();
+        let left = pane.read_with(cx, |pane, _| {
+            pane.items().map(|item| item.item_id()).collect::<Vec<_>>()
+        });
+        assert_eq!(left, [kept]);
+    }
+
+    #[gpui::test]
+    async fn a_tab_that_is_gone_is_left_alone(cx: &mut TestAppContext) {
+        let (workspace, pane, cx) = two_tabs(cx).await;
+        let ctx = ctx_for(&workspace, &pane, 0, None, cx);
+        pane.update_in(cx, |pane, window, cx| {
+            pane.close_item_by_id(ctx.item_id, workspace::SaveIntent::Skip, window, cx)
+                .detach();
+        });
+        cx.run_until_parked();
+        let close = Cmd::Dispatch(Rc::new(CloseActiveItem {
+            save_intent: Some(workspace::SaveIntent::Skip),
+            close_pinned: true,
+        }));
+        pane.update_in(cx, |pane, window, cx| run(&close, &ctx, pane, window, cx));
+        cx.run_until_parked();
+        assert_eq!(pane.read_with(cx, |pane, _| pane.items_len()), 1);
+    }
+
+    thread_local! {
+        static HISTORY_FOR: std::cell::RefCell<Option<ProjectPath>> = const { std::cell::RefCell::new(None) };
+    }
+
+    #[gpui::test]
+    async fn file_history_uses_the_clicked_tabs_path(cx: &mut TestAppContext) {
+        let (workspace, pane, cx) = two_tabs(cx).await;
+        cx.update(|_, cx| {
+            git_ui_core::set_file_history_opener(
+                |_, path, _, _| HISTORY_FOR.with(|slot| *slot.borrow_mut() = Some(path.clone())),
+                cx,
+            );
+        });
+        let path = ProjectPath {
+            worktree_id: project::WorktreeId::from_usize(1),
+            path: util::rel_path::rel_path("src/a.php").into(),
+        };
+        let ctx = ctx_for(&workspace, &pane, 0, Some(path.clone()), cx);
+        pane.update_in(cx, |pane, window, cx| {
+            run(&Cmd::FileHistory, &ctx, pane, window, cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(HISTORY_FOR.with(|slot| slot.borrow().clone()), Some(path));
     }
 }

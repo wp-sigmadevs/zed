@@ -9990,7 +9990,8 @@ fn zenith_active_tab_line(cx: &App) -> gpui::Div {
 
 /// What a replacement tab menu needs to know about the tab that was right-clicked.
 pub struct TabMenuTarget {
-    pub pane: Entity<Pane>,
+    pub pane: WeakEntity<Pane>,
+    pub item_id: EntityId,
     pub ix: usize,
     pub total_items: usize,
     pub has_pinned: bool,
@@ -9999,8 +10000,9 @@ pub struct TabMenuTarget {
     pub has_multibuffer_items: bool,
     /// "Make Tab Read-Only" or "Make Tab Editable"; `None` when the tab cannot be toggled.
     pub read_only_label: Option<&'static str>,
-    /// The tab holds exactly one file or entry (not a multibuffer).
-    pub has_entry: bool,
+    pub project: Option<Entity<Project>>,
+    pub project_path: Option<ProjectPath>,
+    pub workspace: WeakEntity<Workspace>,
     pub abs_path: Option<PathBuf>,
     pub relative_path: Option<String>,
     pub has_git_repo: bool,
@@ -10079,7 +10081,8 @@ fn zenith_tab_menu(
             "Make Tab Editable"
         });
     let target = TabMenuTarget {
-        pane: pane.clone(),
+        pane: pane.downgrade(),
+        item_id: item.item_id(),
         ix,
         total_items: this.items.len(),
         has_pinned: this.pinned_tab_count > 0,
@@ -10090,7 +10093,9 @@ fn zenith_tab_menu(
             .iter()
             .any(|item| item.buffer_kind(cx) == ItemBufferKind::Multibuffer),
         read_only_label,
-        has_entry: entry.is_some(),
+        project: project.clone(),
+        project_path,
+        workspace: this.workspace.clone(),
         abs_path: entry.and_then(|entry| this.entry_abs_path(entry, cx)),
         visible_in_project_panel: relative_path.is_some()
             && worktree.is_some_and(|worktree| worktree.read(cx).is_visible()),
