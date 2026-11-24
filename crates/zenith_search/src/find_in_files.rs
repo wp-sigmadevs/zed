@@ -880,13 +880,18 @@ impl FindInFilesModal {
     /// The splitter pressed at `y`. The popup is pinned at its painted height,
     /// so the preview takes its room from the list and the handle follows the
     /// pointer; it may grow until the list has `MIN_LIST_ROWS` left.
-    fn start_splitter_drag(&mut self, y: Pixels, window: &Window, cx: &mut App) {
-        self.frame.pin(PopupKind::Find, window, cx);
+    fn start_splitter_drag(&mut self, y: Pixels, window: &Window, cx: &mut Context<Self>) {
+        // What is painted now. Pinning makes the popup "sized", which can allow a
+        // different preview height (a short window held it below the default),
+        // so keep this one: the press must not move anything.
         let height = preview_height(window, cx);
+        self.frame.pin(PopupKind::Find, window, cx);
+        set_preview_height(height, cx);
         let max = self.list.get().map_or(height, |list| {
             list.size.height + height - px(ROW_HEIGHT * MIN_LIST_ROWS)
         });
         self.split_drag = Some(SplitDrag { y, height, max });
+        cx.notify();
     }
 
     /// The pointer is at `y`: moving up grows the preview. Remembered for the session.

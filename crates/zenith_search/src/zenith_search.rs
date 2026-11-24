@@ -4072,6 +4072,44 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_pressing_the_splitter_in_a_short_window_moves_nothing(cx: &mut TestAppContext) {
+        let (_, modal, cx) = open_with_hit(cx).await;
+        // Short enough that the unsized popup holds the preview below its default.
+        cx.simulate_resize(gpui::size(px(1400.), px(700.)));
+        modal.update(cx, |_, cx| cx.notify());
+        cx.run_until_parked();
+        let handle = cx.debug_bounds("zenith-find-splitter").unwrap().center();
+        let preview = preview_height_of(cx);
+        assert!(preview < px(210.), "{preview:?}");
+        let none = gpui::Modifiers::none();
+        cx.simulate_mouse_down(handle, gpui::MouseButton::Left, none);
+        cx.run_until_parked();
+        assert_eq!(preview_height_of(cx), preview);
+        assert_eq!(
+            cx.debug_bounds("zenith-find-splitter").unwrap().center(),
+            handle
+        );
+        for step in 1..=4 {
+            cx.simulate_mouse_move(
+                handle - gpui::point(px(0.), px(10. * step as f32)),
+                gpui::MouseButton::Left,
+                none,
+            );
+        }
+        cx.simulate_mouse_up(
+            handle - gpui::point(px(0.), px(40.)),
+            gpui::MouseButton::Left,
+            none,
+        );
+        cx.run_until_parked();
+        assert_eq!(preview_height_of(cx), preview + px(40.));
+        assert_eq!(
+            cx.debug_bounds("zenith-find-splitter").unwrap().center().y,
+            handle.y - px(40.)
+        );
+    }
+
+    #[gpui::test]
     async fn test_a_stored_preview_height_is_held_to_a_smaller_window(cx: &mut TestAppContext) {
         let (_, modal, cx) = open_with_hit(cx).await;
         // Set in a roomier window, or by a bigger drag: far more than any window holds.
