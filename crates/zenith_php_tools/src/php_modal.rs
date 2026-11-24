@@ -1122,6 +1122,14 @@ mod tests {
             "8.4 to 8.5 restarts PHPantom once"
         );
 
+        // Another kind of edit (no level change) restarts nothing.
+        modal.update(cx, |modal, cx| {
+            modal.set_interpreter(Some(PathBuf::from("/opt/php84/bin/php")), cx)
+        });
+        click(cx, "zenith-php-apply");
+        assert_eq!(restarts(&mut servers), 0, "the level did not change");
+        assert!(user_settings_text(&fixture, cx).contains("php_binary"));
+
         // Nothing changed: Apply does nothing, OK just closes.
         modal.update(cx, |modal, cx| modal.apply(false, cx));
         cx.run_until_parked();
@@ -1143,6 +1151,8 @@ mod tests {
             .workspace
             .update_in(cx, |workspace, window, cx| workspace.hide_modal(window, cx));
         drop(modal);
+        // The modal is released here, with its apply task not yet run.
+        cx.update(|_, _| ());
         cx.run_until_parked();
         let text = fixture
             .fs
