@@ -33373,16 +33373,6 @@ async fn test_edits_around_expanded_deletion_hunks(
 #[gpui::test]
 async fn test_backspace_after_deletion_hunk(executor: BackgroundExecutor, cx: &mut TestAppContext) {
     init_test(cx, |_| {});
-    // Sticky scroll is on by default in Zenith; this test predates it.
-    cx.update(|cx| {
-        SettingsStore::update_global(cx, |store, cx| {
-            store.update_user_settings(cx, |settings| {
-                settings.editor.sticky_scroll = Some(settings::StickyScrollContent {
-                    enabled: Some(false),
-                })
-            });
-        });
-    });
 
     let mut cx = EditorTestContext::new(cx).await;
 
@@ -45483,6 +45473,58 @@ async fn test_sticky_scroll_with_expanded_deleted_diff_hunks(
     assert_eq!(sticky_headers(5.5), vec![(fn_foo, -0.5)]);
     // Past the closing brace: no more sticky header.
     assert_eq!(sticky_headers(6.0), vec![]);
+}
+
+#[gpui::test]
+async fn test_sticky_header_count_with_expanded_deleted_hunk_above_fn(
+    executor: BackgroundExecutor,
+    cx: &mut TestAppContext,
+) {
+    init_test(cx, |_| {});
+    let mut cx = EditorTestContext::new(cx).await;
+
+    let diff_base = indoc! {"
+        // removed one
+        // removed two
+        fn foo() {
+            let x = 1;
+            let y = 2;
+        }
+    "};
+
+    cx.set_state(indoc! {"
+        fn foo() {
+            let x = 1;
+            let ˇy = 2;
+        }
+    "});
+    cx.update_editor(|e, _, cx| {
+        e.buffer()
+            .read(cx)
+            .as_singleton()
+            .unwrap()
+            .update(cx, |buffer, cx| {
+                buffer.set_language(Some(rust_lang()), cx);
+            })
+    });
+    cx.set_head_text(diff_base);
+    executor.run_until_parked();
+    cx.update_editor(|editor, window, cx| {
+        editor.expand_all_diff_hunks(&ExpandAllDiffHunks, window, cx);
+    });
+    executor.run_until_parked();
+
+    // Display rows: 0-1 deleted comments, 2 `fn foo() {`, 3 x, 4 y, 5 `}`. The
+    // fn's header starts at the top of the deleted block, as in sticky_headers.
+    let mut count_at = |row: u32| {
+        cx.update_editor(|editor, _, cx| {
+            let snapshot = editor.display_snapshot(cx);
+            let point = DisplayPoint::new(DisplayRow(row), 0);
+            editor.visible_sticky_header_count_for_point(&snapshot, point, cx)
+        })
+    };
+    let counts = (0..6).map(&mut count_at).collect::<Vec<_>>();
+    assert_eq!(counts, vec![0, 1, 1, 1, 1, 0]);
 }
 
 #[gpui::test]

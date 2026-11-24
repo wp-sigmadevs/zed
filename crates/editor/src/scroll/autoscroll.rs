@@ -321,13 +321,19 @@ impl Editor {
             return 0;
         }
 
-        let Some(buffer_snapshot) = display_map.buffer_snapshot().as_singleton() else {
+        // Convert through anchors: with expanded deleted hunks, display and
+        // multi-buffer points are not buffer points.
+        let multi_buffer = display_map.buffer_snapshot();
+        let Some(buffer_snapshot) = multi_buffer.as_singleton() else {
             return 0;
         };
 
-        let point = target_point.to_point(display_map);
+        let anchor = display_map.display_point_to_anchor(target_point, Bias::Left);
+        let Some((target, _)) = multi_buffer.anchor_to_buffer_anchor(anchor) else {
+            return 0;
+        };
         let mut item_ranges = buffer_snapshot
-            .outline_ranges_containing(point..point)
+            .outline_ranges_containing(target..target)
             .collect::<Vec<_>>();
         item_ranges.sort_by_key(|item_range| item_range.start);
 
@@ -335,9 +341,13 @@ impl Editor {
         let mut num_visible_sticky_headers = 0;
 
         for item_range in item_ranges {
-            let sticky_row = display_map
-                .point_to_display_point(item_range.start, Bias::Left)
-                .row();
+            let Some(range) = multi_buffer.buffer_anchor_range_to_anchor_range(
+                buffer_snapshot.anchor_before(item_range.start)
+                    ..buffer_snapshot.anchor_before(item_range.end),
+            ) else {
+                continue;
+            };
+            let sticky_row = range.start.to_display_point(display_map).row();
             if sticky_row >= target_point.row() {
                 break;
             }
@@ -345,9 +355,7 @@ impl Editor {
                 continue;
             }
 
-            let end_row = display_map
-                .point_to_display_point(item_range.end, Bias::Left)
-                .row();
+            let end_row = range.end.to_display_point(display_map).row();
             if end_row <= target_point.row() {
                 continue;
             }
