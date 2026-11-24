@@ -3,7 +3,7 @@
 //! onboarding) from the command palette.
 
 use command_palette_hooks::CommandPaletteFilter;
-use gpui::{App, BorrowAppContext as _};
+use gpui::App;
 use settings::SettingsStore;
 use std::any::TypeId;
 
@@ -34,6 +34,7 @@ pub(crate) fn init(cx: &mut App) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui::BorrowAppContext as _;
 
     #[gpui::test]
     fn test_branded_actions_are_hidden_from_the_palette(cx: &mut gpui::TestAppContext) {
