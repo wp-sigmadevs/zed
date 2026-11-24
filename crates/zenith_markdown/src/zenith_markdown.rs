@@ -79,7 +79,7 @@ fn attach(pane: &Entity<Pane>, window: &mut Window, cx: &mut Context<Workspace>)
                 cx,
             );
             toolbar.add_item(switcher, window, cx);
-            let spacer = cx.new(|_| PreviewToolbarSpacer);
+            let spacer = cx.new(PreviewToolbarSpacer::new);
             toolbar.add_item(spacer, window, cx);
         });
     });
@@ -116,6 +116,8 @@ pub struct MarkdownViewSwitcher {
     pane: WeakEntity<Pane>,
     active_item: Option<Box<dyn ItemHandle>>,
     location: ToolbarItemLocation,
+    // Whether the active item is a Markdown file; what the tab bar's visibility rides on.
+    markdown: bool,
     _settings_subscription: Subscription,
     // The language of a freshly opened buffer can arrive after the item is
     // activated, so the editor is watched until the file is known to be Markdown.
@@ -327,6 +329,7 @@ impl MarkdownViewSwitcher {
             pane,
             active_item: None,
             location: ToolbarItemLocation::Hidden,
+            markdown: false,
             // The tab bar settings decide where the buttons go.
             _settings_subscription: cx
                 .observe_global::<SettingsStore>(|this, cx| this.update_location(cx)),
@@ -346,13 +349,26 @@ impl MarkdownViewSwitcher {
         }
     }
 
+    /// Re-resolves where the buttons go; redraws only when that or the file kind changed.
     fn update_location(&mut self, cx: &mut Context<Self>) {
         let location = Self::location_for(self.active_item.as_deref(), cx);
+        let markdown = self
+            .active_item
+            .as_deref()
+            .is_some_and(|item| markdown_editor(item, cx).is_some());
+        if location == self.location && markdown == self.markdown {
+            return;
+        }
+        self.markdown = markdown;
         if location != self.location {
             self.location = location;
             cx.emit(ToolbarItemEvent::ChangeLocation(location));
         }
         cx.notify();
+        // The tab bar decides whether to draw the buttons while it draws itself.
+        if let Some(pane) = self.pane.upgrade() {
+            pane.update(cx, |_, cx| cx.notify());
+        }
     }
 
     fn target(&self) -> Option<Target> {
@@ -380,6 +396,7 @@ impl ToolbarItemView for MarkdownViewSwitcher {
             .and_then(|item| item.act_as::<Editor>(cx))
             .map(|editor| cx.observe(&editor, |this, _, cx| this.update_location(cx)));
         self.location = Self::location_for(active_pane_item, cx);
+        self.markdown = active_pane_item.is_some_and(|item| markdown_editor(item, cx).is_some());
         cx.notify();
         self.location
     }
@@ -435,9 +452,41 @@ impl Render for MarkdownViewSwitcher {
 /// the free width and pushes the buttons to the right, where they sit over an
 /// editor. The clean fix is `.ml_auto()` on the right group in
 /// `crates/workspace/src/toolbar.rs`; this keeps the change out of upstream.
-pub struct PreviewToolbarSpacer;
+pub struct PreviewToolbarSpacer {
+    active_item: Option<Box<dyn ItemHandle>>,
+    location: ToolbarItemLocation,
+    _settings_subscription: Subscription,
+}
 
 impl EventEmitter<ToolbarItemEvent> for PreviewToolbarSpacer {}
+
+impl PreviewToolbarSpacer {
+    pub fn new(cx: &mut Context<Self>) -> Self {
+        Self {
+            active_item: None,
+            location: ToolbarItemLocation::Hidden,
+            // The tab bar settings decide whether the buttons need the spacer.
+            _settings_subscription: cx.observe_global::<SettingsStore>(|this, cx| {
+                let location = Self::location_for(this.active_item.as_deref(), cx);
+                if location != this.location {
+                    this.location = location;
+                    cx.emit(ToolbarItemEvent::ChangeLocation(location));
+                }
+            }),
+        }
+    }
+
+    fn location_for(item: Option<&dyn ItemHandle>, cx: &App) -> ToolbarItemLocation {
+        let over_preview = cx.has_global::<RailsActive>()
+            && !zenith_rails::draws_tab_bar_end(cx)
+            && item.is_some_and(|item| is_preview(item) && markdown_editor(item, cx).is_some());
+        if over_preview {
+            ToolbarItemLocation::PrimaryLeft
+        } else {
+            ToolbarItemLocation::Hidden
+        }
+    }
+}
 
 impl ToolbarItemView for PreviewToolbarSpacer {
     fn set_active_pane_item(
@@ -446,15 +495,9 @@ impl ToolbarItemView for PreviewToolbarSpacer {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) -> ToolbarItemLocation {
-        let over_preview = cx.has_global::<RailsActive>()
-            && !zenith_rails::draws_tab_bar_end(cx)
-            && active_pane_item
-                .is_some_and(|item| is_preview(item) && markdown_editor(item, cx).is_some());
-        if over_preview {
-            ToolbarItemLocation::PrimaryLeft
-        } else {
-            ToolbarItemLocation::Hidden
-        }
+        self.active_item = active_pane_item.map(ItemHandle::boxed_clone);
+        self.location = Self::location_for(active_pane_item, cx);
+        self.location
     }
 }
 
@@ -485,6 +528,7 @@ mod tests {
         project: Entity<Project>,
         pane: Entity<Pane>,
         switcher: Entity<MarkdownViewSwitcher>,
+        spacer: Entity<PreviewToolbarSpacer>,
     }
 
     async fn fixture(cx: &mut TestAppContext) -> Fixture {
@@ -532,13 +576,17 @@ mod tests {
             .update(cx, |multi, _, _| multi.workspace().clone())
             .unwrap();
         let pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
-        let switcher = pane.read_with(cx, |pane, cx| pane.toolbar().read(cx).item_of_type());
+        let (switcher, spacer) = pane.read_with(cx, |pane, cx| {
+            let toolbar = pane.toolbar().read(cx);
+            (toolbar.item_of_type(), toolbar.item_of_type())
+        });
         Fixture {
             window,
             workspace,
             project,
             pane,
             switcher: switcher.expect("init() adds the switcher to every pane's toolbar"),
+            spacer: spacer.expect("init() adds the spacer to every pane's toolbar"),
         }
     }
 
@@ -786,6 +834,31 @@ mod tests {
             assert_eq!(fixture.location(cx), ToolbarItemLocation::Hidden);
             assert!(fixture.bounds("zenith-tab-bar-end", cx).is_some());
         }
+    }
+
+    #[gpui::test]
+    async fn the_spacer_follows_the_tab_bar_settings_without_a_tab_switch(cx: &mut TestAppContext) {
+        let fixture = fixture(cx).await;
+        fixture.open("b.md", cx).await;
+        fixture.click(Mode::Preview, cx);
+        let location = |cx: &mut TestAppContext| fixture.spacer.read_with(cx, |s, _| s.location);
+        // The tab bar holds the buttons: no spacer.
+        let item = fixture.active(cx);
+        fixture
+            .window
+            .update(cx, |_, window, cx| {
+                fixture.spacer.update(cx, |spacer, cx| {
+                    spacer.set_active_pane_item(Some(item.as_ref()), window, cx)
+                })
+            })
+            .unwrap();
+        assert_eq!(location(cx), ToolbarItemLocation::Hidden);
+        set_tab_bar(cx, true, false);
+        cx.run_until_parked();
+        assert_eq!(location(cx), ToolbarItemLocation::PrimaryLeft);
+        set_tab_bar(cx, true, true);
+        cx.run_until_parked();
+        assert_eq!(location(cx), ToolbarItemLocation::Hidden);
     }
 
     #[gpui::test]
