@@ -488,7 +488,7 @@ mod tests {
                     .get(&pane.read(cx).toolbar().entity_id())
                     .cloned()
                     .unwrap();
-                tab_bar_end::hides_split(&views, cx)
+                tab_bar_end::hides_split(&views, pane.read(cx), cx)
             })
         };
         assert!(hides(cx));
@@ -517,7 +517,7 @@ mod tests {
                 .get(&pane.read(cx).toolbar().entity_id())
                 .cloned()
                 .unwrap();
-            assert!(!tab_bar_end::hides_split(&views, cx));
+            assert!(!tab_bar_end::hides_split(&views, pane.read(cx), cx));
         });
     }
 

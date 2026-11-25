@@ -864,6 +864,12 @@ mod tests {
         assert_eq!(fixture.stock_width(cx).0, rust);
         fixture.activate(1, cx);
         assert_eq!(fixture.stock_width(cx).0, markdown);
+        // The split view cannot be cloned, so the stock button (which can move its pane) stays.
+        fixture.click(Mode::Split, cx);
+        assert!(fixture.active(cx).downcast::<MarkdownSplitView>().is_some());
+        assert_eq!(fixture.stock_width(cx).0, rust);
+        fixture.click(Mode::Editor, cx);
+        assert_eq!(fixture.stock_width(cx).0, markdown);
         // The markdown buttons sit in the toolbar when the tab bar cannot hold them: the stock
         // buttons are not ours to change then.
         set_tab_bar(cx, true, false);

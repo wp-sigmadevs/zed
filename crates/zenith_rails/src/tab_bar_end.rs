@@ -66,7 +66,7 @@ pub fn tab_bar_end(
 
 /// Like [`tab_bar_end`], and while `view` is visible the stock Split Pane button is not drawn
 /// beside it: the view has a split button of its own that would look the same. Splitting stays
-/// in the tab menu and on the keyboard.
+/// in the tab menu and on the keyboard, and the button stays on a tab that cannot split.
 pub fn tab_bar_end_hiding_split(
     view: impl Into<AnyView>,
     order: i32,
@@ -102,10 +102,14 @@ fn register(
     }
 }
 
-/// Whether the stock Split Pane button is left out: a visible view replaces it and the tab bar
-/// end is drawn at all (otherwise that view sits in its toolbar row and the button stays).
-pub(crate) fn hides_split(visible_views: &[Entry], cx: &App) -> bool {
-    draws_tab_bar_end(cx) && visible_views.iter().any(|entry| entry.hides_split)
+/// Whether the stock Split Pane button is left out: a visible view replaces it, the tab bar
+/// end is drawn at all (otherwise that view sits in its toolbar row and the button stays), and
+/// the active tab can be split. A tab that cannot split (the markdown split view) offers only
+/// moving the pane there, and every other route (tab menu, keys) clones, so the button stays.
+pub(crate) fn hides_split(visible_views: &[Entry], pane: &Pane, cx: &App) -> bool {
+    draws_tab_bar_end(cx)
+        && visible_views.iter().any(|entry| entry.hides_split)
+        && pane.active_item().is_some_and(|item| item.can_split(cx))
 }
 
 /// Installed on every workspace pane. Resolved at draw time, so it follows the views the
@@ -123,7 +127,8 @@ pub(crate) fn render(
     views.retain(|entry| (entry.visible)(pane, cx));
     // Decided from the views drawn below, so the split button is back whenever the view that
     // replaces it is not drawn.
-    let (left, right) = default_render_tab_bar_buttons(pane, hides_split(&views, cx), window, cx);
+    let hide_split = hides_split(&views, pane, cx);
+    let (left, right) = default_render_tab_bar_buttons(pane, hide_split, window, cx);
     if views.is_empty() {
         return (left, right);
     }
