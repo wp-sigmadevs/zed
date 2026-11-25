@@ -6140,14 +6140,15 @@ mod tests {
         // From the Atom keymap
         use workspace::ActivatePreviousPane;
         // From the JetBrains keymap
-        use diagnostics::Deploy;
+        // Zenith: ⌘6 is Problems in the fork's own keymap, so ⌘7 stands in for JetBrains.
+        use outline_panel::ToggleFocus;
 
         window
             .update(cx, |_, _, cx| {
                 workspace.update(cx, |workspace, cx| {
                     workspace.register_action(|_, _: &ActionA, _window, _cx| {});
                     workspace.register_action(|_, _: &ActionB, _window, _cx| {});
-                    workspace.register_action(|_, _: &Deploy, _window, _cx| {});
+                    workspace.register_action(|_, _: &ToggleFocus, _window, _cx| {});
                     cx.notify();
                 });
             })
@@ -6226,7 +6227,7 @@ mod tests {
 
         cx.background_executor.run_until_parked();
 
-        assert_key_bindings_for(window.into(), cx, vec![("6", &Deploy)], line!());
+        assert_key_bindings_for(window.into(), cx, vec![("7", &ToggleFocus)], line!());
     }
 
     #[gpui::test]
