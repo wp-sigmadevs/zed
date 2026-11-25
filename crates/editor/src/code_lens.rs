@@ -742,6 +742,7 @@ fn build_code_lens_renderer(line: CodeLensLine, editor: WeakEntity<Editor>) -> R
             );
         }
 
+        let has_items = !children.is_empty(); // Zenith
         div()
             .id(cx.block_id)
             .pl(cx.em_width * (line.indent_column as f32))
@@ -750,7 +751,12 @@ fn build_code_lens_renderer(line: CodeLensLine, editor: WeakEntity<Editor>) -> R
             .flex_row()
             .items_end()
             .children(children)
-            .children(zenith_code_lens_trailing(line.position, &editor, cx.app)) // Zenith
+            .children(zenith_code_lens_trailing(
+                has_items,
+                line.position,
+                &editor,
+                cx.app,
+            )) // Zenith
             .into_any_element()
     })
 }
@@ -2362,11 +2368,17 @@ fn zenith_code_lens_title(title: SharedString) -> SharedString {
         .map_or(title.clone(), |(_, map_title, _)| map_title(title))
 }
 
+/// Nothing trails a lens that is still resolving, so the author does not
+/// render alone and shift when the titles arrive.
 fn zenith_code_lens_trailing(
+    has_items: bool,
     position: Anchor,
     editor: &WeakEntity<Editor>,
     cx: &mut App,
 ) -> Option<AnyElement> {
+    if !has_items {
+        return None;
+    }
     CODE_LENS_STYLE
         .get()
         .and_then(|(_, _, trailing)| trailing(position, editor, cx))
@@ -2374,7 +2386,7 @@ fn zenith_code_lens_trailing(
 
 #[cfg(test)]
 mod zenith_style_tests {
-    use gpui::{SharedString, TestAppContext};
+    use gpui::{IntoElement as _, SharedString, TestAppContext};
 
     #[gpui::test]
     fn test_code_lens_style_defaults_are_identity(cx: &mut TestAppContext) {
@@ -2389,8 +2401,36 @@ mod zenith_style_tests {
             assert_eq!(super::zenith_code_lens_text_style(&base, cx), base);
             let editor = gpui::WeakEntity::<crate::Editor>::new_invalid();
             assert!(
-                super::zenith_code_lens_trailing(multi_buffer::Anchor::Min, &editor, cx).is_none()
+                super::zenith_code_lens_trailing(true, multi_buffer::Anchor::Min, &editor, cx)
+                    .is_none()
             );
+        });
+    }
+
+    static TRAILING_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    fn counting_trailing(
+        _: multi_buffer::Anchor,
+        _: &gpui::WeakEntity<crate::Editor>,
+        _: &mut gpui::App,
+    ) -> Option<gpui::AnyElement> {
+        TRAILING_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Some(gpui::div().into_any_element())
+    }
+
+    #[gpui::test]
+    fn test_code_lens_trailing_skipped_while_resolving(cx: &mut TestAppContext) {
+        // Registers the process-wide style, so it must not share a process with the
+        // identity test above (nextest runs each test in its own process).
+        super::set_code_lens_style(|base, _| base.clone(), |title| title, counting_trailing);
+        cx.update(|cx| {
+            let editor = gpui::WeakEntity::<crate::Editor>::new_invalid();
+            let anchor = multi_buffer::Anchor::Min;
+            let calls = || TRAILING_CALLS.load(std::sync::atomic::Ordering::SeqCst);
+            assert!(super::zenith_code_lens_trailing(false, anchor, &editor, cx).is_none());
+            assert_eq!(calls(), 0, "hook must not run while the lens has no items");
+            assert!(super::zenith_code_lens_trailing(true, anchor, &editor, cx).is_some());
+            assert_eq!(calls(), 1);
         });
     }
 }
