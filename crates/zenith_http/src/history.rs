@@ -222,7 +222,8 @@ fn mask_secret_body(body: &str, content_type: Option<&str>) -> Option<String> {
 const UNMASKABLE_BODY: &str = "[body not stored: truncated, secrets could not be masked]";
 
 /// Whether `body` may be JSON, by content type or, failing that, by its first character. Form
-/// and multipart bodies are masked by prefix, so a cut leaves no secret value unmasked.
+/// and multipart bodies are masked by prefix, so a cut leaves no secret value unmasked (multipart
+/// only with a `boundary=`; without one it is never masked, cut or not).
 fn may_be_json(body: &str, content_type: Option<&str>) -> bool {
     let content_type = content_type.unwrap_or_default().to_ascii_lowercase();
     if content_type.contains("x-www-form-urlencoded") || content_type.starts_with("multipart/") {
