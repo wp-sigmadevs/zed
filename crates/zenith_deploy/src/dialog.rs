@@ -72,6 +72,7 @@ impl Fields {
     }
 }
 
+#[derive(Clone)]
 enum TestStatus {
     Running,
     Passed(SharedString),
@@ -945,9 +946,19 @@ impl DeploymentDialog {
             .when_some(status, |footer, (icon, color, message)| {
                 footer.child(
                     h_flex()
+                        .debug_selector(|| "zenith-deploy-status".to_string())
                         .gap_1()
-                        .child(Icon::new(icon).color(color).size(IconSize::Small))
-                        .child(Label::new(message).color(color)),
+                        .child(
+                            div()
+                                .flex_none()
+                                .child(Icon::new(icon).color(color).size(IconSize::Small)),
+                        )
+                        .child(
+                            div()
+                                .debug_selector(|| "zenith-deploy-status-text".to_string())
+                                .min_w_0()
+                                .child(Label::new(message).color(color)),
+                        ),
                 )
             })
             .when_some(self.error.clone(), |footer, error| {
@@ -1916,26 +1927,36 @@ mod tests {
             "Root path",
             "Web URL",
         ];
-        const CALLOUTS: [&str; 2] = ["zenith-deploy-insecure", "zenith-deploy-password-removed"];
         let servers = Servers {
             servers: vec![server("Live", None)],
             ..Servers::default()
         };
         let (_, dialog, cx) = open_dialog(servers, &FakeRemote::default(), cx).await;
 
-        // (variant, type, anonymous, save password, advanced open)
+        let failed: SharedString =
+            format!("Connection failed: {}", "the server hung up; ".repeat(7)).into();
+        let fixed: SharedString = "Type the password to test a changed host, port, type or username; the saved one is not sent to it.".into();
+        // (variant, type, save password, advanced open, test status)
         let variants = [
-            ("FTPS", ServerType::Ftps, false, true, false),
-            ("FTP", ServerType::Ftp, false, true, false),
+            ("FTPS", ServerType::Ftps, true, false, None),
+            ("FTP", ServerType::Ftp, true, false, None),
+            ("FTP, password removed", ServerType::Ftp, false, false, None),
+            ("FTP, advanced open", ServerType::Ftp, true, true, None),
+            ("SFTP", ServerType::Sftp, true, true, None),
             (
-                "FTP, password removed",
+                "FTP, long failure",
                 ServerType::Ftp,
+                true,
                 false,
-                false,
-                false,
+                Some(TestStatus::Failed(failed)),
             ),
-            ("FTP, advanced open", ServerType::Ftp, false, true, true),
-            ("SFTP", ServerType::Sftp, false, true, true),
+            (
+                "FTP, long fixed message",
+                ServerType::Ftp,
+                true,
+                false,
+                Some(TestStatus::Failed(fixed)),
+            ),
         ];
         let mut problems = Vec::new();
         for window_size in [
@@ -1947,12 +1968,13 @@ mod tests {
                 cx.simulate_resize(window_size);
             }
             let viewport = cx.update(|window, _| window.viewport_size());
-            for (variant, server_type, anonymous, save_password, advanced) in variants {
+            for (variant, server_type, save_password, advanced, status) in variants.clone() {
+                let has_status = status.is_some();
                 dialog.update(cx, |dialog, cx| {
                     dialog.advanced_open = advanced;
+                    dialog.test_status = status;
                     dialog.update_selected(cx, |server| {
                         server.server_type = server_type;
-                        server.anonymous = anonymous;
                         server.save_password = save_password;
                     })
                 });
@@ -1968,18 +1990,34 @@ mod tests {
                         dialog_bounds.left()
                     ));
                 }
-                let mut ids: Vec<String> = vec!["zenith-deploy-form".into()];
+                // (selector, must be drawn): a renamed selector fails loudly.
+                let mut ids: Vec<(String, bool)> = vec![("zenith-deploy-form".into(), true)];
                 for label in ROWS {
-                    ids.push(format!("zenith-deploy-row-{label}"));
-                    ids.push(format!("zenith-deploy-field-{label}"));
+                    // SFTP signs in with a key: no password row.
+                    let drawn = !(label == "Password" && server_type == ServerType::Sftp);
+                    ids.push((format!("zenith-deploy-row-{label}"), drawn));
+                    ids.push((format!("zenith-deploy-field-{label}"), drawn));
                 }
-                ids.extend(CALLOUTS.map(String::from));
-                for id in ids {
+                ids.push((
+                    "zenith-deploy-insecure".into(),
+                    server_type == ServerType::Ftp,
+                ));
+                ids.push((
+                    "zenith-deploy-password-removed".into(),
+                    !save_password || server_type == ServerType::Sftp,
+                ));
+                ids.push(("zenith-deploy-status".into(), has_status));
+                ids.push(("zenith-deploy-status-text".into(), has_status));
+                for (id, drawn) in ids {
                     // Selectors are 'static; leaking a few test strings is fine.
-                    let Some(bounds) = cx.debug_bounds(Box::leak(id.clone().into_boxed_str()))
-                    else {
-                        continue;
-                    };
+                    let bounds = cx.debug_bounds(Box::leak(id.clone().into_boxed_str()));
+                    if bounds.is_some() != drawn {
+                        problems.push(format!(
+                            "{variant}: {id} drawn = {}, expected {drawn}",
+                            bounds.is_some()
+                        ));
+                    }
+                    let Some(bounds) = bounds else { continue };
                     if bounds.right() > limit + px(0.5) {
                         problems.push(format!(
                             "window {:?} {variant}: {id} right {:?} (width {:?}) is past the dialog edge {limit:?}",

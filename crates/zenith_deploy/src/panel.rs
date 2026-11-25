@@ -1711,14 +1711,21 @@ impl Render for RemoteHostPanel {
                                 .px_2()
                                 .gap_1()
                                 .child(
-                                    Icon::new(IconName::Warning)
-                                        .color(Color::Error)
-                                        .size(IconSize::Small),
+                                    div().flex_none().child(
+                                        Icon::new(IconName::Warning)
+                                            .color(Color::Error)
+                                            .size(IconSize::Small),
+                                    ),
                                 )
                                 .child(
-                                    Label::new(status)
-                                        .color(Color::Error)
-                                        .size(LabelSize::Small),
+                                    div()
+                                        .debug_selector(|| "remote-host-error-text".into())
+                                        .min_w_0()
+                                        .child(
+                                            Label::new(status)
+                                                .color(Color::Error)
+                                                .size(LabelSize::Small),
+                                        ),
                                 ),
                         ),
                 )
@@ -1735,11 +1742,22 @@ impl Render for RemoteHostPanel {
                                 .px_2()
                                 .gap_1()
                                 .child(
-                                    Icon::new(IconName::ArrowUp)
-                                        .color(Color::Muted)
-                                        .size(IconSize::Small),
+                                    div().flex_none().child(
+                                        Icon::new(IconName::ArrowUp)
+                                            .color(Color::Muted)
+                                            .size(IconSize::Small),
+                                    ),
                                 )
-                                .child(Label::new(line).color(Color::Muted).size(LabelSize::Small)),
+                                .child(
+                                    div()
+                                        .debug_selector(|| "remote-host-upload-text".into())
+                                        .min_w_0()
+                                        .child(
+                                            Label::new(line)
+                                                .color(Color::Muted)
+                                                .size(LabelSize::Small),
+                                        ),
+                                ),
                         ),
                 )
             })
@@ -3069,6 +3087,43 @@ mod tests {
         fixture.cx.run_until_parked();
         for selector in ["remote-host-hint", "remote-host-upload-status"] {
             assert!(fixture.cx.debug_bounds(selector).is_some(), "{selector}");
+        }
+    }
+
+    #[gpui::test]
+    async fn a_long_error_or_upload_line_stays_inside_the_panel(cx: &mut TestAppContext) {
+        let remote = remote();
+        let fixture = fixture(&remote, cx).await;
+        fixture
+            .workspace
+            .update_in(fixture.cx, |workspace, window, cx| {
+                workspace.focus_panel::<RemoteHostPanel>(window, cx);
+            });
+        fixture.cx.run_until_parked();
+        let long = "Connection failed: the server closed the connection while listing a folder, "
+            .repeat(4);
+        fixture.panel.update(fixture.cx, |panel, cx| {
+            panel.status = Some(long.clone().into());
+            panel.notice = Some(long.into());
+            cx.notify();
+        });
+        fixture.cx.run_until_parked();
+        let row = fixture
+            .cx
+            .debug_bounds("remote-host-error")
+            .expect("the error row is drawn");
+        for selector in ["remote-host-error-text", "remote-host-upload-text"] {
+            let text = fixture
+                .cx
+                .debug_bounds(selector)
+                .unwrap_or_else(|| panic!("{selector} is drawn"));
+            assert!(
+                text.right() <= row.right(),
+                "{selector} right {:?} (width {:?}) is past the panel edge {:?}",
+                text.right(),
+                text.size.width,
+                row.right()
+            );
         }
     }
 
