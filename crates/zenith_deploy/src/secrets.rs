@@ -60,7 +60,7 @@ pub(crate) fn target_account(server: &ServerConfig) -> String {
 }
 
 /// What the Keychain holds for a server's current target.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Lookup {
     Found(String),
     /// An entry exists but was saved for another target (or by an older version).
@@ -147,6 +147,8 @@ pub(crate) mod fake {
         pub fail_write: Mutex<bool>,
         /// Reads never answer (a Keychain that hangs).
         pub read_hang: Mutex<bool>,
+        /// How many reads reached the Keychain.
+        pub reads: Mutex<usize>,
         /// Keys whose delete fails while other deletes work.
         pub failing_delete_keys: Mutex<Vec<String>>,
         /// The next write finishes only when this resolves (a Keychain prompt waiting).
@@ -179,6 +181,7 @@ pub(crate) mod fake {
 
     impl Keychain for FakeKeychain {
         fn read(&self, key: &str, cx: &App) -> Task<Result<Option<(String, Vec<u8>)>>> {
+            *self.reads.lock().expect("lock") += 1;
             if *self.read_hang.lock().expect("lock") {
                 return cx.background_spawn(futures::future::pending());
             }

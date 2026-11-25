@@ -14,7 +14,7 @@ pub mod transport;
 use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::{Context as _, Result, anyhow, bail};
-use futures::future::BoxFuture;
+use futures::future::{BoxFuture, FutureExt as _, Shared};
 use gpui::{App, AppContext as _, Context, Entity, FutureExt as _, Global, Task};
 use settings::{DockPosition, RegisterSetting, Settings, SettingsContent};
 
@@ -88,6 +88,10 @@ pub struct ServerStore {
     /// with the target account it was typed for and only used for that target.
     session_passwords: HashMap<String, (String, Password)>,
     keychain: Arc<dyn secrets::Keychain>,
+    /// The Keychain reads in flight, by (server id, target account): a retry while one still
+    /// waits (a prompt, a stuck daemon) joins it instead of starting another read and prompt.
+    /// An entry leaves the map when its read ends, by answer or by deadline.
+    keychain_reads: Arc<std::sync::Mutex<HashMap<(String, String), KeychainRead>>>,
     connect: ConnectFn,
     /// Cached copies of remote files this app downloaded, by cache path (plan 37 M4a). The only
     /// source of an upload target.
@@ -102,6 +106,8 @@ pub struct ServerStore {
     pending_clear: std::collections::HashSet<String>,
     _load: Task<()>,
 }
+
+type KeychainRead = Shared<BoxFuture<'static, Result<secrets::Lookup, String>>>;
 
 struct GlobalServerStore(Entity<ServerStore>);
 
@@ -127,6 +133,31 @@ fn remove_with_retry(mut remove: impl FnMut() -> std::io::Result<()>) -> std::io
     result
 }
 
+/// Removes every server folder of the cache whose name is a server id (a UUID) no saved server
+/// has. Only real directories: a symlink or a file with such a name is left alone, and
+/// `remove_dir_all` never follows links inside. Failures are logged.
+fn sweep_cache(cache_dir: &std::path::Path, keep: &std::collections::HashSet<String>) {
+    let entries = match std::fs::read_dir(cache_dir) {
+        Ok(entries) => entries,
+        Err(error) => {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                log::warn!("deploy: reading {}: {error}", cache_dir.display());
+            }
+            return;
+        }
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let stale = uuid::Uuid::parse_str(&name).is_ok() && !keep.contains(&name);
+        if !stale || !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            continue;
+        }
+        if let Err(error) = remove_with_retry(|| std::fs::remove_dir_all(entry.path())) {
+            log::warn!("deploy: removing {}: {error}", entry.path().display());
+        }
+    }
+}
+
 impl ServerStore {
     pub fn global(cx: &App) -> Entity<Self> {
         cx.global::<GlobalServerStore>().0.clone()
@@ -135,13 +166,21 @@ impl ServerStore {
     fn load(path: PathBuf, cache_dir: PathBuf, cx: &mut Context<Self>) -> Self {
         let load = cx.spawn({
             let path = path.clone();
+            let cache_dir = cache_dir.clone();
             async move |this, cx| {
                 let result = cx
                     .background_spawn(async move { Servers::load(&path) })
                     .await;
                 this.update(cx, |this, cx| {
                     match result {
-                        Ok(servers) => this.servers = servers,
+                        Ok(servers) => {
+                            // A server deleted while the app was not running (or whose cache
+                            // removal failed) must not leave its cached files behind.
+                            let keep = servers.servers.iter().map(|s| s.id.clone()).collect();
+                            cx.background_spawn(async move { sweep_cache(&cache_dir, &keep) })
+                                .detach();
+                            this.servers = servers;
+                        }
                         Err(error) => this.load_error = Some(format!("{error:#}")),
                     }
                     this.loaded = true;
@@ -160,6 +199,7 @@ impl ServerStore {
             load_error: None,
             session_passwords: HashMap::new(),
             keychain: Arc::new(secrets::SystemKeychain),
+            keychain_reads: Default::default(),
             connect: Arc::new(|server| Box::pin(async move { connect(&server).await })),
             copies: HashMap::new(),
             upload_decisions: HashMap::new(),
@@ -181,6 +221,7 @@ impl ServerStore {
             load_error: None,
             session_passwords: HashMap::new(),
             keychain: Arc::new(secrets::SystemKeychain),
+            keychain_reads: Default::default(),
             connect,
             copies: HashMap::new(),
             upload_decisions: HashMap::new(),
@@ -406,10 +447,36 @@ impl ServerStore {
         if let Some(password) = self.session_password_for(server) {
             return Task::ready(Ok(Some(password)));
         }
-        let load = secrets::load_password(self.keychain.as_ref(), server, cx);
+        let key = (server.id.clone(), secrets::target_account(server));
+        let load = {
+            let mut reads = self
+                .keychain_reads
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            match reads.get(&key) {
+                Some(read) => read.clone(),
+                None => {
+                    let read = secrets::load_password(self.keychain.as_ref(), server, cx);
+                    let reads_map = self.keychain_reads.clone();
+                    let finished = key.clone();
+                    let shared: KeychainRead = async move {
+                        let result = read.await.map_err(|error| format!("{error:#}"));
+                        reads_map
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .remove(&finished);
+                        result
+                    }
+                    .boxed()
+                    .shared();
+                    reads.insert(key, shared.clone());
+                    shared
+                }
+            }
+        };
         let name = server.name.clone();
         cx.background_spawn(async move {
-            match load.await? {
+            match load.await.map_err(|error| anyhow!(error))? {
                 secrets::Lookup::Found(password) => Ok(Some(Password(password))),
                 secrets::Lookup::Missing => {
                     bail!("no password is stored for {name}; enter it in Deployment settings")
@@ -846,5 +913,105 @@ mod tests {
         };
         assert!(error.contains("TLS handshake failed"), "{error}");
         assert!(error.to_lowercase().contains("certificate"), "{error}");
+    }
+
+    #[test]
+    fn the_cache_sweep_removes_only_stale_server_folders() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (kept, stale) = (
+            uuid::Uuid::new_v4().to_string(),
+            uuid::Uuid::new_v4().to_string(),
+        );
+        for name in [kept.as_str(), stale.as_str(), "notes"] {
+            std::fs::create_dir_all(dir.path().join(name).join("www")).expect("mkdir");
+            std::fs::write(dir.path().join(name).join("www/wp-config.php"), "<?php")
+                .expect("write");
+        }
+        // A symlink named like a stale server must not lead the sweep out of the cache.
+        let outside = tempfile::tempdir().expect("tempdir");
+        std::fs::write(outside.path().join("keep.txt"), "x").expect("write");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(
+            outside.path(),
+            dir.path().join(uuid::Uuid::new_v4().to_string()),
+        )
+        .expect("symlink");
+        sweep_cache(dir.path(), &[kept.clone()].into_iter().collect());
+        assert!(dir.path().join(&kept).exists());
+        assert!(
+            !dir.path().join(&stale).exists(),
+            "a deleted server's files go"
+        );
+        assert!(
+            dir.path().join("notes").exists(),
+            "not a server folder: untouched"
+        );
+        assert!(outside.path().join("keep.txt").exists());
+        sweep_cache(&dir.path().join("missing"), &Default::default());
+    }
+
+    #[gpui::test]
+    async fn loading_the_servers_sweeps_the_cache_of_deleted_ones(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (cache, path) = (dir.path().join("cache"), dir.path().join("servers.json"));
+        let saved = test_support::server("Prod", None);
+        let servers = Servers {
+            servers: vec![saved.clone()],
+            ..Servers::default()
+        };
+        servers.save(&path).expect("save");
+        let stale = uuid::Uuid::new_v4().to_string();
+        for id in [saved.id.as_str(), stale.as_str()] {
+            std::fs::create_dir_all(cache.join(id)).expect("mkdir");
+            std::fs::write(cache.join(id).join("wp-config.php"), "<?php").expect("write");
+        }
+        let store = cx.new(|cx| ServerStore::load(path.clone(), cache.clone(), cx));
+        cx.run_until_parked();
+        assert!(store.read_with(cx, |store, _| store.is_loaded()));
+        assert!(cache.join(&saved.id).exists());
+        assert!(!cache.join(&stale).exists());
+
+        // A damaged servers.json is not proof that no server exists: nothing is swept.
+        std::fs::write(&path, "{ not json").expect("write");
+        let other = uuid::Uuid::new_v4().to_string();
+        std::fs::create_dir_all(cache.join(&other)).expect("mkdir");
+        let store = cx.new(|cx| ServerStore::load(path.clone(), cache.clone(), cx));
+        cx.run_until_parked();
+        assert!(store.read_with(cx, |store, _| store.load_error().is_some()));
+        assert!(cache.join(&other).exists());
+    }
+
+    #[gpui::test]
+    async fn retries_join_the_keychain_read_in_flight_until_it_ends(cx: &mut TestAppContext) {
+        let keychain = Arc::new(secrets::fake::FakeKeychain::default());
+        *keychain.read_hang.lock().expect("lock") = true;
+        let mut server = test_support::server("Prod", None);
+        server.save_password = true;
+        let store = cx.new(|_| {
+            let mut store = ServerStore::in_memory(
+                Servers::default(),
+                PathBuf::from("/cache"),
+                Arc::new(|_| Box::pin(async { Err(anyhow!("unused")) })),
+            );
+            store.keychain = keychain.clone();
+            store
+        });
+        let ask =
+            |cx: &mut TestAppContext| store.update(cx, |store, cx| store.password_for(&server, cx));
+        let (first, second) = (ask(cx), ask(cx));
+        cx.run_until_parked();
+        assert_eq!(*keychain.reads.lock().expect("lock"), 1, "the retry joined");
+        cx.executor().advance_clock(Duration::from_secs(121));
+        for task in [first, second] {
+            let error = task.await.expect_err("a hung Keychain");
+            assert!(error.to_string().contains("did not answer"), "{error}");
+        }
+        let _third = ask(cx);
+        cx.run_until_parked();
+        assert_eq!(
+            *keychain.reads.lock().expect("lock"),
+            2,
+            "the ended read is not reused"
+        );
     }
 }
