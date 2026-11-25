@@ -2,6 +2,8 @@
 //! "File" tab (the active editor, every severity) and a "Project Errors" tab (errors only).
 //! Not a wrapper of the diagnostics multibuffer: that view is an editor, this is a list.
 
+mod inspection_widget;
+
 use std::{collections::HashSet, ops::Range};
 
 use editor::Editor;
@@ -61,6 +63,15 @@ pub fn init(cx: &mut App) {
         let Some(window) = window else {
             return;
         };
+        for pane in workspace.panes().to_vec() {
+            inspection_widget::attach(&pane, &workspace.project().clone(), window, cx);
+        }
+        cx.subscribe_in(&cx.entity(), window, |workspace, _, event, window, cx| {
+            if let workspace::Event::PaneAdded(pane) = event {
+                inspection_widget::attach(pane, &workspace.project().clone(), window, cx);
+            }
+        })
+        .detach();
         let panel = cx.new(|cx| ProblemsPanel::new(workspace, cx));
         workspace.add_panel(panel, window, cx);
     })
@@ -110,6 +121,8 @@ struct Problem {
     severity: Severity,
     message: SharedString,
     point: Point,
+    /// A greyed-out hint (unused code); the inspection widget does not count it as a warning.
+    unnecessary: bool,
 }
 
 impl Problem {
@@ -153,7 +166,7 @@ enum Row {
 }
 
 /// The primary diagnostics of `snapshot`, in buffer order; only errors when `errors_only`.
-fn collect(snapshot: &BufferSnapshot, errors_only: bool) -> Vec<Problem> {
+pub(crate) fn collect(snapshot: &BufferSnapshot, errors_only: bool) -> Vec<Problem> {
     snapshot
         .diagnostics_in_range::<_, Point>(0..snapshot.len(), false)
         .filter(|entry| entry.diagnostic.is_primary)
@@ -176,6 +189,7 @@ fn collect(snapshot: &BufferSnapshot, errors_only: bool) -> Vec<Problem> {
                     .to_string()
                     .into(),
                 point: entry.range.start,
+                unnecessary: entry.diagnostic.is_unnecessary,
             })
         })
         .collect()

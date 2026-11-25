@@ -23452,18 +23452,21 @@ dependencies = [
  "anyhow",
  "editor",
  "file_icons",
+ "futures 0.3.34",
  "gpui",
  "language",
  "lsp",
  "menu",
  "project",
  "serde_json",
+ "settings",
  "text",
  "theme",
  "theme_settings",
  "ui",
  "util",
  "workspace",
+ "zenith_rails",
 ]
 
 [[package]]
