@@ -500,8 +500,13 @@ pub(crate) fn is_viewable(file: &worktree::File, cx: &App) -> bool {
     // private and exclusion globs must see the real file name instead.
     let abs_path = worktree.abs_path();
     // Caches of remote hosts (Deployment) hold secrets that must never reach
-    // the history database.
-    if abs_path.starts_with(paths::data_dir()) {
+    // the history database. Test the file, not the worktree root: a project
+    // opened above the data dir reaches the cache too. Scratches live beside
+    // it and keep their history.
+    if abs_path
+        .join(file.path.as_std_path())
+        .starts_with(paths::data_dir().join("deployment"))
+    {
         return false;
     }
     let path = if file.path.is_empty() {

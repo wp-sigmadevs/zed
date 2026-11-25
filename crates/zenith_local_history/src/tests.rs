@@ -173,13 +173,46 @@ async fn test_remote_host_caches_under_the_data_dir_are_not_recorded(cx: &mut Te
     start(cx, dir.path());
     let fs = FakeFs::new(cx.executor());
     let cache = paths::data_dir().join("deployment/cache/srv");
-    fs.insert_tree(&cache, json!({ "index.php": "base" }))
-        .await;
+    fs.insert_tree(&cache, json!({ "index.php": "base" })).await;
     let file = cache.join("index.php");
     let project = Project::test(fs, [file.as_path()], cx).await;
     let path = file.to_string_lossy().into_owned();
     open_edit_save(&project, &path, "SECRET", cx).await;
     assert!(revisions_in(cx, dir.path(), &path, "").is_empty());
+}
+
+#[gpui::test]
+async fn test_a_worktree_above_the_data_dir_still_skips_remote_caches_but_keeps_scratches(
+    cx: &mut TestAppContext,
+) {
+    let dir = history_dir();
+    start(cx, dir.path());
+    let fs = FakeFs::new(cx.executor());
+    let data = paths::data_dir();
+    let root = data.parent().expect("data dir has a parent").to_path_buf();
+    fs.insert_tree(
+        &data,
+        json!({
+            "deployment": { "cache": { "srv": { "index.php": "base" } } },
+            "scratches": { "a.txt": "base" },
+        }),
+    )
+    .await;
+    let project = Project::test(fs, [root.as_path()], cx).await;
+    let root_str = root.to_string_lossy().into_owned();
+    let name = data
+        .file_name()
+        .expect("name")
+        .to_string_lossy()
+        .into_owned();
+    let cache_file = data.join("deployment/cache/srv/index.php");
+    open_edit_save(&project, &cache_file.to_string_lossy(), "SECRET", cx).await;
+    let scratch = data.join("scratches/a.txt");
+    open_edit_save(&project, &scratch.to_string_lossy(), "x", cx).await;
+    let cache_rel = format!("{name}/deployment/cache/srv/index.php");
+    let scratch_rel = format!("{name}/scratches/a.txt");
+    assert!(revisions_in(cx, dir.path(), &root_str, &cache_rel).is_empty());
+    assert!(!revisions_in(cx, dir.path(), &root_str, &scratch_rel).is_empty());
 }
 
 #[gpui::test]
