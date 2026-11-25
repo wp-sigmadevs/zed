@@ -23279,6 +23279,7 @@ dependencies = [
  "editor",
  "feedback",
  "futures 0.3.34",
+ "git",
  "gpui",
  "indoc",
  "language",

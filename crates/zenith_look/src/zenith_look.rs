@@ -14,6 +14,7 @@ use util::ResultExt as _;
 use workspace::Workspace;
 
 mod bulb;
+mod code_lens;
 mod hints;
 mod hover_card;
 mod indent;
@@ -49,6 +50,7 @@ pub fn init(cx: &mut App) {
     }
     bulb::init(cx);
     hints::init(cx);
+    code_lens::init();
     hover_card::init(cx);
     cx.observe_new(|workspace: &mut Workspace, window, cx| {
         let Some(window) = window else { return };
