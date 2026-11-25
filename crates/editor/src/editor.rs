@@ -79,7 +79,7 @@ mod selection;
 pub(crate) use actions::*;
 pub use clipboard::ClipboardSelection;
 pub use code_actions::CodeActionProvider;
-pub use code_lens::{CodeLensOpenInTab, set_code_lens_locations_handler}; // Zenith
+pub use code_lens::{CodeLensOpenInTab, set_code_lens_locations_handler, set_code_lens_style}; // Zenith
 use collections::TypeIdHashMap;
 pub use completions::CompletionProvider;
 #[cfg(test)]

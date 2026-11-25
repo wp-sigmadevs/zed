@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use collections::{HashMap, HashSet};
 use futures::{StreamExt as _, stream::FuturesUnordered};
-use gpui::{MouseButton, SharedString, Task, TaskExt, WeakEntity};
+use gpui::{AnyElement, MouseButton, SharedString, Task, TaskExt, TextStyle, WeakEntity};
 use itertools::Itertools;
 use language::{BufferId, ClientCommand};
 use multi_buffer::{Anchor, BufferOffset, MultiBufferRow, MultiBufferSnapshot, ToPoint as _};
@@ -657,7 +657,7 @@ fn build_code_lens_renderer(line: CodeLensLine, editor: WeakEntity<Editor>) -> R
             })
             .collect::<Vec<_>>();
         let mut children = Vec::with_capacity((2 * resolved_items.len()).saturating_sub(1));
-        let text_style = &cx.editor_style.text;
+        let text_style = &zenith_code_lens_text_style(&cx.editor_style.text, cx.app); // Zenith
         let font = text_style.font();
         let font_size = text_style.font_size.to_pixels(cx.window.rem_size()) * 0.9;
         let colors = cx.app.theme().colors();
@@ -683,7 +683,7 @@ fn build_code_lens_renderer(line: CodeLensLine, editor: WeakEntity<Editor>) -> R
                     .font(font.clone())
                     .text_size(font_size)
                     .text_color(code_lens_color)
-                    .child(title.clone())
+                    .child(zenith_code_lens_title(title.clone())) // Zenith
                     .when_some(action, |code_lens_div, action| {
                         let position = line.position;
                         let editor_handle = editor.clone();
@@ -750,6 +750,7 @@ fn build_code_lens_renderer(line: CodeLensLine, editor: WeakEntity<Editor>) -> R
             .flex_row()
             .items_end()
             .children(children)
+            .children(zenith_code_lens_trailing(line.position, &editor, cx.app)) // Zenith
             .into_any_element()
     })
 }
@@ -2330,4 +2331,66 @@ fn zenith_resolve_locations(
         }
         anyhow::Ok(resolved)
     })
+}
+
+// Zenith: lets zenith_look restyle code lenses (PhpStorm look): the text style, the title shown
+// and an extra element after the lens items. Unregistered, every default returns its input
+// unchanged (the trailing element is `None`).
+type CodeLensStyleFns = (
+    fn(&TextStyle, &App) -> TextStyle,
+    fn(SharedString) -> SharedString,
+    fn(Anchor, &WeakEntity<Editor>, &mut App) -> Option<AnyElement>,
+);
+static CODE_LENS_STYLE: std::sync::OnceLock<CodeLensStyleFns> = std::sync::OnceLock::new();
+pub fn set_code_lens_style(
+    text_style: fn(&TextStyle, &App) -> TextStyle,
+    title: fn(SharedString) -> SharedString,
+    trailing: fn(Anchor, &WeakEntity<Editor>, &mut App) -> Option<AnyElement>,
+) {
+    CODE_LENS_STYLE.set((text_style, title, trailing)).ok();
+}
+
+fn zenith_code_lens_text_style(base: &TextStyle, cx: &App) -> TextStyle {
+    CODE_LENS_STYLE
+        .get()
+        .map_or_else(|| base.clone(), |(text_style, ..)| text_style(base, cx))
+}
+
+fn zenith_code_lens_title(title: SharedString) -> SharedString {
+    CODE_LENS_STYLE
+        .get()
+        .map_or(title.clone(), |(_, map_title, _)| map_title(title))
+}
+
+fn zenith_code_lens_trailing(
+    position: Anchor,
+    editor: &WeakEntity<Editor>,
+    cx: &mut App,
+) -> Option<AnyElement> {
+    CODE_LENS_STYLE
+        .get()
+        .and_then(|(_, _, trailing)| trailing(position, editor, cx))
+}
+
+#[cfg(test)]
+mod zenith_style_tests {
+    use gpui::{SharedString, TestAppContext};
+
+    #[gpui::test]
+    fn test_code_lens_style_defaults_are_identity(cx: &mut TestAppContext) {
+        // No registration in this binary's tests, so the defaults must pass input through.
+        assert!(super::CODE_LENS_STYLE.get().is_none());
+        assert_eq!(
+            super::zenith_code_lens_title(SharedString::from("2 references")),
+            "2 references"
+        );
+        cx.update(|cx| {
+            let base = gpui::TextStyle::default();
+            assert_eq!(super::zenith_code_lens_text_style(&base, cx), base);
+            let editor = gpui::WeakEntity::<crate::Editor>::new_invalid();
+            assert!(
+                super::zenith_code_lens_trailing(multi_buffer::Anchor::Min, &editor, cx).is_none()
+            );
+        });
+    }
 }
