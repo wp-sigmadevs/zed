@@ -8,14 +8,15 @@ use async_trait::async_trait;
 
 use crate::{
     config::{Password, ServerConfig, ServerType},
-    remote_path::{join_local, join_remote, validate_name},
+    remote_path::{join_local, join_remote, validate_name, validate_remote_path},
     sftp::SftpTransport,
 };
 
 /// A server can stream a listing forever; one directory larger than this is refused.
 pub const MAX_LISTING_BYTES: u64 = 8 * 1024 * 1024;
 pub const MAX_LISTING_ENTRIES: usize = 20_000;
-/// Downloads open as read-only copies in an editor; a larger file is refused.
+/// Downloads open as read-only copies in an editor; a larger file is refused. Uploads are bound
+/// by the same limit: a file that opened can be saved back.
 pub const MAX_DOWNLOAD_BYTES: u64 = 64 * 1024 * 1024;
 
 /// The server answered and said no (a 550 on one folder, an `sftp` error exit): the connection
@@ -48,6 +49,15 @@ pub struct RemoteEntry {
     pub modified: Option<SystemTime>,
 }
 
+/// What a server reports about one remote regular file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RemoteStat {
+    pub size: u64,
+    /// Opaque change marker (MDTM reply, `ls` date columns): equal stamps mean "same file",
+    /// nothing else. `None` when the server does not report one.
+    pub stamp: Option<String>,
+}
+
 /// One connected session. FTP/FTPS and SFTP implement it; tests use a fake. Every method waits
 /// on the network: UI code calls them through [`crate::spawn_operation`].
 #[async_trait]
@@ -58,6 +68,11 @@ pub trait Transport: Send {
     async fn list_dir(&mut self, path: &str) -> Result<Vec<RemoteEntry>>;
     /// Writes the remote regular file to `local_path`. Callers go through [`download_entry`].
     async fn download_file(&mut self, remote_path: &str, local_path: &Path) -> Result<()>;
+    /// Size and change stamp of the remote regular file, `None` when it does not exist. A
+    /// directory (and, where the protocol shows it, a symlink) is an error.
+    async fn stat(&mut self, path: &str) -> Result<Option<RemoteStat>>;
+    /// Writes `bytes` over the remote file in place. Callers go through [`upload_entry`].
+    async fn upload_file(&mut self, remote_path: &str, bytes: &[u8]) -> Result<()>;
     async fn disconnect(&mut self) -> Result<()>;
 }
 
@@ -156,6 +171,26 @@ pub async fn download_entry(
     Ok(local_path)
 }
 
+/// Uploads `bytes` over the remote file `remote_path`, in place (no rename, no delete).
+///
+/// The only upload path: it validates the path and refuses more than [`MAX_DOWNLOAD_BYTES`]
+/// before anything reaches the wire. Run it through [`crate::spawn_operation`].
+pub async fn upload_entry(
+    transport: &mut dyn Transport,
+    remote_path: &str,
+    bytes: &[u8],
+) -> Result<()> {
+    validate_remote_path(remote_path)?;
+    validate_name(remote_path.rsplit('/').next().unwrap_or_default())?;
+    if bytes.len() as u64 > MAX_DOWNLOAD_BYTES {
+        bail!(
+            "{remote_path:?} is larger than {} MiB; it is not uploaded",
+            MAX_DOWNLOAD_BYTES / 1024 / 1024
+        );
+    }
+    transport.upload_file(remote_path, bytes).await
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -176,6 +211,8 @@ pub(crate) mod tests {
         pub stall: bool,
         /// Unix mode of the folder holding the partial file, seen while downloading.
         pub part_directory_mode: Option<u32>,
+        pub puts: Vec<(String, Vec<u8>)>,
+        pub stats: std::collections::HashMap<String, RemoteStat>,
     }
 
     #[async_trait]
@@ -201,9 +238,55 @@ pub(crate) mod tests {
             }
             Ok(())
         }
+        async fn stat(&mut self, path: &str) -> Result<Option<RemoteStat>> {
+            Ok(self.stats.get(path).cloned())
+        }
+        async fn upload_file(&mut self, remote_path: &str, bytes: &[u8]) -> Result<()> {
+            self.puts.push((remote_path.to_string(), bytes.to_vec()));
+            Ok(())
+        }
         async fn disconnect(&mut self) -> Result<()> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn an_upload_over_the_limit_is_refused_before_the_wire() {
+        let mut transport = FakeTransport::default();
+        let big = vec![0u8; MAX_DOWNLOAD_BYTES as usize + 1];
+        let error =
+            smol::block_on(upload_entry(&mut transport, "/www/a.php", &big)).expect_err("too big");
+        assert!(error.to_string().contains("larger than"), "{error}");
+        assert!(transport.puts.is_empty(), "nothing may reach the wire");
+        smol::block_on(upload_entry(
+            &mut transport,
+            "/www/a.php",
+            &big[..MAX_DOWNLOAD_BYTES as usize],
+        ))
+        .expect("exactly the limit is fine");
+        assert_eq!(transport.puts.len(), 1);
+    }
+
+    #[test]
+    fn an_upload_refuses_hostile_paths_before_the_wire() {
+        let mut transport = FakeTransport::default();
+        for path in [
+            "/www/../etc/passwd",
+            "/www/a\r\nQUIT",
+            "/www/a\n!touch x",
+            "www/a.php",
+            "-la",
+            "/www/",
+            "/www/..",
+        ] {
+            assert!(
+                smol::block_on(upload_entry(&mut transport, path, b"x")).is_err(),
+                "{path:?}"
+            );
+        }
+        assert!(transport.puts.is_empty());
+        smol::block_on(upload_entry(&mut transport, "/www/a.php", b"x")).expect("plain path");
+        assert_eq!(transport.puts, [("/www/a.php".to_string(), b"x".to_vec())]);
     }
 
     #[test]

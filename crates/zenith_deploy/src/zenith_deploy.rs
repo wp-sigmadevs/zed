@@ -20,7 +20,10 @@ use settings::{DockPosition, RegisterSetting, Settings, SettingsContent};
 pub use config::{Password, ServerConfig, ServerType, Servers};
 pub use dialog::{DeploymentDialog, OpenDeployment};
 pub use panel::{RemoteHostPanel, ToggleFocus};
-pub use transport::{EntryKind, RemoteEntry, ServerRefused, Transport, connect, download_entry};
+pub use transport::{
+    EntryKind, RemoteEntry, RemoteStat, ServerRefused, Transport, connect, download_entry,
+    upload_entry,
+};
 
 /// Every network operation gives up after this long.
 pub const OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
@@ -405,6 +408,9 @@ pub(crate) mod test_support {
         pub broken: Vec<String>,
         /// Folders that refuse the listing (like a 550) even though the tree has them.
         pub refusing: Arc<Mutex<Vec<String>>>,
+        /// Every upload as (path, bytes).
+        pub puts: Arc<Mutex<Vec<(String, Vec<u8>)>>>,
+        pub stats: Arc<Mutex<HashMap<String, RemoteStat>>>,
     }
 
     impl FakeRemote {
@@ -481,6 +487,21 @@ pub(crate) mod test_support {
         async fn download_file(&mut self, remote_path: &str, local_path: &Path) -> Result<()> {
             self.push(format!("get {remote_path}"));
             std::fs::write(local_path, "<?php")?;
+            Ok(())
+        }
+        async fn stat(&mut self, path: &str) -> Result<Option<RemoteStat>> {
+            self.push(format!("stat {path}"));
+            Ok(self
+                .stats
+                .lock()
+                .ok()
+                .and_then(|stats| stats.get(path).cloned()))
+        }
+        async fn upload_file(&mut self, remote_path: &str, bytes: &[u8]) -> Result<()> {
+            self.push(format!("put {remote_path}"));
+            if let Ok(mut puts) = self.puts.lock() {
+                puts.push((remote_path.to_string(), bytes.to_vec()));
+            }
             Ok(())
         }
         async fn disconnect(&mut self) -> Result<()> {

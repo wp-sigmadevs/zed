@@ -7,10 +7,11 @@ use util::command::{Stdio, new_command};
 
 use crate::{
     config::ServerConfig,
-    remote_path::validate_remote_path,
+    ftp::create_part_file,
+    remote_path::{validate_name, validate_remote_path},
     transport::{
         EntryKind, MAX_DOWNLOAD_BYTES, MAX_LISTING_BYTES, MAX_LISTING_ENTRIES, RemoteEntry,
-        ServerRefused, Transport, retain_listable,
+        RemoteStat, ServerRefused, Transport, retain_listable,
     },
 };
 
@@ -49,10 +50,15 @@ impl SftpTransport {
         // A private, empty working directory: a relative local path or `lcd` in a batch can
         // never reach the project or another user's files in the shared temp directory.
         let working_directory = tempfile::tempdir().context("creating a working directory")?;
+        self.run_in(working_directory.path(), batch).await
+    }
+
+    /// [`Self::run`] in a directory the caller owns (an upload puts its file there).
+    async fn run_in(&self, working_directory: &Path, batch: &str) -> Result<String> {
         let mut command = new_command(&self.program);
         command
             .args(&self.args)
-            .current_dir(working_directory.path())
+            .current_dir(working_directory)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -192,16 +198,51 @@ fn list_batch(path: &str) -> Result<String> {
     ))
 }
 
-fn get_batch(remote_path: &str, local_path: &Path) -> Result<String> {
+fn local_argument(local_path: &Path) -> Result<String> {
     let local = local_path.to_str().context("local path is not UTF-8")?;
     if !local_path.is_absolute() {
         bail!("local path {local:?} is not absolute");
     }
+    quote(local, false)
+}
+
+fn get_batch(remote_path: &str, local_path: &Path) -> Result<String> {
     batch_line(format!(
         "get {} {}",
         quote(validate_remote_path(remote_path)?, true)?,
-        quote(local, false)?
+        local_argument(local_path)?
     ))
+}
+
+/// No `-p`: the local file's owner-only mode and its times are never copied onto the remote
+/// file.
+fn put_batch(local_path: &Path, remote_path: &str) -> Result<String> {
+    batch_line(format!(
+        "put {} {}",
+        local_argument(local_path)?,
+        quote(validate_remote_path(remote_path)?, true)?
+    ))
+}
+
+/// `/a/b/c.php` -> (`/a/b`, `c.php`); the parent of `/c.php` is `/`.
+fn split_remote(path: &str) -> Result<(&str, &str)> {
+    let (parent, name) = validate_remote_path(path)?
+        .rsplit_once('/')
+        .context("remote path has no file name")?;
+    Ok((
+        if parent.is_empty() { "/" } else { parent },
+        validate_name(name)?,
+    ))
+}
+
+/// The three date columns of an `ls -la` line (`Nov 22 23:48`): the only change marker the long
+/// format carries, compared for equality and never parsed.
+fn ls_stamp(line: &str) -> String {
+    line.split_whitespace()
+        .skip(5)
+        .take(3)
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Parses `ls -la` output, stopping one entry past [`MAX_LISTING_ENTRIES`] (the caller then refuses it). sftp prints the full path in the name column, so `directory` is
@@ -289,6 +330,55 @@ impl Transport for SftpTransport {
                 MAX_DOWNLOAD_BYTES / 1024 / 1024
             );
         }
+        Ok(())
+    }
+
+    /// Lists the parent folder and picks the entry out: `ls` of a single path follows a symlink
+    /// and would show its target as a regular file, a folder listing shows the link itself.
+    async fn stat(&mut self, path: &str) -> Result<Option<RemoteStat>> {
+        let (parent, name) = split_remote(path)?;
+        let output = match self.run(&list_batch(parent)?).await {
+            Ok(output) => output,
+            Err(error)
+                if error
+                    .downcast_ref::<ServerRefused>()
+                    .is_some_and(|refused| refused.0.contains("not found")) =>
+            {
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+        let prefix = format!("{}/", parent.trim_end_matches('/'));
+        let Some((entry, line)) = output.lines().find_map(|line| {
+            parse_ls_line(line, &prefix)
+                .filter(|entry| entry.name == name)
+                .map(|entry| (entry, line))
+        }) else {
+            return Ok(None);
+        };
+        match entry.kind {
+            EntryKind::File => Ok(Some(RemoteStat {
+                size: entry.size,
+                stamp: Some(ls_stamp(line)),
+            })),
+            EntryKind::Symlink => bail!("{name:?} is a symlink; symlinks are not edited"),
+            EntryKind::Directory => bail!("{name:?} is a directory"),
+        }
+    }
+
+    /// The bytes go through a 0600 file in a private directory that is removed afterwards, then
+    /// one `put`. The remote file is written in place.
+    async fn upload_file(&mut self, remote_path: &str, bytes: &[u8]) -> Result<()> {
+        let directory = tempfile::tempdir().context("creating a directory for the upload")?;
+        let local_path = directory.path().join("upload");
+        let batch = put_batch(&local_path, remote_path)?;
+        let mut file = create_part_file(&local_path)
+            .await
+            .context("writing the upload file")?;
+        file.write_all(bytes).await?;
+        file.flush().await?;
+        drop(file);
+        self.run_in(directory.path(), &batch).await?;
         Ok(())
     }
 
@@ -667,5 +757,209 @@ drwxr-xr-x    ? u   g          64 Nov 22 23:48 /www/sub
             "the transfer ran to the end: {:?}",
             started.elapsed()
         );
+    }
+
+    #[test]
+    fn put_batch_never_emits_a_bang_line_a_second_line_or_a_glob() {
+        let local = Path::new("/tmp/zenith-upload/upload");
+        for hostile in [
+            "/x\n!touch pwned",
+            "/x\r\n!touch pwned",
+            "/x\r!touch pwned",
+            "/x\0y",
+            "/a\\b",
+            "/a/*",
+            "/a/b?",
+            "/a/[x]",
+            "!touch pwned",
+            "/www/../etc/passwd",
+        ] {
+            assert!(put_batch(local, hostile).is_err(), "{hostile:?}");
+        }
+        for hostile in ["/tmp/o\n!touch pwned", "/tmp/o\\x", "relative"] {
+            assert!(
+                put_batch(Path::new(hostile), "/www/a.php").is_err(),
+                "{hostile:?}"
+            );
+        }
+        let batch = put_batch(local, "/www/!touch \"a\".php").expect("a bang inside quotes");
+        assert_eq!(
+            batch,
+            "put \"/tmp/zenith-upload/upload\" \"/www/!touch \\\"a\\\".php\"\n"
+        );
+        assert_eq!(batch.lines().count(), 1);
+        assert!(!batch.starts_with('!') && !batch.contains(" -p"), "{batch}");
+        let long = format!("/{}", "d".repeat(MAX_BATCH_LINE));
+        assert!(put_batch(local, &long).is_err());
+    }
+
+    #[cfg(unix)]
+    const STAT_LISTING: &str = "\
+cat >/dev/null
+cat <<'EOF'
+sftp> ls -la \"/www\"
+-rw-r--r--    ? u   g          12 Nov 22 23:48 /www/index.php
+lrwxr-xr-x    ? u   g          11 Nov 22 23:48 /www/evil -> /etc/passwd
+drwxr-xr-x    ? u   g          64 Nov 22 23:48 /www/sub
+EOF";
+
+    #[cfg(unix)]
+    #[test]
+    fn sftp_stat_reports_a_file_and_refuses_a_symlink_or_directory() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let program = write_script(directory.path(), "sftp", STAT_LISTING);
+        let mut transport = SftpTransport::with_program(program, &server()).expect("transport");
+        smol::block_on(async {
+            assert_eq!(
+                transport.stat("/www/index.php").await.expect("stat"),
+                Some(RemoteStat {
+                    size: 12,
+                    stamp: Some("Nov 22 23:48".into())
+                })
+            );
+            let error = transport.stat("/www/evil").await.expect_err("symlink");
+            assert!(error.to_string().contains("symlink"), "{error}");
+            assert!(transport.stat("/www/sub").await.is_err(), "directory");
+            assert_eq!(transport.stat("/www/missing").await.expect("stat"), None);
+            assert!(transport.stat("/www/../etc/passwd").await.is_err());
+            assert!(transport.stat("/www/a\nb").await.is_err());
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sftp_stat_of_a_missing_folder_is_none_but_a_denied_one_is_an_error() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let program = write_script(
+            directory.path(),
+            "sftp",
+            "cat >/dev/null; echo 'Can'\\''t ls: \"/nope\" not found' >&2; exit 1",
+        );
+        let mut transport = SftpTransport::with_program(program, &server()).expect("transport");
+        assert_eq!(
+            smol::block_on(transport.stat("/nope/x.php")).expect("stat"),
+            None
+        );
+        let program = write_script(
+            directory.path(),
+            "denied",
+            "cat >/dev/null; echo 'remote readdir(\"/www\"): Permission denied' >&2; exit 1",
+        );
+        let mut transport = SftpTransport::with_program(program, &server()).expect("transport");
+        assert!(smol::block_on(transport.stat("/www/x.php")).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_sftp_upload_file_is_owner_only_holds_the_bytes_and_is_removed() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let recorded = directory.path().join("rec");
+        std::fs::create_dir(&recorded).expect("mkdir");
+        let program = write_script(
+            directory.path(),
+            "sftp",
+            &format!(
+                "cat > '{rec}/batch'\n\
+                 local=$(sed -n 's/^put \"\\([^\"]*\\)\".*/\\1/p' '{rec}/batch')\n\
+                 echo \"$local\" > '{rec}/local'\n\
+                 find \"$local\" -perm 600 > '{rec}/mode600'\n\
+                 cat \"$local\" > '{rec}/content'",
+                rec = recorded.display()
+            ),
+        );
+        let mut transport = SftpTransport::with_program(program, &server()).expect("transport");
+        let bytes = b"<?php\r\n\0\xff\n".to_vec();
+        smol::block_on(crate::transport::upload_entry(
+            &mut transport,
+            "/www/index.php",
+            &bytes,
+        ))
+        .expect("upload");
+        let read = |name: &str| std::fs::read(recorded.join(name)).expect(name);
+        let local = String::from_utf8(read("local")).expect("utf8");
+        let local = Path::new(local.trim());
+        assert!(
+            !read("mode600").is_empty(),
+            "the upload file was not exactly 0600"
+        );
+        assert_eq!(read("content"), bytes);
+        let batch = String::from_utf8(read("batch")).expect("utf8");
+        assert_eq!(
+            batch,
+            format!("put \"{}\" \"/www/index.php\"\n", local.display())
+        );
+        assert!(!local.exists(), "{} was left behind", local.display());
+        assert!(
+            !local.parent().is_some_and(Path::exists),
+            "the private directory was left behind"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_refused_sftp_upload_never_starts_sftp() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let marker = directory.path().join("started");
+        let program = write_script(
+            directory.path(),
+            "sftp",
+            &format!("touch '{}'; cat >/dev/null", marker.display()),
+        );
+        let mut transport = SftpTransport::with_program(program, &server()).expect("transport");
+        for hostile in ["/www/a\r\n!touch x", "/www/a\\b", "/www/*", "/www/../x"] {
+            assert!(
+                smol::block_on(transport.upload_file(hostile, b"x")).is_err(),
+                "{hostile:?}"
+            );
+        }
+        assert!(!marker.exists(), "sftp was started for a refused path");
+    }
+
+    /// The real `sftp` client against the local sftp-server: `put` over an existing file keeps its
+    /// mode, a folder listing shows a symlink as one, and a missing file is `None`.
+    #[cfg(unix)]
+    #[test]
+    fn real_sftp_stats_and_uploads_in_place() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let Some(sftp_server) = [
+            "/usr/libexec/sftp-server",
+            "/usr/lib/openssh/sftp-server",
+            "/usr/lib/ssh/sftp-server",
+        ]
+        .into_iter()
+        .find(|path| Path::new(path).exists()) else {
+            eprintln!("skipped: no sftp-server binary found");
+            return;
+        };
+        let directory = tempfile::tempdir().expect("tempdir");
+        let root = directory.path().canonicalize().expect("canonicalize");
+        let remote = root.join("remote");
+        std::fs::create_dir(&remote).expect("mkdir");
+        let file = remote.join("sp ace.php");
+        std::fs::write(&file, "old").expect("write");
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+        std::os::unix::fs::symlink(&file, remote.join("evil")).expect("link");
+
+        let program = write_script(&root, "sftp", &format!("exec sftp -b - -D {sftp_server}"));
+        let mut transport = SftpTransport::with_program(program, &server()).expect("transport");
+        let path = |name: &str| remote.join(name).to_str().expect("utf8").to_string();
+        smol::block_on(async {
+            let stat = transport
+                .stat(&path("sp ace.php"))
+                .await
+                .expect("stat")
+                .expect("exists");
+            assert_eq!(stat.size, 3);
+            assert!(stat.stamp.is_some());
+            assert!(transport.stat(&path("evil")).await.is_err(), "symlink");
+            assert_eq!(transport.stat(&path("missing")).await.expect("stat"), None);
+
+            crate::transport::upload_entry(&mut transport, &path("sp ace.php"), b"<?php new")
+                .await
+                .expect("upload");
+            assert_eq!(std::fs::read(&file).expect("read"), b"<?php new");
+            let mode = std::fs::metadata(&file).expect("meta").permissions().mode();
+            assert_eq!(mode & 0o777, 0o644, "put changed the remote file's mode");
+        });
     }
 }

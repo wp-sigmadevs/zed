@@ -19,7 +19,7 @@ use crate::{
     remote_path::validate_remote_path,
     transport::{
         EntryKind, MAX_DOWNLOAD_BYTES, MAX_LISTING_BYTES, MAX_LISTING_ENTRIES, RemoteEntry,
-        ServerRefused, Transport, login_credentials, retain_listable,
+        RemoteStat, ServerRefused, Transport, login_credentials, retain_listable,
     },
 };
 
@@ -197,7 +197,7 @@ fn keeps_session(status: Status) -> bool {
 }
 
 /// Creates the partial download readable by its owner only.
-async fn create_part_file(path: &Path) -> std::io::Result<smol::fs::File> {
+pub(crate) async fn create_part_file(path: &Path) -> std::io::Result<smol::fs::File> {
     let mut options = smol::fs::OpenOptions::new();
     // create_new: never opens (or follows) something that is already at the path.
     options.write(true).create_new(true);
@@ -271,6 +271,41 @@ impl<T: SmolTlsStream + Send + 'static> Transport for FtpSession<T> {
             .await
             .context("downloading")?;
         file.flush().await?;
+        Ok(())
+    }
+
+    async fn stat(&mut self, path: &str) -> Result<Option<RemoteStat>> {
+        let path = validate_remote_path(path)?;
+        let size = match self.stream.size(path).await {
+            Ok(size) => size as u64,
+            // SIZE answers 550 for a missing file; the session stays usable.
+            Err(suppaftp::FtpError::UnexpectedResponse(response))
+                if response.status == Status::FileUnavailable =>
+            {
+                return Ok(None);
+            }
+            Err(error) => return Err(refusal(error)),
+        };
+        let stamp = match self.stream.mdtm(path).await {
+            Ok(modified) => Some(modified.to_string()),
+            // MDTM is optional: a refusal or an unreadable reply only costs the change stamp.
+            Err(suppaftp::FtpError::UnexpectedResponse(_) | suppaftp::FtpError::BadResponse) => {
+                None
+            }
+            Err(error) => return Err(error.into()),
+        };
+        Ok(Some(RemoteStat { size, stamp }))
+    }
+
+    async fn upload_file(&mut self, remote_path: &str, bytes: &[u8]) -> Result<()> {
+        let remote_path = validate_remote_path(remote_path)?;
+        let mut transfer = self
+            .stream
+            .put_with_stream(remote_path)
+            .await
+            .map_err(refusal)?;
+        transfer.write_all(bytes).await.context("uploading")?;
+        transfer.finish().await.map_err(refusal)?;
         Ok(())
     }
 
@@ -374,6 +409,10 @@ mod tests {
     struct FakeFtp {
         listing: Vec<u8>,
         file: Vec<u8>,
+        /// The SIZE answer; `None` is a 550.
+        size: Option<usize>,
+        /// The MDTM answer; `None` is a refusal.
+        mdtm: Option<&'static str>,
     }
 
     impl Default for FakeFtp {
@@ -381,6 +420,8 @@ mod tests {
             Self {
                 listing: LISTING.as_bytes().to_vec(),
                 file: b"file-contents".to_vec(),
+                size: None,
+                mdtm: None,
             }
         }
     }
@@ -393,7 +434,7 @@ mod tests {
     /// Its PASV reply names an unroutable address (0.0.0.1): only a client that connects back to
     /// the control host reaches the data listener.
     fn fake_ftp_server_with(script: FakeFtp) -> (u16, std::thread::JoinHandle<Vec<String>>) {
-        use std::io::{BufRead as _, BufReader, Write as _};
+        use std::io::{BufRead as _, BufReader, Read as _, Write as _};
         use std::net::TcpListener;
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         let port = listener.local_addr().expect("addr").port();
@@ -448,6 +489,23 @@ mod tests {
                         } else {
                             reply("426 aborted\r\n");
                         }
+                    }
+                    "SIZE" => match script.size {
+                        Some(size) => reply(&format!("213 {size}\r\n")),
+                        None => reply("550 not found\r\n"),
+                    },
+                    "MDTM" => match script.mdtm {
+                        Some(stamp) => reply(&format!("213 {stamp}\r\n")),
+                        None => reply("502 not implemented\r\n"),
+                    },
+                    "STOR" => {
+                        reply("150 opening\r\n");
+                        let (mut stream, _) =
+                            data.take().expect("PASV first").accept().expect("data");
+                        let mut received = Vec::new();
+                        stream.read_to_end(&mut received).expect("receive upload");
+                        commands.push(format!("DATA {received:?}"));
+                        reply("226 done\r\n");
                     }
                     "ABOR" => reply("226 abort ok\r\n"),
                     "QUIT" => {
@@ -635,5 +693,79 @@ mod tests {
             .expect("read_dir")
             .collect();
         assert!(left.is_empty(), "{left:?}");
+    }
+
+    #[test]
+    fn ftp_upload_sends_binary_mode_then_stor_with_the_exact_bytes() {
+        let (port, server_thread) = fake_ftp_server();
+        let bytes = b"<?php\r\n\0\xff\n\r".to_vec();
+        smol::block_on(async {
+            let mut transport = connect(&plain_server(port)).await.expect("connect");
+            crate::transport::upload_entry(transport.as_mut(), "/www/x.php", &bytes)
+                .await
+                .expect("upload");
+            for hostile in ["/a\r\nQUIT", "/a\0b", "-la", "/a/../b"] {
+                assert!(
+                    transport.upload_file(hostile, b"x").await.is_err(),
+                    "{hostile:?}"
+                );
+            }
+            assert_eq!(transport.pwd().await.expect("session still works"), "/www");
+            transport.disconnect().await.expect("quit");
+        });
+        let commands = server_thread.join().expect("server thread");
+        let at = |wanted: &str| commands.iter().position(|c| c == wanted);
+        let binary = at("TYPE I").expect("TYPE I");
+        let store = at("STOR /www/x.php").expect("STOR");
+        assert!(binary < store, "{commands:?}");
+        assert!(
+            at(&format!("DATA {bytes:?}")).is_some_and(|data| data > store),
+            "exact bytes after STOR: {commands:?}"
+        );
+        assert_eq!(
+            commands.iter().filter(|c| c.starts_with("STOR")).count(),
+            1,
+            "hostile paths must not reach the wire: {commands:?}"
+        );
+    }
+
+    #[test]
+    fn ftp_stat_reports_size_and_stamp_and_degrades_without_mdtm() {
+        let stat = |script: FakeFtp| {
+            let (port, server_thread) = fake_ftp_server_with(script);
+            let result = smol::block_on(async {
+                let mut transport = connect(&plain_server(port)).await.expect("connect");
+                let result = transport.stat("/www/x.php").await.expect("stat");
+                assert!(transport.stat("/a/../b").await.is_err());
+                assert_eq!(transport.pwd().await.expect("session still works"), "/www");
+                transport.disconnect().await.expect("quit");
+                result
+            });
+            server_thread.join().expect("server thread");
+            result
+        };
+        let both = stat(FakeFtp {
+            size: Some(42),
+            mdtm: Some("20250101120000"),
+            ..FakeFtp::default()
+        })
+        .expect("exists");
+        assert_eq!(both.size, 42);
+        assert!(
+            both.stamp.is_some_and(|stamp| stamp.contains("2025-01-01")),
+            "stamp from MDTM"
+        );
+        let no_mdtm = stat(FakeFtp {
+            size: Some(42),
+            ..FakeFtp::default()
+        });
+        assert_eq!(
+            no_mdtm,
+            Some(RemoteStat {
+                size: 42,
+                stamp: None
+            })
+        );
+        assert_eq!(stat(FakeFtp::default()), None, "SIZE 550 is a missing file");
     }
 }
