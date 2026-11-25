@@ -18,6 +18,8 @@ use workspace::notifications::{
     NotificationId, show_app_notification, simple_message_notification::MessageNotification,
 };
 
+pub use bar_items::bar_action_names;
+pub use editor_menu::editor_action_names;
 pub use tools::tools_action_names;
 use tools::{
     FEATURES, Feature, changed_restart_features, feature, feature_states, set_feature, tools_menu,

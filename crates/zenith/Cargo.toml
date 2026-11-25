@@ -71,3 +71,6 @@ zenith_postfix = { workspace = true, optional = true }
 zenith_http = { workspace = true, optional = true }
 zenith_refactor = { workspace = true, optional = true }
 zenith_title_bar.workspace = true
+
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }

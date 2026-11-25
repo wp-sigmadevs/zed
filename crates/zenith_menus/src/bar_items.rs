@@ -10,7 +10,7 @@ use gpui::{Action, App, Menu, MenuItem};
 use project::DisableAiSettings;
 use settings::Settings as _;
 
-use crate::editor_menu::{Entry, Spec, entries};
+use crate::editor_menu::{Entry, Spec, entries, spec_names};
 
 /// Menu name and the items to put at its head.
 pub(crate) type Extras = Vec<(&'static str, Vec<MenuItem>)>;
@@ -184,6 +184,16 @@ pub(crate) fn build(
         (menu, rows.into_iter().map(item).collect())
     })
     .collect()
+}
+
+/// Every action name the Code, Refactor, Run and Git menus look up, for tests that check they
+/// exist.
+pub fn bar_action_names() -> Vec<&'static str> {
+    let mut names = Vec::new();
+    for spec in [code(), refactor(), run(), git()] {
+        names.extend(spec_names(spec));
+    }
+    names
 }
 
 /// `build` with real actions and the live `disable_ai` setting.

@@ -108,3 +108,62 @@ pub fn quick_actions_tab_bar_end(
     #[cfg(not(feature = "rails"))]
     let _ = (view, cx);
 }
+
+#[cfg(all(test, feature = "menus"))]
+mod menu_actions {
+    use gpui::TestAppContext;
+
+    /// Optional crates each name prefix needs; a name is skipped (not failed) when its crate
+    /// is compiled out of this build, as the menu itself drops such an item.
+    fn linked(name: &str) -> bool {
+        // `git_ui` (a valid name there: `DeployBranchDiff`, name = "DiffBranch") is linked by
+        // the `zed` binary only.
+        if name == "git::DiffBranch" {
+            return false;
+        }
+        let Some((krate, _)) = name.split_once("::") else {
+            return true;
+        };
+        match krate {
+            // Upstream's CLI installer is linked by the `zed` binary, not by this crate.
+            "install_cli" => false,
+            "zenith_agent_review" => cfg!(feature = "agent_review"),
+            "zenith_deploy" => cfg!(feature = "deploy"),
+            "zenith_external_libraries" => cfg!(feature = "external_libraries"),
+            "zenith_http" => cfg!(feature = "http"),
+            "zenith_inspections" => cfg!(feature = "inspections"),
+            "zenith_laravel" => cfg!(feature = "laravel"),
+            "zenith_markdown" => cfg!(feature = "markdown"),
+            "zenith_nextjs" => cfg!(feature = "nextjs"),
+            "zenith_php_tools" => cfg!(feature = "php"),
+            "zenith_postfix" => cfg!(feature = "postfix"),
+            "zenith_problems" => cfg!(feature = "problems"),
+            "zenith_refactor" => cfg!(feature = "refactor"),
+            "zenith_scratches" => cfg!(feature = "scratches"),
+            "zenith_templates" => cfg!(feature = "templates"),
+            "zenith_todo" => cfg!(feature = "todo"),
+            "zenith_wordpress" => cfg!(feature = "wordpress"),
+            _ => true,
+        }
+    }
+
+    /// A typo in a menu's action name silently drops the item; `zenith_menus` cannot resolve
+    /// the actions of crates it does not link, so this does, with every feature crate linked.
+    #[gpui::test]
+    fn every_menu_action_name_resolves(cx: &mut TestAppContext) {
+        let names: Vec<&str> = zenith_menus::tools_action_names()
+            .into_iter()
+            .chain(zenith_menus::bar_action_names())
+            .chain(zenith_menus::editor_action_names())
+            .filter(|name| linked(name))
+            .collect();
+        assert!(names.len() > 100, "name lists shrank: {}", names.len());
+        let missing: Vec<&str> = cx.update(|cx| {
+            names
+                .into_iter()
+                .filter(|name| cx.build_action(name, None).is_err())
+                .collect()
+        });
+        assert!(missing.is_empty(), "no such action: {missing:?}");
+    }
+}

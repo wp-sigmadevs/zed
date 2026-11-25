@@ -65,6 +65,22 @@ pub(crate) fn entries<T>(
     out
 }
 
+/// Every action name in `spec`, submenu items included.
+pub(crate) fn spec_names(spec: Vec<Spec>) -> Vec<&'static str> {
+    spec.into_iter()
+        .flat_map(|row| match row {
+            Spec::Item(_, name) => vec![name],
+            Spec::Menu(_, items) => items.into_iter().map(|(_, name)| name).collect(),
+            Spec::Separator => vec![],
+        })
+        .collect()
+}
+
+/// Every action name the editor right-click menu looks up, for tests that check they exist.
+pub fn editor_action_names() -> Vec<&'static str> {
+    spec_names(spec())
+}
+
 pub(crate) fn spec() -> Vec<Spec> {
     use Spec::{Item, Menu, Separator};
     vec![
@@ -461,14 +477,7 @@ pub(crate) mod tests {
     }
 
     fn spec_names() -> Vec<&'static str> {
-        spec()
-            .into_iter()
-            .flat_map(|row| match row {
-                Spec::Item(_, name) => vec![name],
-                Spec::Menu(_, items) => items.into_iter().map(|(_, name)| name).collect(),
-                Spec::Separator => vec![],
-            })
-            .collect()
+        super::spec_names(spec())
     }
 
     #[gpui::test]
