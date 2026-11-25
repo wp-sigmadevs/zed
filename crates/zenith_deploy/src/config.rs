@@ -95,9 +95,9 @@ pub struct ServerConfig {
     pub mappings: Vec<Mapping>,
     pub excluded_local: Vec<String>,
     pub excluded_remote: Vec<String>,
-    /// Per server, never a global setting. Nothing here enforces the confirmation: the M4
-    /// prompt must set `upload_on_save_confirmed`, and the uploader must require both. The M1b
-    /// dialog does not offer the switch at all.
+    /// Reserved for M4b (auto-upload of mapped files). The M4a uploader ignores both flags by
+    /// design: its yes is a session-only, in-memory decision (`UploadDecision`), never read from
+    /// a file that could arrive with a repo. The M1b dialog does not offer the switch at all.
     pub upload_on_save: bool,
     pub upload_on_save_confirmed: bool,
     #[serde(skip)]
