@@ -6267,6 +6267,9 @@ mod tests {
                     }
                     if &namespace == "test_only" || &namespace == "stories" {
                         None
+                    } else if namespace.starts_with("zenith") {
+                        // Zenith: fork namespaces are not listed one by one.
+                        None
                     } else {
                         Some(namespace)
                     }
@@ -6371,9 +6374,6 @@ mod tests {
                 "zed",
                 "zed_actions",
                 "zed_predict_onboarding",
-                "zenith_inspections",
-                "zenith_php_tools",
-                "zenith_search",
                 "zeta",
             ];
             assert_eq!(
