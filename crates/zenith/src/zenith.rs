@@ -1,3 +1,6 @@
+mod brand;
+pub use brand::rebrand_text;
+
 use gpui::App;
 
 #[cfg(not(feature = "welcome"))]

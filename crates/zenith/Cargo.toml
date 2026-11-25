@@ -10,7 +10,6 @@ workspace = true
 
 [lib]
 path = "src/zenith.rs"
-test = false
 doctest = false
 
 [features]
