@@ -1,6 +1,6 @@
 use crate::MAX_RESPONSE_BYTES;
 use crate::parser::HttpRequest;
-use crate::response::HttpResponse;
+use crate::response::{HttpResponse, TRUNCATION_NOTE_PREFIX};
 use anyhow::{Context as _, Result};
 use http_client::Url;
 use serde::{Deserialize, Serialize};
@@ -196,13 +196,14 @@ fn content_type(headers: &[(String, String)]) -> Option<&str> {
 }
 
 /// `body` with the values of secret fields masked, or `None` when nothing was masked (or it
-/// did not parse), so the stored body stays byte-for-byte what was sent or received.
+/// did not parse), so the stored body stays byte-for-byte what was sent or received. A multipart
+/// body it cannot split, or a cut line it cannot parse, comes back as a marker instead.
 fn mask_secret_body(body: &str, content_type: Option<&str>) -> Option<String> {
     mask_secret_body_cut(body, content_type, false)
 }
 
-/// [`mask_secret_body`] for a body that may have been cut off by the run (`truncated`): a JSON
-/// lines body then loses the lines it cannot parse instead of keeping them.
+/// [`mask_secret_body`] for a body that may have been cut off by the run (`truncated`): JSON
+/// lines then lose the cut line instead of keeping it.
 fn mask_secret_body_cut(body: &str, content_type: Option<&str>, truncated: bool) -> Option<String> {
     let content_type = content_type.unwrap_or_default().to_ascii_lowercase();
     if content_type.contains("x-www-form-urlencoded") {
@@ -211,59 +212,92 @@ fn mask_secret_body_cut(body: &str, content_type: Option<&str>, truncated: bool)
     if content_type.starts_with("multipart/") {
         return mask_secret_multipart(body, &content_type);
     }
-    if content_type.contains("ndjson") || content_type.contains("jsonl") {
-        return mask_secret_ndjson(body, truncated);
-    }
+    let lines_type = ["ndjson", "jsonl", "stream+json", "json-seq"]
+        .iter()
+        .any(|name| content_type.contains(name));
+    let text = body.trim_start_matches('\u{feff}');
     // shortcut: plain text, XML and other formats are stored as is; add a format here when one
     // starts carrying credentials in practice.
-    let mut json = serde_json::from_str::<serde_json::Value>(body).ok()?;
-    if !mask_secret_json(&mut json) {
-        return None;
+    // A JSON lines body of one line is masked line by line, to keep its line ending; a longer
+    // one may still be one JSON value written over several lines, which parses whole.
+    if !(lines_type && !text.trim().contains('\n'))
+        && let Ok(mut json) = serde_json::from_str::<serde_json::Value>(text)
+    {
+        if !mask_secret_json(&mut json) {
+            return None;
+        }
+        return if text.contains('\n') {
+            serde_json::to_string_pretty(&json).ok()
+        } else {
+            serde_json::to_string(&json).ok()
+        };
     }
-    if body.contains('\n') {
-        serde_json::to_string_pretty(&json).ok()
-    } else {
-        serde_json::to_string(&json).ok()
+    // Whole-body parsing failed: JSON lines served as `application/json` (watch streams, event
+    // feeds) are masked per line, but only when complete; a cut one is not stored (`append`).
+    if lines_type || (!truncated && content_type.contains("json")) {
+        return mask_secret_ndjson(body, truncated);
     }
+    None
 }
 
 /// Stored in place of a line of a cut-off JSON lines body that cannot be parsed.
 const UNMASKABLE_LINE: &str = "[line not stored: truncated, secrets could not be masked]";
 
-/// Stored in place of a multipart body without a usable boundary.
+/// Stored in place of a multipart body that cannot be split into parts.
 const UNMASKABLE_MULTIPART: &str =
-    "[body not stored: multipart without a boundary, secrets could not be masked]";
+    "[body not stored: multipart boundary not found, secrets could not be masked]";
 
 /// Masks a JSON lines body (`application/x-ndjson`, `application/jsonl`) line by line, keeping
-/// every line separator. A line that is not JSON is kept, unless the body was `truncated` and the
-/// line looks like cut-off JSON (it starts with `{` or `[`): it is replaced by a marker, since
-/// a secret may sit before the cut. That also replaces the run's own truncation note, which
-/// starts with `[`; the body stays flagged truncated.
+/// every line separator, a leading BOM and the record separator of `json-seq`. A line that is
+/// not JSON is kept.
+///
+/// A `truncated` body ends in a cut line, then the run's own note: only the last data line may
+/// fail to parse, and is replaced by a marker, since a secret may sit before the cut; the note
+/// is kept. Any earlier line that fails (a pretty-printed value cut off, plain text) makes the
+/// whole body unmaskable: `None`, so `append` stores [`UNMASKABLE_BODY`]. That is simpler than a
+/// marker per line and as safe.
 fn mask_secret_ndjson(body: &str, truncated: bool) -> Option<String> {
+    let segments = body.split_inclusive('\n').collect::<Vec<_>>();
+    let is_blank = |segment: &str| segment.trim().is_empty();
+    let mut data_end = segments.len();
+    if truncated
+        && let Some(last) = segments.iter().rposition(|segment| !is_blank(segment))
+        && segments[last].starts_with(TRUNCATION_NOTE_PREFIX)
+    {
+        data_end = last;
+    }
+    let last_data = segments[..data_end]
+        .iter()
+        .rposition(|segment| !is_blank(segment));
     let mut changed = false;
-    let lines = body
-        .split_inclusive('\n')
-        .map(|segment| {
-            let line = segment.trim_end_matches(['\r', '\n']);
-            let ending = &segment[line.len()..];
-            let masked = match serde_json::from_str::<serde_json::Value>(line) {
+    let mut lines = String::with_capacity(body.len());
+    for (ix, segment) in segments.iter().enumerate() {
+        let line = segment.trim_end_matches(['\r', '\n']);
+        let ending = &segment[line.len()..];
+        let content = line.trim_start_matches(['\u{feff}', '\u{1e}']);
+        let prefix = &line[..line.len() - content.len()];
+        let masked = if ix >= data_end || is_blank(line) {
+            None
+        } else {
+            match serde_json::from_str::<serde_json::Value>(content) {
                 Ok(mut json) => mask_secret_json(&mut json).then(|| {
                     // Compact: one value per line is the format. A value always serializes;
                     // were it not, the marker keeps the secret out.
                     serde_json::to_string(&json).unwrap_or_else(|_| UNMASKABLE_LINE.to_string())
                 }),
-                Err(_) => (truncated && line.trim_start().starts_with(['{', '[']))
-                    .then(|| UNMASKABLE_LINE.to_string()),
-            };
-            match masked {
-                Some(masked) => {
-                    changed = true;
-                    format!("{masked}{ending}")
-                }
-                None => segment.to_string(),
+                Err(_) if !truncated => None,
+                Err(_) if Some(ix) == last_data => Some(UNMASKABLE_LINE.to_string()),
+                Err(_) => return None,
             }
-        })
-        .collect::<String>();
+        };
+        match masked {
+            Some(masked) => {
+                changed = true;
+                lines.push_str(&format!("{prefix}{masked}{ending}"));
+            }
+            None => lines.push_str(segment),
+        }
+    }
     changed.then_some(lines)
 }
 
@@ -271,7 +305,8 @@ fn mask_secret_ndjson(body: &str, truncated: bool) -> Option<String> {
 const UNMASKABLE_BODY: &str = "[body not stored: truncated, secrets could not be masked]";
 
 /// Whether `body` may be JSON, by content type or, failing that, by its first character. Form
-/// and multipart bodies are masked by prefix, so a cut leaves no secret value unmasked.
+/// and multipart bodies are masked by prefix, or replaced by a marker when they cannot be split,
+/// so a cut leaves no secret value unmasked.
 fn may_be_json(body: &str, content_type: Option<&str>) -> bool {
     let content_type = content_type.unwrap_or_default().to_ascii_lowercase();
     if content_type.contains("x-www-form-urlencoded") || content_type.starts_with("multipart/") {
@@ -401,31 +436,34 @@ fn mask_secret_query(url: &str) -> Option<String> {
 }
 
 /// Masks the content of form fields with a secret name. File parts (with a `filename`, or a
-/// `< path` line standing for a file) are left alone.
+/// `< path` line standing for a file) are left alone. A body with no delimiter to split on
+/// comes back as [`UNMASKABLE_MULTIPART`]; an empty one is `None`.
 fn mask_secret_multipart(body: &str, content_type: &str) -> Option<String> {
+    if body.trim().is_empty() {
+        return None;
+    }
     let declared = content_type
         .split(';')
         .find_map(|parameter| parameter.trim().strip_prefix("boundary="))
-        .map(|boundary| boundary.trim_matches('"'));
-    let boundary = match declared {
-        Some(boundary) => boundary.to_string(),
-        // No `boundary=`: the body's first line is the delimiter, or it cannot be split into
-        // parts and so is not stored (an empty body holds nothing).
-        None if body.trim().is_empty() => return None,
-        None => match body
-            .lines()
-            .find(|line| !line.trim().is_empty())
-            .and_then(|line| line.trim_end().strip_prefix("--"))
-            .filter(|boundary| !boundary.is_empty())
-        {
-            // The content type was lowercased; so is the boundary searched for below.
-            Some(boundary) => boundary.to_ascii_lowercase(),
-            None => return Some(UNMASKABLE_MULTIPART.to_string()),
-        },
+        .map(|boundary| boundary.trim_matches('"').to_string());
+    // The declared boundary, else the body's first line when it is a delimiter (a client may
+    // declare one and send another). The content type was lowercased, so the body is searched
+    // lowercased too, to find the boundary as written in the body.
+    let first_line = body
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .and_then(|line| line.trim_end().strip_prefix("--"))
+        .filter(|boundary| !boundary.is_empty())
+        .map(|boundary| boundary.to_ascii_lowercase());
+    let lowered = body.to_ascii_lowercase();
+    let found = declared.into_iter().chain(first_line).find_map(|boundary| {
+        let start = lowered.find(&format!("--{boundary}"))?;
+        body.get(start..start + boundary.len() + 2)
+    });
+    // No delimiter: the body cannot be split into fields, so it is not stored.
+    let Some(delimiter) = found else {
+        return Some(UNMASKABLE_MULTIPART.to_string());
     };
-    // Find the boundary as written in the body.
-    let start = body.to_ascii_lowercase().find(&format!("--{boundary}"))?;
-    let delimiter = body.get(start..start + boundary.len() + 2)?;
     let mut masked = false;
     let parts = body
         .split(delimiter)
@@ -559,8 +597,8 @@ impl HistoryDir {
             request.body = Some(body);
         }
         // Masked before the cut at the size limit below. A body the run already cut does not
-        // parse (it ends mid-value, then the truncation note), so JSON that may hold secrets
-        // is not stored at all.
+        // parse (it ends mid-value, then the truncation note): JSON lines lose their cut line,
+        // other JSON that may hold secrets is not stored at all.
         match mask_secret_body_cut(
             &response.body,
             content_type(&response.headers),
@@ -1012,10 +1050,16 @@ mod tests {
             masked,
             format!("{{\"password\":\"***\"}}\n{UNMASKABLE_LINE}")
         );
-        // Cut line only: still replaced; a cut non-JSON line is kept.
+        // Cut line only: still replaced.
         let masked = mask_secret_body_cut("{\"a\":1}\n{\"pass", ndjson, true).unwrap();
         assert_eq!(masked, format!("{{\"a\":1}}\n{UNMASKABLE_LINE}"));
-        assert_eq!(mask_secret_body_cut("{\"a\":1}\nplain", ndjson, true), None);
+        let masked = mask_secret_body_cut("{\"a\":1}\nplain", ndjson, true).unwrap();
+        assert_eq!(masked, format!("{{\"a\":1}}\n{UNMASKABLE_LINE}"));
+        // Earlier lines that fail mean the body is not JSON lines: none of it is stored.
+        assert_eq!(
+            mask_secret_body_cut("plain\n{\"a\":1}\n{\"pa", ndjson, true),
+            None
+        );
     }
 
     #[test]
@@ -1099,6 +1143,94 @@ mod tests {
         let cut = typed("multipart/mixed", body).mark_truncated(MAX_RESPONSE_BYTES);
         assert_eq!(stored_response(&history, cut)?.body, UNMASKABLE_MULTIPART);
         Ok(())
+    }
+
+    #[test]
+    fn test_mask_secret_ndjson_type_with_one_json_value_over_several_lines() {
+        let body = "{\n  \"token\": \"SECRETVAL\",\n  \"a\": 1\n}\n";
+        for content_type in [
+            "application/x-ndjson",
+            "application/jsonl",
+            "application/stream+json",
+        ] {
+            let masked = mask_secret_body(body, Some(content_type)).unwrap();
+            assert!(!masked.contains("SECRETVAL"), "{content_type}: {masked}");
+            assert!(masked.contains("\"a\": 1"), "{masked}");
+        }
+    }
+
+    #[test]
+    fn test_disk_history_drops_a_cut_pretty_value_under_an_ndjson_type() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let history = HistoryDir::new(temp.path().join("h"), 10, u64::MAX);
+        let cut = typed(
+            "application/x-ndjson",
+            "{\n  \"pad\": 1,\n  \"access_token\": \"SECRETVAL\",\n  \"more\": \"x",
+        )
+        .mark_truncated(MAX_RESPONSE_BYTES);
+        let stored = stored_response(&history, cut)?;
+        assert!(!stored.body.contains("SECRETVAL"), "{}", stored.body);
+        assert_eq!(stored.body, UNMASKABLE_BODY);
+
+        // A cut stream keeps its masked lines and the run's note; only the cut line goes.
+        let stream = typed(
+            "application/x-ndjson",
+            "{\"password\":\"SECRETONE\"}\n{\"a\":1}\n{\"token\":\"SECRETTWO",
+        )
+        .mark_truncated(MAX_RESPONSE_BYTES);
+        let stored = stored_response(&history, stream)?;
+        assert_eq!(
+            stored.body,
+            format!(
+                "{{\"password\":\"***\"}}\n{{\"a\":1}}\n{UNMASKABLE_LINE}\n\n[Response truncated: only the first 10 MiB are shown]"
+            )
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_mask_secret_json_lines_served_as_json_or_with_marks() {
+        let lines = "{\"type\":\"ADDED\"}\n{\"password\":\"SECRETVAL\"}\n";
+        // Complete JSON lines under a plain JSON type (watch streams, event feeds).
+        let masked = mask_secret_body(lines, Some("application/json")).unwrap();
+        assert!(!masked.contains("SECRETVAL") && masked.starts_with("{\"type\":\"ADDED\"}\n"));
+        // Cut under that type: not parsable, left for `append` to drop whole.
+        assert_eq!(
+            mask_secret_body_cut(lines, Some("application/json"), true),
+            None
+        );
+        // json-seq: the record separator stays.
+        let seq = "\u{1e}{\"password\":\"SECRETVAL\"}\n\u{1e}{\"a\":1}\n";
+        let masked = mask_secret_body(seq, Some("application/json-seq")).unwrap();
+        assert_eq!(masked, "\u{1e}{\"password\":\"***\"}\n\u{1e}{\"a\":1}\n");
+        // A byte order mark in front, on the whole-body and on the per-line path.
+        let bom = "\u{feff}{\"token\":\"SECRETVAL\"}\n{\"a\":1}\n";
+        for content_type in ["application/x-ndjson", "application/json"] {
+            let masked = mask_secret_body(bom, Some(content_type)).unwrap();
+            assert!(!masked.contains("SECRETVAL"), "{content_type}: {masked}");
+        }
+        let masked = mask_secret_body(
+            "\u{feff}{\"token\":\"SECRETVAL\"}",
+            Some("application/json"),
+        );
+        assert_eq!(masked.as_deref(), Some("{\"token\":\"***\"}"));
+        // Cut under a stream type: its cut line goes, as for NDJSON.
+        let cut = "{\"a\":1}\n{\"token\":\"SECR";
+        for content_type in ["application/stream+json", "application/json-seq"] {
+            let masked = mask_secret_body_cut(cut, Some(content_type), true).unwrap();
+            assert_eq!(masked, format!("{{\"a\":1}}\n{UNMASKABLE_LINE}"));
+        }
+    }
+
+    #[test]
+    fn test_mask_secret_multipart_boundary_not_in_the_body() {
+        let body = "--WebkitBoundary\r\nContent-Disposition: form-data; name=\"title\"\r\n\r\nhello\r\n--WebkitBoundary\r\nContent-Disposition: form-data; name=\"password\"\r\n\r\nSECRETVAL\r\n--WebkitBoundary--\r\n";
+        let content_type = Some("multipart/form-data; boundary=WebAppBoundary");
+        let masked = mask_secret_body(body, content_type).unwrap();
+        assert!(!masked.contains("SECRETVAL"), "{masked}");
+        assert!(masked.contains("hello") && masked.contains("\r\n***\r\n--WebkitBoundary"));
+        let masked = mask_secret_body("no delimiter\r\nSECRETVAL", content_type);
+        assert_eq!(masked.as_deref(), Some(UNMASKABLE_MULTIPART));
     }
 
     fn get(url: &str) -> HttpRequest {

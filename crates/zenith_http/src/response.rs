@@ -1,5 +1,8 @@
 use serde::{Deserialize, Serialize};
 
+/// Start of the note [`HttpResponse::mark_truncated`] appends to a cut body.
+pub(crate) const TRUNCATION_NOTE_PREFIX: &str = "[Response truncated:";
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HttpResponse {
     pub status: u16,
@@ -41,7 +44,7 @@ impl HttpResponse {
     pub fn mark_truncated(mut self, limit: usize) -> Self {
         self.truncated = true;
         self.body.push_str(&format!(
-            "\n\n[Response truncated: only the first {} MiB are shown]",
+            "\n\n{TRUNCATION_NOTE_PREFIX} only the first {} MiB are shown]",
             limit / (1024 * 1024)
         ));
         self
