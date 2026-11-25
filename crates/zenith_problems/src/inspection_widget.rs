@@ -13,6 +13,7 @@ use gpui::{
 use language::{Buffer, BufferEvent};
 use project::{Project, ProjectItem as _, ProjectPath};
 use settings::{RegisterSetting, Settings, SettingsContent, SettingsStore};
+use std::collections::HashSet;
 use ui::{ButtonLike, KeyBinding, Tooltip, prelude::*};
 use workspace::{
     ItemHandle, Pane, ToolbarItemEvent, ToolbarItemLocation, ToolbarItemView, Workspace, pane,
@@ -98,6 +99,8 @@ pub(crate) struct InspectionWidget {
     /// Cached; only the active-tab change and diagnostics updates of `path` recount it.
     counts: Option<Counts>,
     has_server: bool,
+    /// Remote projects only: paths whose diagnostics showed a server, kept across tab switches.
+    remote_diagnosed: HashSet<ProjectPath>,
     /// Test seam: behave as a project without local language servers.
     #[cfg(test)]
     pretend_remote: bool,
@@ -143,19 +146,26 @@ impl InspectionWidget {
     ) -> Self {
         let mut subscriptions = vec![
             cx.subscribe(&project, |this, _, event, cx| match event {
+                // Remote projects have no local server list; a path's diagnostics prove a server.
+                project::Event::DiagnosticsUpdated { paths, .. } if this.is_remote(cx) => {
+                    this.remote_diagnosed.extend(paths.iter().cloned());
+                    if this.path.as_ref().is_some_and(|path| paths.contains(path)) {
+                        this.changed(cx, |this, cx| {
+                            this.recheck_server(cx);
+                            this.recount(cx);
+                        });
+                    }
+                }
                 project::Event::DiagnosticsUpdated { paths, .. }
                     if this.path.as_ref().is_some_and(|path| paths.contains(path)) =>
                 {
-                    this.changed(cx, |this, cx| {
-                        // Remote projects have no local server list; their diagnostics prove one.
-                        if this.is_remote(cx) {
-                            this.has_server = true;
-                        }
-                        this.recount(cx);
-                    });
+                    this.changed(cx, Self::recount);
                 }
                 project::Event::LanguageServerAdded(..)
                 | project::Event::LanguageServerRemoved(_) => {
+                    if matches!(event, project::Event::LanguageServerRemoved(_)) {
+                        this.remote_diagnosed.clear();
+                    }
                     this.changed(cx, Self::recheck_server)
                 }
                 _ => {}
@@ -188,6 +198,7 @@ impl InspectionWidget {
             path: None,
             counts: None,
             has_server: false,
+            remote_diagnosed: HashSet::new(),
             #[cfg(test)]
             pretend_remote: false,
             _buffer_subscription: None,
@@ -235,8 +246,11 @@ impl InspectionWidget {
 
     fn recheck_server(&mut self, cx: &mut Context<Self>) {
         let lsp_store = self.project.read(cx).lsp_store();
-        // Only local projects list their servers; elsewhere a seen diagnostics update is sticky.
-        let remote_seen = self.has_server && self.is_remote(cx);
+        let remote_seen = self.is_remote(cx)
+            && self
+                .path
+                .as_ref()
+                .is_some_and(|path| self.remote_diagnosed.contains(path));
         self.has_server = remote_seen
             || self.buffer().is_some_and(|buffer| {
                 buffer.update(cx, |buffer, cx| {
@@ -871,6 +885,29 @@ mod tests {
         assert!(on_the_tab_bar(cx));
         publish(&fixture, cx, "/p/c.txt", vec![]);
         assert!(on_the_tab_bar(cx), "a clean file keeps its widget");
+    }
+
+    #[gpui::test]
+    async fn a_remote_file_keeps_its_widget_across_tab_switches(cx: &mut TestAppContext) {
+        let (fixture, cx) = fixture(cx).await;
+        widget(&fixture, cx).update(cx, |widget, _| widget.pretend_remote = true);
+        open(&fixture, cx, "/p/c.txt").await;
+        publish(
+            &fixture,
+            cx,
+            "/p/c.txt",
+            vec![diagnostic(0, 0, DiagnosticSeverity::ERROR, None)],
+        );
+        assert!(on_the_tab_bar(cx));
+        open(&fixture, cx, "/p/b.rs").await;
+        open(&fixture, cx, "/p/c.txt").await;
+        assert!(on_the_tab_bar(cx), "the evidence outlives the tab switch");
+        // A removed server takes the evidence with it.
+        fixture.project.update(cx, |_, cx| {
+            cx.emit(project::Event::LanguageServerRemoved(fixture.server))
+        });
+        cx.run_until_parked();
+        assert!(!on_the_tab_bar(cx));
     }
 
     #[gpui::test]
