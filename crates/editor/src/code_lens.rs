@@ -313,7 +313,7 @@ impl Editor {
             }
         }
 
-        let mut new_lines_by_row = group_lenses_by_row(all_lenses, snapshot)
+        let mut new_lines_by_row = group_lenses_by_row(all_lenses, snapshot, cx)
             .map(|line| (MultiBufferRow(line.position.to_point(snapshot).row), line))
             .collect::<HashMap<_, _>>();
 
@@ -610,6 +610,7 @@ fn displayed_title(item: &CodeLensItem) -> Option<&SharedString> {
 fn group_lenses_by_row(
     lenses: Vec<(Anchor, CodeLensItem)>,
     snapshot: &MultiBufferSnapshot,
+    cx: &App,
 ) -> impl Iterator<Item = CodeLensLine> {
     lenses
         .into_iter()
@@ -622,12 +623,25 @@ fn group_lenses_by_row(
         .filter_map(|(row, entries)| {
             let position = entries.first()?.0;
             let items = entries.into_iter().map(|(_, item)| item).collect();
-            let indent_column = snapshot.indent_size_for_line(row).len;
+            let indent_column = leading_whitespace_width(snapshot, row, cx);
             Some(CodeLensLine {
                 position,
                 indent_column,
                 items,
             })
+        })
+}
+
+/// Visual width of a row's leading whitespace: a tab advances to the next tab stop.
+fn leading_whitespace_width(snapshot: &MultiBufferSnapshot, row: MultiBufferRow, cx: &App) -> u32 {
+    let start = text::Point::new(row.0, 0);
+    let tab_size = snapshot.language_settings_at(start, cx).tab_size.get();
+    snapshot
+        .chars_at(start)
+        .take_while(|c| matches!(c, ' ' | '\t'))
+        .fold(0, |column, c| match c {
+            '\t' => column + tab_size - column % tab_size,
+            _ => column + 1,
         })
 }
 
@@ -730,7 +744,7 @@ fn build_code_lens_renderer(line: CodeLensLine, editor: WeakEntity<Editor>) -> R
 
         div()
             .id(cx.block_id)
-            .pl(cx.em_width * (line.indent_column as f32 + 0.5))
+            .pl(cx.em_width * (line.indent_column as f32))
             .h_full()
             .flex()
             .flex_row()
@@ -758,7 +772,7 @@ mod tests {
     use multi_buffer::{MultiBuffer, MultiBufferRow, PathKey, ToPoint as _};
     use text::Point;
 
-    use super::{CODE_LENS_SEPARATOR, displayed_title};
+    use super::{CODE_LENS_SEPARATOR, displayed_title, leading_whitespace_width};
     use crate::{
         DisplayRow, Editor, LSP_REQUEST_DEBOUNCE_TIMEOUT,
         display_map::Block,
@@ -766,6 +780,21 @@ mod tests {
         scroll::ScrollAnchor,
         test::{build_editor_with_project, editor_lsp_test_context::EditorLspTestContext},
     };
+
+    #[gpui::test]
+    fn test_code_lens_indent_uses_visual_width(cx: &mut TestAppContext) {
+        init_test(cx, |_| {});
+        let multi_buffer =
+            cx.update(|cx| MultiBuffer::build_simple("\tfoo\n  \tbar\n\t  baz\n    qux\nx", cx));
+        let snapshot = multi_buffer.read_with(cx, |multi_buffer, cx| multi_buffer.snapshot(cx));
+        let widths = cx.update(|cx| {
+            (0..5)
+                .map(|row| leading_whitespace_width(&snapshot, MultiBufferRow(row), cx))
+                .collect::<Vec<_>>()
+        });
+        // Default tab size is 4: a tab advances to the next stop, spaces count one each.
+        assert_eq!(widths, vec![4, 4, 6, 4, 0]);
+    }
 
     #[gpui::test]
     async fn test_code_lens_blocks(cx: &mut TestAppContext) {
