@@ -304,7 +304,7 @@ pub fn init(cx: &mut App) {
         with_active_or_new_workspace(cx, |workspace, window, cx| {
             open_bundled_file(
                 workspace,
-                settings::default_settings(),
+                zenith::rebrand_text(settings::default_settings()),
                 "Default Settings",
                 "JSON",
                 window,
@@ -316,7 +316,7 @@ pub fn init(cx: &mut App) {
         with_active_or_new_workspace(cx, |workspace, window, cx| {
             open_bundled_file(
                 workspace,
-                settings::default_keymap(),
+                zenith::rebrand_text(settings::default_keymap()),
                 "Default Key Bindings",
                 "JSON",
                 window,
