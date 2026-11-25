@@ -20,6 +20,7 @@ futures.workspace = true
 futures-rustls.workspace = true
 gpui.workspace = true
 http_client_tls.workspace = true
+language.workspace = true
 log.workspace = true
 menu.workspace = true
 paths.workspace = true

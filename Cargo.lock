@@ -23069,6 +23069,7 @@ dependencies = [
  "futures-rustls",
  "gpui",
  "http_client_tls",
+ "language",
  "log",
  "menu",
  "paths",

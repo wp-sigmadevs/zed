@@ -5,6 +5,7 @@ pub mod config;
 mod dialog;
 mod ftp;
 mod panel;
+pub mod remote_edit;
 pub mod remote_path;
 pub mod secrets;
 mod sftp;
@@ -20,6 +21,10 @@ use settings::{DockPosition, RegisterSetting, Settings, SettingsContent};
 pub use config::{Password, ServerConfig, ServerType, Servers};
 pub use dialog::{DeploymentDialog, OpenDeployment};
 pub use panel::{RemoteHostPanel, ToggleFocus};
+pub use remote_edit::{
+    CopyState, RemoteCopy, ServerStoreEvent, UploadDecision, UploadOutcome, UploadStart,
+    UploadWarnings, cache_path_for, upload_warnings,
+};
 pub use transport::{
     EntryKind, RemoteEntry, RemoteStat, ServerRefused, Transport, connect, download_entry,
     upload_entry,
@@ -84,6 +89,14 @@ pub struct ServerStore {
     session_passwords: HashMap<String, (String, Password)>,
     keychain: Arc<dyn secrets::Keychain>,
     connect: ConnectFn,
+    /// Cached copies of remote files this app downloaded, by cache path (plan 37 M4a). The only
+    /// source of an upload target.
+    copies: HashMap<PathBuf, remote_edit::RemoteCopy>,
+    /// "Upload without asking" per server for this session, with the target it was said for.
+    /// Memory only: never read from settings or any file.
+    upload_decisions: HashMap<String, (String, UploadDecision)>,
+    /// Running uploads, owned here so a panel reset or window close cannot cancel them.
+    uploads: HashMap<PathBuf, Task<()>>,
     _load: Task<()>,
 }
 
@@ -145,6 +158,9 @@ impl ServerStore {
             session_passwords: HashMap::new(),
             keychain: Arc::new(secrets::SystemKeychain),
             connect: Arc::new(|server| Box::pin(async move { connect(&server).await })),
+            copies: HashMap::new(),
+            upload_decisions: HashMap::new(),
+            uploads: HashMap::new(),
             _load: load,
         }
     }
@@ -162,6 +178,9 @@ impl ServerStore {
             session_passwords: HashMap::new(),
             keychain: Arc::new(secrets::SystemKeychain),
             connect,
+            copies: HashMap::new(),
+            upload_decisions: HashMap::new(),
+            uploads: HashMap::new(),
             _load: Task::ready(()),
         }
     }
@@ -279,10 +298,16 @@ impl ServerStore {
         let kept: std::collections::HashSet<_> =
             servers.servers.iter().map(|server| &server.id).collect();
         self.session_passwords.retain(|id, _| kept.contains(id));
-        for server in &self.servers.servers {
-            if !kept.contains(&server.id) {
-                self.clear_cache(&server.id, cx);
-            }
+        self.upload_decisions.retain(|id, _| kept.contains(id));
+        let removed: Vec<String> = self
+            .servers
+            .servers
+            .iter()
+            .filter(|server| !kept.contains(&server.id))
+            .map(|server| server.id.clone())
+            .collect();
+        for id in removed {
+            self.clear_cache(&id, cx);
         }
         self.servers = servers;
         cx.notify();
@@ -293,10 +318,23 @@ impl ServerStore {
     /// writing here: the removal is retried (see [`remove_with_retry`]).
     /// The cache is shared by every window: Disconnect in one window also deletes the files
     /// another window has open.
-    pub(crate) fn clear_cache(&self, server_id: &str, cx: &App) {
+    ///
+    /// Nothing is deleted while a copy of the server has a live buffer (clean or dirty) or a
+    /// running upload: the session still ends, the files stay. Returns how many such open copies
+    /// were kept, for "Kept N open remote files".
+    pub(crate) fn clear_cache(&mut self, server_id: &str, cx: &mut Context<Self>) -> usize {
         if remote_path::validate_name(server_id).is_err() {
-            return;
+            return 0;
         }
+        let open = self
+            .copies
+            .values()
+            .filter(|copy| copy.server_id == server_id && copy.is_open())
+            .count();
+        if open > 0 {
+            return open;
+        }
+        self.copies.retain(|_, copy| copy.server_id != server_id);
         let directory = self.cache_dir.join(server_id);
         cx.background_spawn(async move {
             match remove_with_retry(|| std::fs::remove_dir_all(&directory)) {
@@ -306,6 +344,7 @@ impl ServerStore {
             }
         })
         .detach();
+        0
     }
 
     /// Remembers (or forgets) the typed password of `server` for its current target only.
@@ -427,6 +466,9 @@ pub(crate) mod test_support {
         /// Every upload as (path, bytes).
         pub puts: Arc<Mutex<Vec<(String, Vec<u8>)>>>,
         pub stats: Arc<Mutex<HashMap<String, RemoteStat>>>,
+        /// Makes every `stat` / `upload_file` fail with this text.
+        pub stat_error: Arc<Mutex<Option<String>>>,
+        pub put_error: Arc<Mutex<Option<String>>>,
     }
 
     impl FakeRemote {
@@ -507,6 +549,9 @@ pub(crate) mod test_support {
         }
         async fn stat(&mut self, path: &str) -> Result<Option<RemoteStat>> {
             self.push(format!("stat {path}"));
+            if let Some(error) = self.stat_error.lock().ok().and_then(|error| error.clone()) {
+                return Err(anyhow!(error));
+            }
             Ok(self
                 .stats
                 .lock()
@@ -515,8 +560,21 @@ pub(crate) mod test_support {
         }
         async fn upload_file(&mut self, remote_path: &str, bytes: &[u8]) -> Result<()> {
             self.push(format!("put {remote_path}"));
+            if let Some(error) = self.put_error.lock().ok().and_then(|error| error.clone()) {
+                return Err(anyhow!(error));
+            }
             if let Ok(mut puts) = self.puts.lock() {
                 puts.push((remote_path.to_string(), bytes.to_vec()));
+                // The upload changes the file on the server: a new stamp per put.
+                if let Ok(mut stats) = self.stats.lock() {
+                    stats.insert(
+                        remote_path.to_string(),
+                        RemoteStat {
+                            size: bytes.len() as u64,
+                            stamp: Some(format!("put-{}", puts.len())),
+                        },
+                    );
+                }
             }
             Ok(())
         }
@@ -673,6 +731,7 @@ mod tests {
             ("dialog.rs", include_str!("dialog.rs")),
             ("panel.rs", include_str!("panel.rs")),
             ("ftp.rs", include_str!("ftp.rs")),
+            ("remote_edit.rs", include_str!("remote_edit.rs")),
             ("remote_path.rs", include_str!("remote_path.rs")),
             ("secrets.rs", include_str!("secrets.rs")),
             ("sftp.rs", include_str!("sftp.rs")),

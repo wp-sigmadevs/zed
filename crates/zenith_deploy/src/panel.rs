@@ -219,7 +219,12 @@ impl RemoteHostPanel {
     pub(crate) fn disconnect(&mut self, cx: &mut Context<Self>) {
         self.reset(cx);
         if let Some(server_id) = &self.server_id {
-            self.store.read(cx).clear_cache(server_id, cx);
+            let kept = self
+                .store
+                .update(cx, |store, cx| store.clear_cache(server_id, cx));
+            if kept > 0 {
+                self.status = Some(format!("Kept {kept} open remote files.").into());
+            }
         }
     }
 
