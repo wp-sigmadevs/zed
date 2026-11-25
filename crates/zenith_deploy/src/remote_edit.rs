@@ -1152,7 +1152,7 @@ mod tests {
             })
         };
         let other = cache_path_for(&f.cache_dir, &f.server_id, "/www/b.php").expect("path");
-        assert!(register(other.clone(), &f.server_id, "/www/b.php", cx).is_ok());
+        assert!(register(other, &f.server_id, "/www/b.php", cx).is_ok());
         for (path, remote) in [
             // Outside the cache root.
             (f.dir.path().join("elsewhere/b.php"), "/www/b.php"),
