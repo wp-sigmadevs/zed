@@ -1,7 +1,12 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use gpui::{App, AppContext as _, Task};
+use gpui::{App, AppContext as _, FutureExt as _, Task};
+use std::time::Duration;
+
+/// A Keychain read that nothing answers (a closed prompt, a stuck daemon) must not hold an
+/// upload or a connect forever; generous because the system may ask the user to unlock.
+const KEYCHAIN_TIMEOUT: Duration = Duration::from_secs(120);
 
 use crate::{ServerConfig, ServerType};
 
@@ -94,7 +99,16 @@ pub fn load_password(
 ) -> Task<Result<Lookup>> {
     let read = keychain.read(&keychain_key(&server.id), cx);
     let account = target_account(server);
-    cx.background_spawn(async move { Ok(lookup(read.await?, &account)) })
+    let executor = cx.background_executor().clone();
+    cx.background_spawn(async move {
+        let stored = read
+            .with_timeout(KEYCHAIN_TIMEOUT, &executor)
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!("the Keychain did not answer within {KEYCHAIN_TIMEOUT:?}")
+            })??;
+        Ok(lookup(stored, &account))
+    })
 }
 
 /// Deleting nothing is a success (an SFTP server or one without a stored password): the
@@ -131,6 +145,8 @@ pub(crate) mod fake {
         pub entries: Mutex<HashMap<String, (String, Vec<u8>)>>,
         pub fail_delete: Mutex<bool>,
         pub fail_write: Mutex<bool>,
+        /// Reads never answer (a Keychain that hangs).
+        pub read_hang: Mutex<bool>,
         /// Keys whose delete fails while other deletes work.
         pub failing_delete_keys: Mutex<Vec<String>>,
         /// The next write finishes only when this resolves (a Keychain prompt waiting).
@@ -162,7 +178,10 @@ pub(crate) mod fake {
     }
 
     impl Keychain for FakeKeychain {
-        fn read(&self, key: &str, _: &App) -> Task<Result<Option<(String, Vec<u8>)>>> {
+        fn read(&self, key: &str, cx: &App) -> Task<Result<Option<(String, Vec<u8>)>>> {
+            if *self.read_hang.lock().expect("lock") {
+                return cx.background_spawn(futures::future::pending());
+            }
             Task::ready(Ok(self.entries.lock().expect("lock").get(key).cloned()))
         }
 
@@ -279,5 +298,20 @@ mod tests {
             .await
             .expect("delete");
         assert!(fake.account_of(&server).is_none());
+    }
+
+    #[gpui::test]
+    async fn a_keychain_read_that_never_answers_times_out(cx: &mut TestAppContext) {
+        let keychain = FakeKeychain::default();
+        *keychain.read_hang.lock().expect("lock") = true;
+        let server = ServerConfig::new();
+        let task = cx.update(|cx| load_password(&keychain, &server, cx));
+        cx.run_until_parked();
+        cx.executor()
+            .advance_clock(KEYCHAIN_TIMEOUT + Duration::from_secs(1));
+        match task.await {
+            Err(error) => assert!(error.to_string().contains("did not answer"), "{error}"),
+            Ok(_) => panic!("a hung Keychain must not look like an answer"),
+        }
     }
 }
