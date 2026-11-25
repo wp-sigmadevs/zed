@@ -218,6 +218,19 @@ fn mask_secret_body(body: &str, content_type: Option<&str>) -> Option<String> {
     }
 }
 
+/// Stored in place of a cut-off JSON body: it cannot be parsed, so its secrets cannot be masked.
+const UNMASKABLE_BODY: &str = "[body not stored: truncated, secrets could not be masked]";
+
+/// Whether `body` may be JSON, by content type or, failing that, by its first character. Form
+/// and multipart bodies are masked by prefix, so a cut leaves no secret value unmasked.
+fn may_be_json(body: &str, content_type: Option<&str>) -> bool {
+    let content_type = content_type.unwrap_or_default().to_ascii_lowercase();
+    if content_type.contains("x-www-form-urlencoded") || content_type.starts_with("multipart/") {
+        return false;
+    }
+    content_type.contains("json") || body.trim_start().starts_with(['{', '['])
+}
+
 fn mask_secret_json(value: &mut serde_json::Value) -> bool {
     let mut masked = false;
     match value {
@@ -480,9 +493,17 @@ impl HistoryDir {
         {
             request.body = Some(body);
         }
-        // Masked before truncating: a cut-off JSON body no longer parses.
-        if let Some(body) = mask_secret_body(&response.body, content_type(&response.headers)) {
-            response.body = body;
+        // Masked before the cut at the size limit below. A body the run already cut does not
+        // parse (it ends mid-value, then the truncation note), so JSON that may hold secrets
+        // is not stored at all.
+        match mask_secret_body(&response.body, content_type(&response.headers)) {
+            Some(body) => response.body = body,
+            None if response.truncated
+                && may_be_json(&response.body, content_type(&response.headers)) =>
+            {
+                response.body = UNMASKABLE_BODY.to_string();
+            }
+            None => {}
         }
         if !response.truncated && response.body.len() > MAX_RESPONSE_BYTES {
             let mut end = MAX_RESPONSE_BYTES;
@@ -1194,6 +1215,99 @@ mod tests {
         );
         assert!(response.body.contains("[Response truncated"));
         assert!(!response.body.contains('b'));
+        Ok(())
+    }
+
+    fn typed(content_type: &str, body: &str) -> HttpResponse {
+        let headers = vec![("Content-Type".into(), content_type.into())];
+        HttpResponse::new(200, "OK", headers, body, 1)
+    }
+
+    fn stored_response(history: &HistoryDir, response: HttpResponse) -> Result<HttpResponse> {
+        let id = history
+            .append(get("https://a.test/big"), response)?
+            .expect("stored");
+        Ok(history.load(id)?.response)
+    }
+
+    #[test]
+    fn test_disk_history_drops_a_cut_off_json_body_it_cannot_mask() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let history = HistoryDir::new(temp.path().join("h"), 10, u64::MAX);
+        // What a run keeps of a 10 MiB+ response: cut mid-value, no closing brace.
+        let body = format!(
+            "{{\"access_token\":\"SECRETVAL\",\"pad\":\"{}",
+            "x".repeat(MAX_RESPONSE_BYTES)
+        );
+        let cut = typed("application/json", &body[..MAX_RESPONSE_BYTES]);
+        let stored = stored_response(&history, cut.mark_truncated(MAX_RESPONSE_BYTES))?;
+        assert!(!stored.body.contains("SECRETVAL"));
+        assert_eq!(stored.body, UNMASKABLE_BODY);
+        assert!(stored.truncated);
+        Ok(())
+    }
+
+    #[test]
+    fn test_disk_history_drops_a_cut_off_json_body_by_its_shape_without_a_content_type()
+    -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let history = HistoryDir::new(temp.path().join("h"), 10, u64::MAX);
+        let body = format!(
+            "[{{\"pad\":\"{}\",\"password\":\"SECRETVAL\"",
+            "x".repeat(64)
+        );
+        let cut = ok(&body).mark_truncated(MAX_RESPONSE_BYTES);
+        let stored = stored_response(&history, cut)?;
+        assert!(!stored.body.contains("SECRETVAL"));
+        assert_eq!(stored.body, UNMASKABLE_BODY);
+        Ok(())
+    }
+
+    #[test]
+    fn test_disk_history_keeps_what_it_can_mask_or_that_carries_no_json() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let history = HistoryDir::new(temp.path().join("h"), 10, u64::MAX);
+
+        // Not cut: JSON is still masked, even past the size limit, and cut afterwards.
+        let big = format!(
+            "{{\"access_token\":\"SECRETVAL\",\"pad\":\"{}\"}}",
+            "x".repeat(MAX_RESPONSE_BYTES + 10)
+        );
+        let stored = stored_response(&history, typed("application/json", &big))?;
+        assert!(stored.truncated);
+        assert!(!stored.body.contains("SECRETVAL"));
+        assert!(stored.body.contains(MASKED_VALUE));
+
+        let small = typed(
+            "application/json",
+            "{\"access_token\":\"SECRETVAL\",\"a\":1}",
+        );
+        let stored = stored_response(&history, small)?;
+        assert!(!stored.body.contains("SECRETVAL"));
+        assert!(stored.body.contains("\"a\":1"));
+
+        // Not cut: plain text is stored as is (the documented shortcut).
+        let text = typed("text/plain", "token=SECRETVAL and more");
+        assert_eq!(
+            stored_response(&history, text)?.body,
+            "token=SECRETVAL and more"
+        );
+
+        // Cut, but not JSON: stored with its truncation note.
+        let page = typed("text/html", "<html>no secrets").mark_truncated(MAX_RESPONSE_BYTES);
+        let stored = stored_response(&history, page)?;
+        assert!(stored.body.starts_with("<html>no secrets"));
+        assert!(stored.body.contains("[Response truncated"));
+
+        // Cut form body: masked by prefix, so the value of a complete secret pair is hidden.
+        let form = typed(
+            "application/x-www-form-urlencoded",
+            "a=1&password=SECRETVAL&b=2&pa",
+        )
+        .mark_truncated(MAX_RESPONSE_BYTES);
+        let stored = stored_response(&history, form)?;
+        assert!(!stored.body.contains("SECRETVAL"));
+        assert!(stored.body.contains("[Response truncated"));
         Ok(())
     }
 
