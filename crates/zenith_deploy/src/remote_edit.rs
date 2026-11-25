@@ -588,7 +588,8 @@ mod tests {
             servers: vec![prod],
             ..Servers::default()
         };
-        let store = cx.new(|_| ServerStore::in_memory(servers, cache_dir.clone(), remote.connect_fn()));
+        let store =
+            cx.new(|_| ServerStore::in_memory(servers, cache_dir.clone(), remote.connect_fn()));
         let cache_path = cache_path_for(&cache_dir, &server_id, REMOTE).expect("cache path");
         std::fs::create_dir_all(cache_path.parent().expect("parent")).expect("mkdir");
         std::fs::write(&cache_path, "cache bytes").expect("write");
@@ -632,8 +633,9 @@ mod tests {
         }
 
         fn upload(&self, unshared: bool, force: bool, cx: &mut TestAppContext) -> UploadStart {
-            self.store
-                .update(cx, |store, cx| store.upload(&self.cache_path, unshared, force, cx))
+            self.store.update(cx, |store, cx| {
+                store.upload(&self.cache_path, unshared, force, cx)
+            })
         }
 
         fn puts(&self) -> Vec<(String, Vec<u8>)> {
@@ -650,7 +652,8 @@ mod tests {
 
         fn clear(&self, cx: &mut TestAppContext) -> usize {
             let id = self.server_id.clone();
-            self.store.update(cx, |store, cx| store.clear_cache(&id, cx))
+            self.store
+                .update(cx, |store, cx| store.clear_cache(&id, cx))
         }
     }
 
@@ -731,11 +734,12 @@ mod tests {
         let f = fixture(cx);
         let cache_dir = f.dir.path().join("cache");
         let register = |cache_path: PathBuf, id: &str, remote: &str, cx: &mut TestAppContext| {
-            f.store
-                .update(cx, |store, _| store.register_download(cache_path, id, remote, None))
+            f.store.update(cx, |store, _| {
+                store.register_download(cache_path, id, remote, None)
+            })
         };
         let other = cache_path_for(&cache_dir, &f.server_id, "/www/b.php").expect("path");
-        assert!(register(other.clone(), &f.server_id, "/www/b.php", cx).is_ok());
+        assert!(register(other, &f.server_id, "/www/b.php", cx).is_ok());
         for (path, remote) in [
             // Outside the cache root.
             (f.dir.path().join("elsewhere/b.php"), "/www/b.php"),
@@ -744,7 +748,10 @@ mod tests {
             // A traversing remote path.
             (cache_dir.join("../etc/passwd"), "/../etc/passwd"),
         ] {
-            assert!(register(path.clone(), &f.server_id, remote, cx).is_err(), "{path:?}");
+            assert!(
+                register(path.clone(), &f.server_id, remote, cx).is_err(),
+                "{path:?}"
+            );
         }
         // An open copy (live buffer) is not replaced by a new download.
         assert!(register(f.cache_path.clone(), &f.server_id, REMOTE, cx).is_err());
@@ -793,13 +800,18 @@ mod tests {
             let UploadOutcome::Blocked(message) = event else {
                 panic!("{event:?}");
             };
-            assert!(message.contains("550 is a directory") && message.contains(REMOTE), "{message}");
+            assert!(
+                message.contains("550 is a directory") && message.contains(REMOTE),
+                "{message}"
+            );
         }
         assert!(f.puts().is_empty());
     }
 
     #[gpui::test]
-    fn saves_during_an_upload_coalesce_into_one_rerun_with_the_newest_bytes(cx: &mut TestAppContext) {
+    fn saves_during_an_upload_coalesce_into_one_rerun_with_the_newest_bytes(
+        cx: &mut TestAppContext,
+    ) {
         let f = fixture(cx);
         f.save("one", cx);
         assert_eq!(f.upload(true, false, cx), UploadStart::Started);
@@ -830,9 +842,11 @@ mod tests {
         let f = fixture(cx);
         f.upload(true, false, cx);
         cx.run_until_parked();
-        let recorded = f
-            .store
-            .read_with(cx, |store, _| store.copy_for_buffer_path(&f.cache_path).map(|c| c.stat.clone()));
+        let recorded = f.store.read_with(cx, |store, _| {
+            store
+                .copy_for_buffer_path(&f.cache_path)
+                .map(|c| c.stat.clone())
+        });
         assert_eq!(recorded, Some(Some(stat_after_put(1, 5))));
         // The baseline moved, so the next save is not a conflict with our own write.
         f.save("again", cx);
@@ -852,10 +866,17 @@ mod tests {
     #[gpui::test]
     fn a_shared_or_remote_project_never_uploads_even_when_allowed(cx: &mut TestAppContext) {
         let f = fixture(cx);
-        assert!(matches!(f.upload(false, false, cx), UploadStart::Refused(_)));
+        assert!(matches!(
+            f.upload(false, false, cx),
+            UploadStart::Refused(_)
+        ));
         assert!(matches!(f.upload(false, true, cx), UploadStart::Refused(_)));
         cx.run_until_parked();
-        assert!(f.remote.log().is_empty(), "no connection: {:?}", f.remote.log());
+        assert!(
+            f.remote.log().is_empty(),
+            "no connection: {:?}",
+            f.remote.log()
+        );
         assert!(f.events.borrow().is_empty());
     }
 
@@ -866,13 +887,21 @@ mod tests {
             store.set_upload_decision(&f.server_id, UploadDecision::Ask);
         });
         assert_eq!(f.upload(true, false, cx), UploadStart::NeedsConfirmation);
-        assert_eq!(f.upload(true, true, cx), UploadStart::NeedsConfirmation, "force is not consent");
+        assert_eq!(
+            f.upload(true, true, cx),
+            UploadStart::NeedsConfirmation,
+            "force is not consent"
+        );
         f.store.update(cx, |store, _| {
             store.set_upload_decision(&f.server_id, UploadDecision::Deny);
         });
         assert!(matches!(f.upload(true, false, cx), UploadStart::Refused(_)));
         cx.run_until_parked();
-        assert!(f.remote.log().is_empty(), "no connection: {:?}", f.remote.log());
+        assert!(
+            f.remote.log().is_empty(),
+            "no connection: {:?}",
+            f.remote.log()
+        );
         // Unknown servers cannot be allowed, and a new store starts at Ask.
         f.store.update(cx, |store, _| {
             assert!(!store.set_upload_decision("nope", UploadDecision::Allow));
@@ -884,7 +913,8 @@ mod tests {
     fn allow_is_forgotten_when_the_servers_target_changes(cx: &mut TestAppContext) {
         let f = fixture(cx);
         assert_eq!(
-            f.store.read_with(cx, |store, _| store.upload_decision(&f.server_id)),
+            f.store
+                .read_with(cx, |store, _| store.upload_decision(&f.server_id)),
             UploadDecision::Allow
         );
         f.store.update(cx, |store, cx| {
@@ -893,7 +923,8 @@ mod tests {
             store.apply(servers, Vec::new(), cx);
         });
         assert_eq!(
-            f.store.read_with(cx, |store, _| store.upload_decision(&f.server_id)),
+            f.store
+                .read_with(cx, |store, _| store.upload_decision(&f.server_id)),
             UploadDecision::Ask
         );
     }
@@ -921,7 +952,11 @@ mod tests {
         let sneaky = cache_dir.join(&f.server_id).join("www/../www/a.php");
         for path in [other, sneaky, f.dir.path().join("project/a.php")] {
             f.store.update(cx, |store, cx| {
-                assert_eq!(store.upload(&path, true, true, cx), UploadStart::NotRemote, "{path:?}");
+                assert_eq!(
+                    store.upload(&path, true, true, cx),
+                    UploadStart::NotRemote,
+                    "{path:?}"
+                );
                 assert!(store.copy_for_buffer_path(&path).is_none());
             });
         }
@@ -955,8 +990,14 @@ mod tests {
         let [UploadOutcome::Failed(message)] = events.as_slice() else {
             panic!("{events:?}");
         };
-        assert!(message.contains(REMOTE) && message.contains("Prod"), "{message}");
-        assert!(message.contains("the server file may be incomplete"), "{message}");
+        assert!(
+            message.contains(REMOTE) && message.contains("Prod"),
+            "{message}"
+        );
+        assert!(
+            message.contains("the server file may be incomplete"),
+            "{message}"
+        );
         assert!(!message.contains("TOP-SECRET"), "{message}");
     }
 
@@ -977,14 +1018,18 @@ mod tests {
         cx.run_until_parked();
         assert!(!cache_file_exists(&f));
         f.store.read_with(cx, |store, _| {
-            assert!(store.copy_for_buffer_path(&f.cache_path).is_none(), "index pruned");
+            assert!(
+                store.copy_for_buffer_path(&f.cache_path).is_none(),
+                "index pruned"
+            );
         });
     }
 
     #[gpui::test]
     fn disconnect_keeps_the_cache_while_a_buffer_is_dirty(cx: &mut TestAppContext) {
         let f = fixture(cx);
-        f.buffer.update(cx, |buffer, cx| buffer.edit([(0..0, "x")], None, cx));
+        f.buffer
+            .update(cx, |buffer, cx| buffer.edit([(0..0, "x")], None, cx));
         assert!(f.buffer.read_with(cx, |buffer, _| buffer.is_dirty()));
         assert_eq!(f.clear(cx), 1);
         cx.run_until_parked();
@@ -996,7 +1041,10 @@ mod tests {
         let mut f = fixture(cx);
         assert_eq!(f.upload(true, false, cx), UploadStart::Started);
         // The tab is closed, only the upload holds the copy open.
-        drop(std::mem::replace(&mut f.buffer, cx.new(|cx| Buffer::local("", cx))));
+        drop(std::mem::replace(
+            &mut f.buffer,
+            cx.new(|cx| Buffer::local("", cx)),
+        ));
         assert_eq!(f.clear(cx), 1);
         cx.run_until_parked();
         assert!(cache_file_exists(&f));
@@ -1009,8 +1057,9 @@ mod tests {
     #[gpui::test]
     fn deleting_a_server_keeps_the_cache_of_an_open_copy(cx: &mut TestAppContext) {
         let f = fixture(cx);
-        f.store
-            .update(cx, |store, cx| store.apply(Servers::default(), Vec::new(), cx));
+        f.store.update(cx, |store, cx| {
+            store.apply(Servers::default(), Vec::new(), cx)
+        });
         cx.run_until_parked();
         assert!(cache_file_exists(&f), "live buffer: nothing deleted");
     }
@@ -1018,9 +1067,13 @@ mod tests {
     #[gpui::test]
     fn deleting_a_server_without_open_copies_removes_its_cache(cx: &mut TestAppContext) {
         let mut f = fixture(cx);
-        drop(std::mem::replace(&mut f.buffer, cx.new(|cx| Buffer::local("", cx))));
-        f.store
-            .update(cx, |store, cx| store.apply(Servers::default(), Vec::new(), cx));
+        drop(std::mem::replace(
+            &mut f.buffer,
+            cx.new(|cx| Buffer::local("", cx)),
+        ));
+        f.store.update(cx, |store, cx| {
+            store.apply(Servers::default(), Vec::new(), cx)
+        });
         cx.run_until_parked();
         assert!(!cache_file_exists(&f));
     }
