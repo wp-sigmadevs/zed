@@ -744,6 +744,7 @@ impl DeploymentDialog {
 
     fn row(label: &'static str, editor: &Entity<Editor>, cx: &App) -> impl IntoElement {
         h_flex()
+            .debug_selector(|| format!("zenith-deploy-row-{label}"))
             .gap_2()
             .child(
                 div()
@@ -752,6 +753,7 @@ impl DeploymentDialog {
             )
             .child(
                 div()
+                    .debug_selector(|| format!("zenith-deploy-field-{label}"))
                     .flex_1()
                     .px_2()
                     .border_1()
@@ -793,7 +795,9 @@ impl DeploymentDialog {
         let removes_password = self.removes_saved_password(cx);
         let advanced = &server.advanced;
         v_flex()
+            .debug_selector(|| "zenith-deploy-form".to_string())
             .flex_1()
+            .min_w_0()
             .gap_1p5()
             .child(Self::row("Name", &self.fields.name, cx))
             .child(types)
@@ -984,7 +988,7 @@ impl DeploymentDialog {
 }
 
 impl Render for DeploymentDialog {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let form = match self.selected_server().cloned() {
             Some(server) => self.render_form(&server, cx).into_any_element(),
             None => v_flex()
@@ -1001,12 +1005,18 @@ impl Render for DeploymentDialog {
                 )
                 .into_any_element(),
         };
+        // Never wider than the window: a percentage here would resolve against
+        // the modal layer's shrink-wrapped row, not the window.
+        let width = rems(48.)
+            .to_pixels(window.rem_size())
+            .min(window.viewport_size().width * 0.95);
         v_flex()
+            .debug_selector(|| "zenith-deploy-dialog".to_string())
             .key_context("DeploymentDialog")
             .on_action(cx.listener(Self::confirm))
             .on_action(cx.listener(Self::cancel))
             .elevation_3(cx)
-            .w(rems(48.))
+            .w(width)
             .p_3()
             .gap_2()
             .child(Label::new("Deployment").weight(gpui::FontWeight::BOLD))
@@ -1030,7 +1040,7 @@ impl Render for DeploymentDialog {
 mod tests {
     use super::*;
     use crate::test_support::{FakeRemote, init, server, workspace};
-    use gpui::{TestAppContext, VisualTestContext};
+    use gpui::{TestAppContext, VisualTestContext, size};
 
     async fn open_dialog<'a>(
         servers: Servers,
@@ -1891,6 +1901,97 @@ mod tests {
         );
         assert!(keychain.account_of(&stuck).is_some());
         store.read_with(cx, |store, _| assert_eq!(store.servers().servers.len(), 3));
+    }
+
+    /// The form column must stay inside the dialog (it once ran ~67 pt past
+    /// the right edge because a flex child could not shrink below its content).
+    #[gpui::test]
+    async fn the_form_stays_inside_the_dialog(cx: &mut TestAppContext) {
+        const ROWS: [&str; 7] = [
+            "Name",
+            "Host",
+            "Port",
+            "Username",
+            "Password",
+            "Root path",
+            "Web URL",
+        ];
+        const CALLOUTS: [&str; 2] = ["zenith-deploy-insecure", "zenith-deploy-password-removed"];
+        let servers = Servers {
+            servers: vec![server("Live", None)],
+            ..Servers::default()
+        };
+        let (_, dialog, cx) = open_dialog(servers, &FakeRemote::default(), cx).await;
+
+        // (variant, type, anonymous, save password, advanced open)
+        let variants = [
+            ("FTPS", ServerType::Ftps, false, true, false),
+            ("FTP", ServerType::Ftp, false, true, false),
+            (
+                "FTP, password removed",
+                ServerType::Ftp,
+                false,
+                false,
+                false,
+            ),
+            ("FTP, advanced open", ServerType::Ftp, false, true, true),
+            ("SFTP", ServerType::Sftp, false, true, true),
+        ];
+        let mut problems = Vec::new();
+        for window_size in [
+            None,
+            Some(size(px(900.), px(700.))),
+            Some(size(px(600.), px(700.))),
+        ] {
+            if let Some(window_size) = window_size {
+                cx.simulate_resize(window_size);
+            }
+            let viewport = cx.update(|window, _| window.viewport_size());
+            for (variant, server_type, anonymous, save_password, advanced) in variants {
+                dialog.update(cx, |dialog, cx| {
+                    dialog.advanced_open = advanced;
+                    dialog.update_selected(cx, |server| {
+                        server.server_type = server_type;
+                        server.anonymous = anonymous;
+                        server.save_password = save_password;
+                    })
+                });
+                cx.run_until_parked();
+                let dialog_bounds = cx
+                    .debug_bounds("zenith-deploy-dialog")
+                    .expect("the dialog is drawn");
+                let limit = dialog_bounds.right();
+                if limit > viewport.width || dialog_bounds.left() < px(0.) {
+                    problems.push(format!(
+                        "window {:?} {variant}: dialog {:?}..{limit:?} is outside the window",
+                        viewport.width,
+                        dialog_bounds.left()
+                    ));
+                }
+                let mut ids: Vec<String> = vec!["zenith-deploy-form".into()];
+                for label in ROWS {
+                    ids.push(format!("zenith-deploy-row-{label}"));
+                    ids.push(format!("zenith-deploy-field-{label}"));
+                }
+                ids.extend(CALLOUTS.map(String::from));
+                for id in ids {
+                    // Selectors are 'static; leaking a few test strings is fine.
+                    let Some(bounds) = cx.debug_bounds(Box::leak(id.clone().into_boxed_str()))
+                    else {
+                        continue;
+                    };
+                    if bounds.right() > limit + px(0.5) {
+                        problems.push(format!(
+                            "window {:?} {variant}: {id} right {:?} (width {:?}) is past the dialog edge {limit:?}",
+                            viewport.width,
+                            bounds.right(),
+                            bounds.size.width
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(problems.is_empty(), "{}", problems.join("\n"));
     }
 
     #[gpui::test]
