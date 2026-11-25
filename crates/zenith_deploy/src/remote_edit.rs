@@ -474,7 +474,7 @@ async fn cycle(
 }
 
 /// The absolute path of the local file a buffer shows.
-fn buffer_path(buffer: &Buffer, cx: &App) -> Option<PathBuf> {
+pub(crate) fn buffer_path(buffer: &Buffer, cx: &App) -> Option<PathBuf> {
     Some(buffer.file()?.as_local()?.abs_path(cx))
 }
 
