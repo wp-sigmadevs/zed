@@ -562,6 +562,8 @@ pub(crate) mod test_support {
         pub broken: Vec<String>,
         /// Folders that refuse the listing (like a 550) even though the tree has them.
         pub refusing: Arc<Mutex<Vec<String>>>,
+        /// Folders that list as empty from now on, whatever the tree says.
+        pub emptied: Arc<Mutex<Vec<String>>>,
         /// Every upload as (path, bytes).
         pub puts: Arc<Mutex<Vec<(String, Vec<u8>)>>>,
         pub stats: Arc<Mutex<HashMap<String, RemoteStat>>>,
@@ -639,6 +641,13 @@ pub(crate) mod test_support {
                 .is_ok_and(|refusing| refusing.iter().any(|refused| refused == path))
             {
                 return Err(anyhow::Error::new(ServerRefused(format!("550 {path}"))));
+            }
+            if self
+                .emptied
+                .lock()
+                .is_ok_and(|emptied| emptied.iter().any(|folder| folder == path))
+            {
+                return Ok(Vec::new());
             }
             self.tree.get(path).cloned().ok_or_else(|| {
                 if self.broken.iter().any(|broken| broken == path) {

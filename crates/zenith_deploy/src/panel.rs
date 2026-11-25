@@ -100,11 +100,30 @@ struct Row {
     directory: String,
     entry: RemoteEntry,
     depth: usize,
+    /// The "Empty" line under a listed, empty folder. Never selectable, never acted on.
+    placeholder: bool,
 }
 
 impl Row {
     fn path(&self) -> Option<String> {
+        if self.placeholder {
+            return None;
+        }
         join_remote(&self.directory, &self.entry.name).ok()
+    }
+
+    fn placeholder(directory: &str, depth: usize) -> Self {
+        Self {
+            directory: directory.to_string(),
+            entry: RemoteEntry {
+                name: "Empty".into(),
+                kind: EntryKind::File,
+                size: 0,
+                modified: None,
+            },
+            depth,
+            placeholder: true,
+        }
     }
 }
 
@@ -435,6 +454,13 @@ impl RemoteHostPanel {
         {
             self.selected = self.rows.len().checked_sub(1);
         }
+        // The line a selection index now points at may be a placeholder: step back to the
+        // folder it belongs to (a placeholder always follows a real row).
+        while let Some(selected) = self.selected
+            && self.rows[selected].placeholder
+        {
+            self.selected = selected.checked_sub(1);
+        }
         cx.notify();
     }
 
@@ -447,6 +473,7 @@ impl RemoteHostPanel {
                 directory: directory.to_string(),
                 entry: entry.clone(),
                 depth,
+                placeholder: false,
             };
             let path = row.path();
             rows.push(row);
@@ -456,6 +483,11 @@ impl RemoteHostPanel {
             {
                 self.push_rows(&path, depth + 1, rows);
             }
+        }
+        // A finished listing with nothing in it. The root has no row to sit under, and a
+        // folder being listed again shows "Loading…" instead.
+        if entries.is_empty() && depth > 0 && !self.loading.contains(directory) {
+            rows.push(Row::placeholder(directory, depth));
         }
     }
 
@@ -469,6 +501,9 @@ impl RemoteHostPanel {
         let Some(row) = self.rows.get(index).cloned() else {
             return;
         };
+        if row.placeholder {
+            return;
+        }
         self.selected = Some(index);
         let Some(path) = row.path() else {
             return;
@@ -1109,12 +1144,11 @@ impl RemoteHostPanel {
     }
 
     fn select_next(&mut self, _: &menu::SelectNext, _: &mut Window, cx: &mut Context<Self>) {
-        if self.rows.is_empty() {
+        let from = self.selected.map_or(0, |selected| selected + 1);
+        let Some(next) = (from..self.rows.len()).find(|&index| !self.rows[index].placeholder)
+        else {
             return;
-        }
-        let next = self
-            .selected
-            .map_or(0, |selected| (selected + 1).min(self.rows.len() - 1));
+        };
         self.selected = Some(next);
         self.scroll_handle
             .scroll_to_item(next, gpui::ScrollStrategy::Top);
@@ -1127,12 +1161,12 @@ impl RemoteHostPanel {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.rows.is_empty() {
+        let Some(previous) = (0..self.selected.unwrap_or(1))
+            .rev()
+            .find(|&index| self.rows.get(index).is_some_and(|row| !row.placeholder))
+        else {
             return;
-        }
-        let previous = self
-            .selected
-            .map_or(0, |selected| selected.saturating_sub(1));
+        };
         self.selected = Some(previous);
         self.scroll_handle
             .scroll_to_item(previous, gpui::ScrollStrategy::Top);
@@ -1149,6 +1183,28 @@ impl RemoteHostPanel {
         let Some(row) = self.rows.get(index) else {
             return div().into_any_element();
         };
+        if row.placeholder {
+            // Muted text, no icon, no click handler, no hover: nothing to act on.
+            return div()
+                .debug_selector(|| "remote-host-empty".into())
+                .child(
+                    ListItem::new(SharedString::from(format!(
+                        "zenith-deploy-empty-{}",
+                        row.directory
+                    )))
+                    .height(px(ROW_HEIGHT))
+                    .indent_level(row.depth)
+                    .indent_step_size(px(INDENT))
+                    .selectable(false)
+                    .aria_label("Empty folder")
+                    .child(
+                        Label::new("Empty")
+                            .color(Color::Muted)
+                            .size(LabelSize::Small),
+                    ),
+                )
+                .into_any_element();
+        }
         let path = row.path().unwrap_or_default();
         let expanded = self.expanded.contains(&path);
         let (icon, kind) = match row.entry.kind {
@@ -1927,6 +1983,7 @@ mod tests {
             panel
                 .rows
                 .iter()
+                .filter(|row| !row.placeholder)
                 .map(|row| (row.entry.name.clone(), row.depth))
                 .collect()
         })
@@ -1937,7 +1994,7 @@ mod tests {
             panel
                 .rows
                 .iter()
-                .position(|row| row.entry.name == name)
+                .position(|row| !row.placeholder && row.entry.name == name)
                 .expect("row is shown")
         })
     }
@@ -3088,6 +3145,223 @@ mod tests {
         for selector in ["remote-host-hint", "remote-host-upload-status"] {
             assert!(fixture.cx.debug_bounds(selector).is_some(), "{selector}");
         }
+    }
+
+    fn tree_with_an_empty_folder() -> FakeRemote {
+        FakeRemote::new(&[
+            (
+                "/www",
+                &[
+                    ("empty", EntryKind::Directory),
+                    ("full", EntryKind::Directory),
+                    ("z.php", EntryKind::File),
+                ],
+            ),
+            ("/www/empty", &[]),
+            ("/www/full", &[("a.css", EntryKind::File)]),
+        ])
+    }
+
+    /// Connects to the first server and lists the root of `tree_with_an_empty_folder`.
+    async fn connect(fixture: &mut Fixture<'_>) {
+        fixture
+            .workspace
+            .update_in(fixture.cx, |workspace, window, cx| {
+                workspace.focus_panel::<RemoteHostPanel>(window, cx);
+            });
+        fixture.cx.run_until_parked();
+        let server = fixture.servers[0].clone();
+        fixture.panel.update(fixture.cx, |panel, cx| {
+            panel.select_server(Some(server.id.clone()), cx)
+        });
+        fixture.cx.run_until_parked();
+    }
+
+    /// (folder, depth) of every "Empty" placeholder row.
+    fn placeholders(fixture: &mut Fixture<'_>) -> Vec<(String, usize)> {
+        fixture.panel.read_with(fixture.cx, |panel, _| {
+            panel
+                .rows
+                .iter()
+                .filter(|row| row.placeholder)
+                .map(|row| (row.directory.clone(), row.depth))
+                .collect()
+        })
+    }
+
+    fn selected(fixture: &mut Fixture<'_>) -> Option<usize> {
+        fixture
+            .panel
+            .read_with(fixture.cx, |panel, _| panel.selected)
+    }
+
+    #[gpui::test]
+    async fn an_empty_expanded_folder_shows_one_empty_row_under_it(cx: &mut TestAppContext) {
+        let remote = tree_with_an_empty_folder();
+        let mut fixture = fixture(&remote, cx).await;
+        connect(&mut fixture).await;
+        assert!(placeholders(&mut fixture).is_empty(), "nothing is expanded");
+
+        click_row(&mut fixture, "empty");
+        fixture.cx.run_until_parked();
+        assert_eq!(
+            placeholders(&mut fixture),
+            [("/www/empty".to_string(), 1)],
+            "one level deeper than the folder"
+        );
+        fixture.panel.read_with(fixture.cx, |panel, _| {
+            let kinds: Vec<_> = panel
+                .rows
+                .iter()
+                .map(|row| (row.entry.name.as_str(), row.placeholder))
+                .collect();
+            assert_eq!(
+                kinds,
+                [
+                    ("empty", false),
+                    ("Empty", true),
+                    ("full", false),
+                    ("z.php", false)
+                ]
+            );
+        });
+        assert!(fixture.cx.debug_bounds("remote-host-empty").is_some());
+    }
+
+    #[gpui::test]
+    async fn a_folder_with_entries_has_no_empty_row(cx: &mut TestAppContext) {
+        let remote = tree_with_an_empty_folder();
+        let mut fixture = fixture(&remote, cx).await;
+        connect(&mut fixture).await;
+        click_row(&mut fixture, "full");
+        fixture.cx.run_until_parked();
+        assert!(row_names(&mut fixture).contains(&("a.css".to_string(), 1)));
+        assert!(placeholders(&mut fixture).is_empty());
+        assert!(fixture.cx.debug_bounds("remote-host-empty").is_none());
+    }
+
+    #[gpui::test]
+    async fn a_folder_still_loading_has_no_empty_row(cx: &mut TestAppContext) {
+        let remote = tree_with_an_empty_folder();
+        let mut fixture = fixture(&remote, cx).await;
+        connect(&mut fixture).await;
+        click_row(&mut fixture, "empty");
+        assert!(
+            placeholders(&mut fixture).is_empty(),
+            "the listing has not come back yet"
+        );
+        fixture.cx.run_until_parked();
+        assert_eq!(placeholders(&mut fixture).len(), 1);
+
+        // A re-list keeps the old (empty) listing but is loading again: "Loading…", not "Empty".
+        fixture
+            .panel
+            .update(fixture.cx, |panel, cx| panel.refresh(cx));
+        fixture.panel.update(fixture.cx, |panel, cx| {
+            let loading = panel.loading.contains("/www/empty");
+            assert!(loading, "the folder is being listed again");
+            panel.rebuild_rows(cx);
+        });
+        assert!(placeholders(&mut fixture).is_empty());
+        fixture.cx.run_until_parked();
+        assert_eq!(placeholders(&mut fixture).len(), 1);
+    }
+
+    #[gpui::test]
+    async fn collapsing_hides_the_empty_row(cx: &mut TestAppContext) {
+        let remote = tree_with_an_empty_folder();
+        let mut fixture = fixture(&remote, cx).await;
+        connect(&mut fixture).await;
+        click_row(&mut fixture, "empty");
+        fixture.cx.run_until_parked();
+        assert_eq!(placeholders(&mut fixture).len(), 1);
+
+        click_row(&mut fixture, "empty");
+        assert!(placeholders(&mut fixture).is_empty(), "collapsed");
+        assert!(fixture.cx.debug_bounds("remote-host-empty").is_none());
+
+        click_row(&mut fixture, "empty");
+        assert_eq!(placeholders(&mut fixture).len(), 1, "expanded again");
+        fixture
+            .panel
+            .update(fixture.cx, |panel, cx| panel.collapse_all(cx));
+        assert!(placeholders(&mut fixture).is_empty(), "collapse all");
+    }
+
+    #[gpui::test]
+    async fn the_empty_row_cannot_be_selected_clicked_or_stepped_onto(cx: &mut TestAppContext) {
+        let remote = tree_with_an_empty_folder();
+        let mut fixture = fixture(&remote, cx).await;
+        connect(&mut fixture).await;
+        click_row(&mut fixture, "empty");
+        fixture.cx.run_until_parked();
+        let folder = row_index(&mut fixture, "empty");
+        assert_eq!(selected(&mut fixture), Some(folder));
+        let placeholder = folder + 1;
+        let lists = remote.log().len();
+
+        // Enter on it (a stale selection) and a mouse click do nothing.
+        fixture.panel.update_in(fixture.cx, |panel, window, cx| {
+            panel.activate_row(placeholder, window, cx)
+        });
+        let bounds = fixture
+            .cx
+            .debug_bounds("remote-host-empty")
+            .expect("the empty row is drawn");
+        fixture
+            .cx
+            .simulate_click(bounds.center(), gpui::Modifiers::none());
+        fixture.cx.run_until_parked();
+        assert_eq!(selected(&mut fixture), Some(folder));
+        assert_eq!(placeholders(&mut fixture).len(), 1);
+        assert_eq!(remote.log().len(), lists, "nothing was listed or opened");
+        fixture.panel.read_with(fixture.cx, |panel, _| {
+            assert!(panel.expanded.contains("/www/empty"), "still expanded")
+        });
+
+        // The arrow keys step over it.
+        fixture.panel.update_in(fixture.cx, |panel, window, cx| {
+            panel.select_next(&menu::SelectNext, window, cx)
+        });
+        assert_eq!(
+            selected(&mut fixture),
+            Some(row_index(&mut fixture, "full"))
+        );
+        fixture.panel.update_in(fixture.cx, |panel, window, cx| {
+            panel.select_previous(&menu::SelectPrevious, window, cx)
+        });
+        assert_eq!(selected(&mut fixture), Some(folder));
+
+        // A selection index that lands on it after a rebuild moves to the folder.
+        fixture.panel.update(fixture.cx, |panel, cx| {
+            panel.selected = Some(placeholder);
+            panel.rebuild_rows(cx);
+        });
+        assert_eq!(selected(&mut fixture), Some(folder));
+    }
+
+    #[gpui::test]
+    async fn a_folder_that_becomes_empty_after_a_refresh_gets_the_empty_row(
+        cx: &mut TestAppContext,
+    ) {
+        let remote = tree_with_an_empty_folder();
+        let mut fixture = fixture(&remote, cx).await;
+        connect(&mut fixture).await;
+        click_row(&mut fixture, "full");
+        fixture.cx.run_until_parked();
+        assert!(placeholders(&mut fixture).is_empty());
+
+        remote
+            .emptied
+            .lock()
+            .expect("lock")
+            .push("/www/full".into());
+        fixture
+            .panel
+            .update(fixture.cx, |panel, cx| panel.refresh(cx));
+        fixture.cx.run_until_parked();
+        assert_eq!(placeholders(&mut fixture), [("/www/full".to_string(), 1)]);
+        assert!(!row_names(&mut fixture).contains(&("a.css".to_string(), 1)));
     }
 
     #[gpui::test]
