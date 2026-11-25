@@ -168,6 +168,21 @@ async fn test_single_file_worktrees_use_the_real_file_name(cx: &mut TestAppConte
 }
 
 #[gpui::test]
+async fn test_remote_host_caches_under_the_data_dir_are_not_recorded(cx: &mut TestAppContext) {
+    let dir = history_dir();
+    start(cx, dir.path());
+    let fs = FakeFs::new(cx.executor());
+    let cache = paths::data_dir().join("deployment/cache/srv");
+    fs.insert_tree(&cache, json!({ "index.php": "base" }))
+        .await;
+    let file = cache.join("index.php");
+    let project = Project::test(fs, [file.as_path()], cx).await;
+    let path = file.to_string_lossy().into_owned();
+    open_edit_save(&project, &path, "SECRET", cx).await;
+    assert!(revisions_in(cx, dir.path(), &path, "").is_empty());
+}
+
+#[gpui::test]
 async fn test_symlinks_are_not_recorded(cx: &mut TestAppContext) {
     let dir = history_dir();
     start(cx, dir.path());

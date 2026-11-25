@@ -499,6 +499,11 @@ pub(crate) fn is_viewable(file: &worktree::File, cx: &App) -> bool {
     // A single-file worktree (`/dir/.env`) has an empty relative path; the
     // private and exclusion globs must see the real file name instead.
     let abs_path = worktree.abs_path();
+    // Caches of remote hosts (Deployment) hold secrets that must never reach
+    // the history database.
+    if abs_path.starts_with(paths::data_dir()) {
+        return false;
+    }
     let path = if file.path.is_empty() {
         abs_path
             .file_name()
