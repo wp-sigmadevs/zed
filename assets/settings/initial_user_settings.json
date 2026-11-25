@@ -1,9 +1,9 @@
 // Zenith settings
 //
-// For information on how to configure Zed, see the Zed
+// For information on how to configure Zenith, see the Zenith
 // documentation: https://zed.dev/docs/configuring-zed (upstream reference)
 //
-// To see all of Zed's default settings without changing your
+// To see all of Zenith's default settings without changing your
 // custom settings, run `zed: open default settings` from the
 // command palette (cmd-shift-p / ctrl-shift-p)
 {
