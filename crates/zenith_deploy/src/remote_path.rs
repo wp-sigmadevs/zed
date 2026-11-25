@@ -18,8 +18,8 @@ pub fn validate_name(name: &str) -> Result<&str> {
 /// A remote directory or file path as sent in a protocol command. Absolute, so it can never be
 /// read as an option (`-a`) by `LIST` or `sftp`.
 pub fn validate_remote_path(path: &str) -> Result<&str> {
-    if !path.starts_with('/') || path.chars().any(char::is_control) {
-        bail!("remote path {path:?} is not absolute or contains a control character");
+    if !path.starts_with('/') || path.chars().any(|c| c.is_control() || c == '\\') {
+        bail!("remote path {path:?} is not absolute or contains a control character or `\\`");
     }
     if path.split('/').any(|component| component == "..") {
         bail!("remote path {path:?} contains `..`");
@@ -97,7 +97,10 @@ mod tests {
     #[test]
     fn remote_paths_reject_dotdot_and_control_characters() {
         assert!(validate_remote_path("/var/www/html").is_ok());
-        for bad in ["", "-la", "a/b", "/a/../b", "..", "/a\nb", "/a\0b", "/a\r"] {
+        for bad in [
+            "", "-la", "a/b", "/a/../b", "..", "/a\nb", "/a\0b", "/a\r", "/a\\b", "/a\\../b",
+            "/a/b\\",
+        ] {
             assert!(
                 validate_remote_path(bad).is_err(),
                 "{bad:?} must be rejected"

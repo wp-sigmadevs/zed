@@ -289,10 +289,14 @@ impl<T: SmolTlsStream + Send + 'static> Transport for FtpSession<T> {
         let stamp = match self.stream.mdtm(path).await {
             Ok(modified) => Some(modified.to_string()),
             // MDTM is optional: a refusal or an unreadable reply only costs the change stamp.
-            Err(suppaftp::FtpError::UnexpectedResponse(_) | suppaftp::FtpError::BadResponse) => {
+            Err(suppaftp::FtpError::UnexpectedResponse(response))
+                if keeps_session(response.status) =>
+            {
                 None
             }
-            Err(error) => return Err(error.into()),
+            Err(suppaftp::FtpError::BadResponse) => None,
+            // 421 (the server is closing the connection) and I/O errors are real failures.
+            Err(error) => return Err(refusal(error)),
         };
         Ok(Some(RemoteStat { size, stamp }))
     }
@@ -413,6 +417,8 @@ mod tests {
         size: Option<usize>,
         /// The MDTM answer; `None` is a refusal.
         mdtm: Option<&'static str>,
+        /// MDTM answers 421 (the server is closing the control connection).
+        mdtm_closing: bool,
     }
 
     impl Default for FakeFtp {
@@ -422,6 +428,7 @@ mod tests {
                 file: b"file-contents".to_vec(),
                 size: None,
                 mdtm: None,
+                mdtm_closing: false,
             }
         }
     }
@@ -494,6 +501,7 @@ mod tests {
                         Some(size) => reply(&format!("213 {size}\r\n")),
                         None => reply("550 not found\r\n"),
                     },
+                    "MDTM" if script.mdtm_closing => reply("421 closing\r\n"),
                     "MDTM" => match script.mdtm {
                         Some(stamp) => reply(&format!("213 {stamp}\r\n")),
                         None => reply("502 not implemented\r\n"),
@@ -767,5 +775,26 @@ mod tests {
             })
         );
         assert_eq!(stat(FakeFtp::default()), None, "SIZE 550 is a missing file");
+    }
+
+    #[test]
+    fn ftp_stat_is_an_error_when_the_server_closes_during_mdtm() {
+        let (port, server_thread) = fake_ftp_server_with(FakeFtp {
+            size: Some(42),
+            mdtm_closing: true,
+            ..FakeFtp::default()
+        });
+        smol::block_on(async {
+            let mut transport = connect(&plain_server(port)).await.expect("connect");
+            let error = transport
+                .stat("/www/x.php")
+                .await
+                .expect_err("421 is not a missing MDTM");
+            assert!(
+                error.downcast_ref::<ServerRefused>().is_none(),
+                "421 must reset the session: {error:#}"
+            );
+        });
+        server_thread.join().expect("server thread");
     }
 }

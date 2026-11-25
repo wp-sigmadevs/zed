@@ -171,13 +171,14 @@ pub(crate) fn build_args(server: &ServerConfig) -> Result<Vec<String>> {
 
 /// One sftp argument in double quotes. sftp executes a batch line starting with `!` as a local
 /// shell command and treats a newline as a new line, so control characters are refused outright;
-/// `\` and (for remote paths) the glob characters `*?[` are refused too because sftp's own
-/// escaping of them does not round-trip.
+/// `\` and (for remote paths) the glob characters `*?[{}` are refused too because sftp's own
+/// escaping of them does not round-trip (and a `{` brace makes a listing match nothing, which
+/// would read as "the file does not exist").
 fn quote(argument: &str, remote: bool) -> Result<String> {
     if argument.is_empty()
         || argument.chars().any(char::is_control)
         || argument.contains('\\')
-        || (remote && argument.contains(['*', '?', '[']))
+        || (remote && argument.contains(['*', '?', '[', '{', '}']))
     {
         bail!("{argument:?} cannot be sent to sftp safely");
     }
@@ -193,7 +194,7 @@ fn batch_line(line: String) -> Result<String> {
 
 fn list_batch(path: &str) -> Result<String> {
     batch_line(format!(
-        "ls -la {}",
+        "ls -lan {}",
         quote(validate_remote_path(path)?, true)?
     ))
 }
@@ -214,8 +215,8 @@ fn get_batch(remote_path: &str, local_path: &Path) -> Result<String> {
     ))
 }
 
-/// No `-p`: the local file's owner-only mode and its times are never copied onto the remote
-/// file.
+/// No `-p`: the local file's times are not copied. `put` still sends the local mode bits, which
+/// only matter for a remote file that does not exist yet (see `upload_file`).
 fn put_batch(local_path: &Path, remote_path: &str) -> Result<String> {
     batch_line(format!(
         "put {} {}",
@@ -243,6 +244,44 @@ fn ls_stamp(line: &str) -> String {
         .take(3)
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// Picks `name` out of a listing of `parent` and returns its size and stamp. Fails when the
+/// answer could hide a symlink: the name appears twice (a file name holding a newline can forge
+/// a line), or it is absent while a line shows `name -> target` (a link whose own name contains
+/// ` -> ` parses under a shorter name). Lines without the folder prefix are matched by bare
+/// name, since servers older than OpenSSH 9.1 can print a longname without it.
+fn stat_from_listing(output: &str, parent: &str, name: &str) -> Result<Option<RemoteStat>> {
+    let prefix = format!("{}/", parent.trim_end_matches('/'));
+    let matches: Vec<(RemoteEntry, &str)> = output
+        .lines()
+        .filter_map(|line| {
+            let entry = parse_ls_line(line, &prefix).or_else(|| parse_ls_line(line, ""))?;
+            (entry.name == name).then_some((entry, line))
+        })
+        .collect();
+    let (entry, line) = match matches.as_slice() {
+        [] => {
+            let arrows = [format!("/{name} -> "), format!(" {name} -> ")];
+            if output
+                .lines()
+                .any(|line| arrows.iter().any(|arrow| line.contains(arrow)))
+            {
+                bail!("{name:?} is ambiguous in the listing; it may be a symlink");
+            }
+            return Ok(None);
+        }
+        [only] => only,
+        _ => bail!("{name:?} appears more than once in the listing"),
+    };
+    match entry.kind {
+        EntryKind::File => Ok(Some(RemoteStat {
+            size: entry.size,
+            stamp: Some(ls_stamp(line)),
+        })),
+        EntryKind::Symlink => bail!("{name:?} is a symlink; symlinks are not edited"),
+        EntryKind::Directory => bail!("{name:?} is a directory"),
+    }
 }
 
 /// Parses `ls -la` output, stopping one entry past [`MAX_LISTING_ENTRIES`] (the caller then refuses it). sftp prints the full path in the name column, so `directory` is
@@ -342,34 +381,29 @@ impl Transport for SftpTransport {
             Err(error)
                 if error
                     .downcast_ref::<ServerRefused>()
-                    .is_some_and(|refused| refused.0.contains("not found")) =>
+                    .is_some_and(|refused| refused.0.trim_end().ends_with("\" not found")) =>
             {
                 return Ok(None);
             }
             Err(error) => return Err(error),
         };
-        let prefix = format!("{}/", parent.trim_end_matches('/'));
-        let Some((entry, line)) = output.lines().find_map(|line| {
-            parse_ls_line(line, &prefix)
-                .filter(|entry| entry.name == name)
-                .map(|entry| (entry, line))
-        }) else {
-            return Ok(None);
-        };
-        match entry.kind {
-            EntryKind::File => Ok(Some(RemoteStat {
-                size: entry.size,
-                stamp: Some(ls_stamp(line)),
-            })),
-            EntryKind::Symlink => bail!("{name:?} is a symlink; symlinks are not edited"),
-            EntryKind::Directory => bail!("{name:?} is a directory"),
-        }
+        stat_from_listing(&output, parent, name)
     }
 
-    /// The bytes go through a 0600 file in a private directory that is removed afterwards, then
-    /// one `put`. The remote file is written in place.
+    /// The bytes go through a file in a private (0700) directory that is removed afterwards,
+    /// then one `put`. The remote file is written in place. The file is 0644 because `put`
+    /// sends its mode bits: a new remote file is created with them, and a 0600 file would be
+    /// unreadable to the web server; an existing remote file keeps its own mode.
     async fn upload_file(&mut self, remote_path: &str, bytes: &[u8]) -> Result<()> {
-        let directory = tempfile::tempdir().context("creating a directory for the upload")?;
+        let mut builder = tempfile::Builder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            builder.permissions(std::fs::Permissions::from_mode(0o700));
+        }
+        let directory = builder
+            .tempdir()
+            .context("creating a directory for the upload")?;
         let local_path = directory.path().join("upload");
         let batch = put_batch(&local_path, remote_path)?;
         let mut file = create_part_file(&local_path)
@@ -378,6 +412,13 @@ impl Transport for SftpTransport {
         file.write_all(bytes).await?;
         file.flush().await?;
         drop(file);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            smol::fs::set_permissions(&local_path, std::fs::Permissions::from_mode(0o644))
+                .await
+                .context("setting the upload file's mode")?;
+        }
         self.run_in(directory.path(), &batch).await?;
         Ok(())
     }
@@ -451,6 +492,9 @@ mod tests {
             "/a/*",
             "/a/b?",
             "/a/[x]",
+            "/a/{b,c}",
+            "/a{",
+            "/a}",
             "/a\\b",
         ];
         for path in hostile {
@@ -468,7 +512,7 @@ mod tests {
         assert!(get_batch("/x/a", Path::new("/tmp/o\n!touch pwned")).is_err());
         assert!(get_batch("/x/a", Path::new("relative")).is_err());
         let batch = list_batch("/x/!touch pwned").expect("a bang inside a quoted path is inert");
-        assert_eq!(batch, "ls -la \"/x/!touch pwned\"\n");
+        assert_eq!(batch, "ls -lan \"/x/!touch pwned\"\n");
         assert_eq!(
             get_batch("/x/a \"b\".txt", Path::new("/tmp/o")).expect("get"),
             "get \"/x/a \\\"b\\\".txt\" \"/tmp/o\"\n"
@@ -573,22 +617,35 @@ drwxr-xr-x    ? u   g          64 Nov 22 23:48 /www/sub
         let mut transport = SftpTransport::with_program(program, &server()).expect("transport");
         let sleep =
             |millis: u64| smol::unblock(move || std::thread::sleep(Duration::from_millis(millis)));
+        // A child that was killed but not yet reaped shows as `Z`; it no longer runs.
         let alive = |pid: String| async move {
-            util::command::new_command("kill")
-                .args(["-0", &pid])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
+            util::command::new_command("ps")
+                .args(["-o", "stat=", "-p", &pid])
+                .output()
                 .await
-                .is_ok_and(|status| status.success())
+                .is_ok_and(|output| {
+                    output.status.success()
+                        && !String::from_utf8_lossy(&output.stdout)
+                            .trim()
+                            .starts_with('Z')
+                })
         };
         smol::block_on(async {
-            // The timer wins; the pending operation is dropped when the result goes away.
-            futures::future::select(Box::pin(transport.pwd()), Box::pin(sleep(700))).await;
-            let pid = std::fs::read_to_string(&pid_file)
-                .expect("the fake sftp started")
-                .trim()
-                .to_string();
+            let mut operation = Box::pin(transport.pwd());
+            // Poll the operation until the fake sftp has written its pid, then drop it.
+            let started = Instant::now() + Duration::from_secs(10);
+            let pid = loop {
+                if let Some(pid) = std::fs::read_to_string(&pid_file)
+                    .ok()
+                    .map(|text| text.trim().to_string())
+                    .filter(|text| !text.is_empty())
+                {
+                    break pid;
+                }
+                assert!(Instant::now() < started, "the fake sftp never started");
+                futures::future::select(operation.as_mut(), Box::pin(sleep(50))).await;
+            };
+            drop(operation);
             let deadline = Instant::now() + Duration::from_secs(5);
             while alive(pid.clone()).await && Instant::now() < deadline {
                 sleep(50).await;
@@ -662,8 +719,8 @@ drwxr-xr-x    ? u   g          64 Nov 22 23:48 /www/sub
         let local = format!("/{}", "l".repeat(MAX_BATCH_LINE));
         assert!(get_batch("/www/f", Path::new(&local)).is_err());
 
-        // "ls -la \"" + path + "\"" is 9 bytes plus the path; the newline does not count.
-        let longest = format!("/{}", "d".repeat(MAX_BATCH_LINE - 11));
+        // "ls -lan \"" + path + "\"" is 10 bytes plus the path; the newline does not count.
+        let longest = format!("/{}", "d".repeat(MAX_BATCH_LINE - 12));
         let batch = list_batch(&longest).expect("1023-byte line");
         assert_eq!(batch.len(), MAX_BATCH_LINE);
         assert!(list_batch(&format!("{longest}d")).is_err());
@@ -771,6 +828,9 @@ drwxr-xr-x    ? u   g          64 Nov 22 23:48 /www/sub
             "/a/*",
             "/a/b?",
             "/a/[x]",
+            "/a/{b,c}",
+            "/a{",
+            "/a}",
             "!touch pwned",
             "/www/../etc/passwd",
         ] {
@@ -847,11 +907,73 @@ EOF";
         );
         let mut transport = SftpTransport::with_program(program, &server()).expect("transport");
         assert!(smol::block_on(transport.stat("/www/x.php")).is_err());
+        // "not found" somewhere in other output is not the folder-is-missing answer.
+        let program = write_script(
+            directory.path(),
+            "elsewhere",
+            "cat >/dev/null; echo 'remote: key not found in cache; Permission denied' >&2; exit 1",
+        );
+        let mut transport = SftpTransport::with_program(program, &server()).expect("transport");
+        assert!(smol::block_on(transport.stat("/www/x.php")).is_err());
+    }
+
+    #[test]
+    fn stat_matches_a_longname_without_the_folder_prefix() {
+        // Servers older than OpenSSH 9.1 print their own longname, with the bare name.
+        let output = "\
+-rw-r--r--    1 0   0          12 Nov 22 23:48 index.php
+lrwxrwxrwx    1 0   0          11 Nov 22 23:48 evil -> /etc/passwd
+";
+        assert_eq!(
+            stat_from_listing(output, "/www", "index.php").expect("stat"),
+            Some(RemoteStat {
+                size: 12,
+                stamp: Some("Nov 22 23:48".into())
+            })
+        );
+        let error = stat_from_listing(output, "/www", "evil").expect_err("symlink");
+        assert!(error.to_string().contains("symlink"), "{error}");
+        assert_eq!(
+            stat_from_listing(output, "/www", "none").expect("stat"),
+            None
+        );
+    }
+
+    #[test]
+    fn stat_does_not_read_a_symlink_with_an_arrow_in_its_name_as_missing() {
+        let output = "\
+-rw-r--r--    ? u   g          12 Nov 22 23:48 /www/index.php
+lrwxr-xr-x    ? u   g           5 Nov 22 23:48 /www/x -> y -> /etc/passwd
+";
+        let error = stat_from_listing(output, "/www", "x -> y").expect_err("could be a link");
+        assert!(error.to_string().contains("ambiguous"), "{error}");
+        assert_eq!(stat_from_listing(output, "/www", "z").expect("stat"), None);
+    }
+
+    #[test]
+    fn stat_refuses_a_listing_that_names_the_file_twice() {
+        // A file named "a\n-rw-r--r-- 1 u g 3 Nov 1 10:00 index.php" forges a second line.
+        let output = "\
+lrwxr-xr-x    ? u   g           5 Nov 22 23:48 /www/index.php -> /etc/passwd
+-rw-r--r--    ? u   g           3 Nov 22 23:48 index.php
+";
+        let error = stat_from_listing(output, "/www", "index.php").expect_err("two lines");
+        assert!(error.to_string().contains("more than once"), "{error}");
+    }
+
+    #[test]
+    fn brace_characters_are_refused_in_remote_paths() {
+        for path in ["/a/{b,c}", "/a{", "/a}", "/www{/x.php"] {
+            assert!(list_batch(path).is_err(), "{path:?}");
+            assert!(put_batch(Path::new("/tmp/u"), path).is_err(), "{path:?}");
+            assert!(get_batch(path, Path::new("/tmp/u")).is_err(), "{path:?}");
+        }
     }
 
     #[cfg(unix)]
     #[test]
-    fn the_sftp_upload_file_is_owner_only_holds_the_bytes_and_is_removed() {
+    fn the_sftp_upload_file_is_world_readable_in_a_private_directory_holds_the_bytes_and_is_removed()
+     {
         let directory = tempfile::tempdir().expect("tempdir");
         let recorded = directory.path().join("rec");
         std::fs::create_dir(&recorded).expect("mkdir");
@@ -862,7 +984,8 @@ EOF";
                 "cat > '{rec}/batch'\n\
                  local=$(sed -n 's/^put \"\\([^\"]*\\)\".*/\\1/p' '{rec}/batch')\n\
                  echo \"$local\" > '{rec}/local'\n\
-                 find \"$local\" -perm 600 > '{rec}/mode600'\n\
+                 find \"$local\" -perm 644 > '{rec}/mode644'\n\
+                 find \"$(dirname \"$local\")\" -perm 700 > '{rec}/dir700'\n\
                  cat \"$local\" > '{rec}/content'",
                 rec = recorded.display()
             ),
@@ -879,8 +1002,12 @@ EOF";
         let local = String::from_utf8(read("local")).expect("utf8");
         let local = Path::new(local.trim());
         assert!(
-            !read("mode600").is_empty(),
-            "the upload file was not exactly 0600"
+            !read("mode644").is_empty(),
+            "the upload file was not exactly 0644 (a new remote file would be unreadable)"
+        );
+        assert!(
+            !read("dir700").is_empty(),
+            "the upload directory was not exactly 0700"
         );
         assert_eq!(read("content"), bytes);
         let batch = String::from_utf8(read("batch")).expect("utf8");
@@ -960,6 +1087,19 @@ EOF";
             assert_eq!(std::fs::read(&file).expect("read"), b"<?php new");
             let mode = std::fs::metadata(&file).expect("meta").permissions().mode();
             assert_eq!(mode & 0o777, 0o644, "put changed the remote file's mode");
+
+            crate::transport::upload_entry(&mut transport, &path("new.php"), b"<?php")
+                .await
+                .expect("upload a new file");
+            let created = std::fs::metadata(remote.join("new.php"))
+                .expect("created")
+                .permissions()
+                .mode();
+            assert_eq!(
+                created & 0o777,
+                0o644,
+                "a new remote file must be world-readable"
+            );
         });
     }
 }

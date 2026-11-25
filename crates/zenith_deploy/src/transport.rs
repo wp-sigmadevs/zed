@@ -70,6 +70,10 @@ pub trait Transport: Send {
     async fn download_file(&mut self, remote_path: &str, local_path: &Path) -> Result<()>;
     /// Size and change stamp of the remote regular file, `None` when it does not exist. A
     /// directory (and, where the protocol shows it, a symlink) is an error.
+    ///
+    /// `None` is not proof the path is free: FTP answers SIZE with 550 for a missing file, a
+    /// directory and an unreadable path alike, so there `None` also covers those. Callers treat
+    /// `None` as "ask the user first", never as "go ahead".
     async fn stat(&mut self, path: &str) -> Result<Option<RemoteStat>>;
     /// Writes `bytes` over the remote file in place. Callers go through [`upload_entry`].
     async fn upload_file(&mut self, remote_path: &str, bytes: &[u8]) -> Result<()>;
@@ -174,7 +178,14 @@ pub async fn download_entry(
 /// Uploads `bytes` over the remote file `remote_path`, in place (no rename, no delete).
 ///
 /// The only upload path: it validates the path and refuses more than [`MAX_DOWNLOAD_BYTES`]
-/// before anything reaches the wire. Run it through [`crate::spawn_operation`].
+/// before anything reaches the wire. Run it through
+/// [`crate::spawn_operation_with_timeout`] with [`crate::upload_timeout`]: the fixed
+/// [`crate::OPERATION_TIMEOUT`] would cut a large file short on a slow link and leave the remote
+/// file truncated.
+///
+/// Callers must [`Transport::stat`] first and treat `None` or a directory as "ask the user":
+/// SFTP `put` into a path that is now a directory writes `<dir>/upload`, and an FTP `STOR`
+/// follows a server-side symlink (FTP cannot tell a link from a file) and writes its target.
 pub async fn upload_entry(
     transport: &mut dyn Transport,
     remote_path: &str,

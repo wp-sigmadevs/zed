@@ -373,13 +373,29 @@ pub fn spawn_operation<T: Send + 'static>(
     cx: &App,
     operation: impl Future<Output = Result<T>> + Send + 'static,
 ) -> Task<Result<T>> {
+    spawn_operation_with_timeout(cx, OPERATION_TIMEOUT, operation)
+}
+
+/// [`spawn_operation`] with a caller-chosen deadline (uploads: [`upload_timeout`]).
+pub fn spawn_operation_with_timeout<T: Send + 'static>(
+    cx: &App,
+    timeout: Duration,
+    operation: impl Future<Output = Result<T>> + Send + 'static,
+) -> Task<Result<T>> {
     let executor = cx.background_executor().clone();
     cx.background_spawn(async move {
         operation
-            .with_timeout(OPERATION_TIMEOUT, &executor)
+            .with_timeout(timeout, &executor)
             .await
-            .map_err(|_| anyhow!("the server did not answer within {OPERATION_TIMEOUT:?}"))?
+            .map_err(|_| anyhow!("the server did not answer within {timeout:?}"))?
     })
+}
+
+/// The deadline of an upload of `len` bytes: [`OPERATION_TIMEOUT`] plus one second per 64 KiB
+/// (a 64 KiB/s floor), so a 20 MiB file gets about six minutes instead of being cut off after
+/// 30 seconds with the remote file truncated.
+pub fn upload_timeout(len: usize) -> Duration {
+    OPERATION_TIMEOUT + Duration::from_secs((len / (64 * 1024)) as u64)
 }
 
 #[cfg(test)]
@@ -562,6 +578,22 @@ pub(crate) mod test_support {
 mod tests {
     use super::*;
     use gpui::{BorrowAppContext as _, TestAppContext};
+
+    #[test]
+    fn an_upload_deadline_grows_with_the_size_down_to_a_64_kib_per_second_floor() {
+        assert_eq!(upload_timeout(0), OPERATION_TIMEOUT);
+        assert_eq!(upload_timeout(64 * 1024 - 1), OPERATION_TIMEOUT);
+        assert_eq!(
+            upload_timeout(64 * 1024),
+            OPERATION_TIMEOUT + Duration::from_secs(1)
+        );
+        // 20 MiB at 64 KiB/s is 320 s: the deadline covers it.
+        assert!(upload_timeout(20 * 1024 * 1024) >= Duration::from_secs(320));
+        assert_eq!(
+            upload_timeout(64 * 1024 * 1024),
+            OPERATION_TIMEOUT + Duration::from_secs(1024)
+        );
+    }
 
     #[test]
     fn removing_the_cache_is_retried_while_a_cancelled_download_still_writes() {
