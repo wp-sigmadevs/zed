@@ -563,7 +563,14 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
                     text,
                     title,
                     language,
-                } => open_bundled_file(workspace, text.clone(), title, language, window, cx),
+                } => open_bundled_file(
+                    workspace,
+                    zenith::rebrand_text(text.clone()),
+                    title,
+                    language,
+                    window,
+                    cx,
+                ),
                 _ => {}
             }
         })
