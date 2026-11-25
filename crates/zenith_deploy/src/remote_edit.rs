@@ -531,6 +531,24 @@ impl ServerStore {
             && self.set_upload_decision(server_id, decision)
     }
 
+    /// The remote stat recorded for the copy at `cache_path`, only while it is still the same
+    /// file on the same server target (host, port, type, user): a stat from another host says
+    /// nothing about this one. `None` makes the next upload ask first.
+    pub(crate) fn baseline_for(
+        &self,
+        cache_path: &Path,
+        server_id: &str,
+        remote_path: &str,
+    ) -> Option<RemoteStat> {
+        let copy = self.copies.get(cache_path)?;
+        let current = self.current_target(server_id)?;
+        (copy.server_id == server_id
+            && copy.remote_path == remote_path
+            && target_problem(&copy.target, Some(&current)).is_none())
+        .then(|| copy.stat.clone())
+        .flatten()
+    }
+
     /// Claims `cache_path` for a download that is about to start: `None` while the copy is open
     /// or another download into it (any window) is running. The claim ends when the returned
     /// guard is dropped, so a cancelled task cannot leave it behind. Without it two windows

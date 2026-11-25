@@ -4,9 +4,11 @@
 //! the host after the user confirms (plan 37 M4a).
 
 use std::{
+    cell::Cell,
     collections::{HashMap, HashSet},
     ops::Range,
     path::{Path, PathBuf},
+    rc::Rc,
     sync::Arc,
 };
 
@@ -139,7 +141,7 @@ pub struct RemoteHostPanel {
     notice: Option<SharedString>,
     /// A prompt of this window is on screen: a second one would replace it (window.rs), so
     /// later questions become toasts until it is answered.
-    prompt_open: bool,
+    prompt_open: Rc<Cell<bool>>,
     /// The tasks waiting for those answers. Not cleared by Disconnect: the prompt stays up.
     prompts: HashMap<PathBuf, Task<()>>,
     _subscriptions: Vec<Subscription>,
@@ -198,7 +200,7 @@ impl RemoteHostPanel {
                 })
             },
             notice: None,
-            prompt_open: false,
+            prompt_open: Rc::default(),
             prompts: HashMap::new(),
             _subscriptions: subscriptions,
         };
@@ -520,8 +522,8 @@ impl RemoteHostPanel {
         let workspace = self.workspace.clone();
         let store = self.store.clone();
         let server_id = server.id.clone();
-        let server_name = plain_text(&server.name, 60);
-        let file_label = plain_text(&row.entry.name, 100);
+        let server_name = shown(&server.name, 60);
+        let file_label = shown(&row.entry.name, 100);
         let key = format!("open:{remote_path}");
         let task = cx.spawn_in(window, async move |this, cx| {
             let result = async {
@@ -568,6 +570,8 @@ impl RemoteHostPanel {
                 // closed with changes that never uploaded) is only replaced after the user says so.
                 let incoming = local_directory
                     .join(format!(".zenith-incoming-{}", uuid::Uuid::new_v4()));
+                // Removed on every exit, including a task dropped by a reset or a closing window.
+                let _incoming_guard = IncomingDir(incoming.clone());
                 let fetched = cx
                     .update(|_, cx| {
                         let remote_path = remote_path.clone();
@@ -593,8 +597,9 @@ impl RemoteHostPanel {
                 let mut stat = fetched.stat.clone();
                 let mut choice = ReopenAnswer::UseServer;
                 if fetched.differs {
-                    let busy =
-                        this.update(cx, |this, _| std::mem::replace(&mut this.prompt_open, true))?;
+                    // Freed when this task ends, however it ends.
+                    let slot = this.update(cx, |this, _| claim_prompt(&this.prompt_open))?;
+                    let busy = slot.is_none();
                     choice = if busy {
                         ReopenAnswer::Cancel
                     } else {
@@ -616,16 +621,13 @@ impl RemoteHostPanel {
                             )
                         })?;
                         let answer = answer.await.unwrap_or(2);
-                        this.update(cx, |this, _| this.prompt_open = false).log_err();
+                        drop(slot);
                         reopen_answer(answer)
                     };
                     if choice == ReopenAnswer::Keep {
                         // Your version, compared with the server as it was when you got it.
                         stat = cx.update(|_, cx| {
-                            store
-                                .read(cx)
-                                .copy_for_buffer_path(&cache_path)
-                                .and_then(|copy| copy.stat.clone())
+                            store.read(cx).baseline_for(&cache_path, &server_id, &remote_path)
                         })?;
                     }
                     if busy {
@@ -815,9 +817,9 @@ impl RemoteHostPanel {
             .find(|server| server.id == copy.server_id)?;
         let file = copy.remote_path.rsplit('/').next().unwrap_or_default();
         Some(Described {
-            file: plain_text(file, 100),
-            name: plain_text(&server.name, 60),
-            host: plain_text(&server.host, 100),
+            file: shown(file, 100),
+            name: shown(&server.name, 60),
+            host: shown(&server.host, 100),
             server_type: server.server_type,
             target: secrets::target_account(server),
         })
@@ -842,11 +844,10 @@ impl RemoteHostPanel {
         let Some(described) = self.describe(&cache_path, cx) else {
             return;
         };
-        if self.prompt_open {
+        let Some(slot) = claim_prompt(&self.prompt_open) else {
             self.saved_here_only(&described.file, buffer, cx);
             return;
-        }
-        self.prompt_open = true;
+        };
         let message = format!(
             "Upload {} to {} ({})?",
             described.file, described.name, described.host
@@ -865,8 +866,8 @@ impl RemoteHostPanel {
         let target = described.target;
         let task = cx.spawn_in(window, async move |this, cx| {
             let answer = upload_answer(answer.await.unwrap_or(2));
+            drop(slot);
             this.update_in(cx, |this, window, cx| {
-                this.prompt_open = false;
                 let Some(buffer) = buffer.upgrade() else {
                     return;
                 };
@@ -1016,21 +1017,20 @@ impl RemoteHostPanel {
             );
             return;
         };
-        if self.prompt_open {
+        let Some(slot) = claim_prompt(&self.prompt_open) else {
             let file = self
                 .describe(cache_path, cx)
                 .map(|described| described.file)
                 .unwrap_or_default();
             self.saved_here_only(&file, &buffer, cx);
             return;
-        }
-        self.prompt_open = true;
+        };
         let answers = force_buttons(yes);
         let answer = window.prompt(PromptLevel::Warning, &message, Some(detail), &answers, cx);
         let task = cx.spawn_in(window, async move |this, cx| {
             let answer = answer.await.unwrap_or(0);
+            drop(slot);
             this.update_in(cx, |this, window, cx| {
-                this.prompt_open = false;
                 // The button names the server and the file, and a stop only follows an upload the
                 // user already allowed: this call is consent as well as force.
                 if confirmed(answer) {
@@ -1163,9 +1163,12 @@ impl RemoteHostPanel {
             .indent_level(row.depth)
             .indent_step_size(px(INDENT))
             .toggle_state(self.selected == Some(index))
-            .aria_label(SharedString::from(format!("{} ({kind})", row.entry.name)))
+            .aria_label(SharedString::from(format!(
+                "{} ({kind})",
+                shown(&row.entry.name, 200)
+            )))
             .start_slot(Icon::new(icon).size(IconSize::Small).color(Color::Muted))
-            .child(Label::new(row.entry.name.clone()))
+            .child(Label::new(shown(&row.entry.name, 200)))
             .when(loading, |item| {
                 item.end_slot(
                     Label::new("Loading…")
@@ -1478,12 +1481,61 @@ fn upload_detail(server_type: ServerType) -> String {
     lines.join("\n")
 }
 
+/// `plain_text`, or "(unnamed)" when nothing visible is left: a prompt must never name a file
+/// or server with an empty string.
+fn shown(text: &str, max: usize) -> String {
+    let text = plain_text(text, max);
+    if text.is_empty() {
+        "(unnamed)".into()
+    } else {
+        text
+    }
+}
+
+/// The right to show a prompt in this window; a second prompt would replace the first, so only
+/// one holder exists. Dropping the slot (answer handled, or the task that holds it cancelled by a
+/// reset or a closing window) frees it.
+struct PromptSlot(Rc<Cell<bool>>);
+
+impl Drop for PromptSlot {
+    fn drop(&mut self) {
+        self.0.set(false);
+    }
+}
+
+fn claim_prompt(flag: &Rc<Cell<bool>>) -> Option<PromptSlot> {
+    if flag.replace(true) {
+        None
+    } else {
+        Some(PromptSlot(flag.clone()))
+    }
+}
+
+/// The directory a download waits in; removed when dropped, whatever ends the task. The bytes
+/// are the server's (maybe `wp-config.php`).
+struct IncomingDir(PathBuf);
+
+impl Drop for IncomingDir {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.0).ok();
+    }
+}
+
 /// Characters that show nothing or reorder text: format characters (zero-width, bidi
 /// overrides and isolates, tags, soft hyphen, BOM).
 fn is_invisible(c: char) -> bool {
     matches!(u32::from(c),
-        0xAD | 0x61C | 0x180E | 0x200B..=0x200F | 0x202A..=0x202E | 0x2060..=0x206F
-        | 0xFEFF | 0xFFF9..=0xFFFB | 0xE0000..=0xE007F)
+        0xAD | 0x34F | 0x61C | 0x115F | 0x1160 | 0x180E | 0x200B | 0x200E..=0x200F
+        | 0x202A..=0x202E | 0x2060..=0x206F | 0x3164 | 0xFEFF | 0xFFA0 | 0xFFF9..=0xFFFB
+        | 0xE0000..=0xE007F)
+}
+
+/// A mark that attaches to the character before it: cutting between them, or starting a text
+/// with one, would attach it to whatever is shown next to the text.
+fn is_combining(c: char) -> bool {
+    matches!(u32::from(c),
+        0x300..=0x36F | 0x483..=0x489 | 0x591..=0x5BD | 0x1AB0..=0x1AFF | 0x1DC0..=0x1DFF
+        | 0x200D | 0x20D0..=0x20FF | 0xFE00..=0xFE0F | 0xFE20..=0xFE2F)
 }
 
 /// Text from a server or a listing, made safe to show: ANSI escape sequences removed whole,
@@ -1526,11 +1578,17 @@ fn plain_text(text: &str, max: usize) -> String {
         kept.push(if c.is_control() { ' ' } else { c });
     }
     let line = kept.split_whitespace().collect::<Vec<_>>().join(" ");
-    if line.chars().count() > max {
-        line.chars().take(max).collect::<String>() + "…"
-    } else {
-        line
+    let mut chars: Vec<char> = line.chars().skip_while(|c| is_combining(*c)).collect();
+    if chars.len() > max {
+        let mut cut = max;
+        // Never between a character and its marks: the whole cluster goes.
+        while cut > 0 && is_combining(chars[cut]) {
+            cut -= 1;
+        }
+        chars.truncate(cut);
+        chars.push('…');
     }
+    chars.into_iter().collect()
 }
 
 /// Where a cache file is open.
@@ -2847,7 +2905,7 @@ mod tests {
         assert!(
             !fixture
                 .panel
-                .read_with(fixture.cx, |panel, _| panel.prompt_open)
+                .read_with(fixture.cx, |panel, _| panel.prompt_open.get())
         );
     }
 
@@ -2990,7 +3048,7 @@ mod tests {
         assert!(puts(&remote).is_empty());
         let open = fixture
             .panel
-            .read_with(fixture.cx, |panel, _| panel.prompt_open);
+            .read_with(fixture.cx, |panel, _| panel.prompt_open.get());
         assert!(!open);
     }
 
@@ -3012,6 +3070,87 @@ mod tests {
         for selector in ["remote-host-hint", "remote-host-upload-status"] {
             assert!(fixture.cx.debug_bounds(selector).is_some(), "{selector}");
         }
+    }
+
+    #[gpui::test]
+    async fn a_reset_frees_the_prompt_slot_and_removes_the_waiting_download(
+        cx: &mut TestAppContext,
+    ) {
+        let remote = remote_with_baseline();
+        let mut fixture = fixture(&remote, cx).await;
+        let cached = reopen_with_saved_copy(&mut fixture, &remote, "mine").await;
+        assert!(
+            fixture
+                .panel
+                .read_with(fixture.cx, |panel, _| panel.prompt_open.get())
+        );
+        assert_eq!(
+            incoming_leftovers(&cached).len(),
+            1,
+            "the server's bytes wait beside the cache while the question is up"
+        );
+
+        // Another window edits the server: this panel resets and drops the task that waits.
+        fixture
+            .panel
+            .update(fixture.cx, |panel, cx| panel.reset(cx));
+        // A dropped task releases its future (and what it holds) when the executor next runs it.
+        fixture.cx.run_until_parked();
+        assert!(
+            !fixture
+                .panel
+                .read_with(fixture.cx, |panel, _| panel.prompt_open.get()),
+            "the slot is freed with the task"
+        );
+        assert!(
+            incoming_leftovers(&cached).is_empty(),
+            "{:?}",
+            incoming_leftovers(&cached)
+        );
+
+        // The next question still appears.
+        fixture.cx.simulate_prompt_answer("Cancel"); // the stale prompt on screen
+        let server = fixture.servers[0].clone();
+        fixture.panel.update(fixture.cx, |panel, cx| {
+            panel.select_server(Some(server.id.clone()), cx)
+        });
+        poll_until(&mut fixture, |fixture| !row_names(fixture).is_empty()).await;
+        click_row(&mut fixture, "index.php");
+        poll_until(&mut fixture, |fixture| fixture.cx.has_pending_prompt()).await;
+        let (message, _) = fixture.cx.pending_prompt().expect("prompt");
+        assert!(message.contains("differs"), "{message}");
+    }
+
+    #[gpui::test]
+    async fn keeping_a_saved_copy_does_not_reuse_a_stat_from_another_host(cx: &mut TestAppContext) {
+        let remote = remote_with_baseline();
+        let mut fixture = fixture(&remote, cx).await;
+        let opened = open_index(&mut fixture).await;
+        let (cached, server) = close_tab(&mut fixture, opened).await;
+        std::fs::write(&cached, "mine").expect("saved copy");
+        let store = store(&mut fixture);
+        store.update(fixture.cx, |store, _| {
+            store.servers.servers[0].host = "moved.example.net".into();
+        });
+        let id = server.id.clone();
+        fixture
+            .panel
+            .update(fixture.cx, |panel, cx| panel.select_server(Some(id), cx));
+        poll_until(&mut fixture, |fixture| !row_names(fixture).is_empty()).await;
+        click_row(&mut fixture, "index.php");
+        poll_until(&mut fixture, |fixture| fixture.cx.has_pending_prompt()).await;
+        fixture.cx.simulate_prompt_answer("Keep my saved copy");
+        editor_opens(&mut fixture).await;
+        let baseline = store.read_with(fixture.cx, |store, _| {
+            store
+                .copy_for_buffer_path(&cached)
+                .map(|copy| copy.stat.clone())
+        });
+        assert_eq!(
+            baseline,
+            Some(None),
+            "no stamp of the old host: the first upload asks first"
+        );
     }
 
     #[test]
@@ -3118,6 +3257,21 @@ mod tests {
         assert!(short.ends_with('…'));
         assert_eq!(plain_text("héllo", 5), "héllo");
         assert_eq!(plain_text("日本語.php", 20), "日本語.php");
+        assert_eq!(
+            plain_text("a\u{3164}b\u{FFA0}c\u{115F}d\u{1160}e\u{34F}f", 50),
+            "abcdef"
+        );
+        assert_eq!(
+            plain_text("\u{1F468}\u{200D}\u{1F469}", 50),
+            "\u{1F468}\u{200D}\u{1F469}",
+            "a joiner is not a reordering control"
+        );
+        assert_eq!(plain_text("\u{301}abc", 50), "abc", "no leading mark");
+        // A cut never separates a character from its mark: the whole cluster goes.
+        assert_eq!(plain_text("abe\u{301}f", 3), "ab…");
+        assert_eq!(plain_text("abce\u{301}", 4), "abc…");
+        assert_eq!(shown("\u{200B}\u{202E}", 50), "(unnamed)");
+        assert_eq!(shown("a.php", 50), "a.php");
     }
 
     #[test]
