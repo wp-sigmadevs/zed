@@ -123,6 +123,9 @@ pub struct RemoteHostPanel {
     /// Remote copies this window opened, by cache path. An entry stays after its tab closes so a
     /// late upload result is still reported here; its subscriptions go with the buffer.
     owned: HashMap<PathBuf, OwnedCopy>,
+    /// `is_local_unshared` of this window's project. A closure, not a workspace read: the
+    /// palette action runs while the workspace is being updated.
+    local_unshared: Box<dyn Fn(&App) -> bool>,
     /// A status line that is not an error ("Uploaded …").
     notice: Option<SharedString>,
     /// Cache paths with a confirmation prompt on screen (one at a time per file).
@@ -177,6 +180,13 @@ impl RemoteHostPanel {
             scroll_handle: UniformListScrollHandle::new(),
             operations: HashMap::new(),
             owned: HashMap::new(),
+            local_unshared: {
+                let project = workspace.project().clone();
+                Box::new(move |cx| {
+                    let project = project.read(cx);
+                    is_local_unshared(project.is_local(), project.is_shared())
+                })
+            },
             notice: None,
             asking: HashSet::new(),
             prompts: HashMap::new(),
@@ -647,16 +657,6 @@ impl RemoteHostPanel {
         cx.notify();
     }
 
-    /// `is_local_unshared` for the project of this window (the one that owns the buffer).
-    fn project_is_local_unshared(&self, cx: &App) -> bool {
-        self.workspace
-            .read_with(cx, |workspace, cx| {
-                let project = workspace.project().read(cx);
-                is_local_unshared(project.is_local(), project.is_shared())
-            })
-            .unwrap_or(false)
-    }
-
     fn buffer_saved(
         &mut self,
         buffer: &Entity<Buffer>,
@@ -696,7 +696,7 @@ impl RemoteHostPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let local_unshared = self.project_is_local_unshared(cx);
+        let local_unshared = (self.local_unshared)(cx);
         let start = self.store.update(cx, |store, cx| {
             store.upload(buffer, local_unshared, force, consent_once, cx)
         });
@@ -887,14 +887,18 @@ impl RemoteHostPanel {
     /// Plain, shortened text: a server's reply may be in `message`.
     fn toast(&mut self, message: &str, cx: &mut Context<Self>) {
         let message = plain_truncated(message, MAX_TOAST_CHARS);
-        self.workspace
-            .update(cx, |workspace, cx| {
-                workspace.show_toast(
-                    Toast::new(NotificationId::unique::<RemoteHostPanel>(), message),
-                    cx,
-                )
-            })
-            .log_err();
+        let workspace = self.workspace.clone();
+        // Deferred: the palette action runs while the workspace is being updated.
+        cx.defer(move |cx| {
+            workspace
+                .update(cx, |workspace, cx| {
+                    workspace.show_toast(
+                        Toast::new(NotificationId::unique::<RemoteHostPanel>(), message),
+                        cx,
+                    )
+                })
+                .log_err();
+        });
     }
 
     /// An upload of this panel's server is running.
@@ -2226,6 +2230,84 @@ mod tests {
             .panel
             .read_with(fixture.cx, |panel, _| panel.status.clone());
         assert_eq!(status.as_deref(), Some("Kept 1 open remote files."));
+    }
+
+    #[gpui::test]
+    async fn the_upload_action_uploads_the_saved_text_of_the_active_remote_copy(
+        cx: &mut TestAppContext,
+    ) {
+        let remote = remote_with_baseline();
+        let mut fixture = fixture(&remote, cx).await;
+        let opened = open_index(&mut fixture).await;
+        edit_and_save(&mut fixture, &opened, "kept local").await;
+        fixture.cx.simulate_prompt_answer("Not now");
+        fixture.cx.run_until_parked();
+        assert!(puts(&remote).is_empty());
+
+        // The editor has focus: the action reaches the workspace through the key path.
+        opened.editor.update_in(fixture.cx, |editor, window, cx| {
+            window.focus(&editor.focus_handle(cx), cx)
+        });
+        fixture.cx.dispatch_action(UploadRemoteCopy);
+        fixture.cx.run_until_parked();
+        assert!(fixture.cx.has_pending_prompt(), "still asks first");
+        fixture.cx.simulate_prompt_answer("Upload");
+        fixture.cx.run_until_parked();
+        assert_eq!(puts(&remote), [(INDEX.to_string(), b"kept local".to_vec())]);
+
+        // Another file is not a remote copy: nothing is asked or sent.
+        fixture
+            .workspace
+            .update_in(fixture.cx, |workspace, window, cx| {
+                workspace.open_abs_path(
+                    PathBuf::from("/p/a.txt"),
+                    OpenOptions::default(),
+                    window,
+                    cx,
+                )
+            })
+            .await
+            .expect("another tab");
+        fixture.cx.dispatch_action(UploadRemoteCopy);
+        fixture.cx.run_until_parked();
+        assert!(!fixture.cx.has_pending_prompt());
+        assert_eq!(puts(&remote).len(), 1);
+    }
+
+    #[gpui::test]
+    async fn closing_the_last_tab_finishes_a_disconnect_that_kept_the_copy(
+        cx: &mut TestAppContext,
+    ) {
+        let remote = remote_with_baseline();
+        let mut fixture = fixture(&remote, cx).await;
+        let Opened {
+            editor,
+            buffer,
+            cached,
+            ..
+        } = open_index(&mut fixture).await;
+        fixture
+            .panel
+            .update(fixture.cx, |panel, cx| panel.disconnect(cx));
+        fixture.cx.run_until_parked();
+        assert!(cached.exists(), "kept while the tab is open");
+
+        drop((editor, buffer));
+        fixture
+            .workspace
+            .update_in(fixture.cx, |workspace, window, cx| {
+                let pane = workspace.active_pane().clone();
+                pane.update(cx, |pane, cx| {
+                    pane.close_active_item(&workspace::CloseActiveItem::default(), window, cx)
+                })
+            })
+            .await
+            .expect("closed");
+        fixture.cx.run_until_parked();
+        // The release callbacks run at the next effect flush; the app flushes constantly.
+        fixture.cx.update(|_, _| ());
+        fixture.cx.run_until_parked();
+        assert!(!cached.exists(), "the release finishes the Disconnect");
     }
 
     #[test]
