@@ -292,7 +292,7 @@ pub fn init(cx: &mut App) {
         with_active_or_new_workspace(cx, |workspace, window, cx| {
             open_bundled_file(
                 workspace,
-                settings::default_semantic_token_rules(),
+                zenith::rebrand_text(settings::default_semantic_token_rules()),
                 "Default Semantic Token Rules",
                 "JSONC",
                 window,
