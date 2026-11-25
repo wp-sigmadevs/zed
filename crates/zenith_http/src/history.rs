@@ -197,13 +197,14 @@ fn content_type(headers: &[(String, String)]) -> Option<&str> {
 
 /// `body` with the values of secret fields masked, or `None` when nothing was masked (or it
 /// did not parse), so the stored body stays byte-for-byte what was sent or received. A multipart
-/// body it cannot split, or a cut line it cannot parse, comes back as a marker instead.
+/// body it cannot split comes back as a marker instead. The body is taken as complete: for one
+/// the run cut off, see [`mask_secret_body_cut`].
 fn mask_secret_body(body: &str, content_type: Option<&str>) -> Option<String> {
     mask_secret_body_cut(body, content_type, false)
 }
 
 /// [`mask_secret_body`] for a body that may have been cut off by the run (`truncated`): JSON
-/// lines then lose the cut line instead of keeping it.
+/// lines then lose the cut line, which comes back as [`UNMASKABLE_LINE`].
 fn mask_secret_body_cut(body: &str, content_type: Option<&str>, truncated: bool) -> Option<String> {
     let content_type = content_type.unwrap_or_default().to_ascii_lowercase();
     if content_type.contains("x-www-form-urlencoded") {
@@ -212,30 +213,36 @@ fn mask_secret_body_cut(body: &str, content_type: Option<&str>, truncated: bool)
     if content_type.starts_with("multipart/") {
         return mask_secret_multipart(body, &content_type);
     }
-    let lines_type = ["ndjson", "jsonl", "stream+json", "json-seq"]
+    // json-seq frames its records on U+001E, not on lines: a record may span several.
+    if content_type.contains("json-seq") {
+        return mask_json_records(body, truncated, '\u{1e}');
+    }
+    let lines_type = ["ndjson", "jsonl", "stream+json"]
         .iter()
         .any(|name| content_type.contains(name));
     let text = body.trim_start_matches('\u{feff}');
     // shortcut: plain text, XML and other formats are stored as is; add a format here when one
     // starts carrying credentials in practice.
-    // A JSON lines body of one line is masked line by line, to keep its line ending; a longer
-    // one may still be one JSON value written over several lines, which parses whole.
-    if !(lines_type && !text.trim().contains('\n'))
-        && let Ok(mut json) = serde_json::from_str::<serde_json::Value>(text)
-    {
-        if !mask_secret_json(&mut json) {
+    if !lines_type && let Some(mut parsed) = parse_json(text) {
+        if !mask_parsed(&mut parsed) {
             return None;
         }
-        return if text.contains('\n') {
-            serde_json::to_string_pretty(&json).ok()
-        } else {
-            serde_json::to_string(&json).ok()
-        };
+        return render_json(&parsed.0, text.contains('\n'));
     }
-    // Whole-body parsing failed: JSON lines served as `application/json` (watch streams, event
-    // feeds) are masked per line, but only when complete; a cut one is not stored (`append`).
-    if lines_type || (!truncated && content_type.contains("json")) {
-        return mask_secret_ndjson(body, truncated);
+    if truncated {
+        // A cut body never parses whole; only JSON lines can lose just their cut line, any
+        // other JSON is left for `append` to drop.
+        return lines_type
+            .then(|| mask_json_records(body, true, '\n'))
+            .flatten();
+    }
+    // A complete body in a JSON type is one value, several values one after another (one per
+    // line, pretty-printed, on a shared line) or lines of which some are not JSON.
+    if lines_type || content_type.contains("json") {
+        return match mask_json_stream(text) {
+            Some(masked) => masked,
+            None => mask_json_records(body, false, '\n'),
+        };
     }
     None
 }
@@ -247,72 +254,194 @@ const UNMASKABLE_LINE: &str = "[line not stored: truncated, secrets could not be
 const UNMASKABLE_MULTIPART: &str =
     "[body not stored: multipart boundary not found, secrets could not be masked]";
 
-/// Masks a JSON lines body (`application/x-ndjson`, `application/jsonl`) line by line, keeping
-/// every line separator, a leading BOM and the record separator of `json-seq`. A line that is
-/// not JSON is kept.
-///
-/// A `truncated` body ends in a cut line, then the run's own note: only the last data line may
-/// fail to parse, and is replaced by a marker, since a secret may sit before the cut; the note
-/// is kept. Any earlier line that fails (a pretty-printed value cut off, plain text) makes the
-/// whole body unmaskable: `None`, so `append` stores [`UNMASKABLE_BODY`]. That is simpler than a
-/// marker per line and as safe.
-fn mask_secret_ndjson(body: &str, truncated: bool) -> Option<String> {
-    let segments = body.split_inclusive('\n').collect::<Vec<_>>();
-    let is_blank = |segment: &str| segment.trim().is_empty();
-    let mut data_end = segments.len();
-    if truncated
-        && let Some(last) = segments.iter().rposition(|segment| !is_blank(segment))
-        && segments[last].starts_with(TRUNCATION_NOTE_PREFIX)
-    {
-        data_end = last;
-    }
-    let last_data = segments[..data_end]
-        .iter()
-        .rposition(|segment| !is_blank(segment));
-    let mut changed = false;
-    let mut lines = String::with_capacity(body.len());
-    for (ix, segment) in segments.iter().enumerate() {
-        let line = segment.trim_end_matches(['\r', '\n']);
-        let ending = &segment[line.len()..];
-        let content = line.trim_start_matches(['\u{feff}', '\u{1e}']);
-        let prefix = &line[..line.len() - content.len()];
-        let masked = if ix >= data_end || is_blank(line) {
-            None
-        } else {
-            match serde_json::from_str::<serde_json::Value>(content) {
-                Ok(mut json) => mask_secret_json(&mut json).then(|| {
-                    // Compact: one value per line is the format. A value always serializes;
-                    // were it not, the marker keeps the secret out.
-                    serde_json::to_string(&json).unwrap_or_else(|_| UNMASKABLE_LINE.to_string())
-                }),
-                Err(_) if !truncated => None,
-                Err(_) if Some(ix) == last_data => Some(UNMASKABLE_LINE.to_string()),
-                Err(_) => return None,
+/// A JSON value that remembers whether an object in it repeated a key. `serde_json::Value`
+/// keeps the last value of a repeated key, so `{"token":"s","token":null}` would parse to
+/// nothing secret and be stored as written, secret included.
+struct Parsed(serde_json::Value, bool);
+
+impl<'de> Deserialize<'de> for Parsed {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = Parsed;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("any JSON value")
             }
+
+            fn visit_unit<E>(self) -> Result<Parsed, E> {
+                Ok(Parsed(serde_json::Value::Null, false))
+            }
+
+            fn visit_bool<E>(self, value: bool) -> Result<Parsed, E> {
+                Ok(Parsed(value.into(), false))
+            }
+
+            fn visit_i64<E>(self, value: i64) -> Result<Parsed, E> {
+                Ok(Parsed(value.into(), false))
+            }
+
+            fn visit_u64<E>(self, value: u64) -> Result<Parsed, E> {
+                Ok(Parsed(value.into(), false))
+            }
+
+            fn visit_f64<E>(self, value: f64) -> Result<Parsed, E> {
+                Ok(Parsed(value.into(), false))
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Parsed, E> {
+                Ok(Parsed(value.into(), false))
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Parsed, A::Error> {
+                let (mut items, mut repeated) = (Vec::new(), false);
+                while let Some(Parsed(item, item_repeated)) = seq.next_element()? {
+                    items.push(item);
+                    repeated |= item_repeated;
+                }
+                Ok(Parsed(items.into(), repeated))
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Parsed, A::Error> {
+                let (mut object, mut repeated) = (serde_json::Map::new(), false);
+                while let Some(key) = map.next_key::<String>()? {
+                    let Parsed(value, value_repeated) = map.next_value()?;
+                    repeated |= value_repeated || object.insert(key, value).is_some();
+                }
+                Ok(Parsed(object.into(), repeated))
+            }
+        }
+        deserializer.deserialize_any(Visitor)
+    }
+}
+
+/// `text` as one JSON value, or `None` when it is not exactly one.
+fn parse_json(text: &str) -> Option<Parsed> {
+    let mut deserializer = serde_json::Deserializer::from_str(text);
+    let parsed = Parsed::deserialize(&mut deserializer).ok()?;
+    deserializer.end().ok()?;
+    Some(parsed)
+}
+
+/// Masks `parsed` in place; true when what is stored must differ from what was parsed, because a
+/// value was masked or a repeated key dropped an earlier value (which may have been a secret).
+fn mask_parsed(parsed: &mut Parsed) -> bool {
+    mask_secret_json(&mut parsed.0) | parsed.1
+}
+
+fn render_json(json: &serde_json::Value, pretty: bool) -> Option<String> {
+    if pretty {
+        serde_json::to_string_pretty(json).ok()
+    } else {
+        serde_json::to_string(json).ok()
+    }
+}
+
+/// Masks every JSON value in `text`, however they are separated: one per line, pretty-printed
+/// one after another, several on a line. Only the values that change are rewritten, so the
+/// text between them stays as it was. `None` when `text` is not a plain run of JSON values;
+/// `Some(None)` when nothing needed masking.
+fn mask_json_stream(text: &str) -> Option<Option<String>> {
+    let mut stream = serde_json::Deserializer::from_str(text).into_iter::<Parsed>();
+    let (mut masked, mut cursor, mut changed) = (String::new(), 0, false);
+    loop {
+        let before = stream.byte_offset();
+        let Some(parsed) = stream.next() else { break };
+        let mut parsed = parsed.ok()?;
+        let end = stream.byte_offset();
+        if mask_parsed(&mut parsed) {
+            let rest = text.get(before..end)?;
+            let start = before + (rest.len() - rest.trim_start().len());
+            masked.push_str(text.get(cursor..start)?);
+            let pretty = text.get(start..end)?.contains('\n');
+            masked.push_str(&render_json(&parsed.0, pretty)?);
+            cursor = end;
+            changed = true;
+        }
+    }
+    if !changed {
+        return Some(None);
+    }
+    masked.push_str(text.get(cursor..)?);
+    Some(Some(masked))
+}
+
+/// Masks the JSON records of a body that frames them with `separator`: `\n` for JSON lines (a
+/// line that is not JSON is kept), U+001E for `json-seq`. Whitespace, a BOM and the separators
+/// around each record are kept; a record written over several lines stays so.
+///
+/// A `truncated` body ends in a cut record, then the run's own note: only the last record may
+/// fail to parse, and is replaced by a marker, since a secret may sit before the cut; the note
+/// is kept. Any earlier record that fails (a pretty-printed value cut off, plain text) makes the
+/// whole body unmaskable: `None`, so `append` stores [`UNMASKABLE_BODY`]. That is simpler than a
+/// marker per record and as safe.
+fn mask_json_records(body: &str, truncated: bool, separator: char) -> Option<String> {
+    let note_start = truncated
+        .then(|| body.rfind(TRUNCATION_NOTE_PREFIX))
+        .flatten()
+        .filter(|&ix| {
+            body.get(..ix)
+                .is_some_and(|before| before.is_empty() || before.ends_with('\n'))
+        });
+    let (data, note) = body.split_at(note_start.unwrap_or(body.len()));
+    let framing = |c: char| c.is_whitespace() || c == '\u{feff}' || c == '\u{1e}';
+    let records = data.split_inclusive(separator).collect::<Vec<_>>();
+    let last = records
+        .iter()
+        .rposition(|record| !record.trim_matches(framing).is_empty());
+    let mut changed = false;
+    let mut out = String::with_capacity(body.len());
+    for (ix, record) in records.iter().enumerate() {
+        let (lead, rest) = record.split_at(record.len() - record.trim_start_matches(framing).len());
+        let (content, trail) = rest.split_at(rest.trim_end_matches(framing).len());
+        if content.is_empty() {
+            out.push_str(record);
+            continue;
+        }
+        let masked = match parse_json(content) {
+            Some(mut parsed) => mask_parsed(&mut parsed).then(|| {
+                // A value always serializes; were it not, the marker keeps the secret out.
+                render_json(&parsed.0, content.contains('\n'))
+                    .unwrap_or_else(|| UNMASKABLE_LINE.to_string())
+            }),
+            None if !truncated => None,
+            None if Some(ix) == last => Some(UNMASKABLE_LINE.to_string()),
+            None => return None,
         };
         match masked {
             Some(masked) => {
                 changed = true;
-                lines.push_str(&format!("{prefix}{masked}{ending}"));
+                out.push_str(&format!("{lead}{masked}{trail}"));
             }
-            None => lines.push_str(segment),
+            None => out.push_str(record),
         }
     }
-    changed.then_some(lines)
+    out.push_str(note);
+    changed.then_some(out)
 }
 
 /// Stored in place of a cut-off JSON body: it cannot be parsed, so its secrets cannot be masked.
 const UNMASKABLE_BODY: &str = "[body not stored: truncated, secrets could not be masked]";
 
-/// Whether `body` may be JSON, by content type or, failing that, by its first character. Form
-/// and multipart bodies are masked by prefix, or replaced by a marker when they cannot be split,
-/// so a cut leaves no secret value unmasked.
+/// Whether `body` may be JSON, by content type or, failing that, by its first character. A form
+/// body is masked by prefix, so a cut leaves no secret value unmasked; a multipart one is masked
+/// by part, or replaced by a marker when it cannot be split.
 fn may_be_json(body: &str, content_type: Option<&str>) -> bool {
     let content_type = content_type.unwrap_or_default().to_ascii_lowercase();
     if content_type.contains("x-www-form-urlencoded") || content_type.starts_with("multipart/") {
         return false;
     }
-    content_type.contains("json") || body.trim_start().starts_with(['{', '['])
+    content_type.contains("json")
+        || body
+            .trim_start_matches('\u{feff}')
+            .trim_start()
+            .starts_with(['{', '['])
 }
 
 fn mask_secret_json(value: &mut serde_json::Value) -> bool {
@@ -445,7 +574,9 @@ fn mask_secret_multipart(body: &str, content_type: &str) -> Option<String> {
     let declared = content_type
         .split(';')
         .find_map(|parameter| parameter.trim().strip_prefix("boundary="))
-        .map(|boundary| boundary.trim_matches('"').to_string());
+        .map(|boundary| boundary.trim_matches('"').to_string())
+        // An empty boundary would make `--` the delimiter and shred the body.
+        .filter(|boundary| !boundary.is_empty());
     // The declared boundary, else the body's first line when it is a delimiter (a client may
     // declare one and send another). The content type was lowercased, so the body is searched
     // lowercased too, to find the boundary as written in the body.
@@ -1041,9 +1172,10 @@ mod tests {
     fn test_mask_secret_ndjson_cut_line_is_never_kept() {
         let ndjson = Some("application/x-ndjson");
         let body = "{\"password\":\"SECRETONE\"}\n{\"pad\":\"x\",\"access_token\":\"SECRETTWO";
-        // Not flagged as cut, the stray line is kept as is (it may be plain text).
-        let kept = mask_secret_body(body, ndjson).unwrap();
-        assert!(!kept.contains("SECRETONE") && kept.contains("SECRETTWO"));
+        // Not flagged as cut, a line that is not JSON is kept as is (it may be plain text).
+        let text = "{\"password\":\"SECRETONE\"}\nplain text\n";
+        let kept = mask_secret_body(text, ndjson).unwrap();
+        assert_eq!(kept, "{\"password\":\"***\"}\nplain text\n");
         let masked = mask_secret_body_cut(body, ndjson, true).unwrap();
         assert!(!masked.contains("SECRET"), "{masked}");
         assert_eq!(
@@ -1216,10 +1348,14 @@ mod tests {
         assert_eq!(masked.as_deref(), Some("{\"token\":\"***\"}"));
         // Cut under a stream type: its cut line goes, as for NDJSON.
         let cut = "{\"a\":1}\n{\"token\":\"SECR";
-        for content_type in ["application/stream+json", "application/json-seq"] {
-            let masked = mask_secret_body_cut(cut, Some(content_type), true).unwrap();
-            assert_eq!(masked, format!("{{\"a\":1}}\n{UNMASKABLE_LINE}"));
-        }
+        let masked = mask_secret_body_cut(cut, Some("application/stream+json"), true).unwrap();
+        assert_eq!(masked, format!("{{\"a\":1}}\n{UNMASKABLE_LINE}"));
+        let cut = "\u{1e}{\"a\":1}\n\u{1e}{\"token\":\"SECR";
+        let masked = mask_secret_body_cut(cut, Some("application/json-seq"), true).unwrap();
+        assert_eq!(
+            masked,
+            format!("\u{1e}{{\"a\":1}}\n\u{1e}{UNMASKABLE_LINE}")
+        );
     }
 
     #[test]
@@ -1231,6 +1367,140 @@ mod tests {
         assert!(masked.contains("hello") && masked.contains("\r\n***\r\n--WebkitBoundary"));
         let masked = mask_secret_body("no delimiter\r\nSECRETVAL", content_type);
         assert_eq!(masked.as_deref(), Some(UNMASKABLE_MULTIPART));
+    }
+
+    #[test]
+    fn test_disk_history_masks_a_secret_key_repeated_with_null() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let history = HistoryDir::new(temp.path().join("h"), 10, u64::MAX);
+        let body = "{\"token\":\"SECRETVAL\",\"token\":null}";
+        for content_type in ["application/json", "application/x-ndjson"] {
+            let stored = stored_response(&history, typed(content_type, body))?;
+            assert!(
+                !stored.body.contains("SECRETVAL"),
+                "{content_type}: {}",
+                stored.body
+            );
+            let two = format!("{{\"a\":1}}\n{body}\n");
+            let stored = stored_response(&history, typed(content_type, &two))?;
+            assert!(
+                !stored.body.contains("SECRETVAL"),
+                "{content_type}: {}",
+                stored.body
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_mask_secret_json_seq_records_over_several_lines() {
+        let seq = Some("application/json-seq");
+        let body = "\u{1e}{\n  \"password\": \"SECRETVAL\"\n}\n";
+        let masked = mask_secret_body(body, seq).unwrap();
+        assert_eq!(masked, "\u{1e}{\n  \"password\": \"***\"\n}\n");
+        // A mixed body: compact and pretty records, one clean, framing kept as it was.
+        let mixed = "\u{1e}{\"a\":1}\n\u{1e}{\n  \"token\": \"SECRETVAL\"\n}\n\u{1e}[2]\n\u{1e}{\"secret\":\"SECRETTWO\"}\n";
+        let masked = mask_secret_body(mixed, seq).unwrap();
+        assert!(!masked.contains("SECRET"), "{masked}");
+        assert!(
+            masked.starts_with("\u{1e}{\"a\":1}\n\u{1e}{\n  \"token\": \"***\"\n}\n\u{1e}[2]\n")
+        );
+        let clean = "\u{1e}{\n  \"a\": 1\n}\n\u{1e}[2]\n";
+        assert_eq!(mask_secret_body(clean, seq), None);
+        // Cut: the last record goes; the run's note stays.
+        let cut = "\u{1e}{\"a\":1}\n\u{1e}{\n  \"token\": \"SECR\n\n[Response truncated: only the first 10 MiB are shown]";
+        let masked = mask_secret_body_cut(cut, seq, true).unwrap();
+        assert_eq!(
+            masked,
+            format!(
+                "\u{1e}{{\"a\":1}}\n\u{1e}{UNMASKABLE_LINE}\n\n[Response truncated: only the first 10 MiB are shown]"
+            )
+        );
+    }
+
+    #[test]
+    fn test_mask_secret_json_values_in_any_layout() {
+        let layouts = [
+            "{\"a\":1}\n{\n  \"token\": \"SECRETVAL\"\n}\n",
+            "{\"a\":1} {\"token\":\"SECRETVAL\"}",
+            "{\n  \"a\": 1\n}\n{\n  \"token\": \"SECRETVAL\"\n}\n",
+            "{\"a\":1}\r\n{\"token\":\"SECRETVAL\"}\r\n",
+        ];
+        for content_type in [
+            "application/x-ndjson",
+            "application/jsonl",
+            "application/json",
+            "application/stream+json",
+        ] {
+            for body in layouts {
+                let masked = mask_secret_body(body, Some(content_type)).unwrap();
+                assert!(
+                    !masked.contains("SECRETVAL"),
+                    "{content_type} {body:?}: {masked}"
+                );
+                assert!(masked.contains("\"a\""), "{masked}");
+            }
+        }
+        // Values that need no masking are not rewritten; the rest of the body stays as written.
+        let masked = mask_secret_body(layouts[3], Some("application/jsonl")).unwrap();
+        assert_eq!(masked, "{\"a\":1}\r\n{\"token\":\"***\"}\r\n");
+        assert_eq!(
+            mask_secret_body("{\"a\":1} {\"b\":2}\n", Some("application/json")),
+            None
+        );
+    }
+
+    #[test]
+    fn test_mask_secret_json_repeated_keys_never_keep_the_earlier_value() {
+        for content_type in [
+            "application/json",
+            "application/x-ndjson",
+            "application/json-seq",
+        ] {
+            for body in [
+                "{\"token\":\"SECRETVAL\",\"token\":null}",
+                "{\"a\":{\"token\":\"SECRETVAL\"},\"a\":1}",
+                "[{\"x\":1,\"secret\":\"SECRETVAL\",\"secret\":true}]",
+            ] {
+                let masked = mask_secret_body(body, Some(content_type)).unwrap();
+                assert!(
+                    !masked.contains("SECRETVAL"),
+                    "{content_type} {body}: {masked}"
+                );
+            }
+        }
+        // Distinct keys are untouched.
+        assert_eq!(
+            mask_secret_body("{\"a\":1,\"b\":null}", Some("application/json")),
+            None
+        );
+    }
+
+    #[test]
+    fn test_disk_history_drops_a_cut_bom_json_body_without_a_content_type() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let history = HistoryDir::new(temp.path().join("h"), 10, u64::MAX);
+        let cut = ok("\u{feff}{\"access_token\":\"SECRETVAL\",\"pad\":\"x")
+            .mark_truncated(MAX_RESPONSE_BYTES);
+        let stored = stored_response(&history, cut)?;
+        assert_eq!(stored.body, UNMASKABLE_BODY);
+        Ok(())
+    }
+
+    #[test]
+    fn test_mask_secret_multipart_with_an_empty_declared_boundary() {
+        let body =
+            "--X\r\nContent-Disposition: form-data; name=\"password\"\r\n\r\nab--cd\r\n--X--\r\n";
+        for content_type in [
+            "multipart/form-data; boundary=",
+            "multipart/form-data; boundary=\"\"",
+        ] {
+            let masked = mask_secret_body(body, Some(content_type)).unwrap();
+            assert!(
+                !masked.contains("ab--cd") && masked.contains("\r\n***\r\n--X--"),
+                "{masked}"
+            );
+        }
     }
 
     fn get(url: &str) -> HttpRequest {
