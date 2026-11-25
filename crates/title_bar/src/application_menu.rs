@@ -59,7 +59,9 @@ impl ApplicationMenu {
         let settings_subscription =
             cx.observe_global::<SettingsStore>(move |application_menu, cx| {
                 let new_disable_ai = DisableAiSettings::get_global(cx).disable_ai;
-                if new_disable_ai != disable_ai {
+                if new_disable_ai != disable_ai
+                    || zenith_menus_changed(&application_menu.entries, cx)
+                {
                     disable_ai = new_disable_ai;
                     for entry in &application_menu.entries {
                         if entry.handle.is_deployed() {
@@ -373,6 +375,51 @@ impl Render for ApplicationMenu {
     }
 }
 
+/// Zenith: whether the platform's menus differ from the in-window `entries` in name, disabled,
+/// checked, action or submenus, so toggling a Tools check mark rebuilds the menu. Compares in
+/// place; nothing is cloned when the menus match.
+fn zenith_menus_changed(entries: &[MenuEntry], cx: &gpui::App) -> bool {
+    fn menu_changed(a: &OwnedMenu, b: &OwnedMenu) -> bool {
+        a.name != b.name
+            || a.disabled != b.disabled
+            || a.items.len() != b.items.len()
+            || a.items.iter().zip(&b.items).any(|(a, b)| match (a, b) {
+                (OwnedMenuItem::Separator, OwnedMenuItem::Separator) => false,
+                (OwnedMenuItem::Submenu(a), OwnedMenuItem::Submenu(b)) => menu_changed(a, b),
+                (OwnedMenuItem::SystemMenu(a), OwnedMenuItem::SystemMenu(b)) => a.name != b.name,
+                (
+                    OwnedMenuItem::Action {
+                        name: a_name,
+                        action: a_action,
+                        checked: a_checked,
+                        disabled: a_disabled,
+                        ..
+                    },
+                    OwnedMenuItem::Action {
+                        name: b_name,
+                        action: b_action,
+                        checked: b_checked,
+                        disabled: b_disabled,
+                        ..
+                    },
+                ) => {
+                    a_name != b_name
+                        || a_checked != b_checked
+                        || a_disabled != b_disabled
+                        || a_action.name() != b_action.name()
+                }
+                _ => true,
+            })
+    }
+
+    let menus = cx.get_menus().unwrap_or_default();
+    menus.len() != entries.len()
+        || menus
+            .iter()
+            .zip(entries)
+            .any(|(menu, entry)| menu_changed(menu, &entry.menu))
+}
+
 #[cfg(test)]
 mod tests {
     use gpui::{Action, Menu, MenuItem, OwnedMenu, OwnedMenuItem, TestAppContext, UpdateGlobal};
@@ -567,5 +614,46 @@ mod tests {
         assert!(app_menu.read_with(cx, |app_menu, _| {
             menu_entry(&app_menu.entries, "View").handle.is_deployed()
         }));
+    }
+}
+
+#[cfg(test)]
+mod zenith_menu_tests {
+    use gpui::{Menu, MenuItem, OwnedMenuItem, TestAppContext, UpdateGlobal};
+    use settings::{Settings, SettingsStore};
+
+    use crate::application_menu::{ApplicationMenu, OpenApplicationMenu};
+
+    fn tools_menu(checked: bool) -> Menu {
+        Menu::new("Tools").items([
+            MenuItem::action("Toggle", OpenApplicationMenu(String::new())).checked(checked),
+        ])
+    }
+
+    #[gpui::test]
+    fn test_entries_rebuild_when_menu_checked_changes(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            project::DisableAiSettings::register(cx);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            cx.set_menus(vec![tools_menu(false)]);
+            // Registered before the window, like zenith_menus::init: runs before the bar's observer.
+            cx.observe_global::<SettingsStore>(|cx| cx.set_menus(vec![tools_menu(true)]))
+                .detach();
+        });
+        let (app_menu, cx) = cx.add_window_view(|window, cx| ApplicationMenu::new(window, cx));
+        let checked = |cx: &gpui::VisualTestContext| {
+            app_menu.read_with(cx, |menu, _| {
+                matches!(
+                    menu.entries[0].menu.items[0],
+                    OwnedMenuItem::Action { checked: true, .. }
+                )
+            })
+        };
+        assert!(!checked(cx));
+
+        cx.update(|_, cx| SettingsStore::update_global(cx, |_, _| {}));
+        assert!(checked(cx), "in-window menu kept the stale check mark");
     }
 }
