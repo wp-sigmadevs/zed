@@ -603,7 +603,9 @@ impl Pane {
             can_toggle_zoom: true,
             should_display_tab_bar: Rc::new(|_, cx| TabBarSettings::get_global(cx).show),
             should_display_welcome_page: false,
-            render_tab_bar_buttons: Rc::new(default_render_tab_bar_buttons),
+            render_tab_bar_buttons: Rc::new(|pane, window, cx| {
+                default_render_tab_bar_buttons(pane, false, window, cx)
+            }),
             render_tab_bar: Rc::new(Self::render_tab_bar),
             show_tab_bar_buttons: TabBarSettings::get_global(cx).show_tab_bar_buttons,
             display_nav_history_buttons: Some(
@@ -4324,6 +4326,7 @@ impl Pane {
 
 pub fn default_render_tab_bar_buttons(
     pane: &mut Pane,
+    hide_split: bool,
     window: &mut Window,
     cx: &mut Context<Pane>,
 ) -> (Option<AnyElement>, Option<AnyElement>) {
@@ -4364,7 +4367,7 @@ pub fn default_render_tab_bar_buttons(
                     }))
                 }),
         )
-        .child(
+        .children((!hide_split).then(|| {
             PopoverMenu::new("pane-tab-bar-split")
                 .trigger_with_tooltip(
                     IconButton::new("split", IconName::Split)
@@ -4390,8 +4393,8 @@ pub fn default_render_tab_bar_buttons(
                         }
                     })
                     .into()
-                }),
-        )
+                })
+        }))
         .child({
             let zoomed = pane.is_zoomed();
             IconButton::new("toggle_zoom", IconName::Maximize)

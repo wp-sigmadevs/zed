@@ -22,6 +22,8 @@ pub(crate) struct Entry {
     order: i32,
     view: AnyView,
     visible: Rc<dyn Fn(&Pane, &App) -> bool>,
+    /// While visible, the stock Split Pane button is not drawn beside it.
+    hides_split: bool,
 }
 
 /// Whether the rails draw the toolbar's right-hand items at the tab bar's end: the rails are on
@@ -59,13 +61,36 @@ pub fn tab_bar_end(
     visible: impl Fn(&Pane, &App) -> bool + 'static,
     cx: &mut Context<Toolbar>,
 ) {
+    register(view.into(), order, visible, false, cx);
+}
+
+/// Like [`tab_bar_end`], and while `view` is visible the stock Split Pane button is not drawn
+/// beside it: the view has a split button of its own that would look the same. Splitting stays
+/// in the tab menu and on the keyboard.
+pub fn tab_bar_end_hiding_split(
+    view: impl Into<AnyView>,
+    order: i32,
+    visible: impl Fn(&Pane, &App) -> bool + 'static,
+    cx: &mut Context<Toolbar>,
+) {
+    register(view.into(), order, visible, true, cx);
+}
+
+fn register(
+    view: AnyView,
+    order: i32,
+    visible: impl Fn(&Pane, &App) -> bool + 'static,
+    hides_split: bool,
+    cx: &mut Context<Toolbar>,
+) {
     let toolbar = cx.entity_id();
     let views = cx.default_global::<Views>().0.entry(toolbar).or_default();
     let first = views.is_empty();
     views.push(Entry {
         order,
-        view: view.into(),
+        view,
         visible: Rc::new(visible),
+        hides_split,
     });
     // A pane that already drew must draw again to show it.
     cx.notify();
@@ -77,6 +102,12 @@ pub fn tab_bar_end(
     }
 }
 
+/// Whether the stock Split Pane button is left out: a visible view replaces it and the tab bar
+/// end is drawn at all (otherwise that view sits in its toolbar row and the button stays).
+pub(crate) fn hides_split(visible_views: &[Entry], cx: &App) -> bool {
+    draws_tab_bar_end(cx) && visible_views.iter().any(|entry| entry.hides_split)
+}
+
 /// Installed on every workspace pane. Resolved at draw time, so it follows the views the
 /// toolbar holds then; a pane without registered views keeps exactly the stock buttons.
 pub(crate) fn render(
@@ -84,13 +115,15 @@ pub(crate) fn render(
     window: &mut Window,
     cx: &mut Context<Pane>,
 ) -> (Option<AnyElement>, Option<AnyElement>) {
-    let (left, right) = default_render_tab_bar_buttons(pane, window, cx);
     let mut views = cx
         .try_global::<Views>()
         .and_then(|views| views.0.get(&pane.toolbar().entity_id()))
         .cloned()
         .unwrap_or_default();
     views.retain(|entry| (entry.visible)(pane, cx));
+    // Decided from the views drawn below, so the split button is back whenever the view that
+    // replaces it is not drawn.
+    let (left, right) = default_render_tab_bar_buttons(pane, hides_split(&views, cx), window, cx);
     if views.is_empty() {
         return (left, right);
     }

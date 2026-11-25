@@ -5,7 +5,9 @@
 
 mod tab_bar_end;
 
-pub use tab_bar_end::{draws_tab_bar_end, quick_actions_tab_bar_end, tab_bar_end};
+pub use tab_bar_end::{
+    draws_tab_bar_end, quick_actions_tab_bar_end, tab_bar_end, tab_bar_end_hiding_split,
+};
 
 use gpui::{AnyElement, App, Context, Entity, IntoElement, Render, Window};
 use settings::{RegisterSetting, Settings, SettingsContent};
@@ -412,6 +414,111 @@ mod tests {
             redraw(cx);
             assert_eq!(shown(cx), quick_actions);
         }
+    }
+
+    /// A probe that replaces the stock Split Pane button while `visible`.
+    fn add_split_probe(
+        cx: &mut gpui::VisualTestContext,
+        name: &'static str,
+        visible: Rc<Cell<bool>>,
+    ) -> Entity<workspace::Pane> {
+        cx.update(|window, cx| {
+            let multi = window.root::<MultiWorkspace>().flatten().unwrap();
+            let pane = multi.read(cx).workspace().read(cx).active_pane().clone();
+            let probe = cx.new(|_| Probe(name));
+            pane.update(cx, |pane, cx| {
+                pane.toolbar().update(cx, |_, cx| {
+                    tab_bar_end_hiding_split(probe, 1, move |_, _| visible.get(), cx)
+                })
+            });
+            pane
+        })
+    }
+
+    /// Width the stock buttons take at the end slot: the slot less the (20 px) probes in it.
+    fn stock_width(cx: &mut gpui::VisualTestContext, probes: &[&'static str]) -> Pixels {
+        draw(cx);
+        let end = cx.debug_bounds("zenith-tab-bar-end").expect("tab bar end");
+        let probes = probes
+            .iter()
+            .map(|probe| cx.debug_bounds(probe).expect("probe").size.width)
+            .fold(px(0.), |all, width| all + width);
+        end.size.width - probes
+    }
+
+    #[gpui::test]
+    async fn test_a_replacing_view_takes_the_stock_split_button_away(cx: &mut TestAppContext) {
+        let cx = &mut open_window(cx, true).await;
+        add_probe(cx, "plain", 0, Rc::new(Cell::new(true)));
+        let replacing = Rc::new(Cell::new(false));
+        let pane = add_split_probe(cx, "replacing", replacing.clone());
+        let redraw = |cx: &mut gpui::VisualTestContext| {
+            pane.update(cx, |_, cx| cx.notify());
+        };
+        let with_split = stock_width(cx, &["plain"]);
+        replacing.set(true);
+        redraw(cx);
+        let without = stock_width(cx, &["plain", "replacing"]);
+        // Plus and zoom stay: two buttons are wider than the one that went.
+        assert!(without > px(0.), "plus and zoom are still drawn");
+        assert!(
+            with_split - without > px(16.) && without > with_split - without,
+            "one button less: {with_split:?} -> {without:?}"
+        );
+        // Asked at every draw: the button is back when the view goes.
+        replacing.set(false);
+        redraw(cx);
+        assert_eq!(stock_width(cx, &["plain"]), with_split);
+        replacing.set(true);
+        redraw(cx);
+        assert_eq!(stock_width(cx, &["plain", "replacing"]), without);
+    }
+
+    #[gpui::test]
+    async fn test_the_split_button_stays_where_the_tab_bar_end_is_not_drawn(
+        cx: &mut TestAppContext,
+    ) {
+        let cx = &mut open_window(cx, true).await;
+        let pane = add_split_probe(cx, "replacing", Rc::new(Cell::new(true)));
+        let hides = |cx: &mut gpui::VisualTestContext| {
+            cx.update(|_, cx| {
+                let views = cx
+                    .global::<tab_bar_end::Views>()
+                    .0
+                    .get(&pane.read(cx).toolbar().entity_id())
+                    .cloned()
+                    .unwrap();
+                tab_bar_end::hides_split(&views, cx)
+            })
+        };
+        assert!(hides(cx));
+        for (show, buttons) in [(true, false), (false, true), (false, false)] {
+            cx.update(|_, cx| {
+                cx.update_global::<settings::SettingsStore, _>(|store, cx| {
+                    store.update_user_settings(cx, |content| {
+                        let tab_bar = content.tab_bar.get_or_insert_default();
+                        tab_bar.show = Some(show);
+                        tab_bar.show_tab_bar_buttons = Some(buttons);
+                    });
+                });
+            });
+            assert!(!hides(cx), "show {show}, buttons {buttons}");
+        }
+    }
+
+    #[gpui::test]
+    async fn test_the_split_button_stays_without_rails(cx: &mut TestAppContext) {
+        let cx = &mut open_window(cx, false).await;
+        let pane = add_split_probe(cx, "replacing", Rc::new(Cell::new(true)));
+        cx.update(|_, cx| {
+            let views = cx
+                .global::<tab_bar_end::Views>()
+                .0
+                .get(&pane.read(cx).toolbar().entity_id())
+                .cloned()
+                .unwrap();
+            assert!(!tab_bar_end::hides_split(&views, cx));
+        });
     }
 
     #[gpui::test]

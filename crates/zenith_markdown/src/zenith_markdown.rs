@@ -69,7 +69,7 @@ fn attach(pane: &Entity<Pane>, window: &mut Window, cx: &mut Context<Workspace>)
     pane.update(cx, |pane, cx| {
         pane.toolbar().update(cx, |toolbar, cx| {
             let switcher = cx.new(|cx| MarkdownViewSwitcher::new(workspace, weak_pane, cx));
-            zenith_rails::tab_bar_end(
+            zenith_rails::tab_bar_end_hiding_split(
                 switcher.clone(),
                 0,
                 |pane, cx| {
@@ -809,6 +809,69 @@ mod tests {
                 });
             });
         });
+    }
+
+    /// Stands in for another tab bar end view (such as the inspection widget) that is always shown.
+    struct Probe;
+
+    impl Render for Probe {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .debug_selector(|| "end-probe".into())
+                .w(px(20.))
+                .h(px(10.))
+        }
+    }
+
+    impl Fixture {
+        /// What the stock buttons take of the tab bar end, and one of their buttons' width.
+        fn stock_width(&self, cx: &mut TestAppContext) -> (Pixels, Pixels) {
+            let width = |selector, cx: &mut TestAppContext| {
+                self.bounds(selector, cx)
+                    .map_or(px(0.), |bounds| bounds.size.width)
+            };
+            let end = width("zenith-tab-bar-end", cx);
+            let others = width("end-probe", cx) + width("zenith-markdown-switcher", cx);
+            (end - others, width("zenith-markdown-editor", cx))
+        }
+    }
+
+    #[gpui::test]
+    async fn the_stock_split_button_goes_while_the_markdown_buttons_show(cx: &mut TestAppContext) {
+        let fixture = fixture(cx).await;
+        fixture.pane.update(cx, |pane, cx| {
+            let probe = cx.new(|_| Probe);
+            pane.toolbar().update(cx, |_, cx| {
+                zenith_rails::tab_bar_end(probe, 5, |_, _| true, cx)
+            });
+        });
+        fixture.open("a.rs", cx).await;
+        // Another view's end slot: plus, split and zoom, three buttons.
+        let (rust, _) = fixture.stock_width(cx);
+        fixture.open("b.md", cx).await;
+        let (markdown, button) = fixture.stock_width(cx);
+        assert!(button > px(0.), "the markdown buttons are drawn");
+        assert!(
+            rust >= button * 3.,
+            "plus, split and zoom beside a Rust file: {rust:?} for {button:?} buttons"
+        );
+        assert!(
+            markdown > button && markdown < button * 3.,
+            "plus and zoom beside a Markdown file: {markdown:?} for {button:?} buttons"
+        );
+        // Following the active tab both ways.
+        fixture.activate(0, cx);
+        assert_eq!(fixture.stock_width(cx).0, rust);
+        fixture.activate(1, cx);
+        assert_eq!(fixture.stock_width(cx).0, markdown);
+        // The markdown buttons sit in the toolbar when the tab bar cannot hold them: the stock
+        // buttons are not ours to change then.
+        set_tab_bar(cx, true, false);
+        cx.run_until_parked();
+        assert!(fixture.bounds("zenith-tab-bar-end", cx).is_none());
+        set_tab_bar(cx, true, true);
+        cx.run_until_parked();
+        assert_eq!(fixture.stock_width(cx).0, markdown);
     }
 
     #[gpui::test]
