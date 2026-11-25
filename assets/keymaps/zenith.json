@@ -56,6 +56,15 @@
     },
   },
   {
+    // The Find in Files preview splitter, which is not an editor: the base keymap's context-less
+    // "tab" (menu::SelectNext) would resize it. Same tie-break as the history block above.
+    "context": "FindInFilesSplitter",
+    "bindings": {
+      "tab": "picker::ConfirmCompletion",
+      "shift-tab": "zenith_search::FocusPreviousField",
+    },
+  },
+  {
     // The PHP dialog. Tab and Shift-Tab move between its controls (level, interpreter, the list
     // toolbar, the buttons). The base keymap's context-less "tab" (menu::SelectNext) would step
     // the include list selection instead; same tie-break as the history tab above.

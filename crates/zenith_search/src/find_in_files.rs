@@ -15,11 +15,11 @@ use editor::{
     Editor, EditorEvent, SelectionEffects, display_map::HighlightKey, scroll::Autoscroll,
 };
 use gpui::{
-    App, Bounds, ClickEvent, Context, DismissEvent, Div, DragMoveEvent, Entity, EventEmitter,
-    FocusHandle, Focusable, HighlightStyle, IntoElement, MouseButton, MouseDownEvent, Orientation,
-    ParentElement, Pixels, Render, Role, ScrollStrategy, SharedString, Styled, StyledText,
-    Subscription, Task, UniformListScrollHandle, WeakEntity, Window, canvas, div, prelude::*, px,
-    uniform_list,
+    AccessibleAction, App, Bounds, ClickEvent, Context, DismissEvent, Div, DragMoveEvent, Entity,
+    EventEmitter, FocusHandle, Focusable, HighlightStyle, IntoElement, MouseButton, MouseDownEvent,
+    Orientation, ParentElement, Pixels, Render, Role, ScrollStrategy, SharedString, Styled,
+    StyledText, Subscription, Task, UniformListScrollHandle, WeakEntity, Window, canvas, div,
+    prelude::*, px, uniform_list,
 };
 use language::{BufferEvent, BufferSnapshot, HighlightId, LanguageAwareStyling};
 use project::{
@@ -39,8 +39,8 @@ use workspace::{
 };
 
 use super::{
-    CycleFindContext, CycleFindScope, ToggleFileMaskHistory, ToggleFindCase, ToggleFindMask,
-    ToggleFindRegex, ToggleFindWord, TogglePinFindPopup, mask_history,
+    CycleFindContext, CycleFindScope, FocusPreviousField, ToggleFileMaskHistory, ToggleFindCase,
+    ToggleFindMask, ToggleFindRegex, ToggleFindWord, TogglePinFindPopup, mask_history,
     popup::{Frame, NoDragPreview, PopupKind, preview_height, set_preview_height},
     style::{
         FIELD_HEIGHT, FOOTER_HEIGHT, HEADER_GAP, HEADER_HEIGHT, MASK_WIDTH, MIN_LIST_ROWS,
@@ -70,6 +70,8 @@ fn clamp_preview(wanted: Pixels, max: Pixels) -> Pixels {
 /// More hits than this say "refine the query", not "scroll".
 /// How far an arrow key moves the splitter.
 const SPLITTER_STEP: f32 = 10.;
+/// Home and End nudge by more than any window holds; the clamp stops them at the ends.
+const SPLITTER_MAX_NUDGE: f32 = 100_000.;
 
 const MAX_HITS: usize = 300;
 
@@ -712,10 +714,19 @@ impl FindInFilesModal {
     }
 
     fn select_first(&mut self, _: &menu::SelectFirst, window: &mut Window, cx: &mut Context<Self>) {
+        if self.splitter_focus.is_focused(window) {
+            // The clamp holds it at the tallest the list leaves.
+            self.nudge_splitter(px(SPLITTER_MAX_NUDGE), window, cx);
+            return;
+        }
         self.select(0, window, cx);
     }
 
     fn select_last(&mut self, _: &menu::SelectLast, window: &mut Window, cx: &mut Context<Self>) {
+        if self.splitter_focus.is_focused(window) {
+            self.nudge_splitter(-px(SPLITTER_MAX_NUDGE), window, cx);
+            return;
+        }
         self.select(self.hits.len().saturating_sub(1), window, cx);
     }
 
@@ -773,6 +784,18 @@ impl FindInFilesModal {
         self.open_in_find_window(window, cx);
     }
 
+    /// The boxes and the splitter, in Tab order.
+    fn fields(&self, cx: &App) -> Vec<FocusHandle> {
+        let mut fields = vec![self.query.read(cx).focus_handle(cx)];
+        fields.extend(self.replace.iter().map(|e| e.read(cx).focus_handle(cx)));
+        if self.scope == Scope::Directory {
+            fields.push(self.directory.read(cx).focus_handle(cx));
+        }
+        fields.push(self.mask.read(cx).focus_handle(cx));
+        fields.push(self.splitter_focus.clone());
+        fields
+    }
+
     /// Tab moves between the boxes, since the search box has no use for it.
     fn focus_next_field(
         &mut self,
@@ -785,21 +808,34 @@ impl FindInFilesModal {
             cx.propagate();
             return;
         }
-        let mut fields = vec![self.query.read(cx).focus_handle(cx)];
-        fields.extend(self.replace.iter().map(|e| e.read(cx).focus_handle(cx)));
-        if self.scope == Scope::Directory {
-            fields.push(self.directory.read(cx).focus_handle(cx));
-        }
-        fields.push(self.mask.read(cx).focus_handle(cx));
-        fields.push(self.splitter_focus.clone());
+        let fields = self.fields(cx);
         let current = fields.iter().position(|field| field.is_focused(window));
         let next = current.map_or(0, |ix| (ix + 1) % fields.len());
         window.focus(&fields[next], cx);
     }
 
+    /// Shift-Tab on the splitter, which is not an editor: the box before it.
+    fn focus_previous_field(
+        &mut self,
+        _: &FocusPreviousField,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let fields = self.fields(cx);
+        let current = fields.iter().position(|field| field.is_focused(window));
+        let previous = current.map_or(fields.len() - 1, |ix| {
+            (ix + fields.len() - 1) % fields.len()
+        });
+        window.focus(&fields[previous], cx);
+    }
+
     /// Enter opens the picked line; with "Open results in new tab" ticked it sends the
     /// whole result to a project search tab instead.
     fn confirm(&mut self, _: &menu::Confirm, window: &mut Window, cx: &mut Context<Self>) {
+        if self.splitter_focus.is_focused(window) {
+            self.reset_splitter(cx);
+            return;
+        }
         if self.open_in_tab {
             self.open_in_find_window(window, cx);
             return;
@@ -954,6 +990,11 @@ impl FindInFilesModal {
     fn reset_splitter(&mut self, cx: &mut Context<Self>) {
         set_preview_height(px(PREVIEW_HEIGHT), cx);
         cx.notify();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn splitter_focused(&self, window: &Window) -> bool {
+        self.splitter_focus.is_focused(window)
     }
 
     #[cfg(test)]
@@ -1570,6 +1611,25 @@ impl FindInFilesModal {
             .aria_numeric_value(f64::from(height))
             .aria_min_numeric_value(f64::from(MIN_PREVIEW_HEIGHT))
             .aria_max_numeric_value(f64::from(max.max(px(MIN_PREVIEW_HEIGHT))))
+            .aria_numeric_value_step(f64::from(SPLITTER_STEP))
+            .on_a11y_action(AccessibleAction::Increment, {
+                let this = cx.entity();
+                move |_, window, cx| {
+                    this.update(cx, |this, cx| {
+                        this.nudge_splitter(px(SPLITTER_STEP), window, cx)
+                    })
+                }
+            })
+            .on_a11y_action(AccessibleAction::Decrement, {
+                let this = cx.entity();
+                move |_, window, cx| {
+                    this.update(cx, |this, cx| {
+                        this.nudge_splitter(-px(SPLITTER_STEP), window, cx)
+                    })
+                }
+            })
+            // Tab and Shift-Tab leave it: see the keymap's FindInFilesSplitter block.
+            .key_context("FindInFilesSplitter")
             .track_focus(&self.splitter_focus)
             .h(px(SPLITTER_HEIGHT))
             .w_full()
@@ -1588,7 +1648,7 @@ impl FindInFilesModal {
                     .border_color(colors.border_focused)
             })
             .tooltip(Tooltip::text(
-                "Drag to resize the preview. Double-click to reset",
+                "Drag or use Up/Down to resize the preview. Double-click or Enter to reset",
             ))
             .on_mouse_down(
                 MouseButton::Left,
@@ -1711,6 +1771,7 @@ impl Render for FindInFilesModal {
         let root = v_flex()
             // "Picker" makes the keymap's up, down, escape and tab work in the search box.
             .key_context("FindInFiles Picker")
+            .on_action(cx.listener(Self::focus_previous_field))
             .on_action(cx.listener(Self::select_next))
             .on_action(cx.listener(Self::select_previous))
             .on_action(cx.listener(Self::select_first))

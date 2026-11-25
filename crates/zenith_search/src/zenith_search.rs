@@ -92,6 +92,8 @@ actions!(
         ToggleFindRegex,
         /// Turns the file mask on or off in Find in Files.
         ToggleFindMask,
+        /// Moves to the previous box of Find in Files (Shift-Tab from the preview splitter).
+        FocusPreviousField,
         /// Lists the usages of the symbol at the cursor in a popup (PhpStorm's Show Usages).
         ShowUsages,
         /// Opens every usage the Usages popup lists in a new tab.
@@ -4132,16 +4134,33 @@ mod tests {
         assert_eq!(preview_height_of(cx), px(210.));
     }
 
-    #[gpui::test]
-    async fn test_arrow_keys_on_the_focused_splitter_resize_the_preview(cx: &mut TestAppContext) {
-        let (_, modal, cx) = open_with_hit(cx).await;
-        // The keymaps are not loaded here: the picker's arrows, as the app binds them.
+    /// The keymaps are not loaded in tests: binds the keys the splitter meets in the app,
+    /// the base keymap's context-less ones and the `zenith.json` block for the splitter.
+    fn bind_splitter_keys(cx: &mut VisualTestContext) {
         cx.update(|_, cx| {
             cx.bind_keys([
                 gpui::KeyBinding::new("up", menu::SelectPrevious, None),
                 gpui::KeyBinding::new("down", menu::SelectNext, None),
+                gpui::KeyBinding::new("home", menu::SelectFirst, None),
+                gpui::KeyBinding::new("end", menu::SelectLast, None),
+                gpui::KeyBinding::new("enter", menu::Confirm, None),
+                gpui::KeyBinding::new("tab", menu::SelectNext, None),
+                gpui::KeyBinding::new("shift-tab", menu::SelectPrevious, None),
+                gpui::KeyBinding::new("tab", picker::ConfirmCompletion, Some("Picker > Editor")),
+                gpui::KeyBinding::new(
+                    "tab",
+                    picker::ConfirmCompletion,
+                    Some("FindInFilesSplitter"),
+                ),
+                gpui::KeyBinding::new("shift-tab", FocusPreviousField, Some("FindInFilesSplitter")),
             ])
         });
+    }
+
+    #[gpui::test]
+    async fn test_arrow_keys_on_the_focused_splitter_resize_the_preview(cx: &mut TestAppContext) {
+        let (_, modal, cx) = open_with_hit(cx).await;
+        bind_splitter_keys(cx);
         let default = preview_height_of(cx);
         modal.update_in(cx, |m, window, cx| m.focus_splitter(window, cx));
         cx.simulate_keystrokes("up");
@@ -4154,6 +4173,61 @@ mod tests {
         }
         assert_eq!(preview_height_of(cx), px(80.));
         // The keys moved no result: the selection is where it was.
+        assert_eq!(modal.read_with(cx, |m, _| m.selected_index()), 0);
+    }
+
+    #[gpui::test]
+    async fn test_tab_leaves_the_splitter_and_moves_no_height(cx: &mut TestAppContext) {
+        let (_, modal, cx) = open_with_hit(cx).await;
+        bind_splitter_keys(cx);
+        let focus = |cx: &mut VisualTestContext| {
+            modal.update_in(cx, |m, window, cx| {
+                (m.query_focused(window, cx), m.splitter_focused(window))
+            })
+        };
+        // Tab from the query box reaches the splitter: the file mask is between.
+        assert_eq!(focus(cx), (true, false));
+        cx.simulate_keystrokes("tab tab");
+        assert_eq!(focus(cx), (false, true));
+        cx.simulate_keystrokes("up");
+        let grown = preview_height_of(cx);
+        // Tab goes on to the query box and does not resize the preview.
+        cx.simulate_keystrokes("tab");
+        assert_eq!(focus(cx), (true, false));
+        assert_eq!(preview_height_of(cx), grown);
+        // Shift-Tab goes back, to the box before the splitter.
+        cx.simulate_keystrokes("tab tab");
+        assert_eq!(focus(cx), (false, true));
+        cx.simulate_keystrokes("shift-tab");
+        assert_eq!(focus(cx), (false, false));
+        assert_eq!(preview_height_of(cx), grown);
+    }
+
+    #[gpui::test]
+    async fn test_enter_home_and_end_on_the_focused_splitter(cx: &mut TestAppContext) {
+        let (workspace, modal, cx) = open_with_hit(cx).await;
+        bind_splitter_keys(cx);
+        let default = preview_height_of(cx);
+        modal.update_in(cx, |m, window, cx| m.focus_splitter(window, cx));
+        cx.simulate_keystrokes("up up");
+        assert_eq!(preview_height_of(cx), default + px(20.));
+        // Enter resets it and does not open the hit.
+        cx.simulate_keystrokes("enter");
+        assert_eq!(preview_height_of(cx), default);
+        assert!(
+            workspace.read_with(cx, |w, cx| w
+                .active_modal::<find_in_files::FindInFilesModal>(cx)
+                .is_some()),
+            "Enter opened the hit instead"
+        );
+        // End: the least the preview keeps. Home: the most the list leaves, more than it has.
+        cx.simulate_keystrokes("end");
+        assert_eq!(preview_height_of(cx), px(80.));
+        cx.simulate_keystrokes("home");
+        let tallest = preview_height_of(cx);
+        assert!(tallest > default, "{tallest:?}");
+        let list = cx.debug_bounds("zenith-find-results").unwrap().size.height;
+        assert!(list >= px(3. * 26.) - px(0.5), "{list:?}");
         assert_eq!(modal.read_with(cx, |m, _| m.selected_index()), 0);
     }
 
