@@ -35,6 +35,7 @@ use crate::{
     upload_timeout,
 };
 
+const DENIED: &str = "Uploading to this server is off for this session.";
 const TARGET_CHANGED: &str =
     "The server's host, port, type or user changed since this download; download it again.";
 
@@ -238,9 +239,7 @@ fn gate(is_local_unshared: bool, decision: UploadDecision, consent_once: bool) -
         UploadDecision::Allow => Gate::Go,
         UploadDecision::Ask if consent_once => Gate::Go,
         UploadDecision::Ask => Gate::Ask,
-        UploadDecision::Deny => {
-            Gate::Stop("Uploading to this server is off for this session.".into())
-        }
+        UploadDecision::Deny => Gate::Stop(DENIED.into()),
     }
 }
 
@@ -731,10 +730,15 @@ async fn run_upload(
                 (
                     copy.remote_path.clone(),
                     copy.stat.clone(),
+                    // The gate again: a Deny said while this save waited in the queue applies.
                     target_problem(
                         &copy.target,
                         this.current_target(&copy.server_id).as_deref(),
-                    ),
+                    )
+                    .or_else(|| {
+                        (this.upload_decision(&copy.server_id) == UploadDecision::Deny)
+                            .then_some(DENIED)
+                    }),
                 )
             })
         });
@@ -1657,24 +1661,49 @@ mod tests {
     #[gpui::test]
     async fn a_put_that_never_answers_fails_as_possibly_incomplete(cx: &mut TestAppContext) {
         let f = fixture(cx).await;
+        // 640 KiB: the write deadline (40 s) is longer than the plain one (30 s).
+        f.save(&"a".repeat(640 * 1024), cx);
+        let deadline = Deadlines::for_len(640 * 1024).put;
+        assert!(deadline > OPERATION_TIMEOUT);
         *f.remote.put_hang.lock().expect("flag") = true;
         f.upload(true, false, cx);
         cx.run_until_parked();
-        let deadline = Deadlines::for_len(5).put;
         cx.executor()
-            .advance_clock(deadline - Duration::from_secs(1));
+            .advance_clock(OPERATION_TIMEOUT + Duration::from_secs(1));
         cx.run_until_parked();
         assert!(
             f.events.borrow().is_empty(),
-            "the write keeps its own deadline"
+            "the write keeps its own, longer deadline"
         );
-        cx.executor().advance_clock(Duration::from_secs(2));
+        cx.executor().advance_clock(deadline - OPERATION_TIMEOUT);
         cx.run_until_parked();
         let events = f.events.borrow();
         let [UploadOutcome::Failed(message)] = events.as_slice() else {
             panic!("{events:?}");
         };
         assert!(message.contains("may be incomplete"), "{message}");
+    }
+
+    #[gpui::test]
+    async fn a_deny_said_while_a_save_is_queued_stops_that_save(cx: &mut TestAppContext) {
+        let f = fixture(cx).await;
+        let (release, gate) = futures::channel::oneshot::channel();
+        *f.remote.put_gate.lock().expect("gate") = Some(gate);
+        f.save("one", cx);
+        assert_eq!(f.upload(true, false, cx), UploadStart::Started);
+        cx.run_until_parked();
+        f.save("two", cx);
+        assert_eq!(f.upload(true, false, cx), UploadStart::Queued);
+        f.store.update(cx, |store, _| {
+            store.set_upload_decision(&f.server_id, UploadDecision::Deny);
+        });
+        release.send(()).expect("release");
+        cx.run_until_parked();
+        assert_eq!(f.puts(), [(REMOTE.to_string(), b"one".to_vec())]);
+        assert_eq!(
+            f.events.borrow().last(),
+            Some(&UploadOutcome::Blocked(DENIED.into()))
+        );
     }
 
     #[gpui::test]
