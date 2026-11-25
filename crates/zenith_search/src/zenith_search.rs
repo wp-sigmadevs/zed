@@ -4110,6 +4110,79 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_pressing_the_splitter_without_dragging_stores_and_pins_nothing(
+        cx: &mut TestAppContext,
+    ) {
+        let (_, modal, cx) = open_with_hit(cx).await;
+        cx.simulate_resize(gpui::size(px(1400.), px(700.)));
+        modal.update(cx, |_, cx| cx.notify());
+        cx.run_until_parked();
+        let handle = cx.debug_bounds("zenith-find-splitter").unwrap().center();
+        let none = gpui::Modifiers::none();
+        cx.simulate_mouse_down(handle, gpui::MouseButton::Left, none);
+        cx.simulate_mouse_up(handle, gpui::MouseButton::Left, none);
+        cx.run_until_parked();
+        // The press leaves the query focused, for typing.
+        assert!(modal.update_in(cx, |m, window, cx| m.query_focused(window, cx)));
+        // A click is no resize: a bigger window shows the default preview again,
+        // and an unpinned popup that grows with it.
+        cx.simulate_resize(gpui::size(px(1400.), px(1200.)));
+        modal.update(cx, |_, cx| cx.notify());
+        cx.run_until_parked();
+        assert_eq!(preview_height_of(cx), px(210.));
+    }
+
+    #[gpui::test]
+    async fn test_arrow_keys_on_the_focused_splitter_resize_the_preview(cx: &mut TestAppContext) {
+        let (_, modal, cx) = open_with_hit(cx).await;
+        // The keymaps are not loaded here: the picker's arrows, as the app binds them.
+        cx.update(|_, cx| {
+            cx.bind_keys([
+                gpui::KeyBinding::new("up", menu::SelectPrevious, None),
+                gpui::KeyBinding::new("down", menu::SelectNext, None),
+            ])
+        });
+        let default = preview_height_of(cx);
+        modal.update_in(cx, |m, window, cx| m.focus_splitter(window, cx));
+        cx.simulate_keystrokes("up");
+        assert_eq!(preview_height_of(cx), default + px(10.));
+        cx.simulate_keystrokes("down down");
+        assert_eq!(preview_height_of(cx), default - px(10.));
+        // The least the preview keeps.
+        for _ in 0..30 {
+            cx.simulate_keystrokes("down");
+        }
+        assert_eq!(preview_height_of(cx), px(80.));
+        // The keys moved no result: the selection is where it was.
+        assert_eq!(modal.read_with(cx, |m, _| m.selected_index()), 0);
+    }
+
+    #[gpui::test]
+    async fn test_replace_row_fits_in_a_short_window(cx: &mut TestAppContext) {
+        let (workspace, _, cx) = open_with_hit(cx).await;
+        workspace.update_in(cx, |w, window, cx| w.hide_modal(window, cx));
+        workspace.update_in(cx, |workspace, window, cx| {
+            find_in_files::FindInFilesModal::open(workspace, true, window, cx)
+        });
+        cx.run_until_parked();
+        let modal = workspace.update(cx, |workspace, cx| {
+            workspace
+                .active_modal::<find_in_files::FindInFilesModal>(cx)
+                .expect("open")
+        });
+        modal.update_in(cx, |m, window, cx| m.set_query("add_action", window, cx));
+        cx.simulate_resize(gpui::size(px(1400.), px(700.)));
+        modal.update(cx, |_, cx| cx.notify());
+        cx.run_until_parked();
+        // The body (under the header) stays within the popup's cap: the window
+        // less 180 px.
+        let header = cx.debug_bounds("zenith-popup-drag").unwrap();
+        let footer = cx.debug_bounds("zenith-popup-footer").unwrap();
+        let body = footer.bottom() - header.bottom();
+        assert!(body <= px(700. - 180.), "{body:?}");
+    }
+
+    #[gpui::test]
     async fn test_a_stored_preview_height_is_held_to_a_smaller_window(cx: &mut TestAppContext) {
         let (_, modal, cx) = open_with_hit(cx).await;
         // Set in a roomier window, or by a bigger drag: far more than any window holds.

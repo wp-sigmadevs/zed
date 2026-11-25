@@ -61,6 +61,9 @@ impl PopupKind {
     }
 }
 
+/// The Replace row's height (a search box) and the gap above it.
+const REPLACE_ROW: f32 = 36. + 8.;
+
 /// What the user dragged each popup to this session: the card width and the
 /// height of everything under the header, and the Find in Files preview's height.
 #[derive(Default)]
@@ -90,7 +93,7 @@ impl Render for NoDragPreview {
 /// been made in a bigger window, so it is clamped here, on every read: the
 /// body's minimum grows with the preview, and past the window's cap the
 /// footer and grip would leave the screen.
-pub(crate) fn preview_height(window: &Window, cx: &gpui::App) -> Pixels {
+pub(crate) fn preview_height(replace: bool, window: &Window, cx: &gpui::App) -> Pixels {
     let sizes = cx.try_global::<PopupSizes>();
     let stored = sizes
         .and_then(|sizes| sizes.find_preview)
@@ -98,6 +101,10 @@ pub(crate) fn preview_height(window: &Window, cx: &gpui::App) -> Pixels {
     let sized = sizes.is_some_and(|sizes| sizes.cards.contains_key(&PopupKind::Find));
     // The body minimum (list rows included) was set for the default preview.
     let mut chrome = PopupKind::Find.min_body_height() - px(PREVIEW_HEIGHT);
+    if replace {
+        // The Replace row and the gap above it.
+        chrome += px(REPLACE_ROW);
+    }
     if !sized {
         // The list shows its fixed rows, not the least it keeps, and the body
         // grows with the preview.
@@ -114,9 +121,9 @@ pub(crate) fn set_preview_height(height: Pixels, cx: &mut gpui::App) {
 
 /// How much taller than its default the Find in Files body must be: the body's
 /// minimum was set for the default preview, and the list needs the same room.
-fn preview_extra(kind: PopupKind, window: &Window, cx: &gpui::App) -> Pixels {
+fn preview_extra(kind: PopupKind, replace: bool, window: &Window, cx: &gpui::App) -> Pixels {
     match kind {
-        PopupKind::Find => preview_height(window, cx) - px(PREVIEW_HEIGHT),
+        PopupKind::Find => preview_height(replace, window, cx) - px(PREVIEW_HEIGHT),
         _ => Pixels::ZERO,
     }
 }
@@ -150,9 +157,19 @@ pub(crate) struct Frame {
     resize_last: Option<Point<Pixels>>,
     /// Where the body (everything under the header) was last painted.
     body: Rc<Cell<Option<Bounds<Pixels>>>>,
+    /// Find in Files shows its Replace row, which the body must also hold.
+    pub(crate) replace_row: bool,
 }
 
 impl Frame {
+    /// A frame for Find in Files, which may show its Replace row.
+    pub(crate) fn with_replace_row(replace_row: bool) -> Self {
+        Self {
+            replace_row,
+            ..Self::default()
+        }
+    }
+
     /// The largest card: most of the window, leaving the header and some air.
     fn max_size(viewport: Size<Pixels>) -> Size<Pixels> {
         size(
@@ -179,7 +196,13 @@ impl Frame {
             stored.map_or(kind.default_width().to_pixels(rem), |size| size.width),
             stored.map_or(Pixels::ZERO, |size| size.height),
         );
-        let clamped = clamp_size(kind, preview_extra(kind, window, cx), wanted, max, rem);
+        let clamped = clamp_size(
+            kind,
+            preview_extra(kind, self.replace_row, window, cx),
+            wanted,
+            max,
+            rem,
+        );
         (clamped.width, stored.map(|_| clamped.height))
     }
 
@@ -234,7 +257,7 @@ impl Frame {
                 cap.height.min(viewport.height - origin.y - margin),
             );
             let delta = position - last;
-            let extra = preview_extra(kind, window, cx);
+            let extra = preview_extra(kind, self.replace_row, window, cx);
             let next = clamp_size(
                 kind,
                 extra,
