@@ -54,6 +54,18 @@ pub struct ZenithSettingsContent {
     pub editor_menu: Option<ZenithEditorMenuSettingsContent>,
     /// Settings for the tab right-click menu.
     pub tab_menu: Option<ZenithTabMenuSettingsContent>,
+    /// Settings for the inspection widget at the end of the tab bar.
+    pub inspection_widget: Option<ZenithInspectionWidgetSettingsContent>,
+}
+
+/// Settings for the inspection widget at the end of the tab bar.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+pub struct ZenithInspectionWidgetSettingsContent {
+    /// Whether the tab bar shows the active file's error, warning and weak warning counts with
+    /// previous/next problem buttons.
+    ///
+    /// Default: true
+    pub enabled: Option<bool>,
 }
 
 /// Settings for the tab right-click menu.
