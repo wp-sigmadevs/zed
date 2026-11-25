@@ -10,7 +10,7 @@ const BAR: [&str; 12] = [
 ];
 
 /// Upstream items with no use here: update checks, release notes and links to zed.dev, the
-/// Zed repository and the feedback forms, and the collab panel.
+/// Zed repository and the feedback forms, the collab panel, and Install CLI (moved to Tools).
 const DROP: &[&str] = &[
     "auto_update::Check",
     "auto_update::ViewReleaseNotesLocally",
@@ -20,6 +20,8 @@ const DROP: &[&str] = &[
     "zed::OpenBrowser",
     "zed::OpenZedRepo",
     "collab_panel::ToggleFocus",
+    // Tools has it, as "Create Command Line Launcher…".
+    "install_cli::InstallCliBinary",
 ];
 
 /// Edit and Selection items that PhpStorm keeps in its Code menu.
@@ -124,7 +126,7 @@ pub(crate) fn arrange(upstream: Vec<Menu>, tools: Menu, extras: Extras) -> Vec<M
 }
 
 /// Drops leading, trailing and repeated separators.
-fn tidy(items: Vec<MenuItem>) -> Vec<MenuItem> {
+pub(crate) fn tidy(items: Vec<MenuItem>) -> Vec<MenuItem> {
     let mut tidy: Vec<MenuItem> = Vec::new();
     for item in items {
         let is_separator = matches!(item, MenuItem::Separator);

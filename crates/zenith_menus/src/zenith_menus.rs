@@ -4,6 +4,7 @@
 mod app_menu;
 mod bar_items;
 mod editor_menu;
+mod flatten;
 mod tab_menu;
 #[cfg(test)]
 mod tests;
@@ -17,7 +18,10 @@ use workspace::notifications::{
     NotificationId, show_app_notification, simple_message_notification::MessageNotification,
 };
 
-use tools::{Feature, changed_restart_features, feature, feature_states, set_feature, tools_menu};
+pub use tools::tools_action_names;
+use tools::{
+    FEATURES, Feature, changed_restart_features, feature, feature_states, set_feature, tools_menu,
+};
 
 /// Switches one Zenith feature on or off in the user settings; the Tools menu items run it.
 ///
@@ -25,7 +29,11 @@ use tools::{Feature, changed_restart_features, feature, feature_states, set_feat
 /// the `enabled` setting under `zenith` of the same name (`islands` is `zenith.ui.islands`):
 /// `agent_review`, `local_history`, `scratches`, `todo`, `inspections`, `deploy`, `wordpress`,
 /// `laravel`, `nextjs`, `search`, `navbar`, `rails`, `look`, `islands`, `templates`,
-/// `external_libraries`, `title_bar`, `hover_card`, `welcome`, `editor_menu`, `tab_menu`. An unknown key does nothing.
+/// `external_libraries`, `title_bar`, `hover_card`, `welcome`, `editor_menu`, `tab_menu`,
+/// `inspection_widget`. An unknown key does nothing.
+///
+/// Each feature also has an action without a field, `zenith_features::Toggle<Feature>`
+/// (`ToggleNavbar`, ...), which the Tools menu runs and the command palette lists.
 #[derive(Clone, PartialEq, Deserialize, JsonSchema, gpui::Action)]
 #[action(namespace = zenith_menus)]
 #[serde(deny_unknown_fields)]
@@ -53,6 +61,9 @@ pub fn init(cx: &mut App) {
     editor_menu::init(cx);
     tab_menu::init(cx);
     cx.on_action(toggle_feature);
+    for feature in FEATURES {
+        (feature.register)(cx);
+    }
     let mut shown = FeatureToggles::get_global(cx).clone();
     cx.observe_global::<SettingsStore>(move |cx| {
         let now = FeatureToggles::get_global(cx).clone();
@@ -65,8 +76,7 @@ pub fn init(cx: &mut App) {
         }
         shown = now;
         if let Some(&UpstreamMenus(upstream)) = cx.try_global::<UpstreamMenus>() {
-            let menus =
-                app_menu::arrange(upstream(cx), tools_menu(&shown.0), bar_items::resolve(cx));
+            let menus = menu_bar(upstream, &shown.0, cx);
             cx.set_menus(menus);
         }
     })
@@ -76,13 +86,26 @@ pub fn init(cx: &mut App) {
 /// Upstream's menus rearranged into PhpStorm's order, with the Tools menu added.
 pub fn app_menus(upstream: fn(&mut App) -> Vec<Menu>, cx: &mut App) -> Vec<Menu> {
     cx.set_global(UpstreamMenus(upstream));
-    let tools = tools_menu(&FeatureToggles::get_global(cx).0);
-    app_menu::arrange(upstream(cx), tools, bar_items::resolve(cx))
+    let toggles = FeatureToggles::get_global(cx).0.clone();
+    menu_bar(upstream, &toggles, cx)
+}
+
+fn menu_bar(upstream: fn(&mut App) -> Vec<Menu>, toggles: &[bool], cx: &mut App) -> Vec<Menu> {
+    let upstream = upstream(cx);
+    let tools = tools_menu(toggles, |name| cx.build_action(name, None).ok());
+    let menus = app_menu::arrange(upstream, tools, bar_items::resolve(cx));
+    flatten::for_platform(menus, cfg!(target_os = "macos"))
 }
 
 fn toggle_feature(action: &ToggleFeature, cx: &mut App) {
-    let Some((index, _)) = feature(&action.feature) else {
-        log::warn!("zenith_menus: unknown feature {:?}", action.feature);
+    toggle_key(&action.feature, cx);
+}
+
+/// Flips the setting of the feature `key` in the user settings; the restart notice follows
+/// from the observer in `init` once the setting has changed.
+pub(crate) fn toggle_key(key: &str, cx: &mut App) {
+    let Some((index, _)) = feature(key) else {
+        log::warn!("zenith_menus: unknown feature {key:?}");
         return;
     };
     let on = !FeatureToggles::get_global(cx)
@@ -90,7 +113,7 @@ fn toggle_feature(action: &ToggleFeature, cx: &mut App) {
         .get(index)
         .copied()
         .unwrap_or(true);
-    let key = action.feature.clone();
+    let key = key.to_string();
     settings::update_settings_file(<dyn fs::Fs>::global(cx), cx, move |content, _| {
         set_feature(content, &key, on);
     });

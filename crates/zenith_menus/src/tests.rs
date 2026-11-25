@@ -10,8 +10,12 @@ use crate::{
     ToggleFeature,
     app_menu::arrange as arrange_with,
     bar_items::{self, Extras},
+    flatten::for_platform,
     restart_notice_id, restart_notice_text, toggle_feature,
-    tools::{FEATURES, changed_restart_features, feature, feature_states, set_feature, tools_menu},
+    tools::{
+        FEATURES, GROUPS, changed_restart_features, feature, feature_states, set_feature,
+        tools_action_names, tools_menu,
+    },
 };
 
 /// Not registered anywhere, so a name here never clashes with a real action.
@@ -75,6 +79,7 @@ fn upstream() -> Vec<Menu> {
             vec![
                 item("About Zed", "zed::About"),
                 item("Check for Updates", "auto_update::Check"),
+                item("Install CLI", "install_cli::InstallCliBinary"),
                 MenuItem::separator(),
                 MenuItem::submenu(menu(
                     "Settings",
@@ -193,7 +198,8 @@ fn all_action_names(menus: &[Menu], out: &mut Vec<String>) {
     }
 }
 
-const DROPPED: [&str; 7] = [
+const DROPPED: [&str; 8] = [
+    "install_cli::InstallCliBinary",
     "auto_update::Check",
     "auto_update::ViewReleaseNotesLocally",
     "feedback::EmailZed",
@@ -343,13 +349,21 @@ fn set_feature_round_trip() {
     assert_eq!(islands, Some(false));
 }
 
-/// (key, checked) of every feature item; panics when a submenu nests deeper than one level.
+/// The feature a unit toggle action belongs to.
+fn key_of(action: &dyn Action) -> Option<&'static str> {
+    FEATURES
+        .iter()
+        .find(|feature| (feature.toggle)().name() == action.name())
+        .map(|feature| feature.key)
+}
+
+/// (key, checked) of every feature toggle in the menu, submenus included; panics when a
+/// submenu nests deeper than one level.
 fn checked_flags(menu: &Menu) -> Vec<(String, bool)> {
     let mut flags = Vec::new();
     for item in &menu.items {
         match item {
             MenuItem::Submenu(submenu) => {
-                assert_eq!(submenu.name, "IDE Features");
                 for inner in &submenu.items {
                     assert!(
                         !matches!(inner, MenuItem::Submenu(_)),
@@ -361,11 +375,9 @@ fn checked_flags(menu: &Menu) -> Vec<(String, bool)> {
             MenuItem::Action {
                 action, checked, ..
             } => {
-                let toggle = action
-                    .as_any()
-                    .downcast_ref::<ToggleFeature>()
-                    .expect("ToggleFeature");
-                flags.push((toggle.feature.clone(), *checked));
+                if let Some(key) = key_of(action.as_ref()) {
+                    flags.push((key.to_string(), *checked));
+                }
             }
             _ => {}
         }
@@ -373,10 +385,14 @@ fn checked_flags(menu: &Menu) -> Vec<(String, bool)> {
     flags
 }
 
+fn tools_with(on: &[bool]) -> Menu {
+    tools_menu(on, |name| Some(fake(name)))
+}
+
 #[test]
 fn tools_menu_checked() {
     let on: Vec<bool> = (0..FEATURES.len()).map(|index| index % 3 != 0).collect();
-    let flags = checked_flags(&tools_menu(&on));
+    let flags = checked_flags(&tools_with(&on));
     assert_eq!(flags.len(), FEATURES.len());
     for (index, feature) in FEATURES.iter().enumerate() {
         let (_, checked) = flags
@@ -387,10 +403,298 @@ fn tools_menu_checked() {
     }
     // A short list counts as on.
     assert!(
-        checked_flags(&tools_menu(&[]))
+        checked_flags(&tools_with(&[]))
             .iter()
             .all(|(_, checked)| *checked)
     );
+}
+
+#[test]
+fn tools_menu_structure_and_order() {
+    let tools = tools_with(&[]);
+    assert_eq!(
+        shape(&tools),
+        [
+            "[AI]",
+            "[Templates]",
+            "[Local History]",
+            "[Scratches]",
+            "[TODO]",
+            "[Inspections]",
+            "[Deployment]",
+            "[PHP]",
+            "[WordPress]",
+            "[Laravel]",
+            "[Next.js]",
+            "[Postfix]",
+            "[HTTP Client]",
+            "[Markdown]",
+            "-",
+            "[IDE Features]",
+            "-",
+            "install_cli::InstallCliBinary",
+        ]
+    );
+    let Some(MenuItem::Submenu(ai)) = tools.items.first() else {
+        panic!("AI first");
+    };
+    assert_eq!(
+        shape(ai),
+        [
+            "zenith_agent_review::ToggleFocus",
+            "zenith_agent_review::KeepAll",
+            "zenith_agent_review::RevertTurn",
+            "-",
+            "zenith_features::ToggleAgentReview",
+        ]
+    );
+    assert_eq!(labels(ai).last().map(String::as_str), Some("Enabled"));
+    assert_eq!(
+        labels(&tools),
+        ["Create Command Line Launcher…"],
+        "the launcher is the only top-level action"
+    );
+}
+
+#[test]
+fn tools_menu_without_resolvable_actions_keeps_the_switches() {
+    let tools = tools_menu(&[], |_| None);
+    let submenus: Vec<&str> = tools
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            MenuItem::Submenu(menu) => Some(menu.name.as_ref()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        submenus,
+        [
+            "AI",
+            "Local History",
+            "Scratches",
+            "TODO",
+            "Inspections",
+            "Deployment",
+            "WordPress",
+            "Laravel",
+            "Next.js",
+            "IDE Features"
+        ]
+    );
+    assert_eq!(checked_flags(&tools).len(), FEATURES.len());
+    assert_no_stray_separators(&tools);
+}
+
+fn assert_no_stray_separators(menu: &Menu) {
+    let shown = shape(menu);
+    assert_ne!(
+        shown.first().map(String::as_str),
+        Some("-"),
+        "{}",
+        menu.name
+    );
+    assert_ne!(shown.last().map(String::as_str), Some("-"), "{}", menu.name);
+    assert!(
+        shown.windows(2).all(|w| w[0] != "-" || w[1] != "-"),
+        "{}: {shown:?}",
+        menu.name
+    );
+    for item in &menu.items {
+        if let MenuItem::Submenu(sub) = item {
+            assert!(!sub.items.is_empty(), "{} is empty", sub.name);
+            assert_no_stray_separators(sub);
+        }
+    }
+}
+
+#[test]
+fn every_feature_has_one_toggle_in_tools() {
+    let flags = checked_flags(&tools_with(&[]));
+    for feature in FEATURES {
+        let count = flags.iter().filter(|(key, _)| key == feature.key).count();
+        assert_eq!(count, 1, "{} needs exactly one Tools toggle", feature.key);
+        let name = (feature.toggle)().name();
+        assert!(name.starts_with("zenith_features::Toggle"), "{name}");
+    }
+    let mut names: Vec<_> = FEATURES.iter().map(|f| (f.toggle)().name()).collect();
+    names.sort();
+    names.dedup();
+    assert_eq!(names.len(), FEATURES.len(), "one unit action per feature");
+    // A group's switch is its own feature's, and IDE features keep theirs in IDE Features.
+    for group in GROUPS {
+        if let Some(key) = group.feature {
+            assert!(!feature(key).expect("feature").1.ide, "{key}");
+        }
+    }
+}
+
+#[gpui::test]
+fn unit_actions_are_listed_for_the_palette(cx: &mut TestAppContext) {
+    cx.update(|cx| {
+        let listed = cx
+            .all_action_names()
+            .iter()
+            .filter(|name| name.starts_with("zenith_features::"))
+            .count();
+        assert_eq!(listed, FEATURES.len(), "no unit action without a row");
+        for feature in FEATURES {
+            let name = (feature.toggle)().name();
+            assert!(cx.build_action(name, None).is_ok(), "{name}");
+        }
+    });
+}
+
+#[test]
+fn hover_card_is_disabled_while_look_is_off() {
+    let hover_disabled = |on: &[bool]| {
+        let tools = tools_with(on);
+        let ide = tools
+            .items
+            .iter()
+            .find_map(|item| match item {
+                MenuItem::Submenu(menu) if menu.name == "IDE Features" => Some(menu),
+                _ => None,
+            })
+            .expect("IDE Features");
+        ide.items
+            .iter()
+            .filter(|item| matches!(item, MenuItem::Action { name, .. } if name == "Hover Card"))
+            .map(MenuItem::is_disabled)
+            .collect::<Vec<_>>()
+    };
+    let (look, _) = feature("look").expect("look");
+    let mut on = vec![true; FEATURES.len()];
+    assert_eq!(hover_disabled(&on), [false]);
+    on[look] = false;
+    assert_eq!(hover_disabled(&on), [true]);
+    // Nothing else goes grey with Look.
+    let disabled_items = |on: &[bool]| {
+        let mut count = 0;
+        for item in &tools_with(on).items {
+            if let MenuItem::Submenu(menu) = item {
+                count += menu.items.iter().filter(|item| item.is_disabled()).count();
+            }
+        }
+        count
+    };
+    assert_eq!(disabled_items(&on), 1);
+}
+
+/// Names whose crate this one does not link, so `build_action` cannot see them here; the
+/// umbrella test resolves them (`zenith_menus::tools_action_names`).
+const UNLINKED_TOOLS: &[&str] = &[
+    "zenith_agent_review::",
+    "zenith_templates::",
+    "zenith_scratches::",
+    "zenith_todo::",
+    "zenith_inspections::",
+    "zenith_deploy::",
+    "zenith_php_tools::",
+    "zenith_external_libraries::",
+    "zenith_wordpress::",
+    "zenith_laravel::",
+    "zenith_nextjs::",
+    "zenith_postfix::",
+    "zenith_http::",
+    "zenith_markdown::",
+    "install_cli::",
+];
+
+#[gpui::test]
+fn linked_tools_actions_exist(cx: &mut TestAppContext) {
+    cx.update(|cx| {
+        let missing: Vec<&str> = tools_action_names()
+            .into_iter()
+            .filter(|name| !UNLINKED_TOOLS.iter().any(|prefix| name.starts_with(prefix)))
+            .filter(|name| cx.build_action(name, None).is_err())
+            .collect();
+        assert!(missing.is_empty(), "no such action: {missing:?}");
+    });
+}
+
+fn all_menus() -> Vec<Menu> {
+    arrange_with(upstream(), tools_with(&[]), extras_where(|_| true, false))
+}
+
+#[test]
+fn flattening_leaves_no_submenus_and_labels_each_item() {
+    let flat = for_platform(all_menus(), false);
+    for menu in &flat {
+        assert!(
+            menu.items.iter().all(|item| depth(item) == 0),
+            "{} still nests",
+            menu.name
+        );
+        assert!(!menu.items.is_empty(), "{} is empty", menu.name);
+        assert_no_stray_separators(menu);
+    }
+    let tools = find(&flat, "Tools");
+    let tools_labels = labels(tools);
+    for expected in [
+        "AI: Agent Review Panel",
+        "AI: Enabled",
+        "Markdown: Preview Only",
+        "IDE Features: Navigation Bar",
+        "Create Command Line Launcher…",
+    ] {
+        assert!(tools_labels.iter().any(|l| l == expected), "{expected}");
+    }
+    // A submenu sits between separators.
+    let shown = shape(tools);
+    let at = shown
+        .iter()
+        .position(|name| name == "zenith_agent_review::ToggleFocus")
+        .expect("AI item");
+    assert!(at == 0 || shown[at - 1] == "-" || shown[at - 1].starts_with("zenith"));
+    // Every action survives, and the check marks with it.
+    let mut before = Vec::new();
+    all_action_names(&all_menus(), &mut before);
+    let mut after = Vec::new();
+    all_action_names(&flat, &mut after);
+    before.sort();
+    after.sort();
+    assert_eq!(before, after);
+    assert_eq!(checked_flags(tools).len(), FEATURES.len());
+}
+
+#[test]
+fn flattening_is_off_where_menus_nest() {
+    let nested = for_platform(all_menus(), true);
+    assert_eq!(
+        nested.iter().map(shape).collect::<Vec<_>>(),
+        all_menus().iter().map(shape).collect::<Vec<_>>()
+    );
+    assert!(
+        nested
+            .iter()
+            .any(|menu| menu.items.iter().any(|i| depth(i) == 1))
+    );
+}
+
+#[test]
+fn flattening_edge_cases() {
+    let menus = vec![
+        menu(
+            "A",
+            vec![
+                MenuItem::submenu(menu("Empty", vec![])),
+                MenuItem::submenu(menu("One", vec![item("x", "a::X")]).disabled(true)),
+                MenuItem::submenu(menu("Two", vec![item("y", "a::Y")])),
+                item("z", "a::Z"),
+            ],
+        ),
+        menu(
+            "B",
+            vec![MenuItem::submenu(menu("Only", vec![item("w", "b::W")]))],
+        ),
+    ];
+    let flat = for_platform(menus, false);
+    assert_eq!(shape(&flat[0]), ["a::X", "-", "a::Y", "-", "a::Z"]);
+    assert_eq!(labels(&flat[0]), ["One: x", "Two: y", "z"]);
+    let disabled: Vec<bool> = flat[0].items.iter().map(MenuItem::is_disabled).collect();
+    assert_eq!(disabled, [true, false, false, false, false]);
+    assert_eq!(shape(&flat[1]), ["b::W"]);
 }
 
 fn fake_upstream(_: &mut App) -> Vec<Menu> {
@@ -767,4 +1071,48 @@ fn linked_bar_item_actions_exist(cx: &mut TestAppContext) {
             .collect();
         assert!(missing.is_empty(), "no such action: {missing:?}");
     });
+}
+
+// Every row's unit action, dispatched like a keypress, flips that setting and nothing else, and
+// asks for a restart exactly when the menu item would. templates and agent_review are left to
+// `restart_notice_follows_the_setting`: app notifications live in a process-wide store.
+#[gpui::test]
+async fn unit_actions_toggle_like_the_menu(cx: &mut TestAppContext) {
+    let app_state = cx.update(|cx| {
+        let app_state = AppState::test(cx);
+        workspace::init(app_state.clone(), cx);
+        crate::init(cx);
+        app_state
+    });
+    let project = Project::test(app_state.fs.clone(), [], cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let workspace = multi_workspace.read_with(cx, |multi, _| multi.workspace().clone());
+    cx.run_until_parked();
+
+    for (index, feature) in FEATURES.iter().enumerate() {
+        if ["templates", "agent_review"].contains(&feature.key) {
+            continue;
+        }
+        let before = cx.update(|_, cx| crate::FeatureToggles::get_global(cx).0.clone());
+        assert!(before[index], "{} starts on", feature.key);
+        cx.update(|window, cx| window.dispatch_action((feature.toggle)(), cx));
+        cx.run_until_parked();
+        let after = cx.update(|_, cx| crate::FeatureToggles::get_global(cx).0.clone());
+        let flipped: Vec<usize> = (0..before.len())
+            .filter(|i| before[*i] != after[*i])
+            .collect();
+        assert_eq!(
+            flipped,
+            [index],
+            "{} flips its own setting only",
+            feature.key
+        );
+        assert_eq!(
+            has_notice(feature.key, &workspace, cx),
+            feature.restart,
+            "{} restart notice",
+            feature.key
+        );
+    }
 }

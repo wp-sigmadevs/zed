@@ -192,7 +192,7 @@ pub(crate) fn resolve(cx: &App) -> Extras {
     build(|name| cx.build_action(name, None).ok(), ai_disabled)
 }
 
-fn action(label: &'static str, action: Box<dyn Action>) -> MenuItem {
+pub(crate) fn action(label: &'static str, action: Box<dyn Action>) -> MenuItem {
     MenuItem::Action {
         name: label.into(),
         action,
