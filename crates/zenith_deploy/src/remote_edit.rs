@@ -16,6 +16,14 @@
 //! - The bytes are the saving buffer's text as saved, never a re-read of the cache file and never
 //!   another buffer's text.
 //! - A copy is bound to the server target (host, port, type, user) it was downloaded from.
+//!
+//! Known limits (M4a; each needs more than this crate):
+//! - A save by an agent (ACP `write_text_file`) of an attached cache path fires `Saved` like the
+//!   user's own save and uploads without a prompt when the server's decision is Allow. Telling
+//!   an agent write from an explicit save needs a save intent (M4b) or a hook outside this crate.
+//! - There is no quit guard while an in-place upload runs: quitting mid-write leaves the remote
+//!   file truncated.
+//! - Allow plus autosave uploads half-typed files on every autosave (M4b).
 
 use std::{
     path::{Path, PathBuf},
@@ -153,6 +161,20 @@ impl RemoteCopy {
     pub fn is_open(&self) -> bool {
         self.state == CopyState::Uploading
             || self.buffers.iter().any(|buffer| buffer.upgrade().is_some())
+    }
+}
+
+/// A claim on one cache path, released on drop ([`ServerStore::reserve_download`]).
+pub struct DownloadReservation {
+    claims: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<PathBuf>>>,
+    path: PathBuf,
+}
+
+impl Drop for DownloadReservation {
+    fn drop(&mut self) {
+        if let Ok(mut claims) = self.claims.lock() {
+            claims.remove(&self.path);
+        }
     }
 }
 
@@ -494,6 +516,39 @@ impl ServerStore {
             .get(server_id)
             .filter(|(account, _)| Some(account) == self.current_target(server_id).as_ref())
             .map_or(UploadDecision::Ask, |(_, decision)| *decision)
+    }
+
+    /// [`Self::set_upload_decision`] only while the server's target is still `expected_target`
+    /// (`secrets::target_account` taken when the prompt was built): an answer given for a host
+    /// the user saw is never recorded for a host they did not. False when it does not match.
+    pub(crate) fn set_upload_decision_for_target(
+        &mut self,
+        server_id: &str,
+        expected_target: &str,
+        decision: UploadDecision,
+    ) -> bool {
+        self.current_target(server_id).as_deref() == Some(expected_target)
+            && self.set_upload_decision(server_id, decision)
+    }
+
+    /// Claims `cache_path` for a download that is about to start: `None` while the copy is open
+    /// or another download into it (any window) is running. The claim ends when the returned
+    /// guard is dropped, so a cancelled task cannot leave it behind. Without it two windows
+    /// connecting at once would both pass the "not open" check and the second download would
+    /// replace the file under the first one's buffer.
+    pub fn reserve_download(&self, cache_path: &Path) -> Option<DownloadReservation> {
+        if self.copies.get(cache_path).is_some_and(RemoteCopy::is_open) {
+            return None;
+        }
+        let inserted = self
+            .downloading
+            .lock()
+            .ok()?
+            .insert(cache_path.to_path_buf());
+        inserted.then(|| DownloadReservation {
+            claims: self.downloading.clone(),
+            path: cache_path.to_path_buf(),
+        })
     }
 
     /// Records the user's answer for this session. False when the server does not exist.

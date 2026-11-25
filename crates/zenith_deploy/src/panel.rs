@@ -29,13 +29,13 @@ use workspace::{
 };
 
 use crate::{
-    CopyState, DeploySettings, EntryKind, RemoteCopy, RemoteEntry, ServerConfig, ServerRefused,
-    ServerStore, ServerStoreEvent, ServerType, Transport, UploadDecision, UploadOutcome,
-    UploadStart, cache_path_for,
+    CopyState, DeploySettings, EntryKind, RemoteCopy, RemoteEntry, RemoteStat, ServerConfig,
+    ServerRefused, ServerStore, ServerStoreEvent, ServerType, Transport, UploadDecision,
+    UploadOutcome, UploadStart, cache_path_for,
     dialog::{DeploymentDialog, project_root},
     download_entry,
     remote_path::{join_remote, validate_name, validate_remote_path},
-    spawn_operation, upload_warnings,
+    secrets, spawn_operation, upload_warnings,
 };
 
 actions!(
@@ -58,6 +58,15 @@ const ROW_HEIGHT: f32 = 24.;
 const INDENT: f32 = 14.;
 
 pub(crate) fn init(cx: &mut App) {
+    // Every editor of a cached copy, however it was made (a split clones the editor with
+    // serialization on), keeps its text out of the editor database: hot exit would store the
+    // dirty text of a cached `wp-config.php`.
+    cx.observe_new(|editor: &mut Editor, _, cx| {
+        if is_cache_editor(editor, cx) {
+            editor.set_should_serialize(false, cx);
+        }
+    })
+    .detach();
     cx.observe_new(|workspace: &mut Workspace, window, cx| {
         workspace.register_action(|workspace, _: &ToggleFocus, window, cx| {
             workspace.toggle_panel_focus::<RemoteHostPanel>(window, cx);
@@ -128,8 +137,9 @@ pub struct RemoteHostPanel {
     local_unshared: Box<dyn Fn(&App) -> bool>,
     /// A status line that is not an error ("Uploaded …").
     notice: Option<SharedString>,
-    /// Cache paths with a confirmation prompt on screen (one at a time per file).
-    asking: HashSet<PathBuf>,
+    /// A prompt of this window is on screen: a second one would replace it (window.rs), so
+    /// later questions become toasts until it is answered.
+    prompt_open: bool,
     /// The tasks waiting for those answers. Not cleared by Disconnect: the prompt stays up.
     prompts: HashMap<PathBuf, Task<()>>,
     _subscriptions: Vec<Subscription>,
@@ -188,7 +198,7 @@ impl RemoteHostPanel {
                 })
             },
             notice: None,
-            asking: HashSet::new(),
+            prompt_open: false,
             prompts: HashMap::new(),
             _subscriptions: subscriptions,
         };
@@ -281,7 +291,13 @@ impl RemoteHostPanel {
                 .store
                 .update(cx, |store, cx| store.clear_cache(server_id, cx));
             if kept > 0 {
-                self.status = Some(format!("Kept {kept} open remote files.").into());
+                self.notice = Some(
+                    format!(
+                        "Disconnected. Kept {kept} open file{} with unsaved changes on this computer.",
+                        if kept == 1 { "" } else { "s" }
+                    )
+                    .into(),
+                );
             }
         }
     }
@@ -338,13 +354,19 @@ impl RemoteHostPanel {
             self.session = None;
             self.connected_config = None;
         }
-        self.status = Some(format!("{error:#}").into());
+        self.status = Some(plain_text(&format!("{error:#}"), MAX_STATUS_CHARS).into());
         cx.notify();
     }
 
     fn list(&mut self, path: String, cx: &mut Context<Self>) {
         if validate_remote_path(&path).is_err() {
-            self.status = Some(format!("{path:?} is not an absolute remote path").into());
+            self.status = Some(
+                plain_text(
+                    &format!("{path:?} is not an absolute remote path"),
+                    MAX_STATUS_CHARS,
+                )
+                .into(),
+            );
             cx.notify();
             return;
         }
@@ -498,6 +520,8 @@ impl RemoteHostPanel {
         let workspace = self.workspace.clone();
         let store = self.store.clone();
         let server_id = server.id.clone();
+        let server_name = plain_text(&server.name, 60);
+        let file_label = plain_text(&row.entry.name, 100);
         let key = format!("open:{remote_path}");
         let task = cx.spawn_in(window, async move |this, cx| {
             let result = async {
@@ -534,28 +558,95 @@ impl RemoteHostPanel {
                         return Err(anyhow!("This file is already open in another window."));
                     }
                 }
+                // One download into this path at a time, across windows; held until the buffer
+                // is attached (it then counts as open).
+                let _reservation = cx
+                    .update(|_, cx| store.read(cx).reserve_download(&cache_path))?
+                    .ok_or_else(|| anyhow!("This file is already being opened."))?;
                 let session = session.await.map_err(|error| anyhow!(error))?;
-                let (path, stat) = cx
+                // Into a fresh directory: a saved copy that is still in the cache (its tab was
+                // closed with changes that never uploaded) is only replaced after the user says so.
+                let incoming = local_directory
+                    .join(format!(".zenith-incoming-{}", uuid::Uuid::new_v4()));
+                let fetched = cx
                     .update(|_, cx| {
                         let remote_path = remote_path.clone();
+                        let cache_path = cache_path.clone();
+                        let incoming = incoming.clone();
                         spawn_operation(cx, async move {
-                            create_private_dir(&cache_root, &local_directory)?;
-                            let mut transport = session.lock().await;
-                            // Before the download: what the server looked like for this copy.
-                            // No stamp is allowed; the first upload then asks first.
-                            let stat = transport.stat(&remote_path).await.ok().flatten();
-                            let path = download_entry(
-                                transport.as_mut(),
-                                &row.directory,
-                                &row.entry,
-                                &local_directory,
+                            let fetched = fetch_copy(
+                                session,
+                                &cache_root,
+                                &incoming,
+                                &cache_path,
+                                &remote_path,
+                                &row,
                             )
-                            .await?;
-                            anyhow::Ok((path, stat))
+                            .await;
+                            if fetched.is_err() {
+                                std::fs::remove_dir_all(&incoming).ok();
+                            }
+                            fetched
                         })
                     })?
                     .await?;
-                anyhow::ensure!(path == cache_path, "The download landed outside the cache.");
+                let mut stat = fetched.stat.clone();
+                let mut choice = ReopenAnswer::UseServer;
+                if fetched.differs {
+                    let busy =
+                        this.update(cx, |this, _| std::mem::replace(&mut this.prompt_open, true))?;
+                    choice = if busy {
+                        ReopenAnswer::Cancel
+                    } else {
+                        let message = format!(
+                            "The copy of {file_label} on this computer differs from the one on {server_name}"
+                        );
+                        let answers = [
+                            PromptButton::ok(REOPEN_BUTTONS[0]),
+                            PromptButton::new(REOPEN_BUTTONS[1]),
+                            PromptButton::cancel(REOPEN_BUTTONS[2]),
+                        ];
+                        let answer = cx.update(|window, cx| {
+                            window.prompt(
+                                PromptLevel::Warning,
+                                &message,
+                                Some(REOPEN_DETAIL),
+                                &answers,
+                                cx,
+                            )
+                        })?;
+                        let answer = answer.await.unwrap_or(2);
+                        this.update(cx, |this, _| this.prompt_open = false).log_err();
+                        reopen_answer(answer)
+                    };
+                    if choice == ReopenAnswer::Keep {
+                        // Your version, compared with the server as it was when you got it.
+                        stat = cx.update(|_, cx| {
+                            store
+                                .read(cx)
+                                .copy_for_buffer_path(&cache_path)
+                                .and_then(|copy| copy.stat.clone())
+                        })?;
+                    }
+                    if busy {
+                        cx.update(|_, cx| {
+                            spawn_operation(cx, async move { place_copy(&fetched, &cache_path, false) })
+                        })?
+                        .await?;
+                        return Err(anyhow!(
+                            "Answer the open question first, then open the file again."
+                        ));
+                    }
+                }
+                let use_server = choice == ReopenAnswer::UseServer;
+                cx.update(|_, cx| {
+                    let cache_path = cache_path.clone();
+                    spawn_operation(cx, async move { place_copy(&fetched, &cache_path, use_server) })
+                })?
+                .await?;
+                if choice == ReopenAnswer::Cancel {
+                    return anyhow::Ok(None);
+                }
                 let registered = cx.update(|_, cx| {
                     store.update(cx, |store, _| {
                         store.register_download(cache_path.clone(), &server_id, &remote_path, stat)
@@ -563,7 +654,7 @@ impl RemoteHostPanel {
                 })?;
                 let open = workspace.update_in(cx, |workspace, window, cx| {
                     workspace.open_abs_path(
-                        path,
+                        cache_path.clone(),
                         OpenOptions {
                             visible: Some(OpenVisible::None),
                             ..OpenOptions::default()
@@ -576,9 +667,12 @@ impl RemoteHostPanel {
                 if let Some(editor) = item.downcast::<Editor>() {
                     // Read-only until the buffer is attached to the index.
                     cx.update(|_, cx| editor.update(cx, |editor, _| editor.set_read_only(true)))?;
-                    this.update_in(cx, |this, window, cx| {
-                        this.attach_editor(&cache_path, &editor, window, cx)
-                    })?;
+                    // A copy the index refused stays read-only and is never attached.
+                    if registered.is_ok() {
+                        this.update_in(cx, |this, window, cx| {
+                            this.attach_editor(&cache_path, &editor, window, cx)
+                        })?;
+                    }
                 }
                 if let Err(error) = registered {
                     return Err(error.context("This copy is read-only"));
@@ -709,18 +803,24 @@ impl RemoteHostPanel {
         cx.notify();
     }
 
-    /// The path, server name and host, and file name of the copy `cache_path`.
-    fn describe(&self, cache_path: &Path, cx: &App) -> Option<(String, ServerConfig, String)> {
+    /// What a prompt or toast names for the copy `cache_path`. Every shown piece comes from a
+    /// server's listing or the user's config, so it goes through [`plain_text`].
+    fn describe(&self, cache_path: &Path, cx: &App) -> Option<Described> {
         let store = self.store.read(cx);
         let copy = store.copy_for_buffer_path(cache_path)?;
         let server = store
             .servers
             .servers
             .iter()
-            .find(|server| server.id == copy.server_id)?
-            .clone();
+            .find(|server| server.id == copy.server_id)?;
         let file = copy.remote_path.rsplit('/').next().unwrap_or_default();
-        Some((copy.remote_path.clone(), server, file.to_string()))
+        Some(Described {
+            file: plain_text(file, 100),
+            name: plain_text(&server.name, 60),
+            host: plain_text(&server.host, 100),
+            server_type: server.server_type,
+            target: secrets::target_account(server),
+        })
     }
 
     fn buffer_path(&self, buffer: &Entity<Buffer>) -> Option<PathBuf> {
@@ -729,7 +829,7 @@ impl RemoteHostPanel {
         })
     }
 
-    /// Asks before the first upload to a server: Upload / Always / Not now / Never.
+    /// Asks before the first upload to a server: Upload / Always / Cancel / Never.
     fn confirm_upload(
         &mut self,
         buffer: &Entity<Buffer>,
@@ -739,14 +839,19 @@ impl RemoteHostPanel {
         let Some(cache_path) = self.buffer_path(buffer) else {
             return;
         };
-        let Some((_, server, file)) = self.describe(&cache_path, cx) else {
+        let Some(described) = self.describe(&cache_path, cx) else {
             return;
         };
-        if !self.asking.insert(cache_path.clone()) {
+        if self.prompt_open {
+            self.saved_here_only(&described.file, buffer, cx);
             return;
         }
-        let message = format!("Upload {file} to {} ({})?", server.name, server.host);
-        let detail = upload_detail(server.server_type);
+        self.prompt_open = true;
+        let message = format!(
+            "Upload {} to {} ({})?",
+            described.file, described.name, described.host
+        );
+        let detail = upload_detail(described.server_type);
         let answers = [
             PromptButton::ok(UPLOAD_BUTTONS[0]),
             PromptButton::new(UPLOAD_BUTTONS[1]),
@@ -756,20 +861,25 @@ impl RemoteHostPanel {
         let answer = window.prompt(PromptLevel::Warning, &message, Some(&detail), &answers, cx);
         let buffer = buffer.downgrade();
         let path = cache_path.clone();
+        // The host the user is looking at in this prompt: an answer is recorded for it only.
+        let target = described.target;
         let task = cx.spawn_in(window, async move |this, cx| {
             let answer = upload_answer(answer.await.unwrap_or(2));
             this.update_in(cx, |this, window, cx| {
-                this.asking.remove(&path);
+                this.prompt_open = false;
                 let Some(buffer) = buffer.upgrade() else {
                     return;
                 };
                 match answer {
                     UploadAnswer::Once => this.start_upload(&buffer, false, true, window, cx),
                     UploadAnswer::Always => {
-                        this.set_decision(&path, UploadDecision::Allow, cx);
-                        this.start_upload(&buffer, false, false, window, cx);
+                        if this.set_decision(&path, &target, UploadDecision::Allow, cx) {
+                            this.start_upload(&buffer, false, false, window, cx);
+                        }
                     }
-                    UploadAnswer::Never => this.set_decision(&path, UploadDecision::Deny, cx),
+                    UploadAnswer::Never => {
+                        this.set_decision(&path, &target, UploadDecision::Deny, cx);
+                    }
                     UploadAnswer::NotNow => {}
                 }
             })
@@ -778,24 +888,46 @@ impl RemoteHostPanel {
         self.prompts.insert(cache_path, task);
     }
 
-    /// Records the answer for the server of `cache_path`. Only button clicks reach this.
+    /// A second question while one is on screen would replace it: say where the file stands.
+    fn saved_here_only(&mut self, file: &str, buffer: &Entity<Buffer>, cx: &mut Context<Self>) {
+        self.toast_with(
+            &format!(
+                "{file} is saved on this computer only. Run \"{UPLOAD_COMMAND}\" to upload it."
+            ),
+            Some(buffer.downgrade()),
+            false,
+            cx,
+        );
+    }
+
+    /// Records the answer for the server of `cache_path` if it is still the host the prompt
+    /// named (`target`); otherwise nothing is recorded and the user is told. Only button clicks
+    /// reach this.
     fn set_decision(
         &mut self,
         cache_path: &Path,
+        target: &str,
         decision: UploadDecision,
         cx: &mut Context<Self>,
-    ) {
+    ) -> bool {
         let Some(server_id) = self
             .store
             .read(cx)
             .copy_for_buffer_path(cache_path)
             .map(|copy| copy.server_id.clone())
         else {
-            return;
+            return false;
         };
-        self.store.update(cx, |store, _| {
-            store.set_upload_decision(&server_id, decision)
+        let recorded = self.store.update(cx, |store, _| {
+            store.set_upload_decision_for_target(&server_id, target, decision)
         });
+        if !recorded {
+            self.toast(
+                "The server's address or login changed while the question was open, so your answer was not saved and nothing was uploaded.",
+                cx,
+            );
+        }
+        recorded
     }
 
     /// What the uploader reported for a copy of this window.
@@ -810,41 +942,54 @@ impl RemoteHostPanel {
             return;
         }
         cx.notify();
-        let Some((_, server, file)) = self.describe(cache_path, cx) else {
+        let Some(Described { file, name, .. }) = self.describe(cache_path, cx) else {
             return;
         };
         match outcome {
             UploadOutcome::Uploaded => {
-                self.notice = Some(format!("Uploaded {file} to {}", server.name).into());
+                let line = format!("Uploaded {file} to {name}");
+                self.notice = Some(line.clone().into());
+                // gpui has no live regions: the status line is silent for a screen reader, so
+                // the notification area records every result too (follow-up in gpui).
+                self.toast_with(&line, None, true, cx);
             }
             UploadOutcome::Conflict => self.confirm_force(
                 cache_path,
-                format!("{file} changed on {} since you opened it", server.name),
-                "Overwrite replaces the server's version with yours.",
+                format!("{file} changed on {name} since you opened it"),
+                "Overwrite replaces the server's version with yours. Cancel keeps your version on this computer only.",
                 "Overwrite",
                 window,
                 cx,
             ),
             UploadOutcome::AskFirst => self.confirm_force(
                 cache_path,
-                format!(
-                    "{file} is missing or cannot be verified on {}: upload anyway?",
-                    server.name
-                ),
-                "The server did not report a version to compare with, so the upload could replace a file you have not seen.",
+                format!("{file} is missing or cannot be verified on {name}: upload anyway?"),
+                "The server did not report a version to compare with, so the upload could replace a file you have not seen. Cancel keeps your version on this computer only.",
                 "Upload anyway",
                 window,
                 cx,
             ),
-            UploadOutcome::Blocked(message) => self.toast(message, cx),
-            UploadOutcome::Failed(message) => self.toast(
-                &format!("{message} Run \"zenith deploy: upload remote copy\" to retry."),
-                cx,
-            ),
+            UploadOutcome::Blocked(message) => {
+                self.toast(&plain_text(message, MAX_TOAST_CHARS), cx)
+            }
+            UploadOutcome::Failed(message) => {
+                let retry = self
+                    .owned
+                    .get(cache_path)
+                    .map(|copy| copy.buffer.clone())
+                    .filter(|buffer| buffer.upgrade().is_some());
+                self.toast_with(
+                    &format!("{} {FAILED_HINT}", plain_text(message, MAX_TOAST_CHARS)),
+                    retry,
+                    false,
+                    cx,
+                );
+            }
         }
     }
 
-    /// Overwrite / Upload anyway (index 0) or Cancel; yes uploads again with `force`.
+    /// Cancel (the default, so a stray Return does not overwrite) or `yes`; yes uploads again
+    /// with `force`.
     fn confirm_force(
         &mut self,
         cache_path: &Path,
@@ -859,20 +1004,33 @@ impl RemoteHostPanel {
             .get(cache_path)
             .and_then(|copy| copy.buffer.upgrade());
         let Some(buffer) = buffer else {
-            // The tab is closed: nothing to upload again.
-            self.toast(&format!("{message}. Open the file again to upload it."), cx);
+            // The tab is closed. The saved text stays in the cache; opening the file again asks
+            // before it replaces that text, and the next upload checks the server again.
+            self.toast(
+                &format!(
+                    "{} Your changes are saved on this computer only. To upload them, open the file again, choose \"{}\", then run \"{UPLOAD_COMMAND}\".",
+                    end_sentence(&message),
+                    REOPEN_BUTTONS[0]
+                ),
+                cx,
+            );
             return;
         };
-        if !self.asking.insert(cache_path.to_path_buf()) {
+        if self.prompt_open {
+            let file = self
+                .describe(cache_path, cx)
+                .map(|described| described.file)
+                .unwrap_or_default();
+            self.saved_here_only(&file, &buffer, cx);
             return;
         }
-        let answers = [PromptButton::ok(yes), PromptButton::cancel("Cancel")];
+        self.prompt_open = true;
+        let answers = force_buttons(yes);
         let answer = window.prompt(PromptLevel::Warning, &message, Some(detail), &answers, cx);
-        let path = cache_path.to_path_buf();
         let task = cx.spawn_in(window, async move |this, cx| {
-            let answer = answer.await.unwrap_or(1);
+            let answer = answer.await.unwrap_or(0);
             this.update_in(cx, |this, window, cx| {
-                this.asking.remove(&path);
+                this.prompt_open = false;
                 // The button names the server and the file, and a stop only follows an upload the
                 // user already allowed: this call is consent as well as force.
                 if confirmed(answer) {
@@ -884,19 +1042,43 @@ impl RemoteHostPanel {
         self.prompts.insert(cache_path.to_path_buf(), task);
     }
 
-    /// Plain, shortened text: a server's reply may be in `message`.
+    /// Plain text only: a server's reply may be in `message`.
     fn toast(&mut self, message: &str, cx: &mut Context<Self>) {
-        let message = plain_truncated(message, MAX_TOAST_CHARS);
+        self.toast_with(message, None, false, cx);
+    }
+
+    /// A toast; `retry` adds a "Retry upload" button that uploads that buffer again, `autohide`
+    /// removes it after a while.
+    fn toast_with(
+        &mut self,
+        message: &str,
+        retry: Option<WeakEntity<Buffer>>,
+        autohide: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let message = plain_text(message, 2 * MAX_TOAST_CHARS);
         let workspace = self.workspace.clone();
+        let panel = cx.weak_entity();
         // Deferred: the palette action runs while the workspace is being updated.
         cx.defer(move |cx| {
+            let mut toast = Toast::new(NotificationId::unique::<RemoteHostPanel>(), message);
+            if autohide {
+                toast = toast.autohide();
+            }
+            if let Some(buffer) = retry {
+                toast = toast.on_click("Retry upload", move |window, cx| {
+                    let Some(buffer) = buffer.upgrade() else {
+                        return;
+                    };
+                    panel
+                        .update(cx, |panel, cx| {
+                            panel.start_upload(&buffer, false, false, window, cx)
+                        })
+                        .log_err();
+                });
+            }
             workspace
-                .update(cx, |workspace, cx| {
-                    workspace.show_toast(
-                        Toast::new(NotificationId::unique::<RemoteHostPanel>(), message),
-                        cx,
-                    )
-                })
+                .update(cx, |workspace, cx| workspace.show_toast(toast, cx))
                 .log_err();
         });
     }
@@ -1096,7 +1278,7 @@ impl RemoteHostPanel {
 }
 
 /// The cache holds copies of remote files (maybe `wp-config.php`): owner-only on unix.
-fn create_private_dir(cache_root: &std::path::Path, directory: &PathBuf) -> anyhow::Result<()> {
+fn create_private_dir(cache_root: &Path, directory: &Path) -> anyhow::Result<()> {
     std::fs::create_dir_all(directory)?;
     #[cfg(unix)]
     {
@@ -1108,8 +1290,123 @@ fn create_private_dir(cache_root: &std::path::Path, directory: &PathBuf) -> anyh
     Ok(())
 }
 
-/// Longest toast text, in characters.
+/// Longest piece of server text in a toast, and in the status line, in characters.
 const MAX_TOAST_CHARS: usize = 300;
+const MAX_STATUS_CHARS: usize = 300;
+
+/// The palette name of [`UploadRemoteCopy`].
+const UPLOAD_COMMAND: &str = "zenith deploy: upload remote copy";
+
+const FAILED_HINT: &str = "Your changes are saved on this computer. Choose Retry upload, or run \"zenith deploy: upload remote copy\".";
+
+/// The shown names of one copy and its server, and the host the user is being asked about.
+struct Described {
+    file: String,
+    name: String,
+    host: String,
+    server_type: ServerType,
+    target: String,
+}
+
+/// Whether `editor` shows a file in the remote-copy cache.
+fn is_cache_editor(editor: &Editor, cx: &App) -> bool {
+    let Some(store) = cx.try_global::<crate::GlobalServerStore>() else {
+        return false;
+    };
+    editor
+        .buffer()
+        .read(cx)
+        .as_singleton()
+        .and_then(|buffer| crate::remote_edit::buffer_path(buffer.read(cx), cx))
+        .is_some_and(|path| path.starts_with(&store.0.read(cx).cache_dir))
+}
+
+/// What the dialog asks when a saved copy is still in the cache and differs from the server's.
+const REOPEN_BUTTONS: [&str; 3] = ["Keep my saved copy", "Use the server's version", "Cancel"];
+const REOPEN_DETAIL: &str = "It may hold changes you saved here that were never uploaded, or the file on the server may have changed. Keep my saved copy opens your version, and the next upload checks the server first. Use the server's version replaces your saved copy.";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReopenAnswer {
+    Keep,
+    UseServer,
+    Cancel,
+}
+
+/// A dismissed prompt is Cancel.
+fn reopen_answer(index: usize) -> ReopenAnswer {
+    match index {
+        0 => ReopenAnswer::Keep,
+        1 => ReopenAnswer::UseServer,
+        _ => ReopenAnswer::Cancel,
+    }
+}
+
+/// A downloaded file waiting in `incoming` beside the cache path it would replace.
+struct Fetched {
+    incoming: PathBuf,
+    downloaded: PathBuf,
+    /// A file is already at the cache path and its bytes differ from the download.
+    differs: bool,
+    stat: Option<RemoteStat>,
+}
+
+/// Stat (before the download: what the server looked like), download into `incoming`, and
+/// compare with the file already in the cache.
+async fn fetch_copy(
+    session: Session,
+    cache_root: &Path,
+    incoming: &Path,
+    cache_path: &Path,
+    remote_path: &str,
+    row: &Row,
+) -> anyhow::Result<Fetched> {
+    create_private_dir(cache_root, incoming)?;
+    let mut transport = session.lock().await;
+    // No stamp is allowed; the first upload then asks first.
+    let stat = transport.stat(remote_path).await.ok().flatten();
+    let downloaded =
+        download_entry(transport.as_mut(), &row.directory, &row.entry, incoming).await?;
+    drop(transport);
+    anyhow::ensure!(
+        downloaded.parent() == Some(incoming) && downloaded.file_name() == cache_path.file_name(),
+        "The download landed outside the cache."
+    );
+    let existing = match std::fs::read(cache_path) {
+        Ok(bytes) => Some(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    let differs = match existing {
+        Some(existing) => existing != std::fs::read(&downloaded)?,
+        None => false,
+    };
+    Ok(Fetched {
+        incoming: incoming.to_path_buf(),
+        downloaded,
+        differs,
+        stat,
+    })
+}
+
+/// Moves the download over the cache path (`use_server`) or drops it, and removes `incoming`.
+fn place_copy(fetched: &Fetched, cache_path: &Path, use_server: bool) -> anyhow::Result<()> {
+    let placed = if use_server {
+        std::fs::rename(&fetched.downloaded, cache_path).map_err(anyhow::Error::from)
+    } else {
+        Ok(())
+    };
+    std::fs::remove_dir_all(&fetched.incoming).ok();
+    placed
+}
+
+/// `message` as one sentence: ends in `.`, `?` or `!`.
+fn end_sentence(message: &str) -> String {
+    if message.ends_with(['.', '?', '!']) {
+        message.to_string()
+    } else {
+        format!("{message}.")
+    }
+}
 
 /// `project.is_local() && !project.is_shared()`: a collab guest's save would upload with the
 /// host's credentials, so only a local, unshared project uploads.
@@ -1120,9 +1417,9 @@ fn is_local_unshared(is_local: bool, is_shared: bool) -> bool {
 /// The first-upload prompt's buttons, in order; [`upload_answer`] maps the clicked index back.
 const UPLOAD_BUTTONS: [&str; 4] = [
     "Upload",
-    "Always for this server (this session)",
-    "Not now",
-    "Never for this server (this session)",
+    "Always upload to this server until I quit",
+    "Cancel",
+    "Never upload to this server until I quit",
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1147,9 +1444,15 @@ fn upload_answer(index: usize) -> UploadAnswer {
     }
 }
 
-/// Overwrite / Upload anyway is the first button; anything else cancels.
+/// Cancel first, so it is the default; `yes` is never the button Return presses.
+fn force_buttons(yes: &'static str) -> [PromptButton; 2] {
+    [PromptButton::cancel("Cancel"), PromptButton::new(yes)]
+}
+
+/// Overwrite / Upload anyway is the second button (Cancel is the default); anything else
+/// cancels.
 fn confirmed(index: usize) -> bool {
-    index == 0
+    index == 1
 }
 
 /// What the first-upload prompt says besides the question.
@@ -1157,30 +1460,77 @@ fn upload_detail(server_type: ServerType) -> String {
     let warnings = upload_warnings(server_type);
     let mut lines = vec!["Each save writes the file over the one on the server.".to_string()];
     if warnings.clear_text {
-        lines.push("FTP sends your password and file in clear text.".into());
+        lines.push(
+            "FTP sends your password and the file unencrypted: others on the network can read them."
+                .into(),
+        );
     }
     if warnings.follows_symlinks {
-        lines.push("This server may follow symbolic links and write to another file.".into());
+        lines.push(
+            "If this file is a link (symlink) on the server, the upload may change the file it points to."
+                .into(),
+        );
     }
     lines.push(
-        "A change made on the server in the same second with the same size cannot be detected."
+        "Zenith checks the server for changes first, but can miss a change made in the same second that kept the size the same."
             .into(),
     );
     lines.join("\n")
 }
 
-/// One line of at most `max` characters with control characters replaced by spaces: server
-/// replies and file names are shown as text and nothing else.
-fn plain_truncated(text: &str, max: usize) -> String {
-    let mut line: String = text
-        .chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
-        .take(max + 1)
-        .collect();
-    if line.chars().count() > max {
-        line = line.chars().take(max).collect::<String>() + "…";
+/// Characters that show nothing or reorder text: format characters (zero-width, bidi
+/// overrides and isolates, tags, soft hyphen, BOM).
+fn is_invisible(c: char) -> bool {
+    matches!(u32::from(c),
+        0xAD | 0x61C | 0x180E | 0x200B..=0x200F | 0x202A..=0x202E | 0x2060..=0x206F
+        | 0xFEFF | 0xFFF9..=0xFFFB | 0xE0000..=0xE007F)
+}
+
+/// Text from a server or a listing, made safe to show: ANSI escape sequences removed whole,
+/// control and invisible/bidi format characters dropped, whitespace (newlines, U+2028/2029)
+/// collapsed to single spaces, at most `max` characters (then `…`).
+fn plain_text(text: &str, max: usize) -> String {
+    let mut kept = String::new();
+    // A cap on the work for a huge reply; escape sequences are short.
+    let mut chars = text.chars().take(max.saturating_mul(16).max(64)).peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            match chars.next() {
+                // CSI: parameters, then a final byte in @..~.
+                Some('[') => {
+                    for next in chars.by_ref() {
+                        if ('\u{40}'..='\u{7e}').contains(&next) {
+                            break;
+                        }
+                    }
+                }
+                // OSC: up to BEL or ST (ESC \).
+                Some(']') => {
+                    while let Some(next) = chars.next() {
+                        if next == '\u{7}' {
+                            break;
+                        }
+                        if next == '\u{1b}' {
+                            chars.next_if_eq(&'\\');
+                            break;
+                        }
+                    }
+                }
+                _ => {}
+            }
+            continue;
+        }
+        if is_invisible(c) {
+            continue;
+        }
+        kept.push(if c.is_control() { ' ' } else { c });
     }
-    line
+    let line = kept.split_whitespace().collect::<Vec<_>>().join(" ");
+    if line.chars().count() > max {
+        line.chars().take(max).collect::<String>() + "…"
+    } else {
+        line
+    }
 }
 
 /// Where a cache file is open.
@@ -1291,50 +1641,67 @@ impl Render for RemoteHostPanel {
             .size_full()
             .child(self.render_toolbar(window, cx))
             .when_some(self.status.clone(), |panel, status| {
+                // Wrapped so a screen reader can reach the text (a bare `Label` has no id).
                 panel.child(
-                    h_flex()
-                        .px_2()
-                        .gap_1()
+                    div()
+                        .id("remote-host-error")
+                        .role(gpui::Role::Status)
+                        .aria_label(SharedString::from(format!("Error: {status}")))
+                        .debug_selector(|| "remote-host-error".into())
                         .child(
-                            Icon::new(IconName::Warning)
-                                .color(Color::Error)
-                                .size(IconSize::Small),
-                        )
-                        .child(
-                            Label::new(status)
-                                .color(Color::Error)
-                                .size(LabelSize::Small),
+                            h_flex()
+                                .px_2()
+                                .gap_1()
+                                .child(
+                                    Icon::new(IconName::Warning)
+                                        .color(Color::Error)
+                                        .size(IconSize::Small),
+                                )
+                                .child(
+                                    Label::new(status)
+                                        .color(Color::Error)
+                                        .size(LabelSize::Small),
+                                ),
                         ),
                 )
             })
             .when_some(self.upload_line(cx), |panel, line| {
                 panel.child(
-                    h_flex()
-                        .px_2()
-                        .gap_1()
+                    div()
+                        .id("remote-host-upload-status")
+                        .role(gpui::Role::Status)
+                        .aria_label(line.clone())
+                        .debug_selector(|| "remote-host-upload-status".into())
                         .child(
-                            Icon::new(IconName::ArrowUp)
-                                .color(Color::Muted)
-                                .size(IconSize::Small),
-                        )
-                        .child(Label::new(line).color(Color::Muted).size(LabelSize::Small)),
+                            h_flex()
+                                .px_2()
+                                .gap_1()
+                                .child(
+                                    Icon::new(IconName::ArrowUp)
+                                        .color(Color::Muted)
+                                        .size(IconSize::Small),
+                                )
+                                .child(Label::new(line).color(Color::Muted).size(LabelSize::Small)),
+                        ),
                 )
             })
             .child(body)
             .when(self.server_id.is_some(), |panel| {
                 panel.child(
-                    div().px_2().py_1().child(
-                        Label::new(
-                            "Opened files are editable. A saved file uploads to the host \
-                             only after you confirm.",
-                        )
-                        .color(Color::Muted)
-                        .size(LabelSize::XSmall),
-                    ),
+                    div()
+                        .id("remote-host-hint")
+                        .role(gpui::Role::Label)
+                        .aria_label(HINT)
+                        .debug_selector(|| "remote-host-hint".into())
+                        .px_2()
+                        .py_1()
+                        .child(Label::new(HINT).color(Color::Muted).size(LabelSize::XSmall)),
                 )
             })
     }
 }
+
+const HINT: &str = "Files you open here are editable. Saving asks before uploading to the server, unless you chose Always.";
 
 impl RemoteHostPanel {
     /// "Uploading…" while any copy of the shown server uploads, else the last result.
@@ -1977,7 +2344,7 @@ mod tests {
         assert!(detail.contains("same second"), "{detail}");
         assert!(puts(&remote).is_empty());
 
-        fixture.cx.simulate_prompt_answer("Not now");
+        fixture.cx.simulate_prompt_answer("Cancel");
         fixture.cx.run_until_parked();
         assert!(puts(&remote).is_empty(), "saved locally only");
 
@@ -1997,7 +2364,7 @@ mod tests {
         assert!(fixture.cx.has_pending_prompt(), "asks again");
         fixture
             .cx
-            .simulate_prompt_answer("Always for this server (this session)");
+            .simulate_prompt_answer("Always upload to this server until I quit");
         fixture.cx.run_until_parked();
         assert_eq!(puts(&remote).len(), 2, "the answer uploads this save too");
         edit_and_save(&mut fixture, &opened, "four").await;
@@ -2013,7 +2380,7 @@ mod tests {
         edit_and_save(&mut fixture, &opened, "one").await;
         fixture
             .cx
-            .simulate_prompt_answer("Never for this server (this session)");
+            .simulate_prompt_answer("Never upload to this server until I quit");
         fixture.cx.run_until_parked();
         edit_and_save(&mut fixture, &opened, "two").await;
         assert!(!fixture.cx.has_pending_prompt());
@@ -2229,7 +2596,14 @@ mod tests {
         let status = fixture
             .panel
             .read_with(fixture.cx, |panel, _| panel.status.clone());
-        assert_eq!(status.as_deref(), Some("Kept 1 open remote files."));
+        assert_eq!(status, None, "not an error");
+        let notice = fixture
+            .panel
+            .read_with(fixture.cx, |panel, _| panel.notice.clone());
+        assert_eq!(
+            notice.as_deref(),
+            Some("Disconnected. Kept 1 open file with unsaved changes on this computer.")
+        );
     }
 
     #[gpui::test]
@@ -2240,7 +2614,7 @@ mod tests {
         let mut fixture = fixture(&remote, cx).await;
         let opened = open_index(&mut fixture).await;
         edit_and_save(&mut fixture, &opened, "kept local").await;
-        fixture.cx.simulate_prompt_answer("Not now");
+        fixture.cx.simulate_prompt_answer("Cancel");
         fixture.cx.run_until_parked();
         assert!(puts(&remote).is_empty());
 
@@ -2310,6 +2684,336 @@ mod tests {
         assert!(!cached.exists(), "the release finishes the Disconnect");
     }
 
+    /// Runs `step` (with real time for the smol pool) until `done` holds.
+    async fn poll_until(fixture: &mut Fixture<'_>, mut done: impl FnMut(&mut Fixture<'_>) -> bool) {
+        fixture.cx.executor().allow_parking();
+        for _ in 0..300 {
+            fixture.cx.run_until_parked();
+            if done(fixture) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("the condition never held");
+    }
+
+    /// Closes the copy's tab and drops every handle to its buffer.
+    async fn close_tab(fixture: &mut Fixture<'_>, opened: Opened) -> (PathBuf, ServerConfig) {
+        let Opened {
+            editor,
+            buffer,
+            cached,
+            server,
+        } = opened;
+        drop((editor, buffer));
+        fixture
+            .workspace
+            .update_in(fixture.cx, |workspace, window, cx| {
+                let pane = workspace.active_pane().clone();
+                pane.update(cx, |pane, cx| {
+                    pane.close_active_item(&workspace::CloseActiveItem::default(), window, cx)
+                })
+            })
+            .await
+            .expect("closed");
+        fixture.cx.update(|_, _| ());
+        fixture.cx.run_until_parked();
+        (cached, server)
+    }
+
+    fn incoming_leftovers(cached: &Path) -> Vec<String> {
+        std::fs::read_dir(cached.parent().expect("parent"))
+            .expect("read_dir")
+            .filter_map(|entry| Some(entry.ok()?.file_name().to_string_lossy().into_owned()))
+            .filter(|name| name != "index.php")
+            .collect()
+    }
+
+    /// Closes the tab, puts `saved` in the cache file (a copy saved locally, never uploaded),
+    /// changes the server file and clicks the row; returns when the question is up.
+    async fn reopen_with_saved_copy(
+        fixture: &mut Fixture<'_>,
+        remote: &FakeRemote,
+        saved: &str,
+    ) -> PathBuf {
+        let opened = open_index(fixture).await;
+        let (cached, _) = close_tab(fixture, opened).await;
+        std::fs::write(&cached, saved).expect("saved copy");
+        remote.stats.lock().expect("lock").insert(
+            INDEX.into(),
+            RemoteStat {
+                size: 9,
+                stamp: Some("s2".into()),
+            },
+        );
+        click_row(fixture, "index.php");
+        poll_until(fixture, |fixture| fixture.cx.has_pending_prompt()).await;
+        cached
+    }
+
+    async fn editor_opens(fixture: &mut Fixture<'_>) {
+        poll_until(fixture, |fixture| {
+            fixture.panel.read_with(fixture.cx, |panel, _| {
+                panel
+                    .owned
+                    .values()
+                    .any(|copy| copy.buffer.upgrade().is_some())
+            })
+        })
+        .await;
+    }
+
+    #[gpui::test]
+    async fn reopening_asks_before_replacing_a_saved_copy_and_keep_leaves_it_with_the_old_baseline(
+        cx: &mut TestAppContext,
+    ) {
+        let remote = remote_with_baseline();
+        let mut fixture = fixture(&remote, cx).await;
+        let cached = reopen_with_saved_copy(&mut fixture, &remote, "mine").await;
+        let (message, detail) = fixture.cx.pending_prompt().expect("prompt");
+        assert!(
+            message.contains("index.php") && message.contains("differs"),
+            "{message}"
+        );
+        assert!(detail.contains("never uploaded"), "{detail}");
+        assert_eq!(
+            std::fs::read_to_string(&cached).expect("cache"),
+            "mine",
+            "the saved copy is untouched while the question is open"
+        );
+
+        fixture.cx.simulate_prompt_answer("Keep my saved copy");
+        editor_opens(&mut fixture).await;
+        assert_eq!(std::fs::read_to_string(&cached).expect("cache"), "mine");
+        assert!(
+            incoming_leftovers(&cached).is_empty(),
+            "{:?}",
+            incoming_leftovers(&cached)
+        );
+        let store = store(&mut fixture);
+        let baseline = store.read_with(fixture.cx, |store, _| {
+            store
+                .copy_for_buffer_path(&cached)
+                .and_then(|copy| copy.stat.clone())
+        });
+        assert_eq!(
+            baseline,
+            Some(RemoteStat {
+                size: 5,
+                stamp: Some("s1".into())
+            }),
+            "your version is compared with the server as it was when you got it"
+        );
+    }
+
+    #[gpui::test]
+    async fn reopening_with_use_the_servers_version_replaces_the_copy(cx: &mut TestAppContext) {
+        let remote = remote_with_baseline();
+        let mut fixture = fixture(&remote, cx).await;
+        let cached = reopen_with_saved_copy(&mut fixture, &remote, "mine").await;
+        fixture
+            .cx
+            .simulate_prompt_answer("Use the server's version");
+        editor_opens(&mut fixture).await;
+        assert_eq!(std::fs::read_to_string(&cached).expect("cache"), "<?php");
+        assert!(incoming_leftovers(&cached).is_empty());
+        let store = store(&mut fixture);
+        let stamp = store.read_with(fixture.cx, |store, _| {
+            store
+                .copy_for_buffer_path(&cached)
+                .and_then(|copy| copy.stat.clone())
+                .and_then(|stat| stat.stamp)
+        });
+        assert_eq!(stamp.as_deref(), Some("s2"));
+    }
+
+    #[gpui::test]
+    async fn cancelling_the_reopen_question_keeps_the_copy_and_opens_nothing(
+        cx: &mut TestAppContext,
+    ) {
+        let remote = remote_with_baseline();
+        let mut fixture = fixture(&remote, cx).await;
+        let cached = reopen_with_saved_copy(&mut fixture, &remote, "mine").await;
+        fixture.cx.simulate_prompt_answer("Cancel");
+        poll_until(&mut fixture, |_| incoming_leftovers(&cached).is_empty()).await;
+        assert_eq!(std::fs::read_to_string(&cached).expect("cache"), "mine");
+        let open = fixture.panel.read_with(fixture.cx, |panel, _| {
+            panel
+                .owned
+                .values()
+                .any(|copy| copy.buffer.upgrade().is_some())
+        });
+        assert!(!open);
+        assert!(
+            !fixture
+                .panel
+                .read_with(fixture.cx, |panel, _| panel.prompt_open)
+        );
+    }
+
+    #[gpui::test]
+    async fn reopening_an_unchanged_copy_asks_nothing(cx: &mut TestAppContext) {
+        let remote = remote_with_baseline();
+        let mut fixture = fixture(&remote, cx).await;
+        let opened = open_index(&mut fixture).await;
+        let (cached, _) = close_tab(&mut fixture, opened).await;
+        click_row(&mut fixture, "index.php");
+        editor_opens(&mut fixture).await;
+        assert!(!fixture.cx.has_pending_prompt());
+        assert_eq!(std::fs::read_to_string(&cached).expect("cache"), "<?php");
+        assert!(incoming_leftovers(&cached).is_empty());
+    }
+
+    #[gpui::test]
+    async fn a_download_into_a_claimed_path_is_refused_and_the_claim_ends_with_its_guard(
+        cx: &mut TestAppContext,
+    ) {
+        let remote = remote_with_baseline();
+        let mut fixture = fixture(&remote, cx).await;
+        let server = fixture.servers[0].clone();
+        fixture.panel.update(fixture.cx, |panel, cx| {
+            panel.select_server(Some(server.id.clone()), cx)
+        });
+        fixture.cx.run_until_parked();
+        let cached = cache_path_for(fixture.cache.path(), &server.id, INDEX).expect("cache path");
+        mirror_cache(&fixture, &cached).await;
+        let store = store(&mut fixture);
+        // Another window is in the middle of downloading this file.
+        let claim = store.read_with(fixture.cx, |store, _| store.reserve_download(&cached));
+        assert!(claim.is_some());
+        assert!(
+            store.read_with(fixture.cx, |store, _| store
+                .reserve_download(&cached)
+                .is_none()),
+            "a second claim is refused"
+        );
+
+        click_row(&mut fixture, "index.php");
+        fixture.cx.run_until_parked();
+        assert_eq!(gets(&remote), 0, "no second download into the claimed path");
+        let status = fixture
+            .panel
+            .read_with(fixture.cx, |panel, _| panel.status.clone());
+        assert!(status.is_some_and(|status| status.contains("already being opened")));
+
+        drop(claim);
+        click_row(&mut fixture, "index.php");
+        editor_opens(&mut fixture).await;
+        assert_eq!(gets(&remote), 1);
+        assert!(
+            store.read_with(fixture.cx, |store, _| store
+                .reserve_download(&cached)
+                .is_none()),
+            "an open copy cannot be claimed either"
+        );
+    }
+
+    #[gpui::test]
+    async fn every_editor_of_a_cached_copy_stays_out_of_the_editor_database(
+        cx: &mut TestAppContext,
+    ) {
+        let remote = remote_with_baseline();
+        let mut fixture = fixture(&remote, cx).await;
+        let opened = open_index(&mut fixture).await;
+        // Splitting a pane clones the editor with serialization on.
+        let split = opened.editor.update_in(fixture.cx, |editor, window, cx| {
+            cx.new(|cx| editor.clone(window, cx))
+        });
+        assert!(
+            !split.read_with(fixture.cx, |editor, _| {
+                editor.should_serialize(&editor::EditorEvent::Saved)
+            }),
+            "the clone must not store dirty text"
+        );
+        // A file outside the cache still serializes.
+        fixture
+            .workspace
+            .update_in(fixture.cx, |workspace, window, cx| {
+                workspace.open_abs_path(
+                    PathBuf::from("/p/a.txt"),
+                    OpenOptions::default(),
+                    window,
+                    cx,
+                )
+            })
+            .await
+            .expect("another tab");
+        let other = fixture
+            .workspace
+            .read_with(fixture.cx, |workspace, cx| {
+                workspace.active_item_as::<Editor>(cx)
+            })
+            .expect("editor");
+        assert!(other.read_with(fixture.cx, |editor, _| {
+            editor.should_serialize(&editor::EditorEvent::Saved)
+        }));
+    }
+
+    #[gpui::test]
+    async fn an_answer_is_recorded_only_for_the_host_the_prompt_named(cx: &mut TestAppContext) {
+        let remote = remote_with_baseline();
+        let mut fixture = fixture(&remote, cx).await;
+        let opened = open_index(&mut fixture).await;
+        edit_and_save(&mut fixture, &opened, "one").await;
+        assert!(fixture.cx.has_pending_prompt());
+        // The server's address changes while the question is up.
+        let store = store(&mut fixture);
+        store.update(fixture.cx, |store, _| {
+            store.servers.servers[0].host = "elsewhere.example.net".into();
+        });
+        fixture
+            .cx
+            .simulate_prompt_answer("Always upload to this server until I quit");
+        fixture.cx.run_until_parked();
+        assert_eq!(
+            store.read_with(fixture.cx, |store, _| store
+                .upload_decision(&opened.server.id)),
+            UploadDecision::Ask,
+            "nothing is remembered for the new host"
+        );
+        assert!(puts(&remote).is_empty());
+    }
+
+    #[gpui::test]
+    async fn a_second_question_while_a_prompt_is_up_does_not_replace_it(cx: &mut TestAppContext) {
+        let remote = remote_with_baseline();
+        let mut fixture = fixture(&remote, cx).await;
+        let opened = open_index(&mut fixture).await;
+        edit_and_save(&mut fixture, &opened, "one").await;
+        edit_and_save(&mut fixture, &opened, "two").await;
+        fixture.cx.simulate_prompt_answer("Cancel");
+        fixture.cx.run_until_parked();
+        assert!(
+            !fixture.cx.has_pending_prompt(),
+            "the second save became a toast, not another prompt"
+        );
+        assert!(puts(&remote).is_empty());
+        let open = fixture
+            .panel
+            .read_with(fixture.cx, |panel, _| panel.prompt_open);
+        assert!(!open);
+    }
+
+    #[gpui::test]
+    async fn the_hint_and_the_upload_line_are_elements_a_screen_reader_can_reach(
+        cx: &mut TestAppContext,
+    ) {
+        let remote = remote_with_baseline();
+        let mut fixture = fixture(&remote, cx).await;
+        let opened = open_index(&mut fixture).await;
+        fixture
+            .workspace
+            .update_in(fixture.cx, |workspace, window, cx| {
+                workspace.focus_panel::<RemoteHostPanel>(window, cx);
+            });
+        set_decision(&mut fixture, &opened, UploadDecision::Allow);
+        edit_and_save(&mut fixture, &opened, "x").await;
+        fixture.cx.run_until_parked();
+        for selector in ["remote-host-hint", "remote-host-upload-status"] {
+            assert!(fixture.cx.debug_bounds(selector).is_some(), "{selector}");
+        }
+    }
+
     #[test]
     fn only_a_local_unshared_project_uploads() {
         assert!(is_local_unshared(true, false));
@@ -2330,12 +3034,12 @@ mod tests {
         };
         assert_eq!(by_label("Upload"), UploadAnswer::Once);
         assert_eq!(
-            by_label("Always for this server (this session)"),
+            by_label("Always upload to this server until I quit"),
             UploadAnswer::Always
         );
-        assert_eq!(by_label("Not now"), UploadAnswer::NotNow);
+        assert_eq!(by_label("Cancel"), UploadAnswer::NotNow);
         assert_eq!(
-            by_label("Never for this server (this session)"),
+            by_label("Never upload to this server until I quit"),
             UploadAnswer::Never
         );
         assert_eq!(
@@ -2343,37 +3047,83 @@ mod tests {
             UploadAnswer::NotNow,
             "a dismissed prompt uploads nothing"
         );
-        assert!(confirmed(0));
-        assert!(!confirmed(1) && !confirmed(7));
+        assert!(confirmed(1));
+        assert!(!confirmed(0) && !confirmed(7), "Cancel is the default");
+        let buttons = force_buttons("Overwrite");
+        assert!(matches!(&buttons[0], PromptButton::Cancel(label) if label.as_ref() == "Cancel"));
+        assert!(matches!(&buttons[1], PromptButton::Other(_)));
+        assert_eq!(
+            UPLOAD_BUTTONS[2], "Cancel",
+            "the in-app prompt needs the literal label"
+        );
+        assert_eq!(reopen_answer(0), ReopenAnswer::Keep);
+        assert_eq!(reopen_answer(1), ReopenAnswer::UseServer);
+        assert_eq!(reopen_answer(2), ReopenAnswer::Cancel);
+        assert_eq!(reopen_answer(9), ReopenAnswer::Cancel);
+        assert_eq!(REOPEN_BUTTONS[2], "Cancel");
     }
 
     #[test]
     fn the_prompt_states_what_the_protocol_risks() {
         let ftp = upload_detail(ServerType::Ftp);
         assert!(
-            ftp.contains("clear text") && ftp.contains("symbolic links"),
+            ftp.contains("unencrypted") && ftp.contains("symlink"),
             "{ftp}"
         );
         let ftps = upload_detail(ServerType::Ftps);
         assert!(
-            !ftps.contains("clear text") && ftps.contains("symbolic links"),
+            !ftps.contains("unencrypted") && ftps.contains("symlink"),
             "{ftps}"
         );
         let sftp = upload_detail(ServerType::Sftp);
-        assert!(!sftp.contains("symbolic links"), "{sftp}");
+        assert!(!sftp.contains("symlink"), "{sftp}");
         for detail in [ftp, ftps, sftp] {
             assert!(detail.contains("same second"));
         }
     }
 
     #[test]
-    fn toast_text_is_one_short_plain_line() {
-        assert_eq!(plain_truncated("a\nb\x1b[31mc", 50), "a b [31mc");
-        let long = "x".repeat(1000);
-        let short = plain_truncated(&long, 300);
+    fn server_text_is_one_short_plain_line() {
+        assert_eq!(
+            plain_text("a\nb\r\nc\td", 50),
+            "a b c d",
+            "whitespace collapses"
+        );
+        assert_eq!(
+            plain_text("\x1b[31mred\x1b[0m!", 50),
+            "red!",
+            "the whole sequence goes"
+        );
+        assert_eq!(plain_text("a\x1b]0;title\x07b", 50), "ab", "OSC");
+        assert_eq!(
+            plain_text("a\x1b]0;title\x1b\\b", 50),
+            "ab",
+            "OSC ending in ST"
+        );
+        assert_eq!(plain_text("x\x1b", 50), "x", "a lone ESC");
+        assert_eq!(
+            plain_text("invoice\u{202E}fdp.php", 50),
+            "invoicefdp.php",
+            "a bidi override cannot flip the name"
+        );
+        assert_eq!(
+            plain_text("a\u{2066}b\u{2069}c\u{200B}d\u{FEFF}e", 50),
+            "abcde"
+        );
+        assert_eq!(plain_text("a\u{2028}b\u{2029}c", 50), "a b c");
+        assert_eq!(plain_text("a\u{E0041}b", 50), "ab", "tag characters");
+        let long = "x".repeat(100_000);
+        let short = plain_text(&long, 300);
         assert_eq!(short.chars().count(), 301);
         assert!(short.ends_with('…'));
-        assert_eq!(plain_truncated("héllo", 5), "héllo");
+        assert_eq!(plain_text("héllo", 5), "héllo");
+        assert_eq!(plain_text("日本語.php", 20), "日本語.php");
+    }
+
+    #[test]
+    fn a_message_ends_as_one_sentence() {
+        assert_eq!(end_sentence("a changed"), "a changed.");
+        assert_eq!(end_sentence("upload anyway?"), "upload anyway?");
     }
 
     #[gpui::test]

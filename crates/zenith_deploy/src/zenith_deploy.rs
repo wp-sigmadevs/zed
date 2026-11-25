@@ -104,6 +104,9 @@ pub struct ServerStore {
     /// Servers whose Disconnect (or deletion) left open copies' files in place; their cache is
     /// cleared when those copies are released ([`ServerStore::buffer_released`]).
     pending_clear: std::collections::HashSet<String>,
+    /// Cache paths a panel is downloading into right now, across windows
+    /// ([`ServerStore::reserve_download`]).
+    downloading: Arc<std::sync::Mutex<std::collections::HashSet<PathBuf>>>,
     _load: Task<()>,
 }
 
@@ -205,6 +208,7 @@ impl ServerStore {
             upload_decisions: HashMap::new(),
             uploads: HashMap::new(),
             pending_clear: Default::default(),
+            downloading: Default::default(),
             _load: load,
         }
     }
@@ -227,6 +231,7 @@ impl ServerStore {
             upload_decisions: HashMap::new(),
             uploads: HashMap::new(),
             pending_clear: Default::default(),
+            downloading: Default::default(),
             _load: Task::ready(()),
         }
     }
