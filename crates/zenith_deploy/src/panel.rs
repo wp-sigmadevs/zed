@@ -104,6 +104,12 @@ struct Row {
     placeholder: bool,
 }
 
+/// What a screen reader says for the "Empty" line under `directory`.
+fn empty_label(directory: &str) -> SharedString {
+    let name = directory.rsplit('/').next().unwrap_or(directory);
+    format!("{} is empty", shown(name, 100)).into()
+}
+
 impl Row {
     fn path(&self) -> Option<String> {
         if self.placeholder {
@@ -484,9 +490,11 @@ impl RemoteHostPanel {
                 self.push_rows(&path, depth + 1, rows);
             }
         }
-        // A finished listing with nothing in it. The root has no row to sit under, and a
-        // folder being listed again shows "Loading…" instead.
-        if entries.is_empty() && depth > 0 && !self.loading.contains(directory) {
+        // A listing with nothing in it. A first listing has no `children` entry (returned above),
+        // so it never gets here. A re-list keeps showing the old listing, loading or not:
+        // dropping the row mid-refresh would shift every row below it and move the selection.
+        // The root has no row to sit under.
+        if entries.is_empty() && depth > 0 {
             rows.push(Row::placeholder(directory, depth));
         }
     }
@@ -1196,7 +1204,7 @@ impl RemoteHostPanel {
                     .indent_level(row.depth)
                     .indent_step_size(px(INDENT))
                     .selectable(false)
-                    .aria_label("Empty folder")
+                    .aria_label(empty_label(&row.directory))
                     .child(
                         Label::new("Empty")
                             .color(Color::Muted)
@@ -3241,30 +3249,102 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn a_folder_still_loading_has_no_empty_row(cx: &mut TestAppContext) {
+    async fn a_first_listing_has_no_empty_row_until_it_returns(cx: &mut TestAppContext) {
         let remote = tree_with_an_empty_folder();
+        let (hold, gate) = futures::channel::oneshot::channel();
+        remote
+            .list_gates
+            .lock()
+            .expect("lock")
+            .insert("/www/empty".into(), gate);
         let mut fixture = fixture(&remote, cx).await;
         connect(&mut fixture).await;
         click_row(&mut fixture, "empty");
+        fixture.cx.run_until_parked();
         assert!(
             placeholders(&mut fixture).is_empty(),
             "the listing has not come back yet"
         );
+        hold.send(()).expect("the listing waits");
         fixture.cx.run_until_parked();
         assert_eq!(placeholders(&mut fixture).len(), 1);
+    }
 
-        // A re-list keeps the old (empty) listing but is loading again: "Loading…", not "Empty".
+    /// Refresh lists the root first and the open folders after it. The rows, and so the
+    /// selection index, must not change on the way (the Empty row used to drop out while its
+    /// folder was loading, which moved the selection from z.php to full for good).
+    // The background executor runs the two listings in a seed-dependent order; the guard only
+    // misbehaves when the root comes back first, so try several orders.
+    #[gpui::test(iterations = 20)]
+    async fn a_refresh_keeps_the_empty_row_and_the_selection(cx: &mut TestAppContext) {
+        let remote = tree_with_an_empty_folder();
+        let mut fixture = fixture(&remote, cx).await;
+        connect(&mut fixture).await;
+        click_row(&mut fixture, "empty");
+        fixture.cx.run_until_parked();
+        // Arrow down onto z.php (clicking it would open the file).
+        for _ in 0..2 {
+            fixture.panel.update_in(fixture.cx, |panel, window, cx| {
+                panel.select_next(&menu::SelectNext, window, cx)
+            });
+        }
+        let rows_before: Vec<_> = fixture.panel.read_with(fixture.cx, |panel, _| {
+            panel
+                .rows
+                .iter()
+                .map(|row| (row.entry.name.clone(), row.placeholder))
+                .collect()
+        });
+        let z = rows_before.len() - 1;
+        assert_eq!(rows_before[z].0, "z.php");
+        let selected_name = |fixture: &mut Fixture<'_>| {
+            fixture.panel.read_with(fixture.cx, |panel, _| {
+                panel
+                    .selected
+                    .and_then(|index| panel.rows.get(index))
+                    .map(|row| row.entry.name.clone())
+            })
+        };
+        let rows_now = |fixture: &mut Fixture<'_>| -> Vec<(String, bool)> {
+            fixture.panel.read_with(fixture.cx, |panel, _| {
+                panel
+                    .rows
+                    .iter()
+                    .map(|row| (row.entry.name.clone(), row.placeholder))
+                    .collect()
+            })
+        };
+        assert_eq!(selected_name(&mut fixture).as_deref(), Some("z.php"));
+
+        // Hold the folder's listing after the root's: the state in between is the real one.
+        let (release, gate) = futures::channel::oneshot::channel();
+        remote
+            .list_gates
+            .lock()
+            .expect("lock")
+            .insert("/www/empty".into(), gate);
         fixture
             .panel
             .update(fixture.cx, |panel, cx| panel.refresh(cx));
-        fixture.panel.update(fixture.cx, |panel, cx| {
-            let loading = panel.loading.contains("/www/empty");
-            assert!(loading, "the folder is being listed again");
-            panel.rebuild_rows(cx);
-        });
-        assert!(placeholders(&mut fixture).is_empty());
+        assert_eq!(rows_now(&mut fixture), rows_before, "refresh just started");
+        assert_eq!(selected_name(&mut fixture).as_deref(), Some("z.php"));
         fixture.cx.run_until_parked();
-        assert_eq!(placeholders(&mut fixture).len(), 1);
+        let still_loading = fixture
+            .panel
+            .read_with(fixture.cx, |panel, _| panel.loading.contains("/www/empty"));
+        assert!(still_loading, "the root is back, the folder is still held");
+        assert_eq!(rows_now(&mut fixture), rows_before, "mid-refresh");
+        assert_eq!(selected_name(&mut fixture).as_deref(), Some("z.php"));
+
+        release.send(()).expect("the listing waits");
+        fixture.cx.run_until_parked();
+        assert_eq!(rows_now(&mut fixture), rows_before, "refresh done");
+        assert_eq!(selected_name(&mut fixture).as_deref(), Some("z.php"));
+    }
+
+    #[test]
+    fn the_empty_row_is_announced_with_its_folder_name() {
+        assert_eq!(empty_label("/www/empty").as_ref(), "empty is empty");
     }
 
     #[gpui::test]

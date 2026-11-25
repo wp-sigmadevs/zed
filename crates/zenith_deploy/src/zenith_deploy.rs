@@ -564,6 +564,8 @@ pub(crate) mod test_support {
         pub refusing: Arc<Mutex<Vec<String>>>,
         /// Folders that list as empty from now on, whatever the tree says.
         pub emptied: Arc<Mutex<Vec<String>>>,
+        /// A listing of this folder waits (once) until its sender fires or is dropped.
+        pub list_gates: Arc<Mutex<HashMap<String, futures::channel::oneshot::Receiver<()>>>>,
         /// Every upload as (path, bytes).
         pub puts: Arc<Mutex<Vec<(String, Vec<u8>)>>>,
         pub stats: Arc<Mutex<HashMap<String, RemoteStat>>>,
@@ -635,6 +637,14 @@ pub(crate) mod test_support {
         }
         async fn list_dir(&mut self, path: &str) -> Result<Vec<RemoteEntry>> {
             self.push(format!("list {path}"));
+            let gate = self
+                .list_gates
+                .lock()
+                .ok()
+                .and_then(|mut gates| gates.remove(path));
+            if let Some(gate) = gate {
+                gate.await.ok();
+            }
             if self
                 .refusing
                 .lock()
