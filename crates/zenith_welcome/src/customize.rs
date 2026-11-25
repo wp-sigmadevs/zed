@@ -144,4 +144,13 @@ mod tests {
         assert_eq!(labelled, vec![default]);
         assert!(KEYMAPS.iter().all(|(label, _, _)| !label.contains("Zed")));
     }
+
+    // onboarding's lib has `test = false` and its buttons are built inline in render, so
+    // pin the labels at source level from here.
+    #[test]
+    fn onboarding_keymap_buttons_have_no_zed_label() {
+        let source = include_str!("../../onboarding/src/basics_page.rs");
+        assert!(!source.contains(concat!("ToggleButtonWithIcon::new(\"", "Zed\"")));
+        assert!(source.contains(concat!("ToggleButtonWithIcon::new(\"", "Zenith\"")));
+    }
 }
