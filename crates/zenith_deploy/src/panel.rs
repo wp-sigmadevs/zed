@@ -27,6 +27,7 @@ use workspace::{
 
 use crate::{
     DeploySettings, EntryKind, RemoteEntry, ServerConfig, ServerRefused, ServerStore, Transport,
+    cache_path_for,
     dialog::{DeploymentDialog, project_root},
     download_entry,
     remote_path::{join_remote, validate_name, validate_remote_path},
@@ -419,9 +420,16 @@ impl RemoteHostPanel {
             return;
         }
         let cache_root = self.store.read(cx).cache_dir.clone();
-        let local_directory = cache_root
-            .join(&server.id)
-            .join(row.directory.trim_start_matches('/'));
+        // The one builder of cache paths: the upload index accepts no other layout.
+        let cache_path = row
+            .path()
+            .and_then(|remote_path| cache_path_for(&cache_root, &server.id, &remote_path).ok());
+        let Some(local_directory) = cache_path.and_then(|path| path.parent().map(PathBuf::from))
+        else {
+            self.status = Some("This file cannot be opened from the cache.".into());
+            cx.notify();
+            return;
+        };
         let Some(session) = self.session(cx) else {
             return;
         };
@@ -1113,12 +1121,8 @@ mod tests {
             panel.select_server(Some(server.id.clone()), cx)
         });
         fixture.cx.run_until_parked();
-        let cached = fixture
-            .cache
-            .path()
-            .join(&server.id)
-            .join("www")
-            .join("index.php");
+        let cached =
+            cache_path_for(fixture.cache.path(), &server.id, "/www/index.php").expect("cache path");
         // The project runs on a fake file system; mirror the copy the panel writes to disk.
         let fs = fixture.workspace.read_with(fixture.cx, |workspace, cx| {
             workspace.project().read(cx).fs().clone()

@@ -36,6 +36,7 @@ uuid = { workspace = true, features = ["v4"] }
 workspace.workspace = true
 
 [dev-dependencies]
+encoding_rs.workspace = true
 editor = { workspace = true, features = ["test-support"] }
 gpui = { workspace = true, features = ["test-support"] }
 project = { workspace = true, features = ["test-support"] }

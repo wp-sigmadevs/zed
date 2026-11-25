@@ -97,6 +97,9 @@ pub struct ServerStore {
     upload_decisions: HashMap<String, (String, UploadDecision)>,
     /// Running uploads, owned here so a panel reset or window close cannot cancel them.
     uploads: HashMap<PathBuf, Task<()>>,
+    /// Servers whose Disconnect (or deletion) left open copies' files in place; their cache is
+    /// cleared when those copies are released ([`ServerStore::buffer_released`]).
+    pending_clear: std::collections::HashSet<String>,
     _load: Task<()>,
 }
 
@@ -161,6 +164,7 @@ impl ServerStore {
             copies: HashMap::new(),
             upload_decisions: HashMap::new(),
             uploads: HashMap::new(),
+            pending_clear: Default::default(),
             _load: load,
         }
     }
@@ -181,6 +185,7 @@ impl ServerStore {
             copies: HashMap::new(),
             upload_decisions: HashMap::new(),
             uploads: HashMap::new(),
+            pending_clear: Default::default(),
             _load: Task::ready(()),
         }
     }
@@ -319,9 +324,10 @@ impl ServerStore {
     /// The cache is shared by every window: Disconnect in one window also deletes the files
     /// another window has open.
     ///
-    /// Nothing is deleted while a copy of the server has a live buffer (clean or dirty) or a
-    /// running upload: the session still ends, the files stay. Returns how many such open copies
-    /// were kept, for "Kept N open remote files".
+    /// A copy with a live buffer (clean or dirty) or a running upload keeps its file: the
+    /// session still ends, the server is remembered in `pending_clear` and finished once the
+    /// copy is released. The files of the server's closed copies go at once. Returns how many
+    /// open copies were kept, for "Kept N open remote files".
     pub(crate) fn clear_cache(&mut self, server_id: &str, cx: &mut Context<Self>) -> usize {
         if remote_path::validate_name(server_id).is_err() {
             return 0;
@@ -332,8 +338,29 @@ impl ServerStore {
             .filter(|copy| copy.server_id == server_id && copy.is_open())
             .count();
         if open > 0 {
+            let closed: Vec<PathBuf> = self
+                .copies
+                .iter()
+                .filter(|(_, copy)| copy.server_id == server_id && !copy.is_open())
+                .map(|(path, _)| path.clone())
+                .collect();
+            for path in &closed {
+                self.copies.remove(path);
+            }
+            self.pending_clear.insert(server_id.to_string());
+            cx.background_spawn(async move {
+                for path in closed {
+                    match std::fs::remove_file(&path) {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) => log::warn!("deploy: removing {}: {error}", path.display()),
+                    }
+                }
+            })
+            .detach();
             return open;
         }
+        self.pending_clear.remove(server_id);
         self.copies.retain(|_, copy| copy.server_id != server_id);
         let directory = self.cache_dir.join(server_id);
         cx.background_spawn(async move {
@@ -469,6 +496,13 @@ pub(crate) mod test_support {
         /// Makes every `stat` / `upload_file` fail with this text.
         pub stat_error: Arc<Mutex<Option<String>>>,
         pub put_error: Arc<Mutex<Option<String>>>,
+        /// Makes `stat` / `upload_file` never answer (a dead connection).
+        pub stat_hang: Arc<Mutex<bool>>,
+        pub put_hang: Arc<Mutex<bool>>,
+        /// The next put waits until this resolves (a slow upload).
+        pub put_gate: Arc<Mutex<Option<futures::channel::oneshot::Receiver<()>>>>,
+        /// A put does not change the server's stat (a server that rewrites the file).
+        pub put_keeps_stat: Arc<Mutex<bool>>,
     }
 
     impl FakeRemote {
@@ -549,6 +583,9 @@ pub(crate) mod test_support {
         }
         async fn stat(&mut self, path: &str) -> Result<Option<RemoteStat>> {
             self.push(format!("stat {path}"));
+            if self.stat_hang.lock().is_ok_and(|hang| *hang) {
+                futures::future::pending::<()>().await;
+            }
             if let Some(error) = self.stat_error.lock().ok().and_then(|error| error.clone()) {
                 return Err(anyhow!(error));
             }
@@ -560,13 +597,21 @@ pub(crate) mod test_support {
         }
         async fn upload_file(&mut self, remote_path: &str, bytes: &[u8]) -> Result<()> {
             self.push(format!("put {remote_path}"));
+            if self.put_hang.lock().is_ok_and(|hang| *hang) {
+                futures::future::pending::<()>().await;
+            }
+            let gate = self.put_gate.lock().ok().and_then(|mut gate| gate.take());
+            if let Some(gate) = gate {
+                gate.await.ok();
+            }
             if let Some(error) = self.put_error.lock().ok().and_then(|error| error.clone()) {
                 return Err(anyhow!(error));
             }
             if let Ok(mut puts) = self.puts.lock() {
                 puts.push((remote_path.to_string(), bytes.to_vec()));
                 // The upload changes the file on the server: a new stamp per put.
-                if let Ok(mut stats) = self.stats.lock() {
+                let keeps = self.put_keeps_stat.lock().is_ok_and(|keeps| *keeps);
+                if let (Ok(mut stats), false) = (self.stats.lock(), keeps) {
                     stats.insert(
                         remote_path.to_string(),
                         RemoteStat {

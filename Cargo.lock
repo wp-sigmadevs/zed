@@ -23065,6 +23065,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "editor",
+ "encoding_rs",
  "futures 0.3.34",
  "futures-rustls",
  "gpui",
