@@ -7,15 +7,15 @@ use editor::{
     actions::{GoToDiagnostic, GoToPreviousDiagnostic},
 };
 use gpui::{
-    Context, Entity, EventEmitter, Focusable as _, IntoElement, Render, Subscription, WeakEntity,
-    Window,
+    Action, Context, Entity, EventEmitter, Focusable as _, IntoElement, Render, Role, Subscription,
+    WeakEntity, Window,
 };
-use language::Buffer;
+use language::{Buffer, BufferEvent};
 use project::{Project, ProjectItem as _, ProjectPath};
 use settings::{RegisterSetting, Settings, SettingsContent, SettingsStore};
-use ui::{ButtonLike, Tooltip, prelude::*};
+use ui::{ButtonLike, KeyBinding, Tooltip, prelude::*};
 use workspace::{
-    ItemHandle, Pane, ToolbarItemEvent, ToolbarItemLocation, ToolbarItemView, Workspace,
+    ItemHandle, Pane, ToolbarItemEvent, ToolbarItemLocation, ToolbarItemView, Workspace, pane,
 };
 
 use crate::{Problem, Severity, ShowFileProblems, Tab, collect, show_tab};
@@ -92,11 +92,17 @@ pub(crate) struct InspectionWidget {
     project: Entity<Project>,
     active_item: Option<Box<dyn ItemHandle>>,
     editor: Option<WeakEntity<Editor>>,
+    /// Kept even while `path` is `None` (an untitled tab), so a Save As finds its way back.
     buffer: Option<WeakEntity<Buffer>>,
     path: Option<ProjectPath>,
     /// Cached; only the active-tab change and diagnostics updates of `path` recount it.
     counts: Option<Counts>,
     has_server: bool,
+    /// Test seam: behave as a project without local language servers.
+    #[cfg(test)]
+    pretend_remote: bool,
+    /// Follows `buffer`: a Save As, a rename or a new language retargets the widget.
+    _buffer_subscription: Option<Subscription>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -135,12 +141,18 @@ impl InspectionWidget {
         project: Entity<Project>,
         cx: &mut Context<Self>,
     ) -> Self {
-        let subscriptions = vec![
+        let mut subscriptions = vec![
             cx.subscribe(&project, |this, _, event, cx| match event {
                 project::Event::DiagnosticsUpdated { paths, .. }
                     if this.path.as_ref().is_some_and(|path| paths.contains(path)) =>
                 {
-                    this.changed(cx, Self::recount);
+                    this.changed(cx, |this, cx| {
+                        // Remote projects have no local server list; their diagnostics prove one.
+                        if this.is_remote(cx) {
+                            this.has_server = true;
+                        }
+                        this.recount(cx);
+                    });
                 }
                 project::Event::LanguageServerAdded(..)
                 | project::Event::LanguageServerRemoved(_) => {
@@ -151,6 +163,21 @@ impl InspectionWidget {
             // The setting decides at draw time, which the pane does, not this view.
             cx.observe_global::<SettingsStore>(|this, cx| this.changed(cx, |_, _| {})),
         ];
+        // The pane is updated when it removes an item and `update_toolbar` does not always follow
+        // (a pane that stays open when emptied), so the widget must not keep that tab alive.
+        if let Some(pane) = pane.upgrade() {
+            subscriptions.push(cx.subscribe(&pane, |this, _, event, cx| {
+                if let pane::Event::RemovedItem { item } = event
+                    && this
+                        .active_item
+                        .as_ref()
+                        .is_some_and(|active| active.item_id() == item.item_id())
+                {
+                    this.active_item = None;
+                    this.changed(cx, Self::retarget);
+                }
+            }));
+        }
         Self {
             workspace,
             pane,
@@ -161,6 +188,9 @@ impl InspectionWidget {
             path: None,
             counts: None,
             has_server: false,
+            #[cfg(test)]
+            pretend_remote: false,
+            _buffer_subscription: None,
             _subscriptions: subscriptions,
         }
     }
@@ -187,24 +217,37 @@ impl InspectionWidget {
         self.buffer.as_ref()?.upgrade()
     }
 
+    fn is_remote(&self, cx: &App) -> bool {
+        #[cfg(test)]
+        if self.pretend_remote {
+            return true;
+        }
+        !self.project.read(cx).is_local()
+    }
+
     fn recount(&mut self, cx: &mut Context<Self>) {
-        self.counts = self
-            .buffer()
-            .map(|buffer| Counts::of(&collect(&buffer.read(cx).snapshot(), false)));
+        // A buffer without a file in the project has no diagnostics to count.
+        self.counts = self.path.as_ref().and_then(|_| {
+            self.buffer()
+                .map(|buffer| Counts::of(&collect(&buffer.read(cx).snapshot(), false)))
+        });
     }
 
     fn recheck_server(&mut self, cx: &mut Context<Self>) {
         let lsp_store = self.project.read(cx).lsp_store();
-        self.has_server = self.buffer().is_some_and(|buffer| {
-            buffer.update(cx, |buffer, cx| {
-                lsp_store.update(cx, |store, cx| {
-                    store
-                        .running_language_servers_for_local_buffer(buffer, cx)
-                        .next()
-                        .is_some()
+        // Only local projects list their servers; elsewhere a seen diagnostics update is sticky.
+        let remote_seen = self.has_server && self.is_remote(cx);
+        self.has_server = remote_seen
+            || self.buffer().is_some_and(|buffer| {
+                buffer.update(cx, |buffer, cx| {
+                    lsp_store.update(cx, |store, cx| {
+                        store
+                            .running_language_servers_for_local_buffer(buffer, cx)
+                            .next()
+                            .is_some()
+                    })
                 })
-            })
-        });
+            });
     }
 
     /// The active tab changed: everything is looked up again.
@@ -219,12 +262,21 @@ impl InspectionWidget {
         self.path = buffer
             .as_ref()
             .and_then(|buffer| buffer.read(cx).project_path(cx));
-        // A buffer without a file in the project has no diagnostics to count.
-        self.buffer = self
-            .path
-            .is_some()
-            .then(|| buffer.as_ref().map(Entity::downgrade))
-            .flatten();
+        if buffer.as_ref().map(Entity::entity_id) != self.buffer().map(|buffer| buffer.entity_id())
+        {
+            self.has_server = false;
+            self._buffer_subscription = buffer.as_ref().map(|buffer| {
+                cx.subscribe(buffer, |this, _, event: &BufferEvent, cx| {
+                    if matches!(
+                        event,
+                        BufferEvent::FileHandleChanged | BufferEvent::LanguageChanged(_)
+                    ) {
+                        this.changed(cx, Self::retarget);
+                    }
+                })
+            });
+        }
+        self.buffer = buffer.as_ref().map(Entity::downgrade);
         self.editor = editor.map(|editor| editor.downgrade());
         self.recount(cx);
         self.recheck_server(cx);
@@ -276,7 +328,7 @@ impl ToolbarItemView for InspectionWidget {
 }
 
 impl Render for InspectionWidget {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let Some(counts) = self.counts else {
             return h_flex().into_any_element();
         };
@@ -304,27 +356,54 @@ impl Render for InspectionWidget {
             .when(counts.weak > 0, |this| {
                 this.child(count(IconName::Info, Color::Info, counts.weak))
             });
+        // The arrows act on the editor, so the shortcut is looked up in its key context.
+        let editor_focus = self
+            .editor
+            .as_ref()
+            .and_then(WeakEntity::upgrade)
+            .map(|editor| editor.focus_handle(cx));
+        let clean = counts.is_clean();
         let arrow = |id: &'static str,
                      icon: IconName,
                      label: &'static str,
                      forward: bool,
+                     window: &Window,
                      cx: &mut Context<Self>| {
+            let action: &dyn Action = if forward {
+                &GoToDiagnostic::default()
+            } else {
+                &GoToPreviousDiagnostic::default()
+            };
+            let binding = match &editor_focus {
+                Some(focus) => KeyBinding::for_action_in(action, focus, cx),
+                None => KeyBinding::for_action(action, cx),
+            };
+            let shortcut = binding.keyboard_shortcut_text(window, cx);
+            let action = action.boxed_clone();
+            let focus = editor_focus.clone();
             div().debug_selector(move || id.into()).child(
-                IconButton::new(id, icon)
-                    .icon_size(IconSize::Small)
+                ButtonLike::new(id)
+                    .tab_index(0isize)
+                    .disabled(clean)
                     .aria_label(label)
-                    .tooltip(move |_, cx| {
-                        if forward {
-                            Tooltip::for_action(label, &GoToDiagnostic::default(), cx)
-                        } else {
-                            Tooltip::for_action(label, &GoToPreviousDiagnostic::default(), cx)
-                        }
+                    .when_some(shortcut, |this, shortcut| this.aria_keyshortcuts(shortcut))
+                    .tooltip(move |_, cx| match &focus {
+                        Some(focus) => Tooltip::for_action_in(label, action.as_ref(), focus, cx),
+                        None => Tooltip::for_action(label, action.as_ref(), cx),
                     })
-                    .on_click(cx.listener(move |this, _, window, cx| this.go(forward, window, cx))),
+                    .on_click(cx.listener(move |this, _, window, cx| this.go(forward, window, cx)))
+                    .child(Icon::new(icon).size(IconSize::Small).color(if clean {
+                        Color::Disabled
+                    } else {
+                        Color::Default
+                    })),
             )
         };
         h_flex()
             .debug_selector(|| "zenith-inspection-widget".into())
+            .id("zenith-inspection-widget")
+            .role(Role::Group)
+            .aria_label("Inspections")
             .gap_0p5()
             .child(
                 div()
@@ -348,6 +427,7 @@ impl Render for InspectionWidget {
                 IconName::ArrowUp,
                 "Previous Problem",
                 false,
+                window,
                 cx,
             ))
             .child(arrow(
@@ -355,6 +435,7 @@ impl Render for InspectionWidget {
                 IconName::ArrowDown,
                 "Next Problem",
                 true,
+                window,
                 cx,
             ))
             .into_any_element()
@@ -369,6 +450,7 @@ mod tests {
     use gpui::{Modifiers, TestAppContext, VisualTestContext};
     use language::{FakeLspAdapter, rust_lang};
     use lsp::{DiagnosticSeverity, DiagnosticTag, LanguageServerId};
+    use project::Fs as _;
     use serde_json::json;
     use text::Point;
     use workspace::{AppState, MultiWorkspace, OpenOptions};
@@ -682,6 +764,127 @@ mod tests {
             panel.focus_handle(cx).contains_focused(window, cx)
         });
         assert!(focused, "the Problems panel has focus");
+    }
+
+    #[gpui::test]
+    async fn save_as_shows_the_widget_without_switching_tabs(cx: &mut TestAppContext) {
+        let (fixture, cx) = fixture(cx).await;
+        fixture.workspace.update_in(cx, |workspace, window, cx| {
+            Editor::new_file(workspace, &workspace::NewFile, window, cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(counts(&fixture, cx), None, "an untitled tab has no file");
+        assert!(!on_the_tab_bar(cx));
+        let buffer = fixture
+            .workspace
+            .read_with(cx, |workspace, cx| {
+                workspace.active_item_as::<Editor>(cx).expect("the new tab")
+            })
+            .read_with(cx, |editor, cx| {
+                editor.buffer().read(cx).as_singleton().expect("one buffer")
+            });
+        let worktree_id = fixture.project.read_with(cx, |project, cx| {
+            project
+                .worktrees(cx)
+                .next()
+                .expect("a worktree")
+                .read(cx)
+                .id()
+        });
+        let path = ProjectPath {
+            worktree_id,
+            path: util::rel_path::rel_path("new.rs").into(),
+        };
+        fixture
+            .project
+            .update(cx, |project, cx| project.save_buffer_as(buffer, path, cx))
+            .await
+            .expect("saves");
+        cx.run_until_parked();
+        assert_eq!(counts(&fixture, cx), Some(Counts::default()));
+        assert!(on_the_tab_bar(cx));
+    }
+
+    #[gpui::test]
+    async fn a_renamed_file_keeps_counting(cx: &mut TestAppContext) {
+        let (fixture, cx) = fixture(cx).await;
+        let fs = fixture
+            .project
+            .read_with(cx, |project, _| project.fs().clone());
+        fs.as_fake()
+            .rename("/p/a.rs".as_ref(), "/p/d.rs".as_ref(), Default::default())
+            .await
+            .expect("renames");
+        cx.executor()
+            .advance_clock(std::time::Duration::from_secs(1));
+        cx.run_until_parked();
+        publish(
+            &fixture,
+            cx,
+            "/p/d.rs",
+            vec![diagnostic(1, 4, DiagnosticSeverity::ERROR, None)],
+        );
+        assert_eq!(
+            counts(&fixture, cx),
+            Some(Counts {
+                errors: 1,
+                warnings: 0,
+                weak: 0
+            })
+        );
+    }
+
+    #[gpui::test]
+    async fn a_pane_that_loses_its_last_item_without_closing_lets_go_of_it(
+        cx: &mut TestAppContext,
+    ) {
+        let (fixture, cx) = fixture(cx).await;
+        let pane = fixture
+            .workspace
+            .read_with(cx, |workspace, _| workspace.active_pane().clone());
+        let item_id = fixture
+            .workspace
+            .read_with(cx, |workspace, cx| workspace.active_item(cx))
+            .expect("an active tab")
+            .item_id();
+        pane.update_in(cx, |pane, window, cx| {
+            pane.remove_item(item_id, false, false, window, cx)
+        });
+        cx.run_until_parked();
+        let widget = widget(&fixture, cx);
+        assert!(widget.read_with(cx, |widget, _| widget.active_item.is_none()));
+        assert_eq!(counts(&fixture, cx), None);
+    }
+
+    #[gpui::test]
+    async fn diagnostics_prove_a_server_where_none_is_listed(cx: &mut TestAppContext) {
+        let (fixture, cx) = fixture(cx).await;
+        widget(&fixture, cx).update(cx, |widget, _| widget.pretend_remote = true);
+        open(&fixture, cx, "/p/c.txt").await;
+        assert!(!on_the_tab_bar(cx));
+        publish(
+            &fixture,
+            cx,
+            "/p/c.txt",
+            vec![diagnostic(0, 0, DiagnosticSeverity::ERROR, None)],
+        );
+        assert!(on_the_tab_bar(cx));
+        publish(&fixture, cx, "/p/c.txt", vec![]);
+        assert!(on_the_tab_bar(cx), "a clean file keeps its widget");
+    }
+
+    #[gpui::test]
+    async fn the_arrows_are_inert_while_the_file_is_clean(cx: &mut TestAppContext) {
+        let (fixture, cx) = fixture(cx).await;
+        let editor = open(&fixture, cx, "/p/a.rs").await;
+        fixture.workspace.update_in(cx, |workspace, window, cx| {
+            workspace.focus_panel::<ProblemsPanel>(window, cx);
+        });
+        cx.run_until_parked();
+        click(cx, "zenith-inspection-down");
+        assert!(!editor.update_in(cx, |editor, window, cx| {
+            editor.focus_handle(cx).is_focused(window)
+        }));
     }
 
     #[test]
