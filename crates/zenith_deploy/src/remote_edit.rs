@@ -1632,7 +1632,13 @@ mod tests {
         cx.run_until_parked();
         assert!(f.events.borrow().is_empty(), "still waiting");
         cx.executor()
-            .advance_clock(OPERATION_TIMEOUT + Duration::from_secs(1));
+            .advance_clock(OPERATION_TIMEOUT - Duration::from_secs(1));
+        cx.run_until_parked();
+        assert!(
+            f.events.borrow().is_empty(),
+            "the deadline is the plain one, not shorter"
+        );
+        cx.executor().advance_clock(Duration::from_secs(2));
         cx.run_until_parked();
         let events = f.events.borrow();
         let [UploadOutcome::Blocked(message)] = events.as_slice() else {
@@ -1654,8 +1660,15 @@ mod tests {
         *f.remote.put_hang.lock().expect("flag") = true;
         f.upload(true, false, cx);
         cx.run_until_parked();
+        let deadline = Deadlines::for_len(5).put;
         cx.executor()
-            .advance_clock(Deadlines::for_len(5).put + Duration::from_secs(1));
+            .advance_clock(deadline - Duration::from_secs(1));
+        cx.run_until_parked();
+        assert!(
+            f.events.borrow().is_empty(),
+            "the write keeps its own deadline"
+        );
+        cx.executor().advance_clock(Duration::from_secs(2));
         cx.run_until_parked();
         let events = f.events.borrow();
         let [UploadOutcome::Failed(message)] = events.as_slice() else {
