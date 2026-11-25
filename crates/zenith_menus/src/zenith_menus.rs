@@ -2,6 +2,7 @@
 //! on and off (plan 44 item 14).
 
 mod app_menu;
+mod bar_items;
 mod editor_menu;
 mod tab_menu;
 #[cfg(test)]
@@ -64,7 +65,8 @@ pub fn init(cx: &mut App) {
         }
         shown = now;
         if let Some(&UpstreamMenus(upstream)) = cx.try_global::<UpstreamMenus>() {
-            let menus = app_menu::arrange(upstream(cx), tools_menu(&shown.0));
+            let menus =
+                app_menu::arrange(upstream(cx), tools_menu(&shown.0), bar_items::resolve(cx));
             cx.set_menus(menus);
         }
     })
@@ -75,7 +77,7 @@ pub fn init(cx: &mut App) {
 pub fn app_menus(upstream: fn(&mut App) -> Vec<Menu>, cx: &mut App) -> Vec<Menu> {
     cx.set_global(UpstreamMenus(upstream));
     let tools = tools_menu(&FeatureToggles::get_global(cx).0);
-    app_menu::arrange(upstream(cx), tools)
+    app_menu::arrange(upstream(cx), tools, bar_items::resolve(cx))
 }
 
 fn toggle_feature(action: &ToggleFeature, cx: &mut App) {

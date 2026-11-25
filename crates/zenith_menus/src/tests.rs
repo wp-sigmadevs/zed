@@ -8,7 +8,8 @@ use workspace::{AppState, MultiWorkspace};
 
 use crate::{
     ToggleFeature,
-    app_menu::arrange,
+    app_menu::arrange as arrange_with,
+    bar_items::{self, Extras},
     restart_notice_id, restart_notice_text, toggle_feature,
     tools::{FEATURES, changed_restart_features, feature, feature_states, set_feature, tools_menu},
 };
@@ -35,6 +36,27 @@ impl Action for Fake {
     fn build(_: serde_json::Value) -> anyhow::Result<Box<dyn Action>> {
         anyhow::bail!("Fake is test-only")
     }
+}
+
+fn arrange(upstream: Vec<Menu>, tools: Menu) -> Vec<Menu> {
+    arrange_with(upstream, tools, Vec::new())
+}
+
+fn fake(name: &str) -> Box<dyn Action> {
+    // Leaked: a handful of short names per test run.
+    Box::new(Fake(Box::leak(name.to_string().into_boxed_str())))
+}
+
+fn extras_where(keep: impl Fn(&str) -> bool, ai_disabled: bool) -> Extras {
+    bar_items::build(|name| keep(name).then(|| fake(name)), ai_disabled)
+}
+
+fn tools() -> Menu {
+    Menu::new("Tools").items([item("T", "tools::T")])
+}
+
+fn with_extras(extras: Extras) -> Vec<Menu> {
+    arrange_with(upstream(), tools(), extras)
 }
 
 fn item(label: &'static str, name: &'static str) -> MenuItem {
@@ -504,4 +526,245 @@ async fn restart_notice_follows_the_setting(cx: &mut TestAppContext) {
     });
     cx.run_until_parked();
     assert!(!has_notice("agent_review", &workspace, cx));
+}
+
+#[test]
+fn bar_items_follow_phpstorm_order() {
+    let arranged = with_extras(extras_where(|_| true, false));
+    assert_eq!(
+        names(&arranged),
+        [
+            "Zenith", "File", "Edit", "View", "Navigate", "Code", "Refactor", "Run", "Tools",
+            "Git", "Plugins", "Window", "Help"
+        ]
+    );
+    assert_eq!(
+        shape(find(&arranged, "Code")),
+        [
+            "[Code Completion]",
+            "editor::ToggleCodeActions",
+            "-",
+            "zenith_postfix::SurroundWith",
+            "zenith_postfix::LiveTemplates",
+            "[Folding]",
+            "-",
+            "editor::ToggleComments",
+            "editor::ToggleBlockComments",
+            "-",
+            "editor::Format",
+            "editor::FormatSelections",
+            "editor::AutoIndent",
+            "editor::OrganizeImports",
+            "-",
+            "editor::MoveLineUp",
+            "editor::MoveLineDown",
+            "-",
+            "[Inspect Code]",
+        ]
+    );
+    assert_eq!(
+        shape(find(&arranged, "Refactor")),
+        [
+            "zenith_refactor::RefactorThis",
+            "editor::Rename",
+            "zenith_refactor::ChangeSignature",
+            "zenith_refactor::MoveClass",
+            "zenith_refactor::SafeDelete",
+            "[Extract / Introduce]",
+        ]
+    );
+    assert_eq!(
+        shape(find(&arranged, "Git")),
+        [
+            "git::Commit",
+            "git::Amend",
+            "git::Push",
+            "git::ForcePush",
+            "git::Pull",
+            "git::Fetch",
+            "-",
+            "[Branches]",
+            "git_panel::ToggleFocus",
+            "-",
+            "[Uncommitted Changes]",
+            "[Current File]",
+            "-",
+            "git::Init",
+            "git::Clone",
+            "git::GenerateCommitMessage",
+        ]
+    );
+    // Ours lead, then upstream's own Run items.
+    assert_eq!(
+        shape(find(&arranged, "Run")),
+        [
+            "zenith_run::RunSelected",
+            "zenith_run::DebugSelected",
+            "zenith_run::StopRun",
+            "zenith_run::RerunLast",
+            "-",
+            "zenith_scratches::RunScratch",
+            "zenith_http::RunRequest",
+            "zenith_http::RunAllRequests",
+            "-",
+            "task::Spawn",
+        ]
+    );
+}
+
+#[test]
+fn upstream_items_the_bar_items_repeat_stay_single_and_keep_their_place() {
+    let arranged = with_extras(extras_where(|_| true, false));
+    let mut all = Vec::new();
+    all_action_names(&arranged, &mut all);
+    for name in [
+        "editor::ToggleComments",
+        "editor::MoveLineUp",
+        "editor::MoveLineDown",
+    ] {
+        assert_eq!(all.iter().filter(|n| *n == name).count(), 1, "{name}");
+    }
+    // The upstream item carries on, under PhpStorm's label.
+    assert_eq!(
+        labels(find(&arranged, "Code"))[3..5],
+        ["Comment with Line Comment", "Comment with Block Comment"]
+    );
+}
+
+#[test]
+fn unresolved_bar_items_are_skipped() {
+    // Nothing from the Zenith crates is linked: Refactor keeps only Rename, and the
+    // submenus that held only Zenith actions are gone.
+    let arranged = with_extras(extras_where(|name| !name.starts_with("zenith_"), false));
+    assert_eq!(shape(find(&arranged, "Refactor")), ["editor::Rename"]);
+    assert_eq!(
+        shape(find(&arranged, "Code")),
+        [
+            "[Code Completion]",
+            "editor::ToggleCodeActions",
+            "-",
+            "[Folding]",
+            "-",
+            "editor::ToggleComments",
+            "editor::ToggleBlockComments",
+            "-",
+            "editor::Format",
+            "editor::FormatSelections",
+            "editor::AutoIndent",
+            "editor::OrganizeImports",
+            "-",
+            "editor::MoveLineUp",
+            "editor::MoveLineDown",
+        ]
+    );
+    assert_eq!(shape(find(&arranged, "Run")), ["task::Spawn"]);
+    // Nothing resolves: Refactor and Git are left out, Code is just the moved items.
+    let none = with_extras(extras_where(|_| false, false));
+    assert_eq!(
+        names(&none),
+        [
+            "Zenith", "File", "Edit", "View", "Navigate", "Code", "Run", "Tools", "Plugins",
+            "Window", "Help"
+        ]
+    );
+    assert_eq!(
+        shape(find(&none, "Code")),
+        [
+            "editor::ToggleComments",
+            "editor::MoveLineUp",
+            "editor::MoveLineDown"
+        ]
+    );
+}
+
+#[test]
+fn commit_message_is_hidden_without_ai() {
+    let has = |ai_disabled| {
+        let arranged = with_extras(extras_where(|_| true, ai_disabled));
+        shape(find(&arranged, "Git")).contains(&bar_items::COMMIT_MESSAGE.to_string())
+    };
+    assert!(has(false));
+    assert!(!has(true));
+}
+
+fn depth(item: &MenuItem) -> usize {
+    match item {
+        MenuItem::Submenu(menu) => 1 + menu.items.iter().map(depth).max().unwrap_or(0),
+        _ => 0,
+    }
+}
+
+#[test]
+fn bar_menus_nest_one_level_and_are_never_empty() {
+    for keep_zenith in [true, false] {
+        for ai_disabled in [true, false] {
+            let arranged = with_extras(extras_where(
+                |name| keep_zenith || !name.starts_with("zenith_"),
+                ai_disabled,
+            ));
+            for menu in &arranged {
+                assert!(!menu.items.is_empty(), "{} is empty", menu.name);
+                assert!(
+                    menu.items.iter().all(|item| depth(item) <= 1),
+                    "{} nests deeper than one level",
+                    menu.name
+                );
+                let shown = shape(menu);
+                assert_ne!(
+                    shown.first().map(String::as_str),
+                    Some("-"),
+                    "{}",
+                    menu.name
+                );
+                assert_ne!(shown.last().map(String::as_str), Some("-"), "{}", menu.name);
+                assert!(
+                    shown.windows(2).all(|w| w[0] != "-" || w[1] != "-"),
+                    "{}",
+                    menu.name
+                );
+                for item in &menu.items {
+                    if let MenuItem::Submenu(sub) = item {
+                        assert!(!sub.items.is_empty(), "{} has an empty submenu", sub.name);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Every action name the bar items use.
+fn bar_item_names() -> Vec<String> {
+    let mut all = Vec::new();
+    all_action_names(
+        &bar_items::build(|name| Some(fake(name)), false)
+            .into_iter()
+            .map(|(name, items)| Menu::new(name).items(items))
+            .collect::<Vec<_>>(),
+        &mut all,
+    );
+    all
+}
+
+/// Names whose crate this one does not link, so `build_action` cannot see them here.
+const UNLINKED: &[&str] = &[
+    "zenith_postfix::",
+    "zenith_inspections::",
+    "zenith_problems::",
+    "zenith_refactor::",
+    "zenith_run::",
+    "zenith_scratches::",
+    "zenith_http::",
+    "git::DiffBranch",
+];
+
+#[gpui::test]
+fn linked_bar_item_actions_exist(cx: &mut TestAppContext) {
+    cx.update(|cx| {
+        let missing: Vec<String> = bar_item_names()
+            .into_iter()
+            .filter(|name| !UNLINKED.iter().any(|prefix| name.starts_with(prefix)))
+            .filter(|name| cx.build_action(name, None).is_err())
+            .collect();
+        assert!(missing.is_empty(), "no such action: {missing:?}");
+    });
 }

@@ -2,6 +2,8 @@
 
 use gpui::{Menu, MenuItem, SharedString};
 
+use crate::bar_items::Extras;
+
 const BAR: [&str; 12] = [
     "Zenith", "File", "Edit", "View", "Navigate", "Code", "Refactor", "Run", "Tools", "Git",
     "Window", "Help",
@@ -29,9 +31,10 @@ const CODE: &[&str] = &[
 
 const COMMAND_PALETTE: &str = "command_palette::Toggle";
 
-/// Upstream menu bar plus the Tools menu, in PhpStorm order. Empty menus are left out, and no
-/// upstream action survives except through the DROP list.
-pub(crate) fn arrange(upstream: Vec<Menu>, tools: Menu) -> Vec<Menu> {
+/// Upstream menu bar plus the Tools menu, in PhpStorm order. `extras` lead their menus; where
+/// one repeats an upstream item that moved to Code, the upstream item takes its place. Empty
+/// menus are left out, and no upstream action survives except through the DROP list.
+pub(crate) fn arrange(upstream: Vec<Menu>, tools: Menu, extras: Extras) -> Vec<Menu> {
     let mut bar: Vec<Menu> = BAR.iter().map(|name| Menu::new(*name)).collect();
     let mut extra = Vec::new();
     let mut code = Vec::new();
@@ -77,9 +80,24 @@ pub(crate) fn arrange(upstream: Vec<Menu>, tools: Menu) -> Vec<Menu> {
             }),
         }
     }
-    for (name, moved) in [("Code", code), ("Help", help)] {
+    let mut front: Vec<(&str, Vec<MenuItem>)> = vec![("Code", code), ("Help", help)];
+    for (name, mut items) in extras {
+        if name == "Code" {
+            for item in &mut items {
+                let label = label(item).cloned();
+                let moved = front[0].1.iter().position(|up| {
+                    !action_name(item).is_empty() && action_name(up) == action_name(item)
+                });
+                if let (Some(label), Some(at)) = (label, moved) {
+                    *item = relabel(front[0].1.remove(at), &label);
+                }
+            }
+        }
+        front.push((name, items));
+    }
+    for (name, moved) in front {
         if let Some(slot) = bar.iter_mut().find(|slot| slot.name == name) {
-            // Moved items lead; a separator keeps them apart from what was already there.
+            // Moved items lead; a separator keeps each group apart from what was already there.
             let rest = std::mem::take(&mut slot.items);
             slot.items = moved;
             slot.items.push(MenuItem::separator());
@@ -119,6 +137,20 @@ fn tidy(items: Vec<MenuItem>) -> Vec<MenuItem> {
         tidy.pop();
     }
     tidy
+}
+
+fn action_name(item: &MenuItem) -> &'static str {
+    match item {
+        MenuItem::Action { action, .. } => action.name(),
+        _ => "",
+    }
+}
+
+fn label(item: &MenuItem) -> Option<&SharedString> {
+    match item {
+        MenuItem::Action { name, .. } => Some(name),
+        _ => None,
+    }
 }
 
 fn relabel(item: MenuItem, label: &str) -> MenuItem {
