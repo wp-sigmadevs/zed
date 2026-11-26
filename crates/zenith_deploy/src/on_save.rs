@@ -44,8 +44,8 @@ pub(crate) fn fingerprint(server: &ServerConfig) -> String {
 }
 
 /// Whether saving `new` over `old` must ask the user again before auto-upload may stay on: the
-/// one-time confirmation was given for one host, port, type, user, root folder and set of
-/// mappings ([`fingerprint`]). A server without an `old` (a new one) has nothing confirmed.
+/// one-time confirmation was given for what [`fingerprint`] covers. A server without an `old`
+/// (a new one) has nothing confirmed.
 pub fn needs_reconfirm(old: Option<&ServerConfig>, new: &ServerConfig) -> bool {
     old.is_none_or(|old| fingerprint(old) != fingerprint(new))
 }

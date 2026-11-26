@@ -801,11 +801,10 @@ impl ServerStore {
     }
 
     /// "Always upload the first save without asking" for this session, one server and its
-    /// current [`on_save::fingerprint`] (host, port, type, user, root folder, mappings): a
-    /// change of any of them forgets it, and so does one that comes back. Only the first save of
-    /// a file that was never uploaded in this session: a remote file that changed since our last
-    /// upload (or whose last upload could not be verified) still asks. False when the server
-    /// does not exist.
+    /// current [`on_save::fingerprint`]: a change of anything it covers forgets it, and so does
+    /// one that comes back. Only the first save of a file that was never uploaded in this
+    /// session: a remote file that changed since our last upload (or whose last upload could
+    /// not be verified) still asks. False when the server does not exist.
     ///
     /// Like [`Self::set_upload_decision_for_target`], only while the server's fingerprint is
     /// still `expected` (the one the prompt was built for); false when it does not match.

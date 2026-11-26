@@ -117,7 +117,7 @@ pub struct ServerStore {
     auto_upload_paused: bool,
     /// Servers whose first-save-without-baseline question the user answered "always" this
     /// session. Never skips a Conflict.
-    /// Each with the [`on_save::fingerprint`] (target, root folder, mappings) it was said for
+    /// Each with the [`on_save::fingerprint`] it was said for
     /// ([`ServerStore::set_skip_no_baseline_prompt`]).
     skip_no_baseline_prompt: HashMap<String, String>,
     /// Per server, the number of sessions auto-upload may hold at once (`advanced.connections`).
@@ -410,8 +410,8 @@ impl ServerStore {
             servers.servers.iter().map(|server| &server.id).collect();
         self.session_passwords.retain(|id, _| kept.contains(id));
         // A decision lives only while its server still has the target it was made for, a skip
-        // while it still has the same target, root folder and mappings: a host that changed and
-        // came back must ask again.
+        // while it still has the same `on_save::fingerprint`: a host that changed and came back
+        // must ask again.
         let target_of = |id: &String| {
             servers
                 .servers
