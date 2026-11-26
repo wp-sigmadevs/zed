@@ -28,14 +28,17 @@ pub fn is_explicit(intent: SaveIntent) -> bool {
 }
 
 /// What a one-time confirmation or a session answer was given for: the target (host, port, type,
-/// user), whether it signs in anonymously, the root folder and the mappings. Equal fingerprints,
-/// equal places the files go. In memory only: it holds no secret, but nothing logs or stores it.
+/// user), whether it signs in anonymously, the root folder, the mappings and the excluded local
+/// names. Equal fingerprints, equal places and files that go. In memory only: it holds no secret,
+/// but nothing logs or stores it. Changing the exclusions also forgets a session "skip" answer
+/// (accepted: it asks once more).
 pub(crate) fn fingerprint(server: &ServerConfig) -> String {
     serde_json::json!([
         crate::secrets::target_account(server),
         server.anonymous,
         server.root_path,
-        server.mappings
+        server.mappings,
+        server.excluded_local
     ])
     .to_string()
 }
@@ -650,10 +653,9 @@ mod tests {
         assert!(!needs_reconfirm(Some(&old), &old.clone()));
         let mut renamed = old.clone();
         renamed.name = "Renamed".into();
-        renamed.excluded_local.push("x".into());
         assert!(!needs_reconfirm(Some(&old), &renamed));
         assert!(needs_reconfirm(None, &old));
-        let changes: [fn(&mut ServerConfig); 7] = [
+        let changes: [fn(&mut ServerConfig); 9] = [
             |s| s.host = "other.example.com".into(),
             |s| s.port += 1,
             |s| s.server_type = crate::config::ServerType::Sftp,
@@ -661,6 +663,8 @@ mod tests {
             |s| s.root_path = "/public_html".into(),
             |s| s.mappings[0].remote = "y".into(),
             |s| s.anonymous = !s.anonymous,
+            |s| s.excluded_local.push("x".into()),
+            |s| s.excluded_local.clear(),
         ];
         for change in changes {
             let mut new = old.clone();
