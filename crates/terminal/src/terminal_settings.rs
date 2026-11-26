@@ -325,4 +325,26 @@ mod tests {
         assert_eq!(path_regexes(&store, Some("project/file")), defaults);
         assert!(path_regexes(&store, Some("project/child/file")).is_empty());
     }
+
+    // Zenith: JetBrains Mono needs `calt` for `->`, `==`, `!=`; terminal must not fall back to no ligatures.
+    #[gpui::test]
+    fn test_default_font_features_enable_ligatures(cx: &mut gpui::App) {
+        let store = SettingsStore::new(cx, &settings::default_settings());
+        let expected = vec![("calt".to_owned(), 1), ("liga".to_owned(), 1)];
+        assert_eq!(
+            store
+                .get::<TerminalSettings>(None)
+                .font_features
+                .as_ref()
+                .map(|features| features.tag_value_list().to_vec()),
+            Some(expected.clone())
+        );
+        let buffer = store
+            .raw_default_settings()
+            .theme
+            .buffer_font_features
+            .clone()
+            .expect("default buffer_font_features");
+        assert_eq!(buffer.0.into_iter().collect::<Vec<_>>(), expected);
+    }
 }
