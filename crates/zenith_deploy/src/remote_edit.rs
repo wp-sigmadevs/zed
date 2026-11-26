@@ -485,11 +485,21 @@ async fn cycle(
         )
     });
     match job.await {
-        Ok((transport, stat)) => Cycle {
+        Ok((transport, Ok(stat))) => Cycle {
             transport: Some(transport),
             outcome: UploadOutcome::Uploaded,
-            new_stat: Some(verified_baseline(stat.ok().flatten(), len)),
+            new_stat: Some(verified_baseline(stat, len)),
         },
+        // The re-stat failed (421, an I/O error): the session may be out of step, so it is
+        // closed rather than reused for a queued save.
+        Ok((transport, Err(_))) => {
+            disconnect(cx, transport);
+            Cycle {
+                transport: None,
+                outcome: UploadOutcome::Uploaded,
+                new_stat: Some(None),
+            }
+        }
         // Written, but not verified: no baseline, so the next save asks first.
         Err(_) => Cycle {
             transport: None,
@@ -1368,6 +1378,50 @@ mod tests {
         // Idle again: the next save starts a fresh upload.
         f.save("four", cx);
         assert_eq!(f.upload(true, false, cx), UploadStart::Started);
+    }
+
+    #[gpui::test]
+    async fn a_failed_verify_restat_closes_the_session_instead_of_reusing_it(
+        cx: &mut TestAppContext,
+    ) {
+        let f = fixture(cx).await;
+        *f.remote.stat_error_after_put.lock().expect("error") = Some("421 closing".into());
+        f.save("one", cx);
+        assert_eq!(f.upload(true, false, cx), UploadStart::Started);
+        f.save("two", cx);
+        assert_eq!(f.upload(true, false, cx), UploadStart::Queued);
+        cx.run_until_parked();
+        let log: Vec<_> = f
+            .remote
+            .log()
+            .into_iter()
+            .filter(|line| !line.starts_with("connect"))
+            .collect();
+        let connects = f
+            .remote
+            .log()
+            .iter()
+            .filter(|line| line.starts_with("connect"))
+            .count();
+        assert_eq!(connects, 2, "the queued save opens a fresh session");
+        assert_eq!(
+            log,
+            [
+                format!("stat {REMOTE}"),
+                format!("put {REMOTE}"),
+                format!("stat {REMOTE}"),
+                "disconnect".to_string(),
+                format!("stat {REMOTE}"),
+                "disconnect".to_string(),
+            ]
+        );
+        assert_eq!(
+            *f.events.borrow(),
+            [UploadOutcome::Uploaded, UploadOutcome::AskFirst],
+            "no baseline after the failed verify, so the queued save asks"
+        );
+        assert_eq!(f.puts().len(), 1);
+        assert_eq!(f.copy_stat(cx), None);
     }
 
     #[gpui::test]

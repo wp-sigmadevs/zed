@@ -572,6 +572,8 @@ pub(crate) mod test_support {
         /// Makes every `stat` / `upload_file` fail with this text.
         pub stat_error: Arc<Mutex<Option<String>>>,
         pub put_error: Arc<Mutex<Option<String>>>,
+        /// Makes the first `stat` after a successful put fail with this text, once.
+        pub stat_error_after_put: Arc<Mutex<Option<String>>>,
         /// Makes `stat` / `upload_file` never answer (a dead connection).
         pub stat_hang: Arc<Mutex<bool>>,
         pub put_hang: Arc<Mutex<bool>>,
@@ -678,6 +680,16 @@ pub(crate) mod test_support {
                 futures::future::pending::<()>().await;
             }
             if let Some(error) = self.stat_error.lock().ok().and_then(|error| error.clone()) {
+                return Err(anyhow!(error));
+            }
+            let put_done = self.puts.lock().is_ok_and(|puts| !puts.is_empty());
+            if put_done
+                && let Some(error) = self
+                    .stat_error_after_put
+                    .lock()
+                    .ok()
+                    .and_then(|mut error| error.take())
+            {
                 return Err(anyhow!(error));
             }
             Ok(self
