@@ -2108,7 +2108,7 @@ mod tests {
         // Past the last control it wraps, it does not leave the popover.
         cx.simulate_keystrokes("tab");
         assert!(
-            focused(cx) == Some(settings.clone()),
+            focused(cx) == Some(settings),
             "wraps to the first button"
         );
         cx.simulate_keystrokes("shift-tab");
