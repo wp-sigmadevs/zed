@@ -305,21 +305,23 @@ impl ServerStore {
     /// while its save waited on the Keychain) is refused, never merged: it would overwrite the
     /// newer servers with its stale copy. Only one write runs at a time, so the list cannot
     /// change between this check and `apply` (nothing else replaces `servers`).
+    ///
+    /// `reconfirmed` holds the ids of servers whose "upload on save" confirmation the user has
+    /// just given again for the new settings; the store keeps their flag, and clears it for any
+    /// other server that needs a new confirmation ([`on_save::needs_reconfirm`]).
     fn save(
         &mut self,
         previous: Servers,
         mut servers: Servers,
         session_changes: Vec<(ServerConfig, Option<Password>)>,
+        reconfirmed: &std::collections::HashSet<String>,
         cx: &mut Context<Self>,
     ) -> Task<Result<()>> {
-        // The one-time "upload on save" confirmation was given for one host and folder: a server
-        // that now points elsewhere must be confirmed again (plan 37 M4b).
+        // The one-time "upload on save" confirmation was given for one host, folder and set of
+        // mappings: a server that now points elsewhere must be confirmed again (plan 37 M4b).
         for server in &mut servers.servers {
-            let moved = previous.servers.iter().any(|old| {
-                old.id == server.id
-                    && (old.credentials_target_changed(server) || old.root_path != server.root_path)
-            });
-            if moved {
+            let old = previous.servers.iter().find(|old| old.id == server.id);
+            if !reconfirmed.contains(&server.id) && on_save::needs_reconfirm(old, server) {
                 server.upload_on_save_confirmed = false;
             }
         }
@@ -382,9 +384,19 @@ impl ServerStore {
         let kept: std::collections::HashSet<_> =
             servers.servers.iter().map(|server| &server.id).collect();
         self.session_passwords.retain(|id, _| kept.contains(id));
-        self.upload_decisions.retain(|id, _| kept.contains(id));
+        // A decision or skip lives only while its server still has the target it was made for:
+        // a host that changed and came back must ask again.
+        let target_of = |id: &String| {
+            servers
+                .servers
+                .iter()
+                .find(|server| &server.id == id)
+                .map(secrets::target_account)
+        };
+        self.upload_decisions
+            .retain(|id, (target, _)| target_of(id).as_ref() == Some(target));
         self.skip_no_baseline_prompt
-            .retain(|id, _| kept.contains(id));
+            .retain(|id, target| target_of(id).as_ref() == Some(target));
         self.connection_limits.retain(|id, _| kept.contains(id));
         let removed: Vec<String> = self
             .servers

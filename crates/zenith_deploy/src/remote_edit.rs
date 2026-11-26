@@ -214,6 +214,8 @@ pub enum UploadOutcome {
     AskFirst,
     /// Not sent: the remote could not be checked or the file cannot be uploaded.
     Blocked(String),
+    /// A file under the built-in secret list, never uploaded automatically; the text says so.
+    Excluded(String),
     /// The write started and failed. The text says the server file may be incomplete.
     Failed(String),
 }
@@ -794,10 +796,21 @@ impl ServerStore {
     /// [`Self::upload_decision`]. Only the first save of a file that was never uploaded in this
     /// session: a remote file that changed since our last upload (or whose last upload could not
     /// be verified) still asks. False when the server does not exist.
-    pub fn set_skip_no_baseline_prompt(&mut self, server_id: &str, skip: bool) -> bool {
+    ///
+    /// Like [`Self::set_upload_decision_for_target`], only while the server's target is still
+    /// `expected_target` (the one the prompt was built for); false when it does not match.
+    pub fn set_skip_no_baseline_prompt(
+        &mut self,
+        server_id: &str,
+        expected_target: &str,
+        skip: bool,
+    ) -> bool {
         let Some(target) = self.current_target(server_id) else {
             return false;
         };
+        if target != expected_target {
+            return false;
+        }
         if skip {
             self.skip_no_baseline_prompt
                 .insert(server_id.to_string(), target);
@@ -830,7 +843,14 @@ impl ServerStore {
             return Some(MAPPING_CHANGED);
         };
         match on_save::resolve(&server, local, &self.cache_dir) {
-            Ok(Some(resolved)) if resolved.remote == copy.remote_path => None,
+            // An exclusion added while the save waited (the user's own, or the secret list).
+            Ok(Some(resolved))
+                if resolved.remote == copy.remote_path
+                    && on_save::excluded(&resolved.rel, &on_save::user_matcher(&server))
+                        .is_none() =>
+            {
+                None
+            }
             _ => Some(MAPPING_CHANGED),
         }
     }
@@ -873,7 +893,7 @@ impl ServerStore {
     /// project is local and unshared, the server is visible in it and has both
     /// `upload_on_save` and `upload_on_save_confirmed`, and neither the pause nor a session
     /// Deny is set. A file under a built-in secret exclusion also answers `NotRemote` and
-    /// emits [`UploadOutcome::Blocked`] ("never uploaded automatically"); one under the
+    /// emits [`UploadOutcome::Excluded`] ("never uploaded automatically"); one under the
     /// user's own exclusions answers `NotRemote` silently. An unsafe path or an unreadable
     /// buffer is [`UploadStart::Refused`]. `force` is "upload anyway" after an
     /// [`UploadOutcome::AskFirst`] or [`UploadOutcome::Conflict`]. The result arrives as
@@ -917,7 +937,7 @@ impl ServerStore {
             Some(Excluded::Fixed) => {
                 cx.emit(ServerStoreEvent::UploadFinished {
                     cache_path: local,
-                    outcome: UploadOutcome::Blocked(format!(
+                    outcome: UploadOutcome::Excluded(format!(
                         "{} is never uploaded automatically: it can hold passwords or keys.",
                         resolved.rel.display()
                     )),
@@ -2581,8 +2601,13 @@ mod tests {
         let f = mapped_fixture(cx, |_| {}).await;
         let buffer = f.open("inc/a.php", cx).await;
         let id = f.server_id.clone();
-        f.store
-            .update(cx, |store, _| store.set_skip_no_baseline_prompt(&id, true));
+        f.store.update(cx, |store, _| {
+            store.set_skip_no_baseline_prompt(
+                &id,
+                &store.current_target(&id).expect("target"),
+                true,
+            )
+        });
         Fixture::save_in(&buffer, "<?php echo 1;", cx);
         assert_eq!(f.upload(&buffer, false, cx), UploadStart::Started);
         cx.run_until_parked();
@@ -2667,7 +2692,11 @@ mod tests {
         let events = f.events.borrow().clone();
         assert_eq!(events.len(), 1);
         assert!(
-            matches!(&events[0].1, UploadOutcome::Blocked(message) if message.contains("never uploaded automatically") && message.contains("wp-config.php")),
+            events[0].1
+                == UploadOutcome::Excluded(
+                    "wp-config.php is never uploaded automatically: it can hold passwords or keys."
+                        .into()
+                ),
             "{events:?}"
         );
 
@@ -2807,14 +2836,107 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn a_user_exclusion_added_while_a_save_waits_stops_it(cx: &mut TestAppContext) {
+        let f = mapped_fixture(cx, |server| server.advanced.connections = 1).await;
+        let (release, gate) = futures::channel::oneshot::channel();
+        *f.remote.put_gate.lock().expect("gate") = Some(gate);
+        for rel in ["inc/a.php", "inc/b.php"] {
+            let buffer = f.open(rel, cx).await;
+            Fixture::save_in(&buffer, "new", cx);
+            assert_eq!(f.upload(&buffer, true, cx), UploadStart::Started);
+        }
+        cx.run_until_parked();
+        f.edit_servers(cx, |servers| {
+            servers.servers[0].excluded_local.push("secret".into());
+            servers.servers[0].excluded_local.push("b.php".into());
+        });
+        release.send(()).expect("release");
+        cx.run_until_parked();
+        assert_eq!(f.puts(), [(MAPPED_REMOTE.to_string(), b"new".to_vec())]);
+        assert_eq!(
+            f.outcomes(),
+            [
+                UploadOutcome::Uploaded,
+                UploadOutcome::Blocked(MAPPING_CHANGED.into())
+            ]
+        );
+    }
+
+    #[gpui::test]
+    async fn a_skip_or_decision_does_not_come_back_when_the_host_returns(cx: &mut TestAppContext) {
+        let f = mapped_fixture(cx, |_| {}).await;
+        let id = f.server_id.clone();
+        let (host, target) = f.store.read_with(cx, |store, _| {
+            (
+                store.servers().servers[0].host.clone(),
+                store.current_target(&id).expect("target"),
+            )
+        });
+        f.store.update(cx, |store, _| {
+            assert!(store.set_skip_no_baseline_prompt(&id, &target, true));
+            assert!(store.set_upload_decision_for_target(&id, &target, UploadDecision::Deny));
+        });
+        f.edit_servers(cx, |servers| {
+            servers.servers[0].host = "other.example.com".into()
+        });
+        f.edit_servers(cx, |servers| servers.servers[0].host = host.clone());
+        f.store.read_with(cx, |store, _| {
+            assert!(!store.skips_no_baseline_prompt(&id));
+            assert_eq!(store.upload_decision(&id), UploadDecision::Ask);
+        });
+    }
+
+    #[gpui::test]
+    async fn a_skip_for_a_target_the_user_did_not_see_is_not_recorded(cx: &mut TestAppContext) {
+        let f = mapped_fixture(cx, |_| {}).await;
+        let id = f.server_id.clone();
+        f.store.update(cx, |store, _| {
+            assert!(!store.set_skip_no_baseline_prompt(&id, "1:x|1:y|21|ftp", true));
+            assert!(!store.skips_no_baseline_prompt(&id));
+        });
+    }
+
+    #[gpui::test]
+    async fn a_reconfirmed_server_keeps_its_confirmation_across_a_root_change(
+        cx: &mut TestAppContext,
+    ) {
+        let f = mapped_fixture(cx, |server| server.root_path = "/".into()).await;
+        let id = f.server_id.clone();
+        for (reconfirmed, expected) in [(true, true), (false, false)] {
+            f.edit_servers(cx, |servers| {
+                servers.servers[0].root_path = "/".into();
+                servers.servers[0].upload_on_save_confirmed = true;
+            });
+            let ids: std::collections::HashSet<String> =
+                reconfirmed.then(|| id.clone()).into_iter().collect();
+            let task = f.store.update(cx, |store, cx| {
+                let previous = store.servers().clone();
+                let mut servers = previous.clone();
+                servers.servers[0].root_path = "/public_html".into();
+                store.save(previous, servers, Vec::new(), &ids, cx)
+            });
+            task.await.expect("saved");
+            let server = f
+                .store
+                .read_with(cx, |store, _| store.servers().servers[0].clone());
+            assert_eq!(server.upload_on_save_confirmed, expected, "{reconfirmed}");
+        }
+    }
+
+    #[gpui::test]
     async fn the_skip_set_never_applies_after_an_upload_whose_verification_failed(
         cx: &mut TestAppContext,
     ) {
         let f = mapped_fixture(cx, |_| {}).await;
         let buffer = f.open("inc/a.php", cx).await;
         let id = f.server_id.clone();
-        f.store
-            .update(cx, |store, _| store.set_skip_no_baseline_prompt(&id, true));
+        f.store.update(cx, |store, _| {
+            store.set_skip_no_baseline_prompt(
+                &id,
+                &store.current_target(&id).expect("target"),
+                true,
+            )
+        });
         // The server keeps answering with a size we did not write: the re-stat cannot verify.
         *f.remote.put_keeps_stat.lock().expect("flag") = true;
         f.remote.stats.lock().expect("stats").insert(
@@ -2850,8 +2972,13 @@ mod tests {
         let f = mapped_fixture(cx, |_| {}).await;
         let buffer = f.open("inc/a.php", cx).await;
         let id = f.server_id.clone();
-        f.store
-            .update(cx, |store, _| store.set_skip_no_baseline_prompt(&id, true));
+        f.store.update(cx, |store, _| {
+            store.set_skip_no_baseline_prompt(
+                &id,
+                &store.current_target(&id).expect("target"),
+                true,
+            )
+        });
         f.edit_servers(cx, |servers| {
             servers.servers[0].host = "other.example.com".into()
         });
@@ -2868,12 +2995,17 @@ mod tests {
     ) {
         let f = mapped_fixture(cx, |_| {}).await;
         type Edit = fn(&mut ServerConfig);
-        let rows: [(&str, Edit, bool); 6] = [
+        let rows: [(&str, Edit, bool); 7] = [
             ("host", |s| s.host = "other.example.com".into(), false),
             ("port", |s| s.port = 2222, false),
             ("user", |s| s.username = "someone".into(), false),
             ("type", |s| s.server_type = crate::ServerType::Sftp, false),
             ("root", |s| s.root_path = "/var/www2".into(), false),
+            (
+                "mappings",
+                |s| s.mappings[0].remote = "t-staging".into(),
+                false,
+            ),
             ("name", |s| s.name = "Renamed".into(), true),
         ];
         let original = f
@@ -2886,7 +3018,7 @@ mod tests {
                 let previous = store.servers().clone();
                 let mut servers = previous.clone();
                 edit(&mut servers.servers[0]);
-                store.save(previous, servers, Vec::new(), cx)
+                store.save(previous, servers, Vec::new(), &Default::default(), cx)
             });
             task.await.expect("saved");
             let server = f

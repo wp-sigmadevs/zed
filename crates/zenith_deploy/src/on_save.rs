@@ -14,16 +14,28 @@ use crate::{
     remote_path::{join_remote, validate_name},
 };
 
-/// An explicit save by the user. Closing, skipping and "Save As" never upload.
+/// An explicit save by the user. Closing, skipping and "Save As" never upload. `SaveAll` is not
+/// explicit: the close prompt's "Save all" and the quit prompt send the same intent and cannot be
+/// told apart, so closing or quitting must never upload.
 pub fn is_explicit(intent: SaveIntent) -> bool {
     matches!(
         intent,
         SaveIntent::Save
             | SaveIntent::FormatAndSave
             | SaveIntent::SaveWithoutFormat
-            | SaveIntent::SaveAll
             | SaveIntent::Overwrite
     )
+}
+
+/// Whether saving `new` over `old` must ask the user again before auto-upload may stay on: the
+/// one-time confirmation was given for one host, port, type, user, root folder and set of
+/// mappings. A server without an `old` (a new one) has nothing confirmed.
+pub fn needs_reconfirm(old: Option<&ServerConfig>, new: &ServerConfig) -> bool {
+    old.is_none_or(|old| {
+        old.credentials_target_changed(new)
+            || old.root_path != new.root_path
+            || old.mappings != new.mappings
+    })
 }
 
 /// One `Normal` component as a validated UTF-8 name; `..` and everything else is an error.
@@ -183,7 +195,8 @@ pub fn excluded(rel: &Path, user: &PathMatcher) -> Option<Excluded> {
 /// mapped tree, pointing inside or outside, is refused. Blocking: call it from a background
 /// task (`cx.background_spawn`), never on the main thread.
 ///
-/// The mapped folder `root` itself must not be a symbolic link, and when it lies under
+/// The mapped folder `root` itself must not be a symbolic link (unless it is the project root,
+/// which may have been opened through a link), and when it lies under
 /// `project_root` it must canonicalize to the canonical project root plus its own relative path
 /// (so a link in a folder between the two is refused too).
 pub async fn check_real_path(
@@ -191,7 +204,10 @@ pub async fn check_real_path(
     file: PathBuf,
     project_root: Option<PathBuf>,
 ) -> Result<()> {
-    if std::fs::symlink_metadata(&root)?.file_type().is_symlink() {
+    // A project opened through a link is the user's own choice: the project root itself is
+    // exempt; the real-path check on the file below still covers everything under it.
+    let is_project_root = project_root.as_deref() == Some(root.as_path());
+    if !is_project_root && std::fs::symlink_metadata(&root)?.file_type().is_symlink() {
         bail!(
             "{} is a symbolic link; files under it are not uploaded",
             root.display()
@@ -255,12 +271,16 @@ mod tests {
             SaveIntent::Save,
             SaveIntent::FormatAndSave,
             SaveIntent::SaveWithoutFormat,
-            SaveIntent::SaveAll,
             SaveIntent::Overwrite,
         ] {
             assert!(is_explicit(intent), "{intent:?}");
         }
-        for intent in [SaveIntent::Close, SaveIntent::Skip, SaveIntent::SaveAs] {
+        for intent in [
+            SaveIntent::SaveAll,
+            SaveIntent::Close,
+            SaveIntent::Skip,
+            SaveIntent::SaveAs,
+        ] {
             assert!(!is_explicit(intent), "{intent:?}");
         }
     }
@@ -519,5 +539,78 @@ mod tests {
             ));
             assert!(result.is_ok(), "{result:?}");
         }
+    }
+
+    #[test]
+    fn a_change_of_target_root_or_mappings_needs_a_new_confirmation() {
+        let old = server(&[("/p", "x")]);
+        assert!(!needs_reconfirm(Some(&old), &old.clone()));
+        let mut renamed = old.clone();
+        renamed.name = "Renamed".into();
+        renamed.excluded_local.push("x".into());
+        assert!(!needs_reconfirm(Some(&old), &renamed));
+        assert!(needs_reconfirm(None, &old));
+        let changes: [fn(&mut ServerConfig); 6] = [
+            |s| s.host = "other.example.com".into(),
+            |s| s.port += 1,
+            |s| s.server_type = crate::config::ServerType::Sftp,
+            |s| s.username = "someone".into(),
+            |s| s.root_path = "/public_html".into(),
+            |s| s.mappings[0].remote = "y".into(),
+        ];
+        for change in changes {
+            let mut new = old.clone();
+            change(&mut new);
+            assert!(needs_reconfirm(Some(&old), &new));
+        }
+        let mut more = old.clone();
+        more.mappings.clear();
+        assert!(needs_reconfirm(Some(&old), &more));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_project_root_opened_through_a_link_passes_but_links_below_it_do_not() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let real = dir.path().join("real");
+        let other = dir.path().join("other");
+        std::fs::create_dir_all(real.join("sub")).expect("mkdir");
+        std::fs::create_dir_all(&other).expect("mkdir");
+        std::fs::write(real.join("a.php"), "x").expect("write");
+        std::fs::write(real.join("sub/b.php"), "x").expect("write");
+        std::fs::write(other.join("c.php"), "x").expect("write");
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).expect("link");
+        let result = smol::block_on(check_real_path(
+            link.clone(),
+            link.join("a.php"),
+            Some(link.clone()),
+        ));
+        assert!(result.is_ok(), "{result:?}");
+        // Without being the project root the same link is still refused.
+        assert!(smol::block_on(check_real_path(link.clone(), link.join("a.php"), None)).is_err());
+        // A link inside the project opened through a link is refused, as a mapped folder too.
+        std::os::unix::fs::symlink(&other, real.join("jump")).expect("link");
+        let root = link.join("jump");
+        assert!(
+            smol::block_on(check_real_path(
+                root.clone(),
+                root.join("c.php"),
+                Some(link.clone())
+            ))
+            .is_err()
+        );
+        // A link between the project root and the mapped folder.
+        std::fs::create_dir_all(other.join("inner")).expect("mkdir");
+        std::fs::write(other.join("inner/d.php"), "x").expect("write");
+        let root = link.join("jump/inner");
+        assert!(
+            smol::block_on(check_real_path(
+                root.clone(),
+                root.join("d.php"),
+                Some(link)
+            ))
+            .is_err()
+        );
     }
 }

@@ -1013,7 +1013,7 @@ impl RemoteHostPanel {
                 window,
                 cx,
             ),
-            UploadOutcome::Blocked(message) => {
+            UploadOutcome::Blocked(message) | UploadOutcome::Excluded(message) => {
                 self.toast(&plain_text(message, MAX_TOAST_CHARS), cx)
             }
             UploadOutcome::Failed(message) => {

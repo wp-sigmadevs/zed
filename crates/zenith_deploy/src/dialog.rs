@@ -604,7 +604,7 @@ impl DeploymentDialog {
                     applied += 1;
                 }
                 let save = store.update(cx, |store, cx| {
-                    store.save(base, servers, session_changes, cx)
+                    store.save(base, servers, session_changes, &Default::default(), cx)
                 });
                 save.await.map_err(|error| {
                     if applied == 0 {
@@ -1644,7 +1644,13 @@ mod tests {
         };
         let result = store
             .update(cx, |store, cx| {
-                store.save(Servers::default(), servers, Vec::new(), cx)
+                store.save(
+                    Servers::default(),
+                    servers,
+                    Vec::new(),
+                    &Default::default(),
+                    cx,
+                )
             })
             .await;
         let error = result.expect_err("saving over a damaged file must fail");
@@ -2133,13 +2139,25 @@ mod tests {
         // Both saves started from `start`; B finishes first, then the stale A arrives.
         store
             .update(cx, |store, cx| {
-                store.save(start.clone(), renamed(&start, "B"), Vec::new(), cx)
+                store.save(
+                    start.clone(),
+                    renamed(&start, "B"),
+                    Vec::new(),
+                    &Default::default(),
+                    cx,
+                )
             })
             .await
             .expect("B saves");
         let error = store
             .update(cx, |store, cx| {
-                store.save(start.clone(), renamed(&start, "A"), Vec::new(), cx)
+                store.save(
+                    start.clone(),
+                    renamed(&start, "A"),
+                    Vec::new(),
+                    &Default::default(),
+                    cx,
+                )
             })
             .await
             .expect_err("A started from a list that is no longer the saved one");
@@ -2158,10 +2176,22 @@ mod tests {
         let (store, start) = store_with_live(path.clone(), cx);
 
         let first = store.update(cx, |store, cx| {
-            store.save(start.clone(), renamed(&start, "First"), Vec::new(), cx)
+            store.save(
+                start.clone(),
+                renamed(&start, "First"),
+                Vec::new(),
+                &Default::default(),
+                cx,
+            )
         });
         let second = store.update(cx, |store, cx| {
-            store.save(start.clone(), renamed(&start, "Second"), Vec::new(), cx)
+            store.save(
+                start.clone(),
+                renamed(&start, "Second"),
+                Vec::new(),
+                &Default::default(),
+                cx,
+            )
         });
         let error = second.await.expect_err("the first write is still running");
         assert!(error.to_string().contains("another save"), "{error}");
