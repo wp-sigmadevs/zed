@@ -108,6 +108,18 @@ pub struct ServerStore {
     /// Cache paths a panel is downloading into right now, across windows
     /// ([`ServerStore::reserve_download`]).
     downloading: Arc<std::sync::Mutex<std::collections::HashSet<PathBuf>>>,
+    /// Project files that auto-upload on save (plan 37 M4b), by absolute local path. Apart from
+    /// `copies` on purpose: [`ServerStore::clear_cache`] deletes the file of every entry in
+    /// `copies`, and these are the user's own project files. The stat is the session-only
+    /// baseline (the verified stat after our last upload).
+    mapped: HashMap<PathBuf, remote_edit::RemoteCopy>,
+    /// The kill switch for auto-upload ([`ServerStore::set_auto_upload_paused`]).
+    auto_upload_paused: bool,
+    /// Servers whose first-save-without-baseline question the user answered "always" this
+    /// session. Never skips a Conflict.
+    skip_no_baseline_prompt: std::collections::HashSet<String>,
+    /// Per server, the number of sessions auto-upload may hold at once (`advanced.connections`).
+    connection_limits: HashMap<String, (usize, Arc<smol::lock::Semaphore>)>,
     _load: Task<()>,
 }
 
@@ -210,6 +222,10 @@ impl ServerStore {
             uploads: HashMap::new(),
             pending_clear: Default::default(),
             downloading: Default::default(),
+            mapped: HashMap::new(),
+            auto_upload_paused: false,
+            skip_no_baseline_prompt: Default::default(),
+            connection_limits: HashMap::new(),
             _load: load,
         }
     }
@@ -233,6 +249,10 @@ impl ServerStore {
             uploads: HashMap::new(),
             pending_clear: Default::default(),
             downloading: Default::default(),
+            mapped: HashMap::new(),
+            auto_upload_paused: false,
+            skip_no_baseline_prompt: Default::default(),
+            connection_limits: HashMap::new(),
             _load: Task::ready(()),
         }
     }
@@ -351,6 +371,8 @@ impl ServerStore {
             servers.servers.iter().map(|server| &server.id).collect();
         self.session_passwords.retain(|id, _| kept.contains(id));
         self.upload_decisions.retain(|id, _| kept.contains(id));
+        self.skip_no_baseline_prompt.retain(|id| kept.contains(id));
+        self.connection_limits.retain(|id, _| kept.contains(id));
         let removed: Vec<String> = self
             .servers
             .servers
