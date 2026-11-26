@@ -176,32 +176,64 @@ pub enum Excluded {
     User,
 }
 
+/// The fixed secret list, as data: the one place `is_secret_name` and the dialog's note read.
+/// Private keys by name start with one of these (their `.pub` half is not a secret).
+pub(crate) const SECRET_KEY_PREFIXES: &[&str] = &["id_rsa", "id_dsa", "id_ecdsa", "id_ed25519"];
+pub(crate) const SECRET_PREFIXES: &[&str] = &[".env", "wp-config"];
+pub(crate) const SECRET_SUFFIXES: &[&str] = &[".env", ".pem", ".key", ".p12", ".pfx", ".ppk"];
+pub(crate) const SECRET_NAMES: &[&str] = &[
+    ".htpasswd",
+    "auth.json",
+    ".npmrc",
+    ".git",
+    ".git-credentials",
+    ".netrc",
+    ".pgpass",
+    "sftp-config.json",
+    ".aws",
+];
+/// The one fixed exclusion that is a path, not a name: this file in this folder.
+pub(crate) const VSCODE_SFTP_JSON: (&str, &str) = (".vscode", "sftp.json");
+
+/// The fixed list for the dialog's note, built from the constants above.
+pub(crate) fn fixed_exclusions_text() -> String {
+    let quoted = |names: &[&str], before: &str, after: &str| {
+        names
+            .iter()
+            .map(|name| format!("{before}{name}{after}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    format!(
+        "{}, {}, {}, {}, {}/{}",
+        quoted(SECRET_PREFIXES, "", "*"),
+        quoted(SECRET_SUFFIXES, "*", ""),
+        quoted(SECRET_KEY_PREFIXES, "", "* (not .pub)"),
+        quoted(SECRET_NAMES, "", ""),
+        VSCODE_SFTP_JSON.0,
+        VSCODE_SFTP_JSON.1,
+    )
+}
+
 fn is_secret_name(name: &str) -> bool {
     let name = name.to_ascii_lowercase();
-    // A private key by name (`id_rsa`, `id_rsa_old`), never its public half.
-    let is_key = ["id_rsa", "id_dsa", "id_ecdsa", "id_ed25519"]
-        .iter()
-        .any(|key| name.starts_with(key))
-        && !name.ends_with(".pub");
-    is_key
-        || name.starts_with(".env")
-        || name.ends_with(".env")
-        || name.starts_with("wp-config")
-        || [".pem", ".key", ".p12", ".pfx", ".ppk"]
-            .iter()
-            .any(|suffix| name.ends_with(suffix))
-        || matches!(
-            name.as_str(),
-            ".htpasswd"
-                | "auth.json"
-                | ".npmrc"
-                | ".git"
-                | ".git-credentials"
-                | ".netrc"
-                | ".pgpass"
-                | "sftp-config.json"
-                | ".aws"
-        )
+    let starts = |prefixes: &[&str]| prefixes.iter().any(|prefix| name.starts_with(prefix));
+    let ends = |suffixes: &[&str]| suffixes.iter().any(|suffix| name.ends_with(suffix));
+    (starts(SECRET_KEY_PREFIXES) && !name.ends_with(".pub"))
+        || starts(SECRET_PREFIXES)
+        || ends(SECRET_SUFFIXES)
+        || SECRET_NAMES.contains(&name.as_str())
+}
+
+/// Refuses an `excluded_local` entry that is not a valid glob. [`user_matcher`] skips such an
+/// entry, so a file the user meant to keep out would be uploaded: the dialog and
+/// `validate_changed` refuse it before it is saved.
+pub fn validate_excluded(server: &ServerConfig) -> Result<(), String> {
+    for pattern in &server.excluded_local {
+        PathMatcher::new([pattern], PathStyle::local())
+            .map_err(|error| format!("The excluded pattern {pattern:?} is not valid: {error}"))?;
+    }
+    Ok(())
 }
 
 /// The user's `excluded_local` as a matcher; an invalid pattern is skipped and logged.
@@ -223,7 +255,8 @@ pub fn excluded(rel: &Path, user: &PathMatcher) -> Option<Excluded> {
         })
         .collect();
     let in_vscode = names.windows(2).any(|pair| {
-        pair[0].eq_ignore_ascii_case(".vscode") && pair[1].eq_ignore_ascii_case("sftp.json")
+        pair[0].eq_ignore_ascii_case(VSCODE_SFTP_JSON.0)
+            && pair[1].eq_ignore_ascii_case(VSCODE_SFTP_JSON.1)
     });
     if in_vscode
         || names
@@ -473,6 +506,36 @@ mod tests {
         ] {
             assert_eq!(excluded(Path::new(fine), &user), None, "{fine}");
         }
+    }
+
+    #[test]
+    fn the_dialog_note_names_every_fixed_exclusion() {
+        let text = fixed_exclusions_text();
+        for (entries, before, after) in [
+            (SECRET_PREFIXES, "", "*"),
+            (SECRET_SUFFIXES, "*", ""),
+            (SECRET_KEY_PREFIXES, "", "*"),
+            (SECRET_NAMES, "", ""),
+        ] {
+            for entry in entries {
+                let shown = format!("{before}{entry}{after}");
+                assert!(text.contains(&shown), "{shown} is missing from {text}");
+            }
+        }
+        assert!(text.contains(".vscode/sftp.json"), "{text}");
+    }
+
+    #[test]
+    fn an_invalid_excluded_pattern_is_refused_and_valid_ones_are_not() {
+        let mut server = ServerConfig::new();
+        assert_eq!(validate_excluded(&server), Ok(()), "the defaults are valid");
+        server.excluded_local = ["vendor", "*.log", "build/**", "[ab]c"]
+            .map(String::from)
+            .to_vec();
+        assert_eq!(validate_excluded(&server), Ok(()));
+        server.excluded_local.push("[unclosed".into());
+        let error = validate_excluded(&server).expect_err("an unclosed class is no glob");
+        assert!(error.contains("[unclosed"), "{error}");
     }
 
     #[test]

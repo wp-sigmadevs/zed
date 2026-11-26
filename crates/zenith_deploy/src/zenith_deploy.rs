@@ -128,10 +128,11 @@ pub struct ServerStore {
 type KeychainRead = Shared<BoxFuture<'static, Result<secrets::Lookup, String>>>;
 
 /// Refuses `servers` when a new server, or one whose root folder or mappings changed against
-/// `previous`, has unusable mappings ([`on_save::validate_mappings`]). Only what the user changes
-/// now is checked, so a mapping that is already saved does not block an edit of something else;
-/// it does block every mapped upload of its server, because `on_save::resolve` checks all of a
-/// server's mappings. The dialog calls this before it touches the Keychain: a refused save must
+/// `previous`, has unusable mappings ([`on_save::validate_mappings`]), or when one whose
+/// excluded paths changed has an invalid pattern ([`on_save::validate_excluded`]). Only what the
+/// user changes now is checked, so a mapping that is already saved does not block an edit of
+/// something else; it does block every mapped upload of its server, because `on_save::resolve`
+/// checks all of a server's mappings. The dialog calls this before it touches the Keychain: a refused save must
 /// change nothing.
 pub(crate) fn validate_changed(previous: &Servers, servers: &Servers) -> Result<()> {
     for server in &servers.servers {
@@ -139,6 +140,12 @@ pub(crate) fn validate_changed(previous: &Servers, servers: &Servers) -> Result<
         let changed = old
             .is_none_or(|old| old.root_path != server.root_path || old.mappings != server.mappings);
         if changed && let Err(message) = on_save::validate_mappings(server) {
+            bail!("{}: {message}", server.name);
+        }
+        // The lenient matcher skips an invalid pattern, which would upload a file the user
+        // meant to exclude: refuse a changed list that has one.
+        let excluded_changed = old.is_none_or(|old| old.excluded_local != server.excluded_local);
+        if excluded_changed && let Err(message) = on_save::validate_excluded(server) {
             bail!("{}: {message}", server.name);
         }
     }
@@ -865,6 +872,24 @@ pub(crate) mod test_support {
 mod tests {
     use super::*;
     use gpui::{BorrowAppContext as _, TestAppContext};
+
+    #[test]
+    fn a_changed_invalid_excluded_pattern_is_refused_but_a_saved_one_is_left_alone() {
+        let saved = Servers {
+            servers: vec![ServerConfig::new()],
+            ..Servers::default()
+        };
+        let mut edited = saved.clone();
+        edited.servers[0].excluded_local.push("[unclosed".into());
+        let error = validate_changed(&saved, &edited).expect_err("a changed list is checked");
+        assert!(format!("{error:#}").contains("[unclosed"), "{error:#}");
+        // Already saved with it: an edit of something else is not blocked.
+        let mut elsewhere = edited.clone();
+        elsewhere.servers[0].host = "other.example.com".into();
+        assert!(validate_changed(&edited, &elsewhere).is_ok());
+        // A new server is checked too.
+        assert!(validate_changed(&Servers::default(), &edited).is_err());
+    }
 
     #[test]
     fn an_upload_deadline_grows_with_the_size_down_to_a_64_kib_per_second_floor() {
