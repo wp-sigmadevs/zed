@@ -343,6 +343,85 @@ pub async fn detect_php(
     }
 }
 
+/// What "PHP tools: status" shows: the PHP binary and where each tool resolves from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StatusReport {
+    pub kind: ProjectKind,
+    /// Version and path; `None` when no PHP binary ran.
+    pub php: Option<(String, PathBuf)>,
+    pub tools: Vec<(Tool, Option<Resolved>)>,
+}
+
+impl Tool {
+    pub const ALL: [Tool; 5] = [
+        Tool::Phpcs,
+        Tool::Phpcbf,
+        Tool::Phpstan,
+        Tool::Pint,
+        Tool::PhpCsFixer,
+    ];
+}
+
+impl ProjectKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            ProjectKind::WordPress => "WordPress",
+            ProjectKind::Laravel => "Laravel",
+            ProjectKind::Php => "PHP",
+        }
+    }
+}
+
+impl Source {
+    pub fn label(self) -> &'static str {
+        match self {
+            Source::Project => "project",
+            Source::Managed => "Zenith",
+            Source::System => "system",
+        }
+    }
+}
+
+/// Looks every tool up (file-system checks): call it from a background task.
+pub fn collect(
+    root: &Path,
+    info: &PhpInfo,
+    managed_bin: Option<&Path>,
+    path_dirs: &[PathBuf],
+) -> StatusReport {
+    StatusReport {
+        kind: info.kind,
+        php: info.version.clone().zip(info.php_path.clone()),
+        tools: Tool::ALL
+            .into_iter()
+            .map(|tool| (tool, resolve(root, tool, managed_bin, path_dirs)))
+            .collect(),
+    }
+}
+
+impl std::fmt::Display for StatusReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Project: {}", self.kind.label())?;
+        match &self.php {
+            Some((version, path)) => write!(f, "\nPHP {version}: {}", path.display())?,
+            None => write!(f, "\nPHP: not found (install Herd or Homebrew PHP)")?,
+        }
+        for (tool, resolved) in &self.tools {
+            match resolved {
+                Some(Resolved { path, source }) => write!(
+                    f,
+                    "\n{}: {}, {}",
+                    tool.binary(),
+                    source.label(),
+                    path.display()
+                )?,
+                None => write!(f, "\n{}: not found", tool.binary())?,
+            }
+        }
+        Ok(())
+    }
+}
+
 /// What "PHP tools: status" shows.
 pub fn status_report(
     root: &Path,
@@ -350,36 +429,19 @@ pub fn status_report(
     managed_bin: Option<&Path>,
     path_dirs: &[PathBuf],
 ) -> String {
-    let kind = match info.kind {
-        ProjectKind::WordPress => "WordPress",
-        ProjectKind::Laravel => "Laravel",
-        ProjectKind::Php => "PHP",
-    };
-    let mut lines = vec![format!("Project: {kind}")];
-    lines.push(match (&info.version, &info.php_path) {
-        (Some(version), Some(path)) => format!("PHP {version}: {}", path.display()),
-        _ => "PHP: not found (install Herd or Homebrew PHP)".to_string(),
-    });
-    for tool in [
-        Tool::Phpcs,
-        Tool::Phpcbf,
-        Tool::Phpstan,
-        Tool::Pint,
-        Tool::PhpCsFixer,
-    ] {
-        lines.push(match resolve(root, tool, managed_bin, path_dirs) {
-            Some(Resolved { path, source }) => {
-                let source = match source {
-                    Source::Project => "project",
-                    Source::Managed => "Zenith",
-                    Source::System => "system",
-                };
-                format!("{}: {source}, {}", tool.binary(), path.display())
-            }
-            None => format!("{}: not found", tool.binary()),
-        });
+    collect(root, info, managed_bin, path_dirs).to_string()
+}
+
+/// A path for a narrow column: relative to the project when inside it, `~/…` inside the home
+/// folder, else absolute. Compares path components, so `/u/site-other` is not inside `/u/site`.
+pub fn display_path(path: &Path, root: &Path, home: &Path) -> String {
+    if let Ok(relative) = path.strip_prefix(root) {
+        return relative.display().to_string();
     }
-    lines.join("\n")
+    match path.strip_prefix(home) {
+        Ok(relative) => format!("~/{}", relative.display()),
+        Err(_) => path.display().to_string(),
+    }
 }
 
 // ---- consent and install ----
@@ -1625,6 +1687,19 @@ mod tests {
         assert!(report.starts_with("Project: Laravel\nPHP 8.4.1: /opt/homebrew/bin/php"));
         assert!(report.contains("phpstan: project,"));
         assert!(report.contains("pint: not found"));
+    }
+
+    #[test]
+    fn test_display_path_prefers_project_then_home() {
+        let (root, home) = (Path::new("/Users/u/site"), Path::new("/Users/u"));
+        let show = |path: &str| display_path(Path::new(path), root, home);
+        assert_eq!(show("/Users/u/site/vendor/bin/phpcs"), "vendor/bin/phpcs");
+        assert_eq!(
+            show("/Users/u/Library/Application Support/Herd/bin/php"),
+            "~/Library/Application Support/Herd/bin/php"
+        );
+        assert_eq!(show("/Users/u/site-other/x"), "~/site-other/x");
+        assert_eq!(show("/usr/bin/php"), "/usr/bin/php");
     }
 
     #[gpui::test]
