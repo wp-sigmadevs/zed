@@ -250,14 +250,48 @@ fn mask_secret_body_cut(body: &str, content_type: Option<&str>, truncated: bool)
     }
     // Any other type (HTML, plain text, JSONP, none) that carried JSON a parser rejected, as a PHP
     // notice or a stray `0` after it does on WordPress `admin-ajax`, or that holds a secret as
-    // `key=value`: masked as pairs when it is one line of them, else not stored if it names one.
-    if !body.contains('\n')
-        && body.contains('=')
-        && let Some(masked) = mask_secret_pairs(body)
-    {
-        return Some(masked);
+    // `key=value`: not stored if it names a secret key, else masked when it is one line of pairs.
+    if has_secret_key(text) {
+        return Some(UNPARSEABLE.to_string());
     }
-    has_secret_key(text).then(|| UNPARSEABLE.to_string())
+    let line = body.trim_end();
+    if looks_like_pairs(line)
+        && let Some(masked) = mask_secret_pairs(line)
+    {
+        return Some(format!(
+            "{masked}{}",
+            body.get(line.len()..).unwrap_or_default()
+        ));
+    }
+    None
+}
+
+/// Whether `line` is one line of `name=value` pairs joined by `&`, not markup or code that has an
+/// `=` and an `&` in it.
+fn looks_like_pairs(line: &str) -> bool {
+    !line.contains(['\n', '<', '{', '"', ';'])
+        && line.contains('=')
+        && line.split('&').all(|pair| pair.contains('='))
+}
+
+/// Whether the brackets of `text` close on its own line, outside its double-quoted strings.
+fn brackets_balance(text: &str) -> bool {
+    let (mut depth, mut in_string, mut escaped) = (0i32, false, false);
+    for c in text.chars() {
+        match (in_string, escaped, c) {
+            (true, true, _) => escaped = false,
+            (true, false, '\\') => escaped = true,
+            (true, false, '"') => in_string = false,
+            (false, _, '"') => in_string = true,
+            (false, _, '{' | '[') => depth += 1,
+            (false, _, '}' | ']') => depth -= 1,
+            _ => {}
+        }
+        if depth < 0 {
+            return false;
+        }
+    }
+    depth == 0 && !in_string
 }
 
 /// Stored in place of a line of a cut-off JSON lines body that cannot be parsed.
@@ -427,9 +461,13 @@ fn mask_json_records(body: &str, truncated: bool, separator: char) -> Option<Str
             None => match mask_json_stream(content) {
                 Some(stream) => stream,
                 None if !truncated && !has_secret_key(content) => None,
-                // A key that opens a block (`"token": {`, `"secrets": [`): the lines after it
-                // are its value, so no line can be cut alone.
-                None if !truncated && content.trim_end().ends_with(['{', '[', ':']) => {
+                // A key whose value runs on (a block left open, `"token":` ending the line): the
+                // lines after it are its value, so no line can be cut alone. A json-seq record
+                // already holds its lines.
+                None if !truncated
+                    && separator == '\n'
+                    && (!brackets_balance(content) || content.trim_end().ends_with(':')) =>
+                {
                     return Some(UNPARSEABLE.to_string());
                 }
                 None if !truncated => Some(UNPARSEABLE.to_string()),
@@ -503,7 +541,7 @@ fn has_secret_key(text: &str) -> bool {
     if quoted {
         return true;
     }
-    // Bare keys (`{token: "s"}`, a header line): a run of name characters followed by a colon.
+    // Bare keys (`{token: "s"}`): a run of name characters after `{` or `,`, then a colon.
     let mut start = None;
     for (ix, c) in text.char_indices().chain([(text.len(), ' ')]) {
         let in_name = c.is_alphanumeric() || matches!(c, '_' | '$' | '-');
@@ -516,6 +554,10 @@ fn has_secret_key(text: &str) -> bool {
                     && text
                         .get(ix..)
                         .is_some_and(|rest| rest.trim_start().starts_with(':'))
+                    // A key follows `{` or `,`; `a:hover`, `<b>Password:</b>`, `f(key:` do not.
+                    && text
+                        .get(..from)
+                        .is_some_and(|before| before.trim_end().ends_with(['{', ',']))
                     && is_secret_name(word)
                 {
                     return true;
@@ -1665,6 +1707,58 @@ mod tests {
         .mark_truncated(MAX_RESPONSE_BYTES);
         assert_eq!(stored_response(&history, page)?.body, UNMASKABLE_BODY);
         Ok(())
+    }
+
+    #[test]
+    fn test_mask_secret_body_of_other_types_keeps_json_secrets_out_before_any_equals() {
+        let html = Some("text/html");
+        for body in [
+            "{\"api_key\":\"SECRETVAL\",\"redirect\":\"https://s/?page=x\"}0",
+            "{\"password\":\"hunter2\",\"url\":\"/x?a=1\"}0",
+        ] {
+            let masked = mask_secret_body(body, html);
+            assert_eq!(masked.as_deref(), Some(UNPARSEABLE), "{body}");
+        }
+    }
+
+    #[test]
+    fn test_mask_secret_body_of_other_types_leaves_code_and_markup_alone() {
+        for (content_type, body) in [
+            ("text/javascript", "var password=e.value&&f()"),
+            (
+                "text/html",
+                "<p>Enter your password</p><a href=\"/x?a=1\">x</a>",
+            ),
+            ("text/html", "<label>Password:</label>"),
+            (
+                "text/html",
+                "<style>.cookie-notice:hover{color:red}</style>",
+            ),
+            ("text/html", "<auth:token>x</auth:token>"),
+            ("text/javascript", "f(key:1)"),
+        ] {
+            assert_eq!(mask_secret_body(body, Some(content_type)), None, "{body}");
+        }
+        // Real pairs still are masked, a trailing newline kept.
+        let masked = mask_secret_body("oauth_token=X&oauth_token_secret=S\n", Some("text/plain"));
+        assert_eq!(
+            masked.as_deref(),
+            Some("oauth_token=***&oauth_token_secret=***\n")
+        );
+    }
+
+    #[test]
+    fn test_mask_secret_lines_with_a_secret_in_an_open_block_are_not_stored() {
+        let ndjson = Some("application/x-ndjson");
+        let body =
+            "{\"a\":1}\n{\"credentials\": {\"user\": \"u\",\n  \"value\": \"SECRETVAL\"},}\n";
+        assert_eq!(mask_secret_body(body, ndjson).as_deref(), Some(UNPARSEABLE));
+        // A record whose brackets close on its line is replaced alone.
+        let body = "{\"a\":1}\n{\"secret\":\"SECRETVAL\",}\n{\"b\":[1,2]}\n";
+        assert_eq!(
+            mask_secret_body(body, ndjson),
+            Some(format!("{{\"a\":1}}\n{UNPARSEABLE}\n{{\"b\":[1,2]}}\n"))
+        );
     }
 
     #[test]
