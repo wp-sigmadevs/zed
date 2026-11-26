@@ -27,15 +27,23 @@ pub fn is_explicit(intent: SaveIntent) -> bool {
     )
 }
 
+/// What a one-time confirmation or a session answer was given for: the target (host, port, type,
+/// user), the root folder and the mappings. Equal fingerprints, equal places the files go. In
+/// memory only: it holds no secret, but nothing logs or stores it.
+pub(crate) fn fingerprint(server: &ServerConfig) -> String {
+    serde_json::json!([
+        crate::secrets::target_account(server),
+        server.root_path,
+        server.mappings
+    ])
+    .to_string()
+}
+
 /// Whether saving `new` over `old` must ask the user again before auto-upload may stay on: the
 /// one-time confirmation was given for one host, port, type, user, root folder and set of
-/// mappings. A server without an `old` (a new one) has nothing confirmed.
+/// mappings ([`fingerprint`]). A server without an `old` (a new one) has nothing confirmed.
 pub fn needs_reconfirm(old: Option<&ServerConfig>, new: &ServerConfig) -> bool {
-    old.is_none_or(|old| {
-        old.credentials_target_changed(new)
-            || old.root_path != new.root_path
-            || old.mappings != new.mappings
-    })
+    old.is_none_or(|old| fingerprint(old) != fingerprint(new))
 }
 
 /// One `Normal` component as a validated UTF-8 name; `..` and everything else is an error.

@@ -117,7 +117,8 @@ pub struct ServerStore {
     auto_upload_paused: bool,
     /// Servers whose first-save-without-baseline question the user answered "always" this
     /// session. Never skips a Conflict.
-    /// Each with the target it was said for ([`ServerStore::set_skip_no_baseline_prompt`]).
+    /// Each with the [`on_save::fingerprint`] (target, root folder, mappings) it was said for
+    /// ([`ServerStore::set_skip_no_baseline_prompt`]).
     skip_no_baseline_prompt: HashMap<String, String>,
     /// Per server, the number of sessions auto-upload may hold at once (`advanced.connections`).
     connection_limits: HashMap<String, (usize, Arc<smol::lock::Semaphore>)>,
@@ -306,22 +307,25 @@ impl ServerStore {
     /// newer servers with its stale copy. Only one write runs at a time, so the list cannot
     /// change between this check and `apply` (nothing else replaces `servers`).
     ///
-    /// `reconfirmed` holds the ids of servers whose "upload on save" confirmation the user has
-    /// just given again for the new settings; the store keeps their flag, and clears it for any
-    /// other server that needs a new confirmation ([`on_save::needs_reconfirm`]).
+    /// `reconfirmed` maps the id of a server whose "upload on save" confirmation the user has
+    /// just given again to the [`on_save::fingerprint`] of the settings they confirmed; the
+    /// store keeps the flag only while the server being saved still has that fingerprint, and
+    /// clears it for any other server that needs a new confirmation
+    /// ([`on_save::needs_reconfirm`]).
     fn save(
         &mut self,
         previous: Servers,
         mut servers: Servers,
         session_changes: Vec<(ServerConfig, Option<Password>)>,
-        reconfirmed: &std::collections::HashSet<String>,
+        reconfirmed: &HashMap<String, String>,
         cx: &mut Context<Self>,
     ) -> Task<Result<()>> {
         // The one-time "upload on save" confirmation was given for one host, folder and set of
         // mappings: a server that now points elsewhere must be confirmed again (plan 37 M4b).
         for server in &mut servers.servers {
             let old = previous.servers.iter().find(|old| old.id == server.id);
-            if !reconfirmed.contains(&server.id) && on_save::needs_reconfirm(old, server) {
+            let confirmed_now = reconfirmed.get(&server.id) == Some(&on_save::fingerprint(server));
+            if !confirmed_now && on_save::needs_reconfirm(old, server) {
                 server.upload_on_save_confirmed = false;
             }
         }
@@ -384,8 +388,9 @@ impl ServerStore {
         let kept: std::collections::HashSet<_> =
             servers.servers.iter().map(|server| &server.id).collect();
         self.session_passwords.retain(|id, _| kept.contains(id));
-        // A decision or skip lives only while its server still has the target it was made for:
-        // a host that changed and came back must ask again.
+        // A decision lives only while its server still has the target it was made for, a skip
+        // while it still has the same target, root folder and mappings: a host that changed and
+        // came back must ask again.
         let target_of = |id: &String| {
             servers
                 .servers
@@ -395,8 +400,15 @@ impl ServerStore {
         };
         self.upload_decisions
             .retain(|id, (target, _)| target_of(id).as_ref() == Some(target));
-        self.skip_no_baseline_prompt
-            .retain(|id, target| target_of(id).as_ref() == Some(target));
+        self.skip_no_baseline_prompt.retain(|id, saved| {
+            servers
+                .servers
+                .iter()
+                .find(|server| &server.id == id)
+                .map(on_save::fingerprint)
+                .as_ref()
+                == Some(saved)
+        });
         self.connection_limits.retain(|id, _| kept.contains(id));
         let removed: Vec<String> = self
             .servers

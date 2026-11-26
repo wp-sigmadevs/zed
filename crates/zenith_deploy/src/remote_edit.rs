@@ -533,6 +533,15 @@ impl ServerStore {
             .map(secrets::target_account)
     }
 
+    /// The [`on_save::fingerprint`] of a saved server, as it is now.
+    pub(crate) fn current_fingerprint(&self, server_id: &str) -> Option<String> {
+        self.servers
+            .servers
+            .iter()
+            .find(|server| server.id == server_id)
+            .map(on_save::fingerprint)
+    }
+
     /// The decision for `server`: [`UploadDecision::Ask`] unless the user chose one this session
     /// for the server's current target (a changed host, port, type or username resets it).
     pub fn upload_decision(&self, server_id: &str) -> UploadDecision {
@@ -792,28 +801,29 @@ impl ServerStore {
     }
 
     /// "Always upload the first save without asking" for this session, one server and its
-    /// current target (host, port, type, user): a changed target forgets it, like
-    /// [`Self::upload_decision`]. Only the first save of a file that was never uploaded in this
-    /// session: a remote file that changed since our last upload (or whose last upload could not
-    /// be verified) still asks. False when the server does not exist.
+    /// current [`on_save::fingerprint`] (host, port, type, user, root folder, mappings): a
+    /// change of any of them forgets it, and so does one that comes back. Only the first save of
+    /// a file that was never uploaded in this session: a remote file that changed since our last
+    /// upload (or whose last upload could not be verified) still asks. False when the server
+    /// does not exist.
     ///
-    /// Like [`Self::set_upload_decision_for_target`], only while the server's target is still
-    /// `expected_target` (the one the prompt was built for); false when it does not match.
+    /// Like [`Self::set_upload_decision_for_target`], only while the server's fingerprint is
+    /// still `expected` (the one the prompt was built for); false when it does not match.
     pub fn set_skip_no_baseline_prompt(
         &mut self,
         server_id: &str,
-        expected_target: &str,
+        expected: &str,
         skip: bool,
     ) -> bool {
-        let Some(target) = self.current_target(server_id) else {
+        let Some(current) = self.current_fingerprint(server_id) else {
             return false;
         };
-        if target != expected_target {
+        if current != expected {
             return false;
         }
         if skip {
             self.skip_no_baseline_prompt
-                .insert(server_id.to_string(), target);
+                .insert(server_id.to_string(), current);
         } else {
             self.skip_no_baseline_prompt.remove(server_id);
         }
@@ -823,7 +833,7 @@ impl ServerStore {
     fn skips_no_baseline_prompt(&self, server_id: &str) -> bool {
         self.skip_no_baseline_prompt
             .get(server_id)
-            .is_some_and(|target| Some(target) == self.current_target(server_id).as_ref())
+            .is_some_and(|saved| Some(saved) == self.current_fingerprint(server_id).as_ref())
     }
 
     /// Whether a mapped file still goes where it was queued for: `project_root` still has this
@@ -1216,7 +1226,7 @@ async fn run_upload(
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::RefCell, rc::Rc, sync::Arc};
+    use std::{cell::RefCell, collections::HashMap, rc::Rc, sync::Arc};
 
     use gpui::{Subscription, TestAppContext};
     use project::Project;
@@ -2604,7 +2614,7 @@ mod tests {
         f.store.update(cx, |store, _| {
             store.set_skip_no_baseline_prompt(
                 &id,
-                &store.current_target(&id).expect("target"),
+                &store.current_fingerprint(&id).expect("fingerprint"),
                 true,
             )
         });
@@ -2866,14 +2876,15 @@ mod tests {
     async fn a_skip_or_decision_does_not_come_back_when_the_host_returns(cx: &mut TestAppContext) {
         let f = mapped_fixture(cx, |_| {}).await;
         let id = f.server_id.clone();
-        let (host, target) = f.store.read_with(cx, |store, _| {
+        let (host, target, fingerprint) = f.store.read_with(cx, |store, _| {
             (
                 store.servers().servers[0].host.clone(),
                 store.current_target(&id).expect("target"),
+                store.current_fingerprint(&id).expect("fingerprint"),
             )
         });
         f.store.update(cx, |store, _| {
-            assert!(store.set_skip_no_baseline_prompt(&id, &target, true));
+            assert!(store.set_skip_no_baseline_prompt(&id, &fingerprint, true));
             assert!(store.set_upload_decision_for_target(&id, &target, UploadDecision::Deny));
         });
         f.edit_servers(cx, |servers| {
@@ -2907,12 +2918,14 @@ mod tests {
                 servers.servers[0].root_path = "/".into();
                 servers.servers[0].upload_on_save_confirmed = true;
             });
-            let ids: std::collections::HashSet<String> =
-                reconfirmed.then(|| id.clone()).into_iter().collect();
             let task = f.store.update(cx, |store, cx| {
                 let previous = store.servers().clone();
                 let mut servers = previous.clone();
                 servers.servers[0].root_path = "/public_html".into();
+                let ids: HashMap<String, String> = reconfirmed
+                    .then(|| (id.clone(), on_save::fingerprint(&servers.servers[0])))
+                    .into_iter()
+                    .collect();
                 store.save(previous, servers, Vec::new(), &ids, cx)
             });
             task.await.expect("saved");
@@ -2933,7 +2946,7 @@ mod tests {
         f.store.update(cx, |store, _| {
             store.set_skip_no_baseline_prompt(
                 &id,
-                &store.current_target(&id).expect("target"),
+                &store.current_fingerprint(&id).expect("fingerprint"),
                 true,
             )
         });
@@ -2975,7 +2988,7 @@ mod tests {
         f.store.update(cx, |store, _| {
             store.set_skip_no_baseline_prompt(
                 &id,
-                &store.current_target(&id).expect("target"),
+                &store.current_fingerprint(&id).expect("fingerprint"),
                 true,
             )
         });
@@ -2987,6 +3000,98 @@ mod tests {
         cx.run_until_parked();
         assert_eq!(f.outcomes(), [UploadOutcome::AskFirst]);
         assert!(f.puts().is_empty(), "the new host was not sent the file");
+    }
+
+    #[gpui::test]
+    async fn the_skip_set_is_forgotten_when_the_root_path_changes(cx: &mut TestAppContext) {
+        type Edit = fn(&mut ServerConfig);
+        let rows: [(&str, Edit); 2] = [
+            ("root", |s| s.root_path = "/var/other".into()),
+            ("mapping remote", |s| {
+                s.mappings[0].remote = "elsewhere".into()
+            }),
+        ];
+        for (what, edit) in rows {
+            let f = mapped_fixture(cx, |_| {}).await;
+            let buffer = f.open("inc/a.php", cx).await;
+            let id = f.server_id.clone();
+            f.store.update(cx, |store, _| {
+                store.set_skip_no_baseline_prompt(
+                    &id,
+                    &store.current_fingerprint(&id).expect("fingerprint"),
+                    true,
+                )
+            });
+            f.edit_servers(cx, |servers| edit(&mut servers.servers[0]));
+            Fixture::save_in(&buffer, "<?php echo 1;", cx);
+            assert_eq!(f.upload(&buffer, false, cx), UploadStart::Started, "{what}");
+            cx.run_until_parked();
+            assert_eq!(f.outcomes(), [UploadOutcome::AskFirst], "{what}");
+            assert!(
+                f.puts().is_empty(),
+                "{what}: the new place was not sent the file"
+            );
+        }
+    }
+
+    #[gpui::test]
+    async fn a_skip_does_not_come_back_when_the_root_returns(cx: &mut TestAppContext) {
+        let f = mapped_fixture(cx, |_| {}).await;
+        let id = f.server_id.clone();
+        let root = f
+            .store
+            .read_with(cx, |store, _| store.servers().servers[0].root_path.clone());
+        f.store.update(cx, |store, _| {
+            let fingerprint = store.current_fingerprint(&id).expect("fingerprint");
+            assert!(store.set_skip_no_baseline_prompt(&id, &fingerprint, true));
+        });
+        f.edit_servers(cx, |servers| {
+            servers.servers[0].root_path = "/var/other".into()
+        });
+        f.edit_servers(cx, |servers| servers.servers[0].root_path = root.clone());
+        f.store
+            .read_with(cx, |store, _| assert!(!store.skips_no_baseline_prompt(&id)));
+    }
+
+    #[gpui::test]
+    async fn a_skip_for_a_prompt_built_before_a_root_change_is_not_recorded(
+        cx: &mut TestAppContext,
+    ) {
+        let f = mapped_fixture(cx, |_| {}).await;
+        let id = f.server_id.clone();
+        let seen = f.store.read_with(cx, |store, _| {
+            store.current_fingerprint(&id).expect("fingerprint")
+        });
+        f.edit_servers(cx, |servers| {
+            servers.servers[0].root_path = "/var/other".into()
+        });
+        f.store.update(cx, |store, _| {
+            assert!(!store.set_skip_no_baseline_prompt(&id, &seen, true));
+            assert!(!store.skips_no_baseline_prompt(&id));
+        });
+    }
+
+    #[gpui::test]
+    async fn a_reconfirmation_for_other_settings_does_not_keep_the_flag(cx: &mut TestAppContext) {
+        let f = mapped_fixture(cx, |server| server.root_path = "/".into()).await;
+        let id = f.server_id.clone();
+        let task = f.store.update(cx, |store, cx| {
+            let previous = store.servers().clone();
+            let mut confirmed = previous.clone();
+            confirmed.servers[0].root_path = "/public_html".into();
+            let reconfirmed =
+                HashMap::from([(id.clone(), on_save::fingerprint(&confirmed.servers[0]))]);
+            // The user confirmed "/public_html", but the list being saved says "/elsewhere".
+            let mut servers = previous.clone();
+            servers.servers[0].root_path = "/elsewhere".into();
+            store.save(previous, servers, Vec::new(), &reconfirmed, cx)
+        });
+        task.await.expect("saved");
+        let server = f
+            .store
+            .read_with(cx, |store, _| store.servers().servers[0].clone());
+        assert_eq!(server.root_path, "/elsewhere");
+        assert!(!server.upload_on_save_confirmed);
     }
 
     #[gpui::test]
