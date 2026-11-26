@@ -50,8 +50,9 @@ pub struct AdvancedOptions {
     pub hidden_files: bool,
     /// List with `LIST` instead of `MLSD`.
     pub use_list: bool,
-    /// List the way some old FTP servers need: change into the folder (`CWD`), then send the
-    /// listing command with no path. Unverified: this follows the label of the same option in
+    /// List the way some old FTP servers need: change into the folder (`CWD`), then send `LIST`
+    /// with no path. Only applies with [`Self::use_list`]; `MLSD` always names its path (the
+    /// stored value is kept either way). Unverified: this follows the label of the same option in
     /// JetBrains' deployment settings ("Compatible with old version of listing children"); what
     /// JetBrains actually sends was not checked. Missing in an old `servers.json`: off.
     pub list_compat: bool,

@@ -34,7 +34,8 @@ const SUPPAFTP_CONTROL_TARGET: &str = "suppaftp::async_ftp::smol_ftp::control";
 struct FtpSession<T: SmolTlsStream + Send> {
     stream: ImplAsyncFtpStream<T>,
     use_list: bool,
-    /// `CWD` into the folder and list without a path ([`crate::config::AdvancedOptions::list_compat`]).
+    /// `CWD` into the folder and list without a path. Only with `LIST`: set from
+    /// `use_list && list_compat` ([`crate::config::AdvancedOptions::list_compat`]).
     list_compat: bool,
     hidden_files: bool,
 }
@@ -123,7 +124,7 @@ async fn open<T: SmolTlsStream + Send + 'static>(
     Ok(FtpSession {
         stream,
         use_list: server.advanced.use_list,
-        list_compat: server.advanced.list_compat,
+        list_compat: server.advanced.use_list && server.advanced.list_compat,
         hidden_files: server.advanced.hidden_files,
     })
 }
@@ -998,7 +999,6 @@ mod tests {
     fn compat_mode_changes_into_the_folder_and_lists_without_a_path() {
         let unix_listing = "-rw-r--r--   1 u g   12 Nov 22 10:00 a.php\r\n";
         for (use_list, hidden_files, expected) in [
-            (false, false, "MLSD"),
             (true, false, "LIST"),
             (true, true, "LIST -a"),
         ] {
@@ -1038,12 +1038,35 @@ mod tests {
     }
 
     #[test]
+    fn compat_mode_is_ignored_with_mlsd() {
+        let (port, server_thread) = fake_ftp_server_with(FakeFtp::default());
+        let mut server = plain_server(port);
+        server.advanced.use_list = false;
+        server.advanced.list_compat = true;
+        smol::block_on(async {
+            let mut transport = connect(&server).await.expect("connect");
+            transport.list_dir("/www").await.expect("list");
+            transport.disconnect().await.expect("quit");
+        });
+        let commands = server_thread.join().expect("server thread");
+        assert!(
+            commands.iter().any(|c| c == "MLSD /www"),
+            "MLSD with its path: {commands:?}"
+        );
+        assert!(
+            !commands.iter().any(|c| c == "CWD /www"),
+            "no CWD with MLSD: {commands:?}"
+        );
+    }
+
+    #[test]
     fn a_refused_change_of_folder_is_a_refusal_and_lists_nothing() {
         let (port, server_thread) = fake_ftp_server_with(FakeFtp {
             cwd_reply: "550 no such directory",
             ..FakeFtp::default()
         });
         let mut server = plain_server(port);
+        server.advanced.use_list = true;
         server.advanced.list_compat = true;
         smol::block_on(async {
             let mut transport = connect(&server).await.expect("connect");

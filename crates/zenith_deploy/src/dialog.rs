@@ -904,6 +904,7 @@ impl DeploymentDialog {
                         )
                         .child(
                             div()
+                                .pl_4()
                                 .debug_selector(|| "zenith-deploy-list-compat".to_string())
                                 .child(
                                     Checkbox::new(
@@ -911,6 +912,7 @@ impl DeploymentDialog {
                                         advanced.list_compat.into(),
                                     )
                                     .label("Compatible with old version of listing children")
+                                    .disabled(!advanced.use_list)
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.update_selected(cx, |server| {
                                             server.advanced.list_compat =
