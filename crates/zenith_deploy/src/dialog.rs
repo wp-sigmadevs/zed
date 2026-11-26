@@ -526,6 +526,13 @@ impl DeploymentDialog {
             cx.notify();
             return;
         }
+        // Also before any Keychain work: the store refuses these too, but by then a delete or
+        // write would have changed the Keychain for a save that never happens.
+        if let Err(error) = crate::validate_changed(self.store.read(cx).servers(), &self.servers) {
+            self.error = Some(format!("{error:#}").into());
+            cx.notify();
+            return;
+        }
         // Held until the task ends, so a save cannot start while another one is still on the
         // Keychain (see `ServerStore::begin_save`).
         if let Err(error) = self.store.update(cx, |store, _| store.begin_save()) {
@@ -1353,6 +1360,58 @@ mod tests {
                 message.is_some_and(|message| message.contains("Nothing was saved")),
                 "the user is told the save was aborted"
             );
+        });
+    }
+
+    #[gpui::test]
+    async fn a_save_with_an_unusable_mapping_never_touches_the_keychain(cx: &mut TestAppContext) {
+        let mut saved = server("Live", None);
+        saved.root_path = "/var/www".into();
+        saved.mappings = vec![crate::config::Mapping {
+            local: "/proj".into(),
+            remote: "t".into(),
+        }];
+        let servers = Servers {
+            servers: vec![saved.clone()],
+            ..Servers::default()
+        };
+        let keychain = std::sync::Arc::new(crate::secrets::fake::FakeKeychain::default());
+        keychain.put(&saved, "not-a-real-value-0");
+        let (_, dialog, cx) = open_dialog(servers, &FakeRemote::default(), cx).await;
+        let store = cx.update(|_, cx| ServerStore::global(cx));
+        store.update(cx, |store, _| store.keychain = keychain.clone());
+        dialog.update(cx, |dialog, cx| {
+            // A host change deletes the old entry, a typed password writes a new one: both
+            // would happen before the store refuses the root.
+            dialog.servers.servers[0].host = "elsewhere.example.com".into();
+            dialog.servers.servers[0].root_path = "relative".into();
+            dialog.passwords.insert(saved.id.clone(), fake_secret());
+            dialog.save(cx);
+        });
+        cx.run_until_parked();
+        let message = error_text(&dialog, cx);
+        assert!(
+            message.contains("Live") && message.contains("root"),
+            "{message}"
+        );
+        assert_eq!(
+            keychain.account_of(&saved),
+            Some(crate::secrets::target_account(&saved)),
+            "the saved entry is untouched"
+        );
+        assert_eq!(keychain.entries.lock().expect("lock").len(), 1);
+        dialog.read_with(cx, |dialog, _| assert!(!dialog.saving));
+        store.read_with(cx, |store, _| {
+            assert_eq!(store.servers().servers[0].host, saved.host);
+            // `begin_save` was never taken: a corrected save can start.
+        });
+        dialog.update(cx, |dialog, cx| {
+            dialog.servers.servers[0].root_path = "/var/www2".into();
+            dialog.save(cx);
+        });
+        cx.run_until_parked();
+        store.read_with(cx, |store, _| {
+            assert_eq!(store.servers().servers[0].root_path, "/var/www2");
         });
     }
 

@@ -127,6 +127,24 @@ pub struct ServerStore {
 
 type KeychainRead = Shared<BoxFuture<'static, Result<secrets::Lookup, String>>>;
 
+/// Refuses `servers` when a new server, or one whose root folder or mappings changed against
+/// `previous`, has unusable mappings ([`on_save::validate_mappings`]). Only what the user changes
+/// now is checked, so a mapping that is already saved does not block an edit of something else;
+/// it does block every mapped upload of its server, because `on_save::resolve` checks all of a
+/// server's mappings. The dialog calls this before it touches the Keychain: a refused save must
+/// change nothing.
+pub(crate) fn validate_changed(previous: &Servers, servers: &Servers) -> Result<()> {
+    for server in &servers.servers {
+        let old = previous.servers.iter().find(|old| old.id == server.id);
+        let changed = old
+            .is_none_or(|old| old.root_path != server.root_path || old.mappings != server.mappings);
+        if changed && let Err(message) = on_save::validate_mappings(server) {
+            bail!("{}: {message}", server.name);
+        }
+    }
+    Ok(())
+}
+
 struct GlobalServerStore(Entity<ServerStore>);
 
 impl Global for GlobalServerStore {}
@@ -320,6 +338,9 @@ impl ServerStore {
         reconfirmed: &HashMap<String, String>,
         cx: &mut Context<Self>,
     ) -> Task<Result<()>> {
+        if let Err(error) = validate_changed(&previous, &servers) {
+            return Task::ready(Err(error));
+        }
         // The one-time "upload on save" confirmation was given for one host, folder and set of
         // mappings: a server that now points elsewhere must be confirmed again (plan 37 M4b).
         for server in &mut servers.servers {
@@ -327,14 +348,6 @@ impl ServerStore {
             let confirmed_now = reconfirmed.get(&server.id) == Some(&on_save::fingerprint(server));
             if !confirmed_now && on_save::needs_reconfirm(old, server) {
                 server.upload_on_save_confirmed = false;
-            }
-            // Only what the user is changing now: an old, unusable mapping must not block an
-            // edit of something else (it blocks its own uploads, see `on_save::resolve`).
-            let changed = old.is_none_or(|old| {
-                old.root_path != server.root_path || old.mappings != server.mappings
-            });
-            if changed && let Err(message) = on_save::validate_mappings(server) {
-                return Task::ready(Err(anyhow!("{}: {message}", server.name)));
             }
         }
         if let Some(error) = &self.load_error {
