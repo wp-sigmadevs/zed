@@ -34,6 +34,8 @@ const SUPPAFTP_CONTROL_TARGET: &str = "suppaftp::async_ftp::smol_ftp::control";
 struct FtpSession<T: SmolTlsStream + Send> {
     stream: ImplAsyncFtpStream<T>,
     use_list: bool,
+    /// `CWD` into the folder and list without a path ([`crate::config::AdvancedOptions::list_compat`]).
+    list_compat: bool,
     hidden_files: bool,
 }
 
@@ -121,6 +123,7 @@ async fn open<T: SmolTlsStream + Send + 'static>(
     Ok(FtpSession {
         stream,
         use_list: server.advanced.use_list,
+        list_compat: server.advanced.list_compat,
         hidden_files: server.advanced.hidden_files,
     })
 }
@@ -256,10 +259,19 @@ impl<T: SmolTlsStream + Send + 'static> Transport for FtpSession<T> {
 
     async fn list_dir(&mut self, path: &str) -> Result<Vec<RemoteEntry>> {
         let path = validate_remote_path(path)?;
+        // Compatibility mode: the listing names no path, so the session changes into the folder
+        // first and stays there (every other command here uses absolute paths). A refused `CWD`
+        // is a refusal of this folder and lists nothing.
+        let argument = if self.list_compat {
+            self.stream.cwd(path).await.map_err(refusal)?;
+            String::new()
+        } else {
+            format!(" {path}")
+        };
         let command = match (self.use_list, self.hidden_files) {
-            (true, true) => format!("LIST -a {path}"),
-            (true, false) => format!("LIST {path}"),
-            (false, _) => format!("MLSD {path}"),
+            (true, true) => format!("LIST -a{argument}"),
+            (true, false) => format!("LIST{argument}"),
+            (false, _) => format!("MLSD{argument}"),
         };
         let (_, transfer) = self
             .stream
@@ -469,6 +481,8 @@ mod tests {
         list_drops_data: bool,
         /// Opens the listing data connection and resets it (RST) before sending any byte.
         list_resets_data: bool,
+        /// The answer to `CWD`.
+        cwd_reply: &'static str,
     }
 
     /// Closes `stream` with a TCP reset (SO_LINGER 0) instead of a FIN.
@@ -513,6 +527,7 @@ mod tests {
                 list_reply: None,
                 list_drops_data: false,
                 list_resets_data: false,
+                cwd_reply: "250 ok",
             }
         }
     }
@@ -554,6 +569,7 @@ mod tests {
                     "PASS" => reply("230 in\r\n"),
                     "TYPE" => reply("200 ok\r\n"),
                     "PWD" => reply("257 \"/www\" is the directory\r\n"),
+                    "CWD" => reply(&format!("{}\r\n", script.cwd_reply)),
                     "PASV" => {
                         let listener = TcpListener::bind("127.0.0.1:0").expect("bind data");
                         let data_port = listener.local_addr().expect("addr").port();
@@ -692,6 +708,10 @@ mod tests {
             "binary: {commands:?}"
         );
         assert!(commands.contains(&"MLSD /www".to_string()), "{commands:?}");
+        assert!(
+            !commands.iter().any(|c| c.starts_with("CWD")),
+            "no compatibility mode, no CWD: {commands:?}"
+        );
         let retrievals: Vec<_> = commands.iter().filter(|c| c.starts_with("RETR")).collect();
         assert_eq!(retrievals.len(), 1, "only index.php: {commands:?}");
         assert_eq!(
@@ -972,6 +992,80 @@ mod tests {
                 .expect("exists");
             assert_eq!(stat.stamp, None);
         }
+    }
+
+    #[test]
+    fn compat_mode_changes_into_the_folder_and_lists_without_a_path() {
+        let unix_listing = "-rw-r--r--   1 u g   12 Nov 22 10:00 a.php\r\n";
+        for (use_list, hidden_files, expected) in [
+            (false, false, "MLSD"),
+            (true, false, "LIST"),
+            (true, true, "LIST -a"),
+        ] {
+            let (port, server_thread) = fake_ftp_server_with(FakeFtp {
+                listing: if use_list {
+                    unix_listing.as_bytes().to_vec()
+                } else {
+                    LISTING.as_bytes().to_vec()
+                },
+                ..FakeFtp::default()
+            });
+            let mut server = plain_server(port);
+            server.advanced.list_compat = true;
+            server.advanced.use_list = use_list;
+            server.advanced.hidden_files = hidden_files;
+            let entries = smol::block_on(async {
+                let mut transport = connect(&server).await.expect("connect");
+                let entries = transport.list_dir("/www").await.expect("list");
+                transport.disconnect().await.expect("quit");
+                entries
+            });
+            assert!(!entries.is_empty(), "{expected}");
+            let commands = server_thread.join().expect("server thread");
+            let change = commands.iter().position(|c| c == "CWD /www");
+            let listing = commands.iter().position(|c| c == expected);
+            assert!(
+                change.is_some() && listing.is_some() && change < listing,
+                "{expected}: CWD /www, then a bare {expected}: {commands:?}"
+            );
+            assert!(
+                !commands
+                    .iter()
+                    .any(|c| c.starts_with(&format!("{expected} "))),
+                "{expected}: no path on the listing: {commands:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_refused_change_of_folder_is_a_refusal_and_lists_nothing() {
+        let (port, server_thread) = fake_ftp_server_with(FakeFtp {
+            cwd_reply: "550 no such directory",
+            ..FakeFtp::default()
+        });
+        let mut server = plain_server(port);
+        server.advanced.list_compat = true;
+        smol::block_on(async {
+            let mut transport = connect(&server).await.expect("connect");
+            let error = transport
+                .list_dir("/www")
+                .await
+                .expect_err("the folder is refused");
+            assert!(
+                error.downcast_ref::<ServerRefused>().is_some(),
+                "a refusal that keeps the session: {error:#}"
+            );
+            assert_eq!(transport.pwd().await.expect("the session lives"), "/www");
+            transport.disconnect().await.expect("quit");
+        });
+        let commands = server_thread.join().expect("server thread");
+        assert!(commands.contains(&"CWD /www".to_string()), "{commands:?}");
+        assert!(
+            !commands
+                .iter()
+                .any(|c| c.starts_with("MLSD") || c.starts_with("LIST")),
+            "nothing was listed: {commands:?}"
+        );
     }
 
     #[test]

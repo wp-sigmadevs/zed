@@ -894,6 +894,23 @@ impl DeploymentDialog {
                                         server.advanced.use_list = !server.advanced.use_list
                                     })
                                 })),
+                        )
+                        .child(
+                            div()
+                                .debug_selector(|| "zenith-deploy-list-compat".to_string())
+                                .child(
+                                    Checkbox::new(
+                                        "zenith-deploy-list-compat",
+                                        advanced.list_compat.into(),
+                                    )
+                                    .label("Compatible with old version of listing children")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.update_selected(cx, |server| {
+                                            server.advanced.list_compat =
+                                                !server.advanced.list_compat
+                                        })
+                                    })),
+                                ),
                         ),
                 )
             })
@@ -2011,6 +2028,11 @@ mod tests {
                 ids.push((
                     "zenith-deploy-password-removed".into(),
                     !save_password || server_type == ServerType::Sftp,
+                ));
+                // Drawn only while Advanced is open on an FTP or FTPS server.
+                ids.push((
+                    "zenith-deploy-list-compat".into(),
+                    advanced && server_type != ServerType::Sftp,
                 ));
                 ids.push(("zenith-deploy-status".into(), has_status));
                 ids.push(("zenith-deploy-status-text".into(), has_status));

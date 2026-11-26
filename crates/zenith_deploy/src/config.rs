@@ -50,6 +50,11 @@ pub struct AdvancedOptions {
     pub hidden_files: bool,
     /// List with `LIST` instead of `MLSD`.
     pub use_list: bool,
+    /// List the way some old FTP servers need: change into the folder (`CWD`), then send the
+    /// listing command with no path. Unverified: this follows the label of the same option in
+    /// JetBrains' deployment settings ("Compatible with old version of listing children"); what
+    /// JetBrains actually sends was not checked. Missing in an old `servers.json`: off.
+    pub list_compat: bool,
     pub connections: u32,
     pub keep_alive_secs: Option<u32>,
     pub keep_alive_command: String,
@@ -61,6 +66,7 @@ impl Default for AdvancedOptions {
             passive: true,
             hidden_files: false,
             use_list: false,
+            list_compat: false,
             connections: 5,
             keep_alive_secs: None,
             keep_alive_command: "NOOP".into(),
@@ -332,6 +338,11 @@ mod tests {
         assert_eq!(server.root_path, "/");
         assert!(server.excluded_local.iter().any(|entry| entry == ".env"));
         assert!(!server.upload_on_save);
+        assert!(!server.advanced.list_compat);
+        // A file written before `list_compat` existed has an `advanced` block without it.
+        let old: ServerConfig =
+            serde_json::from_str(r#"{"advanced":{"use_list":true}}"#).expect("parse");
+        assert!(old.advanced.use_list && !old.advanced.list_compat);
         assert_eq!(
             servers.project_defaults.get("/p").map(String::as_str),
             Some("a")
