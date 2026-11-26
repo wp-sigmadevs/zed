@@ -53,10 +53,14 @@ pub fn project_badge(project_name: &str, cx: &App) -> Option<impl IntoElement + 
     )
 }
 
-/// The project-name button always shows its chevron under Zenith's switcher; upstream's
-/// rule (several roots) applies with `zenith.title_bar.enabled` off.
-pub fn switcher_chevron(worktree_count: usize, cx: &App) -> bool {
-    ZenithTitleBarSettings::get_global(cx).enabled || worktree_count > 1
+/// The project-name button's chevron under Zenith's switcher: always shown (upstream shows
+/// it only with several roots, and still does with `zenith.title_bar.enabled` off).
+pub fn chevron(cx: &App) -> Option<Icon> {
+    ZenithTitleBarSettings::get_global(cx).enabled.then(|| {
+        Icon::new(IconName::ChevronDown)
+            .size(IconSize::XSmall)
+            .color(Color::Muted)
+    })
 }
 
 /// 20 px badge, radius 5, 9.5 px bold white letters on `color`.
