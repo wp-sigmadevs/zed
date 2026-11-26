@@ -1,0 +1,394 @@
+//! Auto-upload of mapped project files (plan 37 M4b), the pure rules.
+//!
+//! No store and no UI here. The mapping lives only in the user's own `servers.json`
+//! (`ServerConfig::mappings`); nothing in a repo is read for a mapping or for permission.
+
+use std::path::{Component, Path, PathBuf};
+
+use anyhow::{Result, bail};
+use util::{paths::PathMatcher, paths::PathStyle};
+use workspace::SaveIntent;
+
+use crate::{
+    config::ServerConfig,
+    remote_path::{join_remote, validate_name},
+};
+
+/// An explicit save by the user. Closing, skipping and "Save As" never upload.
+pub fn is_explicit(intent: SaveIntent) -> bool {
+    matches!(
+        intent,
+        SaveIntent::Save
+            | SaveIntent::FormatAndSave
+            | SaveIntent::SaveWithoutFormat
+            | SaveIntent::SaveAll
+            | SaveIntent::Overwrite
+    )
+}
+
+/// One `Normal` component as a validated UTF-8 name; `..` and everything else is an error.
+fn part(component: Component<'_>) -> Result<&str, String> {
+    let Component::Normal(name) = component else {
+        return Err(format!("{component:?} is not a plain path part"));
+    };
+    let name = name
+        .to_str()
+        .ok_or_else(|| format!("{name:?} is not valid UTF-8"))?;
+    validate_name(name).map_err(|error| format!("{error:#}"))
+}
+
+/// The remote path of the project file `local`, from the longest of the server's mappings that
+/// contains it (whole path parts, never a text prefix). `Ok(None)`: no mapping contains it.
+/// `Err`: the path or the matched mapping is unsafe, or the file is in the download cache.
+pub fn resolve_mapped(
+    server: &ServerConfig,
+    local: &Path,
+    cache_dir: &Path,
+) -> Result<Option<String>, String> {
+    Ok(resolve(server, local, cache_dir)?.map(|resolved| resolved.remote))
+}
+
+/// A mapped file: where it goes, the mapping folder it is under and its path inside it.
+pub struct Resolved {
+    pub remote: String,
+    pub folder: PathBuf,
+    pub rel: PathBuf,
+}
+
+pub fn resolve(
+    server: &ServerConfig,
+    local: &Path,
+    cache_dir: &Path,
+) -> Result<Option<Resolved>, String> {
+    if !local.is_absolute() {
+        return Err(format!("{} is not an absolute path", local.display()));
+    }
+    if local.starts_with(cache_dir) {
+        return Err("Files of the download cache are never uploaded by a mapping.".into());
+    }
+    // Every part of the file path is checked, also the ones above the mapping folder.
+    for component in local.components() {
+        if !matches!(component, Component::RootDir | Component::Prefix(_)) {
+            part(component)?;
+        }
+    }
+    let best = server
+        .mappings
+        .iter()
+        .filter_map(|mapping| {
+            let folder = Path::new(&mapping.local);
+            let rest = local.strip_prefix(folder).ok()?;
+            folder.is_absolute().then_some((folder, mapping, rest))
+        })
+        .max_by_key(|(folder, ..)| folder.components().count());
+    let Some((folder, mapping, rest)) = best else {
+        return Ok(None);
+    };
+    // The file is the mapped folder itself: nothing to upload.
+    if rest.as_os_str().is_empty() {
+        return Ok(None);
+    }
+    // `join_remote` checks the root and every part again.
+    let mut remote = server.root_path.clone();
+    for name in mapping.remote.split('/').filter(|name| !name.is_empty()) {
+        remote = join_remote(&remote, name).map_err(|error| format!("{error:#}"))?;
+    }
+    for component in rest.components() {
+        remote = join_remote(&remote, part(component)?).map_err(|error| format!("{error:#}"))?;
+    }
+    Ok(Some(Resolved {
+        remote,
+        folder: folder.to_path_buf(),
+        rel: rest.to_path_buf(),
+    }))
+}
+
+/// Why a file is not auto-uploaded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Excluded {
+    /// The built-in secret list; the user cannot remove it. Worth a message.
+    Fixed,
+    /// The user's own `excluded_local`. Silent.
+    User,
+}
+
+fn is_secret_name(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    name.starts_with(".env")
+        || name == "wp-config.php"
+        || [".pem", ".key", ".p12", ".pfx"]
+            .iter()
+            .any(|suffix| name.ends_with(suffix))
+        || matches!(
+            name.as_str(),
+            "id_dsa"
+                | "id_ecdsa"
+                | "id_ed25519"
+                | "id_rsa"
+                | ".htpasswd"
+                | "auth.json"
+                | ".npmrc"
+                | ".git"
+        )
+}
+
+/// The user's `excluded_local` as a matcher; an invalid pattern is skipped and logged.
+pub fn user_matcher(server: &ServerConfig) -> PathMatcher {
+    PathMatcher::new_lenient(&server.excluded_local, PathStyle::local(), |error| {
+        log::warn!("deploy: excluded path pattern skipped: {error}");
+    })
+}
+
+/// Whether `rel` (relative to the mapped folder) must not be uploaded. The secret list is tried
+/// on every part of the path (so anything under `.git`, `.env.d`, ...); the user's matcher on the
+/// whole path, on every folder above the file and on every single name.
+pub fn excluded(rel: &Path, user: &PathMatcher) -> Option<Excluded> {
+    let names: Vec<&std::ffi::OsStr> = rel
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(name) => Some(name),
+            _ => None,
+        })
+        .collect();
+    if names
+        .iter()
+        .any(|name| name.to_str().is_none_or(is_secret_name))
+    {
+        return Some(Excluded::Fixed);
+    }
+    let mut folder = PathBuf::new();
+    for name in names {
+        folder.push(name);
+        if user.is_match_std_path(&folder) || user.is_match_std_path(Path::new(name)) {
+            return Some(Excluded::User);
+        }
+    }
+    None
+}
+
+/// Refuses a file whose real location is not where its path says: `file` (under `root`) must
+/// canonicalize to the canonical `root` plus its relative path, so a symlink anywhere in the
+/// mapped tree, pointing inside or outside, is refused. Blocking: call it from a background
+/// task (`cx.background_spawn`), never on the main thread.
+pub async fn check_real_path(root: PathBuf, file: PathBuf) -> Result<()> {
+    let rel = file.strip_prefix(&root)?.to_path_buf();
+    let real_root = std::fs::canonicalize(&root)?;
+    let real_file = std::fs::canonicalize(&file)?;
+    if real_file != real_root.join(rel) {
+        bail!(
+            "{} is not at its own path (a symbolic link is in the way); it is not uploaded",
+            file.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Mapping;
+
+    fn server(mappings: &[(&str, &str)]) -> ServerConfig {
+        ServerConfig {
+            root_path: "/var/www".into(),
+            mappings: mappings
+                .iter()
+                .map(|(local, remote)| Mapping {
+                    local: local.to_string(),
+                    remote: remote.to_string(),
+                })
+                .collect(),
+            ..ServerConfig::default()
+        }
+    }
+
+    fn resolve(server: &ServerConfig, local: &str) -> Result<Option<String>, String> {
+        resolve_mapped(server, Path::new(local), Path::new("/cache"))
+    }
+
+    fn user() -> PathMatcher {
+        PathMatcher::new(
+            ["node_modules", "*.cache", "*/cache", "?.php"],
+            PathStyle::Unix,
+        )
+        .expect("matcher")
+    }
+
+    #[test]
+    fn only_explicit_saves_are_explicit() {
+        for intent in [
+            SaveIntent::Save,
+            SaveIntent::FormatAndSave,
+            SaveIntent::SaveWithoutFormat,
+            SaveIntent::SaveAll,
+            SaveIntent::Overwrite,
+        ] {
+            assert!(is_explicit(intent), "{intent:?}");
+        }
+        for intent in [SaveIntent::Close, SaveIntent::Skip, SaveIntent::SaveAs] {
+            assert!(!is_explicit(intent), "{intent:?}");
+        }
+    }
+
+    #[test]
+    fn a_mapped_file_lands_under_the_root_and_the_mapped_folder() {
+        let server = server(&[("/p", "wp-content/themes/t")]);
+        assert_eq!(
+            resolve(&server, "/p/inc/a.php"),
+            Ok(Some("/var/www/wp-content/themes/t/inc/a.php".into()))
+        );
+    }
+
+    #[test]
+    fn a_sibling_folder_with_the_same_text_prefix_is_not_mapped() {
+        let server = server(&[("/p", "x")]);
+        assert_eq!(resolve(&server, "/p2/a.php"), Ok(None));
+        assert_eq!(resolve(&server, "/other/a.php"), Ok(None));
+        // The mapped folder itself is not a file.
+        assert_eq!(resolve(&server, "/p"), Ok(None));
+    }
+
+    #[test]
+    fn the_longest_mapping_wins() {
+        let server = server(&[("/p", "x"), ("/p/theme", "t")]);
+        assert_eq!(
+            resolve(&server, "/p/theme/a.php"),
+            Ok(Some("/var/www/t/a.php".into()))
+        );
+        assert_eq!(
+            resolve(&server, "/p/b.php"),
+            Ok(Some("/var/www/x/b.php".into()))
+        );
+    }
+
+    #[test]
+    fn unsafe_paths_are_errors() {
+        let server = server(&[("/p", "x")]);
+        assert!(resolve(&server, "/p/../etc/passwd").is_err());
+        assert!(resolve(&server, "p/a.php").is_err());
+        assert!(resolve(&server, "/p/a\nb.php").is_err());
+        // The cache is never uploaded by a mapping, even when a mapping covers it.
+        let covering = self::server(&[("/", "x")]);
+        assert!(resolve(&covering, "/cache/s/h/a.php").is_err());
+        // A bad remote part of the matched mapping is an error, not a fallback.
+        assert!(resolve(&self::server(&[("/p", "../up")]), "/p/a.php").is_err());
+        assert!(resolve(&self::server(&[("/p", "a")]), "/p/b\\c.php").is_err());
+        // A root that is not an absolute remote path is an error.
+        let mut relative_root = self::server(&[("/p", "x")]);
+        relative_root.root_path = "www".into();
+        assert!(resolve(&relative_root, "/p/a.php").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_path_that_is_not_utf8_is_an_error() {
+        use std::{ffi::OsStr, os::unix::ffi::OsStrExt as _};
+        let server = server(&[("/p", "x")]);
+        let bad = Path::new(OsStr::from_bytes(b"/p/\xff.php"));
+        assert!(resolve_mapped(&server, bad, Path::new("/cache")).is_err());
+    }
+
+    #[test]
+    fn the_root_and_an_empty_mapped_folder_join_cleanly() {
+        let mut at_root = server(&[("/p", "")]);
+        at_root.root_path = "/".into();
+        assert_eq!(resolve(&at_root, "/p/a.php"), Ok(Some("/a.php".into())));
+        let in_root = server(&[("/p", "/")]);
+        assert_eq!(
+            resolve(&in_root, "/p/s/a.php"),
+            Ok(Some("/var/www/s/a.php".into()))
+        );
+    }
+
+    #[test]
+    fn secrets_are_excluded_by_the_fixed_list() {
+        let user = user();
+        for secret in [
+            "a/.git/config",
+            "sub/wp-config.php",
+            ".env.local",
+            "WP-Config.php",
+            "k/site.pem",
+            "k/site.KEY",
+            "id_rsa",
+            "d/.htpasswd",
+            "auth.json",
+            ".npmrc",
+            ".env.d/x.php",
+        ] {
+            assert_eq!(
+                excluded(Path::new(secret), &user),
+                Some(Excluded::Fixed),
+                "{secret}"
+            );
+        }
+        assert_eq!(excluded(Path::new("index.php"), &user), None);
+        assert_eq!(excluded(Path::new("inc/keys.php"), &user), None);
+    }
+
+    #[test]
+    fn the_users_patterns_apply_to_the_path_every_folder_and_every_name() {
+        let user = user();
+        assert_eq!(
+            excluded(Path::new("node_modules/x.js"), &user),
+            Some(Excluded::User)
+        );
+        // Only the folder above matches (`*.cache` does not match the whole path).
+        assert_eq!(
+            excluded(Path::new("a.cache/x.js"), &user),
+            Some(Excluded::User)
+        );
+        // Matches only the folder above (`*/cache` does not match the whole path or one name).
+        assert_eq!(
+            excluded(Path::new("d/cache/x.js"), &user),
+            Some(Excluded::User)
+        );
+        // Matches only the single name (`?.php` does not match `d/b.php`).
+        assert_eq!(excluded(Path::new("d/b.php"), &user), Some(Excluded::User));
+        assert_eq!(
+            excluded(Path::new("deep/node_modules"), &user),
+            Some(Excluded::User)
+        );
+        assert_eq!(excluded(Path::new("src/x.js"), &user), None);
+        // The user cannot switch the fixed list off.
+        assert_eq!(
+            excluded(Path::new("wp-config.php"), &PathMatcher::default()),
+            Some(Excluded::Fixed)
+        );
+    }
+
+    #[test]
+    fn a_real_path_equal_to_the_given_path_passes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("inc")).expect("mkdir");
+        std::fs::write(dir.path().join("inc/a.php"), "x").expect("write");
+        let result = smol::block_on(check_real_path(
+            dir.path().to_path_buf(),
+            dir.path().join("inc/a.php"),
+        ));
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_in_the_mapped_tree_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("project");
+        std::fs::create_dir_all(&root).expect("mkdir");
+        std::fs::create_dir_all(dir.path().join("outside")).expect("mkdir");
+        std::fs::write(dir.path().join("outside/s.txt"), "secret").expect("write");
+        std::fs::write(root.join("real.php"), "x").expect("write");
+        std::os::unix::fs::symlink("../outside/s.txt", root.join("link.php")).expect("link");
+        // A link to a file inside the tree and a link to a folder are refused too.
+        std::os::unix::fs::symlink("real.php", root.join("inside.php")).expect("link");
+        std::os::unix::fs::symlink("../outside", root.join("dirlink")).expect("link");
+        for file in ["link.php", "inside.php", "dirlink/s.txt"] {
+            let result = smol::block_on(check_real_path(root.clone(), root.join(file)));
+            assert!(result.is_err(), "{file} must be refused");
+        }
+        let result = smol::block_on(check_real_path(root.clone(), root.join("real.php")));
+        assert!(result.is_ok(), "{result:?}");
+        // A missing file is an error, not a pass.
+        assert!(smol::block_on(check_real_path(root.clone(), root.join("gone.php"))).is_err());
+    }
+}

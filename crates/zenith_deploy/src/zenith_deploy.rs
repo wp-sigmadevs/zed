@@ -4,6 +4,7 @@
 pub mod config;
 mod dialog;
 mod ftp;
+pub mod on_save;
 mod panel;
 pub mod remote_edit;
 pub mod remote_path;
