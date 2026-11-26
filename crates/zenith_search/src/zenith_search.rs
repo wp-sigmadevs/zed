@@ -1469,6 +1469,8 @@ impl PickerDelegate for SearchDelegate {
         cx: &mut Context<Picker<Self>>,
     ) -> Task<()> {
         self.latest_query = query.clone();
+        // Reset before the early returns, or a `file:12` typed on All sticks to other tabs.
+        self.file_target = None;
         let tab = self.tab;
         if tab == Tab::Hooks {
             self.set_matches(Vec::new(), Vec::new(), true, cx);
@@ -1896,7 +1898,10 @@ mod tests {
     /// the checkout holding the test binary's target dir, which is another worktree's when
     /// several share one `CARGO_TARGET_DIR`, and would not see this branch's bindings.
     pub(crate) fn zenith_keymap(cx: &App) -> Vec<gpui::KeyBinding> {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/keymaps/zenith.json");
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../assets/keymaps/zenith.json"
+        );
         let content = std::fs::read_to_string(path).expect("Zenith keymap file");
         match KeymapFile::load(&content, cx) {
             settings::KeymapFileLoadResult::Success { key_bindings }
@@ -2541,6 +2546,81 @@ mod tests {
         cx.dispatch_action(FindAction);
         workspace.update(cx, |workspace, cx| {
             assert!(workspace.active_modal::<SearchEverywhere>(cx).is_none());
+        });
+    }
+
+    #[gpui::test]
+    async fn test_line_target_does_not_leak_to_recent_tab(cx: &mut TestAppContext) {
+        let app_state = init_test(cx);
+        app_state
+            .fs
+            .as_fake()
+            .insert_tree(path!("/root"), json!({ "a.rs": "one\ntwo\nthree\nfour\n" }))
+            .await;
+        let project = Project::test(app_state.fs.clone(), [path!("/root").as_ref()], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        cx.run_until_parked();
+        let worktree_id = workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .project()
+                .read(cx)
+                .worktrees(cx)
+                .next()
+                .unwrap()
+                .read(cx)
+                .id()
+        });
+        // Opened once, so it is listed in Recent; the caret stays on row 0.
+        workspace
+            .update_in(cx, |workspace, window, cx| {
+                let path = ProjectPath {
+                    worktree_id,
+                    path: RelPath::from_unix_str("a.rs").unwrap().into(),
+                };
+                workspace.open_path(path, None, true, window, cx)
+            })
+            .await
+            .unwrap();
+
+        open_on(Tab::All, &workspace, cx);
+        let picker = open_picker(&workspace, cx);
+        picker.update_in(cx, |picker, window, cx| {
+            picker.set_query("a.rs:3", window, cx)
+        });
+        cx.run_until_parked();
+        picker.read_with(cx, |picker, _| {
+            assert!(picker.delegate.file_target.is_some())
+        });
+
+        // Switch to Recent (as `switch_tab` does) and filter to the same file.
+        picker.update_in(cx, |picker, window, cx| {
+            picker.delegate.tab = Tab::Recent;
+            picker.set_query("a.rs", window, cx);
+        });
+        cx.run_until_parked();
+        picker.read_with(cx, |picker, _| {
+            assert_eq!(picker.delegate.file_target, None);
+            // Without a file row, Confirm would do nothing and the caret check would pass anyway.
+            assert!(matches!(
+                picker.delegate.matches.first(),
+                Some(SearchMatch::File { .. })
+            ));
+        });
+        cx.dispatch_action(menu::Confirm);
+        cx.run_until_parked();
+        let editor = workspace.update(cx, |workspace, cx| {
+            workspace.active_item_as::<Editor>(cx).expect("a.rs editor")
+        });
+        editor.update(cx, |editor, cx| {
+            let caret = editor
+                .selections
+                .all_adjusted(&editor.display_snapshot(cx))
+                .into_iter()
+                .next()
+                .expect("one caret");
+            assert_eq!(caret.start.row, 0);
         });
     }
 
