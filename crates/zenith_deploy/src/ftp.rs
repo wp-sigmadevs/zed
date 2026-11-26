@@ -472,7 +472,7 @@ mod tests {
     }
 
     /// Closes `stream` with a TCP reset (SO_LINGER 0) instead of a FIN.
-    #[cfg(unix)]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn reset_on_close(stream: std::net::TcpStream) {
         use std::os::fd::AsRawFd as _;
         #[repr(C)]
@@ -483,9 +483,9 @@ mod tests {
         unsafe extern "C" {
             fn setsockopt(fd: i32, level: i32, name: i32, value: *const Linger, len: u32) -> i32;
         }
-        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        #[cfg(target_os = "macos")]
         let (level, name) = (0xffff, 0x80);
-        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+        #[cfg(target_os = "linux")]
         let (level, name) = (1, 13);
         let linger = Linger { on: 1, seconds: 0 };
         // SAFETY: a valid open socket fd and a correctly sized `struct linger`.
@@ -578,6 +578,7 @@ mod tests {
                             reply("426 aborted\r\n");
                             continue;
                         }
+                        #[cfg(any(target_os = "macos", target_os = "linux"))]
                         if listing && script.list_resets_data {
                             reset_on_close(stream);
                             continue;
@@ -940,6 +941,7 @@ mod tests {
                 ..FakeFtp::default()
             },
             // A reset before any byte is an io::Error, not an FtpError.
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
             FakeFtp {
                 list_resets_data: true,
                 ..FakeFtp::default()
