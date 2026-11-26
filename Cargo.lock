@@ -23619,17 +23619,29 @@ dependencies = [
 name = "zenith_title_bar"
 version = "0.1.0"
 dependencies = [
+ "assets",
+ "chrono",
  "db",
+ "editor",
+ "fs",
+ "fuzzy_nucleo",
+ "git",
  "gpui",
+ "menu",
+ "picker",
  "project",
+ "recent_projects",
  "serde_json",
  "settings",
  "task",
  "tasks_ui",
+ "theme",
+ "theme_settings",
  "ui",
  "util",
  "workspace",
  "zed_actions",
+ "zenith_welcome",
 ]
 
 [[package]]

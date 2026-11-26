@@ -1,6 +1,8 @@
 //! Zenith additions to the title bar (plan 34, step 2).
 
+mod project_switcher;
 mod run;
+mod switcher_rows;
 
 use std::collections::HashMap;
 
@@ -9,6 +11,7 @@ use project::Project;
 use settings::{RegisterSetting, Settings, SettingsContent};
 use ui::{ButtonLike, IconButton, Tooltip, Vector, VectorName, prelude::*};
 
+pub use project_switcher::{ProjectSwitcher, open_recent_paths, project_switcher};
 pub use run::{DebugSelected, RerunLast, RunConfig, RunModel, RunSelected, StopRun, init};
 
 /// `zenith.title_bar.enabled`: off, the title bar is upstream's. Read on every render.
@@ -31,30 +34,45 @@ impl Settings for ZenithTitleBarSettings {
     }
 }
 
-/// Two-letter badge shown before the project name, e.g. "LG" for `lumen-gallery`.
+/// Badge shown before the project name, e.g. "LG" for `lumen-gallery` (rule in
+/// [`switcher_rows::initials`]), in a colour taken from the name.
 pub fn project_badge(project_name: &str, cx: &App) -> Option<impl IntoElement + use<>> {
     if !ZenithTitleBarSettings::get_global(cx).enabled {
         return None;
     }
-    let initials = initials(project_name)?;
-    // Board: 22 px mark, then a 20 px #4a5b8c badge, radius 5, 9.5 px bold white.
+    let initials = switcher_rows::initials(&[project_name])?;
+    let color = switcher_rows::badge_color(project_name);
+    // Board: 22 px mark, then a 20 px badge.
     let mark = show_mark(cx).then(|| Vector::square(VectorName::ZedLogo, rems_from_px(22_f32)));
     Some(
-        h_flex().flex_none().gap(px(8.)).children(mark).child(
-            div()
-                .flex_none()
-                .size(px(20.))
-                .flex()
-                .items_center()
-                .justify_center()
-                .rounded(px(5.))
-                .bg(gpui::rgb(0x4a5b8c))
-                .text_color(gpui::white())
-                .text_size(px(9.5))
-                .font_weight(FontWeight::BOLD)
-                .child(initials),
-        ),
+        h_flex()
+            .flex_none()
+            .gap(px(8.))
+            .children(mark)
+            .child(badge(&initials, color)),
     )
+}
+
+/// The project-name button always shows its chevron under Zenith's switcher; upstream's
+/// rule (several roots) applies with `zenith.title_bar.enabled` off.
+pub fn switcher_chevron(worktree_count: usize, cx: &App) -> bool {
+    ZenithTitleBarSettings::get_global(cx).enabled || worktree_count > 1
+}
+
+/// 20 px badge, radius 5, 9.5 px bold white letters on `color`.
+fn badge(initials: &str, color: Hsla) -> impl IntoElement + use<> {
+    div()
+        .flex_none()
+        .size(px(20.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(5.))
+        .bg(color)
+        .text_color(gpui::white())
+        .text_size(px(9.5))
+        .font_weight(FontWeight::BOLD)
+        .child(SharedString::from(initials.to_string()))
 }
 
 /// JetBrains' title bar has no logo: the mark is dropped under the islands/rails chrome.
@@ -279,28 +297,9 @@ fn dispatch(action: Box<dyn Action>) -> impl Fn(&gpui::ClickEvent, &mut Window, 
     move |_, window, cx| window.dispatch_action(action.boxed_clone(), cx)
 }
 
-/// First letter of the first two words, or the first two letters of a single word.
-fn initials(name: &str) -> Option<SharedString> {
-    let mut words = name
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|word| !word.is_empty());
-    let first = words.next()?;
-    let letters: String = match words.next() {
-        Some(second) => first
-            .chars()
-            .take(1)
-            .chain(second.chars().take(1))
-            .collect(),
-        None => first.chars().take(2).collect(),
-    };
-    Some(letters.to_uppercase().into())
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{
-        AgentChip, AgentCounts, agent_chip_aria_label, agent_chip_label, initials, show_mark,
-    };
+    use super::{AgentChip, AgentCounts, agent_chip_aria_label, agent_chip_label, show_mark};
     use gpui::{EntityId, TestAppContext};
 
     #[gpui::test]
@@ -335,17 +334,6 @@ mod tests {
             });
             assert!(super::project_badge("lumen-gallery", cx).is_none());
         });
-    }
-
-    #[test]
-    fn test_initials() {
-        assert_eq!(initials("lumen-gallery").as_deref(), Some("LG"));
-        assert_eq!(initials("my_wp plugin").as_deref(), Some("MW"));
-        assert_eq!(initials("zenith").as_deref(), Some("ZE"));
-        assert_eq!(initials("a").as_deref(), Some("A"));
-        assert_eq!(initials("ünïcode-tëst").as_deref(), Some("ÜT"));
-        assert_eq!(initials("--"), None);
-        assert_eq!(initials(""), None);
     }
 
     #[test]
