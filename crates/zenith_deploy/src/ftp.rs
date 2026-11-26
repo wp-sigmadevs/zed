@@ -1,4 +1,8 @@
-use std::{path::Path, sync::Arc, time::Duration};
+use std::{
+    path::Path,
+    sync::Arc,
+    time::{Duration, UNIX_EPOCH},
+};
 
 use anyhow::{Context as _, Result, bail};
 use async_trait::async_trait;
@@ -16,7 +20,7 @@ use util::ResultExt as _;
 
 use crate::{
     config::{ServerConfig, ServerType},
-    remote_path::validate_remote_path,
+    remote_path::{split_remote, validate_remote_path},
     transport::{
         EntryKind, MAX_DOWNLOAD_BYTES, MAX_LISTING_BYTES, MAX_LISTING_ENTRIES, RemoteEntry,
         RemoteStat, ServerRefused, Transport, login_credentials, retain_listable,
@@ -149,6 +153,19 @@ fn mlsd_symlink(line: &str) -> Option<RemoteEntry> {
         size: 0,
         modified: None,
     })
+}
+
+/// The change stamp of `name` from its parent's listing, for servers without MDTM. Only exactly
+/// one regular-file entry with a real date counts: a listing without a date reads as the epoch
+/// (a constant stamp would prove "unchanged" forever), a symlink or directory has no file date.
+fn listing_stamp(entries: &[RemoteEntry], name: &str) -> Option<String> {
+    let mut named = entries.iter().filter(|entry| entry.name == name);
+    let entry = named.next().filter(|_| named.next().is_none())?;
+    if entry.kind != EntryKind::File {
+        return None;
+    }
+    let secs = entry.modified?.duration_since(UNIX_EPOCH).ok()?.as_secs();
+    (secs > 0).then(|| format!("list:{secs}"))
 }
 
 /// Parses at most [`MAX_LISTING_ENTRIES`] + 1 entries (one over the limit, so
@@ -297,6 +314,18 @@ impl<T: SmolTlsStream + Send + 'static> Transport for FtpSession<T> {
             Err(suppaftp::FtpError::BadResponse) => None,
             // 421 (the server is closing the connection) and I/O errors are real failures.
             Err(error) => return Err(refusal(error)),
+        };
+        // Without MDTM the parent listing's date is the stamp; a listing failure only costs it.
+        let stamp = match stamp {
+            Some(stamp) => Some(stamp),
+            None => async {
+                let (parent, name) = split_remote(path)?;
+                let entries = self.list_dir(parent).await?;
+                anyhow::Ok(listing_stamp(&entries, name))
+            }
+            .await
+            .log_err()
+            .flatten(),
         };
         Ok(Some(RemoteStat { size, stamp }))
     }
@@ -775,6 +804,47 @@ mod tests {
             })
         );
         assert_eq!(stat(FakeFtp::default()), None, "SIZE 550 is a missing file");
+    }
+
+    #[test]
+    fn ftp_stat_without_mdtm_takes_the_stamp_from_the_parent_listing() {
+        let (port, server_thread) = fake_ftp_server_with(FakeFtp {
+            size: Some(12),
+            ..FakeFtp::default()
+        });
+        let result = smol::block_on(async {
+            let mut transport = connect(&plain_server(port)).await.expect("connect");
+            let result = transport.stat("/www/index.php").await.expect("stat");
+            transport.disconnect().await.expect("quit");
+            result
+        });
+        server_thread.join().expect("server thread");
+        assert_eq!(
+            result,
+            Some(RemoteStat {
+                size: 12,
+                stamp: Some("list:1735732800".into())
+            })
+        );
+    }
+
+    #[test]
+    fn a_listing_stamp_needs_exactly_one_dated_regular_file() {
+        let stamp = |listing: &str, name: &str| listing_stamp(&parse_listing(listing, false), name);
+        assert_eq!(
+            stamp(LISTING, "index.php"),
+            Some("list:1735732800".to_string())
+        );
+        for name in ["evil", "sub", "x.php"] {
+            assert_eq!(stamp(LISTING, name), None, "{name}");
+        }
+        assert_eq!(
+            stamp("type=file;size=5; nomod.php", "nomod.php"),
+            None,
+            "no date reads as the epoch, never a stamp"
+        );
+        let twice = format!("{LISTING}type=file;size=7;modify=20250102120000; index.php\r\n");
+        assert_eq!(stamp(&twice, "index.php"), None, "ambiguous name");
     }
 
     #[test]

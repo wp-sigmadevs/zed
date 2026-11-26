@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use anyhow::{Result, bail};
+use anyhow::{Context as _, Result, bail};
 
 /// A single file name from a remote listing. Rejects everything that could climb out of its
 /// directory or smuggle a second command line: separators, `.`/`..`, and every control
@@ -25,6 +25,17 @@ pub fn validate_remote_path(path: &str) -> Result<&str> {
         bail!("remote path {path:?} contains `..`");
     }
     Ok(path)
+}
+
+/// `/a/b/c.php` -> (`/a/b`, `c.php`); the parent of `/c.php` is `/`.
+pub(crate) fn split_remote(path: &str) -> Result<(&str, &str)> {
+    let (parent, name) = validate_remote_path(path)?
+        .rsplit_once('/')
+        .context("remote path has no file name")?;
+    Ok((
+        if parent.is_empty() { "/" } else { parent },
+        validate_name(name)?,
+    ))
 }
 
 pub fn join_remote(directory: &str, name: &str) -> Result<String> {

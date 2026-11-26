@@ -8,7 +8,7 @@ use util::command::{Stdio, new_command};
 use crate::{
     config::ServerConfig,
     ftp::create_part_file,
-    remote_path::{validate_name, validate_remote_path},
+    remote_path::{split_remote, validate_remote_path},
     transport::{
         EntryKind, MAX_DOWNLOAD_BYTES, MAX_LISTING_BYTES, MAX_LISTING_ENTRIES, RemoteEntry,
         RemoteStat, ServerRefused, Transport, retain_listable,
@@ -222,17 +222,6 @@ fn put_batch(local_path: &Path, remote_path: &str) -> Result<String> {
         "put {} {}",
         local_argument(local_path)?,
         quote(validate_remote_path(remote_path)?, true)?
-    ))
-}
-
-/// `/a/b/c.php` -> (`/a/b`, `c.php`); the parent of `/c.php` is `/`.
-fn split_remote(path: &str) -> Result<(&str, &str)> {
-    let (parent, name) = validate_remote_path(path)?
-        .rsplit_once('/')
-        .context("remote path has no file name")?;
-    Ok((
-        if parent.is_empty() { "/" } else { parent },
-        validate_name(name)?,
     ))
 }
 
