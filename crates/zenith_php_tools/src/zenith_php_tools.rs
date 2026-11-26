@@ -5,6 +5,7 @@
 pub mod php_config;
 mod php_modal;
 mod phpantom;
+mod status_view;
 mod string_completions;
 
 pub use string_completions::{StringCompletionSource, add_string_completions};
@@ -438,9 +439,10 @@ pub fn display_path(path: &Path, root: &Path, home: &Path) -> String {
     if let Ok(relative) = path.strip_prefix(root) {
         return relative.display().to_string();
     }
+    // An empty home (no `HOME`) is a prefix of everything: not a home folder.
     match path.strip_prefix(home) {
-        Ok(relative) => format!("~/{}", relative.display()),
-        Err(_) => path.display().to_string(),
+        Ok(relative) if !home.as_os_str().is_empty() => format!("~/{}", relative.display()),
+        _ => path.display().to_string(),
     }
 }
 
@@ -645,17 +647,18 @@ pub async fn download_composer(
 
 use editor::Editor;
 use gpui::{
-    Action as _, App, AppContext as _, Context, Entity, IntoElement, PromptLevel, Render,
+    App, AppContext as _, Context, Entity, IntoElement, PromptLevel, Render,
     SharedString, WeakEntity, Window, actions,
 };
 use project::{Project, WorktreeId};
 use settings::Settings as _;
-use ui::{Button, ButtonCommon as _, ButtonSize, Clickable as _, LabelSize, Tooltip, prelude::*};
+use ui::{Button, ButtonCommon as _, ButtonSize, LabelSize, Tooltip, prelude::*};
 use util::ResultExt as _;
 use workspace::{
     HideStatusItem, ItemHandle, OpenOptions, StatusItemView, Workspace,
     notifications::{NotificationId, simple_message_notification::MessageNotification},
 };
+use ui::{PopoverMenu, PopoverMenuHandle};
 
 actions!(
     zenith_php_tools,
@@ -686,11 +689,16 @@ pub fn init(cx: &mut App) {
             .status_bar()
             .update(cx, |bar, cx| bar.add_right_item(item, window, cx));
         workspace.register_action(move |workspace, _: &Status, window, cx| {
-            show_status(workspace, window, cx);
-            // The status bar may still read "not found" from a slow first run.
-            status_item
-                .update(cx, |status, cx| status.refresh_info(false, cx))
-                .ok();
+            // The popover when the status bar item is drawn, else a modal. Shown outside the
+            // item's update: opening it refreshes the item (`on_open`).
+            let popover = status_item
+                .read_with(cx, |status, _| status.info.is_some().then(|| status.popover.clone()))
+                .ok()
+                .flatten();
+            match popover {
+                Some(popover) => popover.toggle(window, cx),
+                None => show_status_modal(workspace, window, cx),
+            }
         });
         workspace.register_action(|workspace, _: &Update, window, cx| {
             manage(workspace, Manage::Update, window, cx)
@@ -733,30 +741,14 @@ fn first_root(project: &Entity<Project>, cx: &App) -> Option<PathBuf> {
         .find(|root| !zenith_external_libraries::is_library_worktree(root, cx))
 }
 
-fn show_status(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
+/// Opens the status as a modal; used when the status bar item is not drawn.
+fn show_status_modal(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
     let Some(root) = first_root(workspace.project(), cx) else {
         return;
     };
-    cx.spawn_in(window, async move |workspace, cx| {
-        let executor = cx.background_executor().clone();
-        let report = cx
-            .background_spawn(async move {
-                let (candidates, path_dirs) = environment();
-                let info = detect_php(&executor, &root, &candidates).await;
-                let managed = std::env::var_os("HOME")
-                    .map(|home| managed_bin(Path::new(&home), Profile::for_project(info.kind)));
-                status_report(&root, &info, managed.as_deref(), &path_dirs)
-            })
-            .await;
-        workspace
-            .update(cx, |workspace, cx| {
-                workspace.show_notification(NotificationId::unique::<Status>(), cx, |cx| {
-                    cx.new(|cx| MessageNotification::new(report, cx))
-                });
-            })
-            .ok();
-    })
-    .detach();
+    workspace.toggle_modal(window, cx, |window, cx| {
+        status_view::PhpStatusView::new(root, window, cx)
+    });
 }
 
 /// `PHP 8.5` in the status bar of a PHP project; nothing elsewhere.
@@ -764,6 +756,7 @@ pub struct PhpStatus {
     project: Entity<Project>,
     workspace: WeakEntity<Workspace>,
     info: Option<PhpInfo>,
+    popover: PopoverMenuHandle<status_view::PhpStatusView>,
     applied_include: phpantom::AppliedInclude,
     /// The running lookup; a newer one replaces it, which kills a hanging `php -v`.
     _refresh: Task<()>,
@@ -796,6 +789,7 @@ impl PhpStatus {
             project,
             workspace,
             info: None,
+            popover: PopoverMenuHandle::default(),
             applied_include: Default::default(),
             _refresh: Task::ready(()),
             pending_offer: false,
@@ -891,14 +885,29 @@ impl Render for PhpStatus {
             Some(version) => format!("PHP {}", short_version(version)),
             None => "PHP: not found".to_string(),
         };
+        let (project, this) = (self.project.clone(), cx.weak_entity());
         div()
             .debug_selector(|| "zenith-php-status".into())
             .child(
-                Button::new("zenith-php-status", label)
-                    .label_size(LabelSize::Small)
-                    .size(ButtonSize::Compact)
-                    .tooltip(Tooltip::text("PHP tools: status"))
-                    .on_click(|_, window, cx| window.dispatch_action(Status.boxed_clone(), cx)),
+                PopoverMenu::new("zenith-php-status-popover")
+                    .with_handle(self.popover.clone())
+                    .anchor(gpui::Anchor::BottomRight)
+                    // The item may still read "not found" from a slow first run.
+                    .on_open(std::rc::Rc::new(move |_, cx| {
+                        this.update(cx, |status, cx| status.refresh_info(false, cx))
+                            .ok();
+                    }))
+                    .menu(move |window, cx| {
+                        let root = first_root(&project, cx)?;
+                        Some(cx.new(|cx| status_view::PhpStatusView::new(root, window, cx)))
+                    })
+                    .trigger_with_tooltip(
+                        Button::new("zenith-php-status", label)
+                            .label_size(LabelSize::Small)
+                            .size(ButtonSize::Compact)
+                            .aria_label("PHP tools: status"),
+                        Tooltip::text("PHP tools: status"),
+                    ),
             )
             .into_any_element()
     }
@@ -1751,6 +1760,20 @@ mod tests {
         gpui::Entity<PhpStatus>,
         &mut gpui::VisualTestContext,
     ) {
+        let (dir, status, _, cx) = php_window_multi(cx, candidates).await;
+        (dir, status, cx)
+    }
+
+    #[cfg(unix)]
+    async fn php_window_multi(
+        cx: &mut gpui::TestAppContext,
+        candidates: Vec<PathBuf>,
+    ) -> (
+        tempfile::TempDir,
+        gpui::Entity<PhpStatus>,
+        gpui::Entity<workspace::MultiWorkspace>,
+        &mut gpui::VisualTestContext,
+    ) {
         TEST_CANDIDATES.with(|slot| *slot.borrow_mut() = Some(candidates));
         let app_state = cx.update(|cx| {
             let app_state = workspace::AppState::test(cx);
@@ -1780,7 +1803,7 @@ mod tests {
                 .item_of_type::<PhpStatus>()
                 .expect("the status item is added")
         });
-        (dir, status, cx)
+        (dir, status, multi, cx)
     }
 
     /// Runs the executor until `done`, giving real threads a moment.
@@ -1931,6 +1954,141 @@ mod tests {
             }
             assert_eq!(cx.debug_bounds("zenith-php-status").is_some(), expected);
         }
+    }
+
+    /// Like `wait_for`, for a check that reads the window.
+    #[cfg(unix)]
+    fn wait_for_window(
+        cx: &mut gpui::VisualTestContext,
+        done: impl Fn(&mut gpui::VisualTestContext) -> bool,
+    ) {
+        for _ in 0..150 {
+            cx.run_until_parked();
+            if done(cx) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        panic!("timed out waiting");
+    }
+
+    /// Clicks the status item of a PHP project that has only `vendor/bin/phpcs`.
+    #[cfg(unix)]
+    async fn open_status_popover(
+        cx: &mut gpui::TestAppContext,
+    ) -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        gpui::Entity<PhpStatus>,
+        gpui::Entity<workspace::MultiWorkspace>,
+        &mut gpui::VisualTestContext,
+    ) {
+        let tools = tempfile::tempdir().unwrap();
+        let (dir, status, multi, cx) = php_window_multi(cx, vec![fake_php(tools.path(), "PHP 8.5.0 (cli)")]).await;
+        write(dir.path(), "vendor/bin/phpcs", "");
+        wait_for_window(cx, |cx| cx.debug_bounds("zenith-php-status").is_some());
+        let bounds = cx.debug_bounds("zenith-php-status").unwrap();
+        cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+        wait_for_window(cx, |cx| {
+            cx.debug_bounds("zenith-php-row pint = Not found").is_some()
+        });
+        (tools, dir, status, multi, cx)
+    }
+
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn test_clicking_the_status_opens_a_popover_with_the_tool_rows(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (_tools, _dir, status, multi, cx) = open_status_popover(cx).await;
+        assert!(
+            cx.debug_bounds("zenith-php-row phpcs = vendor/bin/phpcs")
+                .is_some()
+        );
+        assert!(status.read_with(cx, |status, _| status.popover.is_deployed()));
+        let ids = multi.read_with(cx, |multi, cx| multi.workspace().read(cx).notification_ids());
+        assert!(ids.is_empty(), "the status is no toast: {ids:?}");
+    }
+
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn test_cancel_closes_the_status_popover_and_returns_focus(cx: &mut gpui::TestAppContext) {
+        let (_tools, _dir, status, _multi, cx) = open_status_popover(cx).await;
+        cx.run_until_parked();
+        assert!(cx.update(|window, cx| status.read(cx).popover.is_focused(window, cx)));
+        cx.dispatch_action(menu::Cancel);
+        cx.run_until_parked();
+        assert!(!status.read_with(cx, |status, _| status.popover.is_deployed()));
+        assert!(!cx.update(|window, cx| status.read(cx).popover.is_focused(window, cx)));
+    }
+
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn test_tab_moves_focus_between_the_status_buttons(cx: &mut gpui::TestAppContext) {
+        let (_tools, _dir, status, _multi, cx) = open_status_popover(cx).await;
+        cx.run_until_parked();
+        let focused = |cx: &mut gpui::VisualTestContext| cx.update(|window, cx| window.focused(cx));
+        let first = focused(cx);
+        // The base keymap binds Tab to `menu::SelectNext`.
+        cx.dispatch_action(menu::SelectNext);
+        let second = focused(cx);
+        assert!(first.is_some() && second.is_some() && first != second);
+        assert!(status.read_with(cx, |status, _| status.popover.is_deployed()));
+    }
+
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn test_copy_puts_the_exact_report_text_on_the_clipboard(cx: &mut gpui::TestAppContext) {
+        let (tools, dir, _status, _multi, cx) = open_status_popover(cx).await;
+        let bounds = cx.debug_bounds("zenith-php-status-copy").unwrap();
+        cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+        let copied = cx.read_from_clipboard().and_then(|item| item.text());
+        assert_eq!(
+            copied,
+            Some(format!(
+                "Project: PHP\nPHP 8.5.0: {}\nphpcs: project, {}\nphpcbf: not found\nphpstan: not found\npint: not found\nphp-cs-fixer: not found",
+                tools.path().join("php").display(),
+                dir.path().join("vendor/bin/phpcs").display()
+            ))
+        );
+    }
+
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn test_status_action_opens_a_modal_when_the_item_is_not_drawn(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let app_state = cx.update(|cx| {
+            let app_state = workspace::AppState::test(cx);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            workspace::init(app_state.clone(), cx);
+            init(cx);
+            app_state
+        });
+        // Not a PHP project: no status bar item.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap().to_string();
+        fs::write(dir.path().join("notes.txt"), "x").unwrap();
+        app_state
+            .fs
+            .as_fake()
+            .insert_tree(&root, serde_json::json!({ "notes.txt": "x" }))
+            .await;
+        let project = Project::test(app_state.fs.clone(), [Path::new(&root)], cx).await;
+        let (multi, cx) = cx
+            .add_window_view(|window, cx| workspace::MultiWorkspace::test_new(project, window, cx));
+        cx.executor().allow_parking();
+        wait_for(cx, || REFRESHES.with(|n| n.get()) >= 1);
+        assert!(cx.debug_bounds("zenith-php-status").is_none());
+        cx.dispatch_action(Status);
+        cx.run_until_parked();
+        assert!(multi.read_with(cx, |multi, cx| {
+            multi
+                .workspace()
+                .read(cx)
+                .active_modal::<status_view::PhpStatusView>(cx)
+                .is_some()
+        }));
     }
 
     #[test]
