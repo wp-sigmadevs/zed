@@ -282,12 +282,17 @@ enum StatCheck {
     AskFirst,
 }
 
-/// `recorded` is the baseline, `current` the server now. Only an exact match proceeds; no
-/// baseline or a missing file is never "go ahead".
+/// `recorded` is the baseline, `current` the server now. Only a match with BOTH stamps present
+/// proceeds: a `None` stamp never proves equality, so a same-size file without stamps asks.
+/// No baseline or a missing file is never "go ahead"; a size change is a conflict either way.
 fn check_stat(recorded: Option<&RemoteStat>, current: Option<&RemoteStat>) -> StatCheck {
     match (recorded, current) {
-        (Some(recorded), Some(current)) if recorded == current => StatCheck::Proceed,
-        (Some(_), Some(_)) => StatCheck::Conflict,
+        (Some(recorded), Some(current)) if recorded.size != current.size => StatCheck::Conflict,
+        (Some(recorded), Some(current)) => match (&recorded.stamp, &current.stamp) {
+            (Some(recorded), Some(current)) if recorded == current => StatCheck::Proceed,
+            (Some(_), Some(_)) => StatCheck::Conflict,
+            _ => StatCheck::AskFirst,
+        },
         _ => StatCheck::AskFirst,
     }
 }
@@ -1113,6 +1118,41 @@ mod tests {
         assert_eq!(check_stat(Some(&v1), None), StatCheck::AskFirst);
         assert_eq!(check_stat(None, Some(&v1)), StatCheck::AskFirst);
         assert_eq!(check_stat(None, None), StatCheck::AskFirst);
+        // A None stamp never proves equality, even with the same size.
+        let s5n = RemoteStat {
+            size: 5,
+            stamp: None,
+        };
+        let s6n = RemoteStat {
+            size: 6,
+            stamp: None,
+        };
+        assert_eq!(check_stat(Some(&s5n), Some(&s5n)), StatCheck::AskFirst);
+        assert_eq!(check_stat(Some(&v1), Some(&s5n)), StatCheck::AskFirst);
+        assert_eq!(check_stat(Some(&s5n), Some(&v1)), StatCheck::AskFirst);
+        assert_eq!(check_stat(Some(&s5n), Some(&s6n)), StatCheck::Conflict);
+    }
+
+    #[gpui::test]
+    async fn a_same_size_file_without_stamps_asks_instead_of_overwriting(cx: &mut TestAppContext) {
+        let f = fixture(cx).await;
+        let no_stamp = RemoteStat {
+            size: 5,
+            stamp: None,
+        };
+        f.remote
+            .stats
+            .lock()
+            .expect("stats")
+            .insert(REMOTE.into(), no_stamp.clone());
+        f.store.update(cx, |store, _| {
+            store.copies.get_mut(&f.cache_path).expect("copy").stat = Some(no_stamp);
+        });
+        f.save("hello", cx);
+        assert_eq!(f.upload(true, false, cx), UploadStart::Started);
+        cx.run_until_parked();
+        assert_eq!(*f.events.borrow(), [UploadOutcome::AskFirst]);
+        assert!(f.puts().is_empty(), "an unprovable match must not write");
     }
 
     #[test]

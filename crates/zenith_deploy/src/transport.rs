@@ -54,7 +54,8 @@ pub struct RemoteEntry {
 pub struct RemoteStat {
     pub size: u64,
     /// Opaque change marker (MDTM reply, `ls` date columns): equal stamps mean "same file",
-    /// nothing else. `None` when the server does not report one.
+    /// nothing else. `None` when the server does not report one; a `None` stamp never proves
+    /// equality (the remote-edit save check asks instead of proceeding).
     pub stamp: Option<String>,
 }
 
