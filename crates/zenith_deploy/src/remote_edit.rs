@@ -47,6 +47,7 @@ use crate::{
 };
 
 const DENIED: &str = "Uploading to this server is off for this session.";
+const MAPPING_CHANGED: &str = "The mapping changed; save again.";
 const TARGET_CHANGED: &str =
     "The server's host, port, type or user changed since this download; download it again.";
 
@@ -157,6 +158,9 @@ pub struct RemoteCopy {
     pub again: Option<(SavedText, bool)>,
     /// The server target (`secrets::target_account`) this copy was downloaded from.
     target: String,
+    /// A write to this file started in this session (it succeeded or failed). A missing
+    /// baseline after that is a failed verification, not a first save: never "no baseline".
+    uploaded_once: bool,
 }
 
 impl RemoteCopy {
@@ -638,6 +642,7 @@ impl ServerStore {
                 state: CopyState::Idle,
                 again: None,
                 target,
+                uploaded_once: false,
             },
         );
         Ok(())
@@ -784,13 +789,49 @@ impl ServerStore {
         self.auto_upload_paused
     }
 
-    /// "Always upload the first save without asking" for this session, one server. Only the
-    /// no-baseline question: a remote file that changed since our last upload still asks.
-    pub fn set_skip_no_baseline_prompt(&mut self, server_id: &str, skip: bool) {
+    /// "Always upload the first save without asking" for this session, one server and its
+    /// current target (host, port, type, user): a changed target forgets it, like
+    /// [`Self::upload_decision`]. Only the first save of a file that was never uploaded in this
+    /// session: a remote file that changed since our last upload (or whose last upload could not
+    /// be verified) still asks. False when the server does not exist.
+    pub fn set_skip_no_baseline_prompt(&mut self, server_id: &str, skip: bool) -> bool {
+        let Some(target) = self.current_target(server_id) else {
+            return false;
+        };
         if skip {
-            self.skip_no_baseline_prompt.insert(server_id.to_string());
+            self.skip_no_baseline_prompt
+                .insert(server_id.to_string(), target);
         } else {
             self.skip_no_baseline_prompt.remove(server_id);
+        }
+        true
+    }
+
+    fn skips_no_baseline_prompt(&self, server_id: &str) -> bool {
+        self.skip_no_baseline_prompt
+            .get(server_id)
+            .is_some_and(|target| Some(target) == self.current_target(server_id).as_ref())
+    }
+
+    /// Whether a mapped file still goes where it was queued for: `project_root` still has this
+    /// server as its default and the saved mapping, root path and exclusions still send the file
+    /// to the same remote path. A save that waited for a slot or behind a running upload
+    /// is not sent on the strength of a configuration that has since been edited.
+    fn mapping_problem(
+        &self,
+        local: &Path,
+        copy: &RemoteCopy,
+        project_root: &str,
+    ) -> Option<&'static str> {
+        if self.default_for(project_root) != Some(copy.server_id.as_str()) {
+            return Some(MAPPING_CHANGED);
+        }
+        let Some(server) = self.server_for(Some(project_root), &copy.server_id) else {
+            return Some(MAPPING_CHANGED);
+        };
+        match on_save::resolve(&server, local, &self.cache_dir) {
+            Ok(Some(resolved)) if resolved.remote == copy.remote_path => None,
+            _ => Some(MAPPING_CHANGED),
         }
     }
 
@@ -863,7 +904,8 @@ impl ServerStore {
         let Some(local) = buffer_path(buffer.read(cx), cx) else {
             return UploadStart::NotRemote;
         };
-        if local.starts_with(&self.cache_dir) {
+        // A buffer of another folder of the same window is not covered by this project's opt-in.
+        if local.starts_with(&self.cache_dir) || !local.starts_with(project_root) {
             return UploadStart::NotRemote;
         }
         let resolved = match on_save::resolve(&server, &local, &self.cache_dir) {
@@ -920,12 +962,14 @@ impl ServerStore {
                         state: CopyState::Uploading,
                         again: None,
                         target,
+                        uploaded_once: false,
                     },
                 );
             }
         }
         let run = MappedRun {
             root: resolved.folder,
+            project_root: project_root.to_string(),
             limit: self.connection_limit(&server),
         };
         let task = cx.spawn({
@@ -954,6 +998,9 @@ impl ServerStore {
             if let Some(stat) = new_stat {
                 copy.stat = stat;
             }
+            if matches!(outcome, UploadOutcome::Uploaded | UploadOutcome::Failed(_)) {
+                copy.uploaded_once = true;
+            }
             next = copy.again.take().filter(|(_, forced)| match outcome {
                 UploadOutcome::Uploaded => true,
                 UploadOutcome::Conflict | UploadOutcome::AskFirst => *forced,
@@ -980,6 +1027,7 @@ impl ServerStore {
 /// check and the server's session limit.
 struct MappedRun {
     root: PathBuf,
+    project_root: String,
     limit: std::sync::Arc<smol::lock::Semaphore>,
 }
 
@@ -1028,12 +1076,21 @@ async fn run_upload(
                             .is_some()
                             .then(|| this.auto_upload_problem(&copy.server_id))
                             .flatten()
+                    })
+                    // The mapping, root path or default server was edited while this waited.
+                    .or_else(|| {
+                        mapped.as_ref().and_then(|run| {
+                            this.mapping_problem(&cache_path, copy, &run.project_root)
+                        })
                     }),
-                    // The user's "always" for the first save of a file with no baseline. With a
-                    // baseline there is nothing to skip, so a Conflict is never silenced.
+                    // The user's "always" for the first save of a file never uploaded in this
+                    // session. With a baseline there is nothing to skip, so a Conflict is never
+                    // silenced; after an upload whose verification failed there is no baseline
+                    // either, but that is not a first save and asks.
                     mapped.is_some()
                         && copy.stat.is_none()
-                        && this.skip_no_baseline_prompt.contains(&copy.server_id),
+                        && !copy.uploaded_once
+                        && this.skips_no_baseline_prompt(&copy.server_id),
                 )
             })
         });
@@ -1060,6 +1117,7 @@ async fn run_upload(
             let check = cx.background_spawn(on_save::check_real_path(
                 run.root.clone(),
                 cache_path.clone(),
+                Some(PathBuf::from(&run.project_root)),
             ));
             if let Err(error) = check.await {
                 this.update(cx, |this, cx| {
@@ -2660,5 +2718,246 @@ mod tests {
         cx.run_until_parked();
         assert!(f.puts().is_empty());
         assert_eq!(f.connects(), 0);
+    }
+
+    /// Starts an upload, queues a second save behind it, edits the saved servers, then lets the
+    /// first upload finish: the queued save must not follow the old configuration.
+    async fn a_queued_save_after_an_edit(cx: &mut TestAppContext, edit: impl FnOnce(&mut Servers)) {
+        let f = mapped_fixture(cx, |_| {}).await;
+        let buffer = f.open("inc/a.php", cx).await;
+        let (release, gate) = futures::channel::oneshot::channel();
+        *f.remote.put_gate.lock().expect("gate") = Some(gate);
+        Fixture::save_in(&buffer, "one", cx);
+        assert_eq!(f.upload(&buffer, true, cx), UploadStart::Started);
+        cx.run_until_parked();
+        Fixture::save_in(&buffer, "two", cx);
+        assert_eq!(f.upload(&buffer, true, cx), UploadStart::Queued);
+        f.edit_servers(cx, edit);
+        release.send(()).expect("release");
+        cx.run_until_parked();
+        assert_eq!(
+            f.puts(),
+            [(MAPPED_REMOTE.to_string(), b"one".to_vec())],
+            "nothing more goes to the old path"
+        );
+        assert_eq!(
+            f.outcomes(),
+            [
+                UploadOutcome::Uploaded,
+                UploadOutcome::Blocked("The mapping changed; save again.".into())
+            ]
+        );
+    }
+
+    #[gpui::test]
+    async fn a_queued_save_stops_when_the_mapping_is_deleted(cx: &mut TestAppContext) {
+        a_queued_save_after_an_edit(cx, |servers| servers.servers[0].mappings.clear()).await;
+    }
+
+    #[gpui::test]
+    async fn a_queued_save_stops_when_the_mapped_remote_folder_changes(cx: &mut TestAppContext) {
+        a_queued_save_after_an_edit(cx, |servers| {
+            servers.servers[0].mappings[0].remote = "t-staging".into()
+        })
+        .await;
+    }
+
+    #[gpui::test]
+    async fn a_queued_save_stops_when_the_root_path_changes(cx: &mut TestAppContext) {
+        a_queued_save_after_an_edit(cx, |servers| {
+            servers.servers[0].root_path = "/var/www2".into()
+        })
+        .await;
+    }
+
+    #[gpui::test]
+    async fn a_queued_save_stops_when_the_project_default_moves_to_another_server(
+        cx: &mut TestAppContext,
+    ) {
+        a_queued_save_after_an_edit(cx, |servers| {
+            let mut other = servers.servers[0].clone();
+            other.id = "other-server".into();
+            servers.servers.push(other);
+            for default in servers.project_defaults.values_mut() {
+                *default = "other-server".into();
+            }
+        })
+        .await;
+    }
+
+    #[gpui::test]
+    async fn a_save_waiting_for_a_slot_rechecks_the_mapping_too(cx: &mut TestAppContext) {
+        let f = mapped_fixture(cx, |server| server.advanced.connections = 1).await;
+        let (release, gate) = futures::channel::oneshot::channel();
+        *f.remote.put_gate.lock().expect("gate") = Some(gate);
+        let mut buffers = Vec::new();
+        for rel in ["inc/a.php", "inc/b.php"] {
+            let buffer = f.open(rel, cx).await;
+            Fixture::save_in(&buffer, "new", cx);
+            assert_eq!(f.upload(&buffer, true, cx), UploadStart::Started);
+            buffers.push(buffer);
+        }
+        cx.run_until_parked();
+        f.edit_servers(cx, |servers| servers.servers[0].mappings.clear());
+        release.send(()).expect("release");
+        cx.run_until_parked();
+        assert_eq!(f.puts().len(), 1, "only the upload that already ran");
+        assert_eq!(f.outcomes().len(), 2);
+        assert!(matches!(&f.outcomes()[1], UploadOutcome::Blocked(_)));
+    }
+
+    #[gpui::test]
+    async fn the_skip_set_never_applies_after_an_upload_whose_verification_failed(
+        cx: &mut TestAppContext,
+    ) {
+        let f = mapped_fixture(cx, |_| {}).await;
+        let buffer = f.open("inc/a.php", cx).await;
+        let id = f.server_id.clone();
+        f.store
+            .update(cx, |store, _| store.set_skip_no_baseline_prompt(&id, true));
+        // The server keeps answering with a size we did not write: the re-stat cannot verify.
+        *f.remote.put_keeps_stat.lock().expect("flag") = true;
+        f.remote.stats.lock().expect("stats").insert(
+            MAPPED_REMOTE.into(),
+            RemoteStat {
+                size: 99,
+                stamp: Some("x".into()),
+            },
+        );
+        Fixture::save_in(&buffer, "<?php echo 1;", cx);
+        assert_eq!(f.upload(&buffer, false, cx), UploadStart::Started);
+        cx.run_until_parked();
+        assert_eq!(f.outcomes(), [UploadOutcome::Uploaded]);
+        assert_eq!(f.puts().len(), 1);
+
+        // Someone changes the file; the next save must ask, not overwrite unchecked.
+        f.remote.stats.lock().expect("stats").insert(
+            MAPPED_REMOTE.into(),
+            RemoteStat {
+                size: 77,
+                stamp: Some("y".into()),
+            },
+        );
+        Fixture::save_in(&buffer, "<?php echo 2;", cx);
+        assert_eq!(f.upload(&buffer, false, cx), UploadStart::Started);
+        cx.run_until_parked();
+        assert_eq!(f.outcomes().last(), Some(&UploadOutcome::AskFirst));
+        assert_eq!(f.puts().len(), 1);
+    }
+
+    #[gpui::test]
+    async fn the_skip_set_is_forgotten_when_the_servers_host_changes(cx: &mut TestAppContext) {
+        let f = mapped_fixture(cx, |_| {}).await;
+        let buffer = f.open("inc/a.php", cx).await;
+        let id = f.server_id.clone();
+        f.store
+            .update(cx, |store, _| store.set_skip_no_baseline_prompt(&id, true));
+        f.edit_servers(cx, |servers| {
+            servers.servers[0].host = "other.example.com".into()
+        });
+        Fixture::save_in(&buffer, "<?php echo 1;", cx);
+        assert_eq!(f.upload(&buffer, false, cx), UploadStart::Started);
+        cx.run_until_parked();
+        assert_eq!(f.outcomes(), [UploadOutcome::AskFirst]);
+        assert!(f.puts().is_empty(), "the new host was not sent the file");
+    }
+
+    #[gpui::test]
+    async fn saving_a_server_that_points_elsewhere_clears_its_upload_confirmation(
+        cx: &mut TestAppContext,
+    ) {
+        let f = mapped_fixture(cx, |_| {}).await;
+        type Edit = fn(&mut ServerConfig);
+        let rows: [(&str, Edit, bool); 6] = [
+            ("host", |s| s.host = "other.example.com".into(), false),
+            ("port", |s| s.port = 2222, false),
+            ("user", |s| s.username = "someone".into(), false),
+            ("type", |s| s.server_type = crate::ServerType::Sftp, false),
+            ("root", |s| s.root_path = "/var/www2".into(), false),
+            ("name", |s| s.name = "Renamed".into(), true),
+        ];
+        let original = f
+            .store
+            .read_with(cx, |store, _| store.servers().servers[0].clone());
+        for (what, edit, stays) in rows {
+            // Every row starts from the confirmed server as it was.
+            f.edit_servers(cx, |servers| servers.servers[0] = original.clone());
+            let task = f.store.update(cx, |store, cx| {
+                let previous = store.servers().clone();
+                let mut servers = previous.clone();
+                edit(&mut servers.servers[0]);
+                store.save(previous, servers, Vec::new(), cx)
+            });
+            task.await.expect("saved");
+            let server = f
+                .store
+                .read_with(cx, |store, _| store.servers().servers[0].clone());
+            assert_eq!(server.upload_on_save_confirmed, stays, "{what}");
+            assert!(server.upload_on_save, "{what}: the switch itself stays");
+        }
+    }
+
+    #[gpui::test]
+    async fn a_file_of_another_folder_of_the_window_is_not_covered_by_this_projects_opt_in(
+        cx: &mut TestAppContext,
+    ) {
+        let f = mapped_fixture(cx, |_| {}).await;
+        let other = f.dir.path().join("other");
+        std::fs::create_dir_all(&other).expect("mkdir");
+        std::fs::write(other.join("x.php"), "x").expect("write");
+        f.app_state
+            .fs
+            .as_fake()
+            .insert_tree(&other, serde_json::json!({ "x.php": "x" }))
+            .await;
+        let other_text = other.to_string_lossy().into_owned();
+        f.edit_servers(cx, |servers| {
+            servers.servers[0].mappings.push(crate::config::Mapping {
+                local: other_text,
+                remote: "o".into(),
+            });
+        });
+        let buffer = open(&f.app_state, &other.join("x.php"), cx).await;
+        Fixture::save_in(&buffer, "changed", cx);
+        assert_eq!(f.upload(&buffer, true, cx), UploadStart::NotRemote);
+        cx.run_until_parked();
+        assert!(f.puts().is_empty());
+        assert_eq!(f.connects(), 0);
+    }
+
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn a_link_between_the_project_root_and_the_mapped_folder_blocks_the_upload(
+        cx: &mut TestAppContext,
+    ) {
+        let f = mapped_fixture(cx, |_| {}).await;
+        let elsewhere = f.dir.path().join("elsewhere");
+        std::fs::create_dir_all(elsewhere.join("inner")).expect("mkdir");
+        std::fs::write(elsewhere.join("inner/x.php"), "x").expect("write");
+        std::os::unix::fs::symlink(&elsewhere, f.project.join("real")).expect("link");
+        let mapped = f.project.join("real/inner");
+        f.app_state
+            .fs
+            .as_fake()
+            .insert_tree(&mapped, serde_json::json!({ "x.php": "x" }))
+            .await;
+        let mapped_text = mapped.to_string_lossy().into_owned();
+        f.edit_servers(cx, |servers| {
+            servers.servers[0].mappings.push(crate::config::Mapping {
+                local: mapped_text,
+                remote: "m".into(),
+            });
+        });
+        let buffer = open(&f.app_state, &mapped.join("x.php"), cx).await;
+        Fixture::save_in(&buffer, "changed", cx);
+        assert_eq!(f.upload(&buffer, true, cx), UploadStart::Started);
+        cx.run_until_parked();
+        assert!(f.puts().is_empty());
+        assert_eq!(f.connects(), 0);
+        let outcomes = f.outcomes();
+        assert!(
+            matches!(outcomes.as_slice(), [UploadOutcome::Blocked(message)] if message.contains("symbolic link")),
+            "{outcomes:?}"
+        );
     }
 }

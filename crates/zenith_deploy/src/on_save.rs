@@ -114,21 +114,29 @@ pub enum Excluded {
 
 fn is_secret_name(name: &str) -> bool {
     let name = name.to_ascii_lowercase();
-    name.starts_with(".env")
-        || name == "wp-config.php"
-        || [".pem", ".key", ".p12", ".pfx"]
+    // A private key by name (`id_rsa`, `id_rsa_old`), never its public half.
+    let is_key = ["id_rsa", "id_dsa", "id_ecdsa", "id_ed25519"]
+        .iter()
+        .any(|key| name.starts_with(key))
+        && !name.ends_with(".pub");
+    is_key
+        || name.starts_with(".env")
+        || name.ends_with(".env")
+        || name.starts_with("wp-config")
+        || [".pem", ".key", ".p12", ".pfx", ".ppk"]
             .iter()
             .any(|suffix| name.ends_with(suffix))
         || matches!(
             name.as_str(),
-            "id_dsa"
-                | "id_ecdsa"
-                | "id_ed25519"
-                | "id_rsa"
-                | ".htpasswd"
+            ".htpasswd"
                 | "auth.json"
                 | ".npmrc"
                 | ".git"
+                | ".git-credentials"
+                | ".netrc"
+                | ".pgpass"
+                | "sftp-config.json"
+                | ".aws"
         )
 }
 
@@ -150,9 +158,13 @@ pub fn excluded(rel: &Path, user: &PathMatcher) -> Option<Excluded> {
             _ => None,
         })
         .collect();
-    if names
-        .iter()
-        .any(|name| name.to_str().is_none_or(is_secret_name))
+    let in_vscode = names.windows(2).any(|pair| {
+        pair[0].eq_ignore_ascii_case(".vscode") && pair[1].eq_ignore_ascii_case("sftp.json")
+    });
+    if in_vscode
+        || names
+            .iter()
+            .any(|name| name.to_str().is_none_or(is_secret_name))
     {
         return Some(Excluded::Fixed);
     }
@@ -170,7 +182,30 @@ pub fn excluded(rel: &Path, user: &PathMatcher) -> Option<Excluded> {
 /// canonicalize to the canonical `root` plus its relative path, so a symlink anywhere in the
 /// mapped tree, pointing inside or outside, is refused. Blocking: call it from a background
 /// task (`cx.background_spawn`), never on the main thread.
-pub async fn check_real_path(root: PathBuf, file: PathBuf) -> Result<()> {
+///
+/// The mapped folder `root` itself must not be a symbolic link, and when it lies under
+/// `project_root` it must canonicalize to the canonical project root plus its own relative path
+/// (so a link in a folder between the two is refused too).
+pub async fn check_real_path(
+    root: PathBuf,
+    file: PathBuf,
+    project_root: Option<PathBuf>,
+) -> Result<()> {
+    if std::fs::symlink_metadata(&root)?.file_type().is_symlink() {
+        bail!(
+            "{} is a symbolic link; files under it are not uploaded",
+            root.display()
+        );
+    }
+    if let Some(project_root) = project_root
+        && let Ok(root_rel) = root.strip_prefix(&project_root)
+        && std::fs::canonicalize(&root)? != std::fs::canonicalize(&project_root)?.join(root_rel)
+    {
+        bail!(
+            "{} is not at its own path (a symbolic link is in the way); it is not uploaded",
+            root.display()
+        );
+    }
     let rel = file.strip_prefix(&root)?.to_path_buf();
     let real_root = std::fs::canonicalize(&root)?;
     let real_file = std::fs::canonicalize(&file)?;
@@ -327,6 +362,48 @@ mod tests {
     }
 
     #[test]
+    fn more_secret_names_are_excluded_and_a_public_key_is_not() {
+        let user = user();
+        for secret in [
+            "wp-config.php.bak",
+            "wp-config.php~",
+            "wp-config.old.php",
+            "wp-config-sample.php",
+            "production.env",
+            "foo.ENV",
+            ".git-credentials",
+            ".netrc",
+            ".pgpass",
+            "putty/site.ppk",
+            "id_rsa_old",
+            "id_ed25519.bak",
+            "id_dsa",
+            "id_ecdsa",
+            "sftp-config.json",
+            ".vscode/sftp.json",
+            "a/.VSCode/SFTP.json",
+            ".aws/credentials",
+            "x/.aws/config",
+        ] {
+            assert_eq!(
+                excluded(Path::new(secret), &user),
+                Some(Excluded::Fixed),
+                "{secret}"
+            );
+        }
+        for fine in [
+            "id_rsa.pub",
+            "id_ed25519.pub",
+            "sftp.json",
+            ".vscode/settings.json",
+            "foo.environment",
+            "inc/aws.php",
+        ] {
+            assert_eq!(excluded(Path::new(fine), &user), None, "{fine}");
+        }
+    }
+
+    #[test]
     fn the_users_patterns_apply_to_the_path_every_folder_and_every_name() {
         let user = user();
         assert_eq!(
@@ -365,6 +442,7 @@ mod tests {
         let result = smol::block_on(check_real_path(
             dir.path().to_path_buf(),
             dir.path().join("inc/a.php"),
+            None,
         ));
         assert!(result.is_ok(), "{result:?}");
     }
@@ -383,12 +461,63 @@ mod tests {
         std::os::unix::fs::symlink("real.php", root.join("inside.php")).expect("link");
         std::os::unix::fs::symlink("../outside", root.join("dirlink")).expect("link");
         for file in ["link.php", "inside.php", "dirlink/s.txt"] {
-            let result = smol::block_on(check_real_path(root.clone(), root.join(file)));
+            let result = smol::block_on(check_real_path(root.clone(), root.join(file), None));
             assert!(result.is_err(), "{file} must be refused");
         }
-        let result = smol::block_on(check_real_path(root.clone(), root.join("real.php")));
+        let result = smol::block_on(check_real_path(root.clone(), root.join("real.php"), None));
         assert!(result.is_ok(), "{result:?}");
         // A missing file is an error, not a pass.
-        assert!(smol::block_on(check_real_path(root.clone(), root.join("gone.php"))).is_err());
+        assert!(
+            smol::block_on(check_real_path(root.clone(), root.join("gone.php"), None)).is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_mapped_folder_that_is_a_link_or_sits_behind_one_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let project = dir.path().join("project");
+        let other = dir.path().join("other");
+        std::fs::create_dir_all(project.join("real/inner")).expect("mkdir");
+        std::fs::create_dir_all(other.join("inner")).expect("mkdir");
+        std::fs::write(other.join("x.php"), "x").expect("write");
+        std::fs::write(other.join("inner/x.php"), "x").expect("write");
+        std::fs::write(project.join("real/inner/x.php"), "x").expect("write");
+        // The mapped folder itself is a link to another directory.
+        std::os::unix::fs::symlink(&other, project.join("sub")).expect("link");
+        let root = project.join("sub");
+        let result = smol::block_on(check_real_path(
+            root.clone(),
+            root.join("x.php"),
+            Some(project.clone()),
+        ));
+        assert!(result.is_err(), "a link as the mapped folder: {result:?}");
+        let result = smol::block_on(check_real_path(root.clone(), root.join("x.php"), None));
+        assert!(result.is_err(), "also without a project root: {result:?}");
+
+        // A folder between the project root and the mapped folder is a link.
+        std::fs::rename(project.join("real"), dir.path().join("moved")).expect("move");
+        std::os::unix::fs::symlink(&other, project.join("real")).expect("link");
+        let root = project.join("real/inner");
+        let file = root.join("x.php");
+        let result = smol::block_on(check_real_path(root, file, Some(project)));
+        assert!(
+            result.is_err(),
+            "a link above the mapped folder: {result:?}"
+        );
+
+        // A plain tree passes, with and without the project root; a mapped folder above the
+        // project root only gets the link check on itself.
+        let plain = dir.path().join("plain");
+        std::fs::create_dir_all(plain.join("a/b")).expect("mkdir");
+        std::fs::write(plain.join("a/b/f.php"), "x").expect("write");
+        for project_root in [None, Some(plain.clone()), Some(plain.join("a/b/c"))] {
+            let result = smol::block_on(check_real_path(
+                plain.join("a/b"),
+                plain.join("a/b/f.php"),
+                project_root,
+            ));
+            assert!(result.is_ok(), "{result:?}");
+        }
     }
 }

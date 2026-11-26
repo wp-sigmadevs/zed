@@ -117,7 +117,8 @@ pub struct ServerStore {
     auto_upload_paused: bool,
     /// Servers whose first-save-without-baseline question the user answered "always" this
     /// session. Never skips a Conflict.
-    skip_no_baseline_prompt: std::collections::HashSet<String>,
+    /// Each with the target it was said for ([`ServerStore::set_skip_no_baseline_prompt`]).
+    skip_no_baseline_prompt: HashMap<String, String>,
     /// Per server, the number of sessions auto-upload may hold at once (`advanced.connections`).
     connection_limits: HashMap<String, (usize, Arc<smol::lock::Semaphore>)>,
     _load: Task<()>,
@@ -307,10 +308,21 @@ impl ServerStore {
     fn save(
         &mut self,
         previous: Servers,
-        servers: Servers,
+        mut servers: Servers,
         session_changes: Vec<(ServerConfig, Option<Password>)>,
         cx: &mut Context<Self>,
     ) -> Task<Result<()>> {
+        // The one-time "upload on save" confirmation was given for one host and folder: a server
+        // that now points elsewhere must be confirmed again (plan 37 M4b).
+        for server in &mut servers.servers {
+            let moved = previous.servers.iter().any(|old| {
+                old.id == server.id
+                    && (old.credentials_target_changed(server) || old.root_path != server.root_path)
+            });
+            if moved {
+                server.upload_on_save_confirmed = false;
+            }
+        }
         if let Some(error) = &self.load_error {
             return Task::ready(Err(anyhow!(
                 "the saved servers could not be read, so they are not overwritten: {error}"
@@ -371,7 +383,8 @@ impl ServerStore {
             servers.servers.iter().map(|server| &server.id).collect();
         self.session_passwords.retain(|id, _| kept.contains(id));
         self.upload_decisions.retain(|id, _| kept.contains(id));
-        self.skip_no_baseline_prompt.retain(|id| kept.contains(id));
+        self.skip_no_baseline_prompt
+            .retain(|id, _| kept.contains(id));
         self.connection_limits.retain(|id, _| kept.contains(id));
         let removed: Vec<String> = self
             .servers
