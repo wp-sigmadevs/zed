@@ -866,7 +866,7 @@ impl TitleBar {
 
         PopoverMenu::new("recent-projects-menu")
             .menu(move |window, cx| {
-                Some(recent_projects::RecentProjects::popover(
+                Some(zenith_title_bar::project_switcher(
                     workspace.clone(),
                     window_project_groups.clone(),
                     None,
@@ -918,7 +918,7 @@ impl TitleBar {
 
         PopoverMenu::new("sidebar-title-recent-projects-menu")
             .menu(move |window, cx| {
-                Some(recent_projects::RecentProjects::popover(
+                Some(zenith_title_bar::project_switcher(
                     workspace.clone(),
                     window_project_groups.clone(),
                     None,
