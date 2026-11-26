@@ -29,7 +29,7 @@ actions!(
 
 /// Detection results for this app session, keyed by project root.
 #[derive(Default)]
-pub(crate) struct DetectCache(pub(crate) HashMap<PathBuf, ProjectInfo>);
+pub struct DetectCache(pub HashMap<PathBuf, ProjectInfo>);
 impl Global for DetectCache {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -1,5 +1,5 @@
 mod customize;
-mod detect;
+pub mod detect;
 mod learn;
 mod plugins;
 mod projects;
@@ -22,7 +22,8 @@ use workspace::{
 };
 use zed_actions::OpenOnboarding;
 
-pub use view::{FinishSetup, NewProject, Page, ZenithWelcome};
+pub use projects::open_mode;
+pub use view::{DetectCache, FinishSetup, NewProject, Page, ZenithWelcome};
 
 #[derive(Debug, Clone, Copy, RegisterSetting)]
 pub struct ZenithWelcomeSettings {

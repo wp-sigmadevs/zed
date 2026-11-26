@@ -72,7 +72,7 @@ fn project_name(project: &RecentWorkspace) -> String {
 }
 
 /// Where opened projects go, per the `default_open_behavior` setting.
-pub(crate) fn open_mode(cx: &App) -> OpenMode {
+pub fn open_mode(cx: &App) -> OpenMode {
     match WorkspaceSettings::get_global(cx).default_open_behavior {
         settings::DefaultOpenBehavior::ExistingWindow => OpenMode::Activate,
         settings::DefaultOpenBehavior::NewWindow => OpenMode::NewWindow,
