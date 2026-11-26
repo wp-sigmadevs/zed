@@ -269,9 +269,12 @@ fn mask_secret_body_cut(body: &str, content_type: Option<&str>, truncated: bool)
 /// Whether `line` is one line of `name=value` pairs joined by `&`, not markup or code that has an
 /// `=` and an `&` in it.
 fn looks_like_pairs(line: &str) -> bool {
-    !line.contains(['\n', '<', '{', '"', ';'])
+    !line.contains(['\n', '<', '{'])
         && line.contains('=')
-        && line.split('&').all(|pair| pair.contains('='))
+        && line
+            .split('&')
+            .filter(|pair| !pair.is_empty())
+            .all(|pair| pair.contains('='))
 }
 
 /// Whether the brackets of `text` close on its own line, outside its double-quoted strings.
@@ -554,10 +557,15 @@ fn has_secret_key(text: &str) -> bool {
                     && text
                         .get(ix..)
                         .is_some_and(|rest| rest.trim_start().starts_with(':'))
-                    // A key follows `{` or `,`; `a:hover`, `<b>Password:</b>`, `f(key:` do not.
-                    && text
-                        .get(..from)
-                        .is_some_and(|before| before.trim_end().ends_with(['{', ',']))
+                    // A key follows `{` or `,`, or starts its line (a header, YAML, `- key:`);
+                    // `a:hover`, `<b>Password:</b>`, `f(key:` do not.
+                    && text.get(..from).is_some_and(|before| {
+                        before.trim_end().ends_with(['{', ','])
+                            || before
+                                .rsplit('\n')
+                                .next()
+                                .is_some_and(|line| line.trim_matches([' ', '\t', '-']).is_empty())
+                    })
                     && is_secret_name(word)
                 {
                     return true;
@@ -1706,7 +1714,58 @@ mod tests {
         )
         .mark_truncated(MAX_RESPONSE_BYTES);
         assert_eq!(stored_response(&history, page)?.body, UNMASKABLE_BODY);
+        // A cut plain-text body with a header-style secret.
+        let text = typed("text/plain", "Authorization: Bearer SECRETVAL\nmore")
+            .mark_truncated(MAX_RESPONSE_BYTES);
+        assert_eq!(stored_response(&history, text)?.body, UNMASKABLE_BODY);
         Ok(())
+    }
+
+    #[test]
+    fn test_mask_secret_body_of_other_types_names_colon_style_secrets() {
+        for (content_type, body) in [
+            (Some("text/plain"), "Authorization: Bearer SECRETVAL"),
+            (None, "token: abc123"),
+            (
+                Some("application/yaml"),
+                "users:\n- user:\n    token: SECRETVAL\n",
+            ),
+            (Some("application/json"), "token: SECRETVAL"),
+        ] {
+            let masked = mask_secret_body(body, content_type);
+            assert_eq!(masked.as_deref(), Some(UNPARSEABLE), "{body}");
+        }
+        // Per record in a lines type.
+        let masked = mask_secret_body(
+            "{\"a\":1}\ntoken: SECRETVAL\n",
+            Some("application/x-ndjson"),
+        );
+        let expected = format!("{{\"a\":1}}\n{UNPARSEABLE}\n");
+        assert_eq!(masked.as_deref(), Some(expected.as_str()));
+    }
+
+    #[test]
+    fn test_mask_secret_body_of_pairs_with_empty_segments_or_semicolons() {
+        let plain = Some("text/plain");
+        for (body, expected) in [
+            (
+                "access_token=SECRETVAL&scope=read;write",
+                "access_token=***&scope=read;write",
+            ),
+            (
+                "oauth_token=X&oauth_token_secret=SECRETVAL&",
+                "oauth_token=***&oauth_token_secret=***&",
+            ),
+            ("token=SECRETVAL&&a=1", "token=***&&a=1"),
+        ] {
+            assert_eq!(
+                mask_secret_body(body, plain).as_deref(),
+                Some(expected),
+                "{body}"
+            );
+        }
+        // Still code, not pairs: a segment without `=` rejects the line.
+        assert_eq!(mask_secret_body("var password=e.value&&f()", plain), None);
     }
 
     #[test]
