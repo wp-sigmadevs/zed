@@ -998,21 +998,14 @@ mod tests {
     #[test]
     fn compat_mode_changes_into_the_folder_and_lists_without_a_path() {
         let unix_listing = "-rw-r--r--   1 u g   12 Nov 22 10:00 a.php\r\n";
-        for (use_list, hidden_files, expected) in [
-            (true, false, "LIST"),
-            (true, true, "LIST -a"),
-        ] {
+        for (hidden_files, expected) in [(false, "LIST"), (true, "LIST -a")] {
             let (port, server_thread) = fake_ftp_server_with(FakeFtp {
-                listing: if use_list {
-                    unix_listing.as_bytes().to_vec()
-                } else {
-                    LISTING.as_bytes().to_vec()
-                },
+                listing: unix_listing.as_bytes().to_vec(),
                 ..FakeFtp::default()
             });
             let mut server = plain_server(port);
             server.advanced.list_compat = true;
-            server.advanced.use_list = use_list;
+            server.advanced.use_list = true;
             server.advanced.hidden_files = hidden_files;
             let entries = smol::block_on(async {
                 let mut transport = connect(&server).await.expect("connect");

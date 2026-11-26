@@ -903,8 +903,9 @@ impl DeploymentDialog {
                                 })),
                         )
                         .child(
-                            div()
+                            h_flex()
                                 .pl_4()
+                                .gap_2()
                                 .debug_selector(|| "zenith-deploy-list-compat".to_string())
                                 .child(
                                     Checkbox::new(
@@ -919,7 +920,18 @@ impl DeploymentDialog {
                                                 !server.advanced.list_compat
                                         })
                                     })),
-                                ),
+                                )
+                                .when(!advanced.use_list, |row| {
+                                    row.child(
+                                        div()
+                                            .debug_selector(|| "zenith-deploy-needs-list".to_string())
+                                            .child(
+                                                Label::new("(needs LIST)")
+                                                    .size(LabelSize::Small)
+                                                    .color(Color::Muted),
+                                            ),
+                                    )
+                                }),
                         ),
                 )
             })
@@ -2146,6 +2158,62 @@ mod tests {
             }
         }
         assert!(problems.is_empty(), "{}", problems.join("\n"));
+    }
+
+    #[gpui::test]
+    async fn compat_listing_is_disabled_and_says_why_without_list(cx: &mut TestAppContext) {
+        let servers = Servers {
+            servers: vec![server("Live", None)],
+            ..Servers::default()
+        };
+        let (_, dialog, cx) = open_dialog(servers, &FakeRemote::default(), cx).await;
+        dialog.update(cx, |dialog, cx| {
+            dialog.advanced_open = true;
+            dialog.update_selected(cx, |server| {
+                server.server_type = ServerType::Ftps;
+                server.advanced.use_list = false;
+                server.advanced.list_compat = true;
+            })
+        });
+        cx.run_until_parked();
+        let compat = |dialog: &Entity<DeploymentDialog>, cx: &mut VisualTestContext| {
+            dialog.read_with(cx, |dialog, _| {
+                dialog
+                    .selected_server()
+                    .expect("selected")
+                    .advanced
+                    .list_compat
+            })
+        };
+        let click_checkbox = |cx: &mut VisualTestContext| {
+            let row = cx
+                .debug_bounds("zenith-deploy-list-compat")
+                .expect("the compat row is drawn");
+            // The checkbox sits at the left of the row, after its indent.
+            let at = gpui::point(row.left() + rems(1.5).to_pixels(px(16.)), row.center().y);
+            cx.simulate_click(at, gpui::Modifiers::none());
+            cx.run_until_parked();
+        };
+        assert!(
+            cx.debug_bounds("zenith-deploy-needs-list").is_some(),
+            "LIST is off: the row says what it needs"
+        );
+        click_checkbox(cx);
+        assert!(
+            compat(&dialog, cx),
+            "a click on the disabled checkbox changes nothing"
+        );
+
+        dialog.update(cx, |dialog, cx| {
+            dialog.update_selected(cx, |server| server.advanced.use_list = true)
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("zenith-deploy-needs-list").is_none());
+        click_checkbox(cx);
+        assert!(
+            !compat(&dialog, cx),
+            "the same click works once LIST is on, so the click above did reach the checkbox"
+        );
     }
 
     #[gpui::test]

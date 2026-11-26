@@ -341,8 +341,8 @@ impl ServerStore {
         if let Err(error) = validate_changed(&previous, &servers) {
             return Task::ready(Err(error));
         }
-        // The one-time "upload on save" confirmation was given for one host, folder and set of
-        // mappings: a server that now points elsewhere must be confirmed again (plan 37 M4b).
+        // The one-time "upload on save" confirmation was given for what `on_save::fingerprint`
+        // covers: a server that now differs in any of it must be confirmed again (plan 37 M4b).
         for server in &mut servers.servers {
             let old = previous.servers.iter().find(|old| old.id == server.id);
             let confirmed_now = reconfirmed.get(&server.id) == Some(&on_save::fingerprint(server));

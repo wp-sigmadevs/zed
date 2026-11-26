@@ -543,7 +543,7 @@ impl ServerStore {
     }
 
     /// The decision for `server`: [`UploadDecision::Ask`] unless the user chose one this session
-    /// for the server's current target (a changed host, port, type or username resets it).
+    /// for the server's current target (a changed host, port, type, username or anonymous login resets it).
     pub fn upload_decision(&self, server_id: &str) -> UploadDecision {
         self.upload_decisions
             .get(server_id)
@@ -565,8 +565,8 @@ impl ServerStore {
     }
 
     /// The remote stat recorded for the copy at `cache_path`, only while it is still the same
-    /// file on the same server target (host, port, type, user): a stat from another host says
-    /// nothing about this one. `None` makes the next upload ask first.
+    /// file on the same server target (`secrets::upload_target`: host, port, type, user and
+    /// anonymous login): a stat from another host says nothing about this one. `None` makes the next upload ask first.
     pub(crate) fn baseline_for(
         &self,
         cache_path: &Path,
