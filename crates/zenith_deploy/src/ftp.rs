@@ -467,6 +467,39 @@ mod tests {
         list_reply: Option<&'static str>,
         /// Opens the listing data connection, closes it unread and answers `426`.
         list_drops_data: bool,
+        /// Opens the listing data connection and resets it (RST) before sending any byte.
+        list_resets_data: bool,
+    }
+
+    /// Closes `stream` with a TCP reset (SO_LINGER 0) instead of a FIN.
+    #[cfg(unix)]
+    fn reset_on_close(stream: std::net::TcpStream) {
+        use std::os::fd::AsRawFd as _;
+        #[repr(C)]
+        struct Linger {
+            on: i32,
+            seconds: i32,
+        }
+        unsafe extern "C" {
+            fn setsockopt(fd: i32, level: i32, name: i32, value: *const Linger, len: u32) -> i32;
+        }
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        let (level, name) = (0xffff, 0x80);
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+        let (level, name) = (1, 13);
+        let linger = Linger { on: 1, seconds: 0 };
+        // SAFETY: a valid open socket fd and a correctly sized `struct linger`.
+        let status = unsafe {
+            setsockopt(
+                stream.as_raw_fd(),
+                level,
+                name,
+                &linger,
+                std::mem::size_of::<Linger>() as u32,
+            )
+        };
+        assert_eq!(status, 0, "SO_LINGER");
+        drop(stream);
     }
 
     impl Default for FakeFtp {
@@ -479,6 +512,7 @@ mod tests {
                 mdtm_closing: false,
                 list_reply: None,
                 list_drops_data: false,
+                list_resets_data: false,
             }
         }
     }
@@ -542,6 +576,10 @@ mod tests {
                         if listing && script.list_drops_data {
                             drop(stream);
                             reply("426 aborted\r\n");
+                            continue;
+                        }
+                        if listing && script.list_resets_data {
+                            reset_on_close(stream);
                             continue;
                         }
                         let body = if listing {
@@ -901,6 +939,11 @@ mod tests {
                 list_drops_data: true,
                 ..FakeFtp::default()
             },
+            // A reset before any byte is an io::Error, not an FtpError.
+            FakeFtp {
+                list_resets_data: true,
+                ..FakeFtp::default()
+            },
         ] {
             assert!(stat_without_mdtm(script, false).is_err());
         }
@@ -910,6 +953,11 @@ mod tests {
         for script in [
             FakeFtp {
                 list_reply: Some("550 denied"),
+                ..FakeFtp::default()
+            },
+            // 425 (no data connection) is a refusal that keeps the session.
+            FakeFtp {
+                list_reply: Some("425 no data"),
                 ..FakeFtp::default()
             },
             FakeFtp {
