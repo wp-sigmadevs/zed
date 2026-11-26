@@ -886,6 +886,7 @@ impl TitleBar {
                                 .color(Color::Muted),
                         )
                     })
+                    .when_some(zenith_title_bar::chevron(cx), |this, i| this.end_icon(i))
                     .selected_style(ButtonStyle::Tinted(TintColor::Accent))
                     .when(!is_project_selected, |s| s.color(Color::Muted)),
                 move |_window, cx| {
@@ -938,6 +939,7 @@ impl TitleBar {
                                 .color(Color::Muted),
                         )
                     })
+                    .when_some(zenith_title_bar::chevron(cx), |this, i| this.end_icon(i))
                     .selected_style(ButtonStyle::Tinted(TintColor::Accent))
                     .when(!is_project_selected, |s| s.color(Color::Muted)),
                 move |_window, cx| {
