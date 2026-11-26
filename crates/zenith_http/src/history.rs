@@ -241,6 +241,10 @@ fn mask_secret_body_cut(body: &str, content_type: Option<&str>, truncated: bool)
     if lines_type || content_type.contains("json") {
         return match mask_json_stream(text) {
             Some(masked) => masked,
+            // Not a run of JSON values (a PHP notice before the JSON, a trailing comma, a number
+            // out of range): serde cannot mask it, so one that names a secret is not stored. A
+            // lines type is cut per record below, as a line is its own value.
+            None if !lines_type && has_secret_key(text) => Some(UNPARSEABLE.to_string()),
             None => mask_json_records(body, false, '\n'),
         };
     }
@@ -410,9 +414,13 @@ fn mask_json_records(body: &str, truncated: bool, separator: char) -> Option<Str
                 render_json(&parsed.0, content.contains('\n'))
                     .unwrap_or_else(|| UNMASKABLE_LINE.to_string())
             }),
-            None if !truncated => None,
-            None if Some(ix) == last => Some(UNMASKABLE_LINE.to_string()),
-            None => return None,
+            // Several values in one record (json-seq without U+001E) are masked one by one.
+            None => match mask_json_stream(content) {
+                Some(stream) => stream,
+                None if !truncated => has_secret_key(content).then(|| UNPARSEABLE.to_string()),
+                None if Some(ix) == last => Some(UNMASKABLE_LINE.to_string()),
+                None => return None,
+            },
         };
         match masked {
             Some(masked) => {
@@ -424,6 +432,44 @@ fn mask_json_records(body: &str, truncated: bool, separator: char) -> Option<Str
     }
     out.push_str(note);
     changed.then_some(out)
+}
+
+/// Stored in place of a JSON-typed body, or one of its records, that does not parse and names a
+/// secret: it cannot be masked, and it is not known to be cut.
+const UNPARSEABLE: &str = "[not stored: not valid JSON, secrets could not be masked]";
+
+/// Whether `text` holds a `"name":` with a secret `name`, found by scanning for quotes rather than
+/// parsing, so it works on text no JSON parser accepts. Every quote is tried as the start of a key
+/// (a stray quote in the text cannot throw the later ones off); a false hit only costs a marker.
+// shortcut: a key written with a surrogate pair escape is read as two replacement characters,
+// so an exotic name spelled that way is not caught.
+fn has_secret_key(text: &str) -> bool {
+    text.match_indices('"').any(|(ix, _)| {
+        let Some(rest) = text.get(ix + 1..) else {
+            return false;
+        };
+        let (mut name, mut chars) = (String::new(), rest.chars());
+        loop {
+            match chars.next() {
+                Some('"') => break,
+                Some('\\') => match chars.next() {
+                    Some('u') => {
+                        let hex = chars.by_ref().take(4).collect::<String>();
+                        let decoded = u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32);
+                        name.push(decoded.unwrap_or('\u{fffd}'));
+                    }
+                    Some('n') => name.push('\n'),
+                    Some('t') => name.push('\t'),
+                    Some('r') => name.push('\r'),
+                    Some(other) => name.push(other),
+                    None => return false,
+                },
+                Some(c) => name.push(c),
+                None => return false,
+            }
+        }
+        chars.as_str().trim_start().starts_with(':') && is_secret_name(&name)
+    })
 }
 
 /// Stored in place of a cut-off JSON body: it cannot be parsed, so its secrets cannot be masked.
@@ -1390,6 +1436,71 @@ mod tests {
             );
         }
         Ok(())
+    }
+
+    #[test]
+    fn test_mask_secret_json_that_does_not_parse_fails_closed() {
+        let json = Some("application/json");
+        let deep = format!("{}{}", "[".repeat(129), "]".repeat(129));
+        let bodies = [
+            // Number out of range.
+            "{\"token\":\"SECRETVAL\",\"n\":1e999}".to_string(),
+            // Past serde's recursion limit.
+            format!("{{\"token\":\"SECRETVAL\",\"x\":{deep}}}"),
+            // Lone surrogate.
+            "{\"access_token\":\"SECRETVAL\",\"name\":\"\\ud83d\"}".to_string(),
+            // PHP notice before pretty-printed JSON.
+            "<br />\n<b>Notice</b>: x<br />\n{\n    \"token\": \"SECRETVAL\"\n}\n".to_string(),
+            // Trailing comma.
+            "{\"password\":\"SECRETVAL\",}".to_string(),
+            // Key spelled with an escape.
+            "{\"tok\\u0065n\":\"SECRETVAL\",}".to_string(),
+        ];
+        for body in &bodies {
+            let masked = mask_secret_body(body, json);
+            assert_eq!(masked.as_deref(), Some(UNPARSEABLE), "{body}");
+        }
+        // The same record under a lines type is replaced alone, its neighbours stay.
+        let lines = format!("{{\"a\":1}}\n{}\n{{\"b\":2}}\n", bodies[4]);
+        let masked = mask_secret_body(&lines, Some("application/x-ndjson")).unwrap();
+        assert_eq!(masked, format!("{{\"a\":1}}\n{UNPARSEABLE}\n{{\"b\":2}}\n"));
+        // json-seq record with a secret that does not parse.
+        let seq = format!("\u{1e}{}\n", bodies[4]);
+        let masked = mask_secret_body(&seq, Some("application/json-seq")).unwrap();
+        assert_eq!(masked, format!("\u{1e}{UNPARSEABLE}\n"));
+        // No secret key in it: stored as it was.
+        for plain in [
+            "<br />\n<b>Notice</b>: x<br />\n{\"a\":1,}\n",
+            "{\"name\":\"password\",}",
+            "not json at all",
+            "{\"a\":\"say \\\"token\\\" now\",}",
+        ] {
+            assert_eq!(mask_secret_body(plain, json), None, "{plain}");
+            assert_eq!(mask_secret_body(plain, Some("application/x-ndjson")), None);
+        }
+    }
+
+    #[test]
+    fn test_disk_history_does_not_store_json_that_does_not_parse_and_names_a_secret() -> Result<()>
+    {
+        let temp = tempfile::tempdir()?;
+        let history = HistoryDir::new(temp.path().join("h"), 10, u64::MAX);
+        let stored = stored_response(
+            &history,
+            typed("application/json", "{\"token\":\"SECRETVAL\",\"n\":1e999}"),
+        )?;
+        assert_eq!(stored.body, UNPARSEABLE);
+        let stored = stored_response(&history, typed("application/json", "{\"a\":1,}"))?;
+        assert_eq!(stored.body, "{\"a\":1,}");
+        Ok(())
+    }
+
+    #[test]
+    fn test_mask_secret_json_seq_without_record_separators() {
+        let seq = Some("application/json-seq");
+        let masked = mask_secret_body("{\"a\":1}\n{\"token\":\"SECRETVAL\"}\n", seq).unwrap();
+        assert_eq!(masked, "{\"a\":1}\n{\"token\":\"***\"}\n");
+        assert_eq!(mask_secret_body("{\"a\":1}\n{\"b\":2}\n", seq), None);
     }
 
     #[test]
