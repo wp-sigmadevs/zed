@@ -2606,13 +2606,12 @@ mod tests {
         cx.run_until_parked();
         assert!(f.puts().is_empty());
         assert_eq!(f.connects(), 0);
-        let events = f.events.borrow();
+        let events = f.events.borrow().clone();
         assert_eq!(events.len(), 1);
         assert!(
             matches!(&events[0].1, UploadOutcome::Blocked(message) if message.contains("never uploaded automatically") && message.contains("wp-config.php")),
             "{events:?}"
         );
-        drop(events);
 
         // The default `excluded_local` list: silent.
         let ignored = f.open("node_modules/x.js", cx).await;
