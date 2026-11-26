@@ -1082,7 +1082,7 @@ fn register_actions(
         })
         .register_action(|workspace, action: &workspace::Open, window, cx| {
             telemetry::event!("Project Opened");
-            workspace::prompt_for_open_path_and_open(
+            zenith::prompt_for_open_path_and_open(
                 workspace,
                 workspace.app_state().clone(),
                 PathPromptOptions {
@@ -1105,7 +1105,7 @@ fn register_actions(
         })
         .register_action(|workspace, _: &workspace::OpenFiles, window, cx| {
             let directories = cx.can_select_mixed_files_and_dirs();
-            workspace::prompt_for_open_path_and_open(
+            zenith::prompt_for_open_path_and_open(
                 workspace,
                 workspace.app_state().clone(),
                 PathPromptOptions {
