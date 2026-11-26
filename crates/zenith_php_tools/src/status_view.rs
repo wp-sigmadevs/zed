@@ -2,13 +2,14 @@
 //! anchored to the status bar item, or as a modal when that item is not drawn (a non-PHP project,
 //! or the palette action).
 
+use crate::php_modal::{FocusNextControl, FocusPreviousControl};
 use crate::{
     ProjectKind, Reinstall, Remove, ShowInstallLog, StatusReport, Update, collect, detect_php,
     display_path, environment, managed_bin,
 };
 use gpui::{
     Action as _, Anchor, App, ClipboardItem, Context, DismissEvent, Entity, EventEmitter,
-    FocusHandle, Focusable, Role, SharedString, Task, WeakEntity, Window,
+    FocusHandle, Focusable, MouseDownEvent, Role, SharedString, Task, WeakEntity, Window,
 };
 use std::path::{Path, PathBuf};
 use ui::{
@@ -18,8 +19,12 @@ use ui::{
 use workspace::ModalView;
 
 pub struct PhpStatusView {
+    /// The whole view: what the popover or modal layer focuses and restores focus from.
+    focus_handle: FocusHandle,
     /// The first button, "PHP Settings…": where focus lands on open.
     settings_focus: FocusHandle,
+    /// "Copy" ran: shown as a status line.
+    copied: bool,
     root: PathBuf,
     home: PathBuf,
     /// `None` while the lookup runs.
@@ -32,6 +37,12 @@ impl PhpStatusView {
     pub fn new(root: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let settings_focus = cx.focus_handle();
         settings_focus.focus(window, cx);
+        // The layer that shows this focuses the root; focus still starts on the first button.
+        let focus_handle = cx.focus_handle();
+        cx.on_focus(&focus_handle, window, |this, window, cx| {
+            this.settings_focus.focus(window, cx)
+        })
+        .detach();
         let home = std::env::var_os("HOME")
             .map(PathBuf::from)
             .unwrap_or_default();
@@ -66,7 +77,9 @@ impl PhpStatusView {
             }
         });
         Self {
+            focus_handle,
             settings_focus,
+            copied: false,
             root,
             home,
             report: None,
@@ -151,7 +164,7 @@ impl PhpStatusView {
                 self.row(
                     "PHP",
                     &self.short(path),
-                    format!("PHP {version}: {}", self.short(path)),
+                    format!("PHP {version}: {}", path.display()),
                     self.found("php", path, None, Some(version.clone()), cx),
                 )
                 .into_any_element(),
@@ -185,7 +198,7 @@ impl PhpStatusView {
                         format!(
                             "{name}: {}, {}",
                             resolved.source.label(),
-                            self.short(&resolved.path)
+                            resolved.path.display()
                         ),
                         self.found(
                             name,
@@ -220,6 +233,21 @@ impl PhpStatusView {
     fn copy(&mut self, cx: &mut Context<Self>) {
         if let Some(report) = &self.report {
             cx.write_to_clipboard(ClipboardItem::new_string(report.to_string()));
+            self.copied = true;
+            cx.notify();
+        }
+    }
+
+    /// Tab and Shift-Tab stay inside the view: past the last control they wrap.
+    fn move_focus(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if forward {
+            window.focus_next(cx);
+        } else {
+            window.focus_prev(cx);
+        }
+        if !self.focus_handle.contains_focused(window, cx) {
+            // Focusing the root would bounce to the first button (`on_focus`): go there directly.
+            self.settings_focus.focus(window, cx);
         }
     }
 }
@@ -233,13 +261,14 @@ fn more_menu(
     cx: &mut App,
 ) -> Entity<ContextMenu> {
     ContextMenu::build(window, cx, move |menu, _, _| {
-        let item = |menu: ContextMenu, label: &'static str, action: fn() -> Box<dyn gpui::Action>| {
-            let this = this.clone();
-            menu.entry(label, None, move |window, cx| {
-                this.update(cx, |_, cx| cx.emit(DismissEvent)).ok();
-                window.dispatch_action(action(), cx);
-            })
-        };
+        let item =
+            |menu: ContextMenu, label: &'static str, action: fn() -> Box<dyn gpui::Action>| {
+                let this = this.clone();
+                menu.entry(label, None, move |window, cx| {
+                    this.update(cx, |_, cx| cx.emit(DismissEvent)).ok();
+                    window.dispatch_action(action(), cx);
+                })
+            };
         let menu = menu.context(focus.clone());
         let menu = item(menu, "Update PHP Tools", || Update.boxed_clone());
         let menu = item(menu, "Reinstall PHP Tools", || Reinstall.boxed_clone());
@@ -264,7 +293,7 @@ impl EventEmitter<DismissEvent> for PhpStatusView {}
 
 impl Focusable for PhpStatusView {
     fn focus_handle(&self, _: &App) -> FocusHandle {
-        self.settings_focus.clone()
+        self.focus_handle.clone()
     }
 }
 
@@ -272,16 +301,34 @@ impl Render for PhpStatusView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let this = cx.weak_entity();
         let kind = self.report.as_ref().map(|report| report.kind);
+        let dialog_label = match kind {
+            Some(kind) => format!("PHP tools, {} project", kind.label()),
+            None => "PHP tools".to_string(),
+        };
         v_flex()
             .id("zenith-php-status-view")
+            .debug_selector(|| "zenith-php-status-view".into())
             .key_context("ZenithPhpStatus")
             .role(Role::Dialog)
-            .aria_label("PHP tools status")
+            .aria_label(dialog_label)
             .tab_group()
+            .track_focus(&self.focus_handle)
             .on_action(cx.listener(|_, _: &menu::Cancel, _, cx| cx.emit(DismissEvent)))
-            // The base keymap's Tab is `menu::SelectNext`; nothing here selects, so it moves focus.
-            .on_action(cx.listener(|_, _: &menu::SelectNext, window, cx| window.focus_next(cx)))
-            .on_action(cx.listener(|_, _: &menu::SelectPrevious, window, cx| window.focus_prev(cx)))
+            // The base keymap's Tab is `menu::SelectNext`: `assets/keymaps/zenith.json` takes it
+            // over here, so Tab moves focus and Up/Down do nothing.
+            .on_action(cx.listener(|this, _: &FocusNextControl, window, cx| {
+                this.move_focus(true, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &FocusPreviousControl, window, cx| {
+                this.move_focus(false, window, cx)
+            }))
+            // A popover has no layer to close it on an outside click. The "⋯" menu is outside this
+            // view's bounds: its own clicks must not close the status.
+            .on_mouse_down_out(cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                if !this.more.is_deployed() {
+                    cx.emit(DismissEvent);
+                }
+            }))
             .elevation_3(cx)
             .w(rems(30.))
             .p_3()
@@ -307,9 +354,25 @@ impl Render for PhpStatusView {
                     .gap_1()
                     .children(self.render_rows(report, cx))
                     .into_any_element(),
-                None => Label::new("Looking up PHP and its tools…")
-                    .color(Color::Muted)
+                None => div()
+                    .id("zenith-php-status-loading")
+                    .role(Role::Status)
+                    .aria_label("Looking up PHP and its tools")
+                    .child(Label::new("Looking up PHP and its tools…").color(Color::Muted))
                     .into_any_element(),
+            })
+            .when(self.copied, |this| {
+                this.child(
+                    div()
+                        .id("zenith-php-status-copied")
+                        .role(Role::Status)
+                        .aria_label("Status copied to the clipboard")
+                        .child(
+                            Label::new("Copied")
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                        ),
+                )
             })
             .child(
                 h_flex()
@@ -325,21 +388,25 @@ impl Render for PhpStatusView {
                     .child(
                         h_flex()
                             .gap_1()
-                            .child(div().debug_selector(|| "zenith-php-status-copy".into()).child(
-                                IconButton::new("zenith-php-status-copy", IconName::Copy)
-                                    .icon_size(IconSize::Small)
-                                    .tab_index(1isize)
-                                    .aria_label("Copy status")
-                                    .disabled(self.report.is_none())
-                                    .tooltip(Tooltip::text("Copy status"))
-                                    .on_click(cx.listener(|this, _, _, cx| this.copy(cx))),
-                            ))
+                            .child(
+                                div()
+                                    .debug_selector(|| "zenith-php-status-copy".into())
+                                    .child(
+                                        IconButton::new("zenith-php-status-copy", IconName::Copy)
+                                            .icon_size(IconSize::Small)
+                                            .tab_index(1isize)
+                                            .aria_label("Copy status")
+                                            .disabled(self.report.is_none())
+                                            .tooltip(Tooltip::text("Copy status"))
+                                            .on_click(cx.listener(|this, _, _, cx| this.copy(cx))),
+                                    ),
+                            )
                             .child(
                                 PopoverMenu::new("zenith-php-status-more")
                                     .with_handle(self.more.clone())
                                     .anchor(Anchor::BottomRight)
                                     .menu({
-                                        let focus = self.settings_focus.clone();
+                                        let focus = self.focus_handle.clone();
                                         move |window, cx| {
                                             Some(more_menu(this.clone(), focus.clone(), window, cx))
                                         }
@@ -351,6 +418,7 @@ impl Render for PhpStatusView {
                                         )
                                         .icon_size(IconSize::Small)
                                         .tab_index(2isize)
+                                        .aria_expanded(self.more.is_deployed())
                                         .aria_label("More PHP tools actions"),
                                         Tooltip::text("More PHP tools actions"),
                                     ),

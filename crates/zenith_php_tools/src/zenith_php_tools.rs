@@ -647,18 +647,18 @@ pub async fn download_composer(
 
 use editor::Editor;
 use gpui::{
-    App, AppContext as _, Context, Entity, IntoElement, PromptLevel, Render,
-    SharedString, WeakEntity, Window, actions,
+    App, AppContext as _, Context, Entity, IntoElement, PromptLevel, Render, SharedString,
+    WeakEntity, Window, actions,
 };
 use project::{Project, WorktreeId};
 use settings::Settings as _;
 use ui::{Button, ButtonCommon as _, ButtonSize, LabelSize, Tooltip, prelude::*};
+use ui::{PopoverMenu, PopoverMenuHandle};
 use util::ResultExt as _;
 use workspace::{
     HideStatusItem, ItemHandle, OpenOptions, StatusItemView, Workspace,
     notifications::{NotificationId, simple_message_notification::MessageNotification},
 };
-use ui::{PopoverMenu, PopoverMenuHandle};
 
 actions!(
     zenith_php_tools,
@@ -689,10 +689,14 @@ pub fn init(cx: &mut App) {
             .status_bar()
             .update(cx, |bar, cx| bar.add_right_item(item, window, cx));
         workspace.register_action(move |workspace, _: &Status, window, cx| {
-            // The popover when the status bar item is drawn, else a modal. Shown outside the
+            // The popover when the status bar item is drawn, else a modal. A hidden status bar
+            // never draws the item, so its popover handle is empty or stale. Shown outside the
             // item's update: opening it refreshes the item (`on_open`).
+            let bar_visible = workspace.status_bar_visible(cx);
             let popover = status_item
-                .read_with(cx, |status, _| status.info.is_some().then(|| status.popover.clone()))
+                .read_with(cx, |status, _| {
+                    (bar_visible && status.info.is_some()).then(|| status.popover.clone())
+                })
                 .ok()
                 .flatten();
             match popover {
@@ -886,6 +890,7 @@ impl Render for PhpStatus {
             None => "PHP: not found".to_string(),
         };
         let (project, this) = (self.project.clone(), cx.weak_entity());
+        let label_text = label.clone();
         div()
             .debug_selector(|| "zenith-php-status".into())
             .child(
@@ -905,7 +910,9 @@ impl Render for PhpStatus {
                         Button::new("zenith-php-status", label)
                             .label_size(LabelSize::Small)
                             .size(ButtonSize::Compact)
-                            .aria_label("PHP tools: status"),
+                            .aria_expanded(self.popover.is_deployed())
+                            // Starts with the visible text (label in name).
+                            .aria_label(format!("{label_text}, tools status")),
                         Tooltip::text("PHP tools: status"),
                     ),
             )
@@ -1962,6 +1969,7 @@ mod tests {
         cx: &mut gpui::VisualTestContext,
         done: impl Fn(&mut gpui::VisualTestContext) -> bool,
     ) {
+        // Real sleep: `php -v` is a real process that finishes off the test executor.
         for _ in 0..150 {
             cx.run_until_parked();
             if done(cx) {
@@ -1984,14 +1992,37 @@ mod tests {
         &mut gpui::VisualTestContext,
     ) {
         let tools = tempfile::tempdir().unwrap();
-        let (dir, status, multi, cx) = php_window_multi(cx, vec![fake_php(tools.path(), "PHP 8.5.0 (cli)")]).await;
+        let (dir, status, multi, cx) =
+            php_window_multi(cx, vec![fake_php(tools.path(), "PHP 8.5.0 (cli)")]).await;
         write(dir.path(), "vendor/bin/phpcs", "");
+        // The real keymaps, so the tests press real keys.
+        cx.update(|_, cx| {
+            // Read from the checkout, not the embedded copy, which cargo does not rebuild for.
+            for text in [
+                include_str!("../../../assets/keymaps/default-macos.json"),
+                include_str!("../../../assets/keymaps/zenith.json"),
+            ] {
+                match settings::KeymapFile::load(text, cx) {
+                    settings::KeymapFileLoadResult::Success { key_bindings }
+                    | settings::KeymapFileLoadResult::SomeFailedToLoad { key_bindings, .. } => {
+                        cx.bind_keys(key_bindings)
+                    }
+                    settings::KeymapFileLoadResult::JsonParseFailure { error } => panic!("{error}"),
+                }
+            }
+        });
         wait_for_window(cx, |cx| cx.debug_bounds("zenith-php-status").is_some());
+        // Focus is somewhere outside the status before it opens: that is where it must return.
+        let workspace_focus = multi.read_with(cx, |multi, cx| {
+            gpui::Focusable::focus_handle(multi.workspace().read(cx), cx)
+        });
+        cx.update(|window, cx| window.focus(&workspace_focus, cx));
         let bounds = cx.debug_bounds("zenith-php-status").unwrap();
         cx.simulate_click(bounds.center(), gpui::Modifiers::none());
         wait_for_window(cx, |cx| {
             cx.debug_bounds("zenith-php-row pint = Not found").is_some()
         });
+        settle(cx);
         (tools, dir, status, multi, cx)
     }
 
@@ -2006,34 +2037,164 @@ mod tests {
                 .is_some()
         );
         assert!(status.read_with(cx, |status, _| status.popover.is_deployed()));
-        let ids = multi.read_with(cx, |multi, cx| multi.workspace().read(cx).notification_ids());
+        let ids = multi.read_with(cx, |multi, cx| {
+            multi.workspace().read(cx).notification_ids()
+        });
         assert!(ids.is_empty(), "the status is no toast: {ids:?}");
     }
 
     #[cfg(unix)]
     #[gpui::test]
-    async fn test_cancel_closes_the_status_popover_and_returns_focus(cx: &mut gpui::TestAppContext) {
-        let (_tools, _dir, status, _multi, cx) = open_status_popover(cx).await;
+    async fn test_cancel_closes_the_status_popover_and_returns_focus(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (_tools, _dir, status, multi, cx) = open_status_popover(cx).await;
         cx.run_until_parked();
-        assert!(cx.update(|window, cx| status.read(cx).popover.is_focused(window, cx)));
+        assert!(!workspace_has_focus(&multi, cx), "focus is in the popover");
         cx.dispatch_action(menu::Cancel);
         cx.run_until_parked();
         assert!(!status.read_with(cx, |status, _| status.popover.is_deployed()));
-        assert!(!cx.update(|window, cx| status.read(cx).popover.is_focused(window, cx)));
+        assert!(workspace_has_focus(&multi, cx));
+    }
+
+    /// A popover focuses its view two frames after it opens: draw until that has happened.
+    #[cfg(unix)]
+    fn settle(cx: &mut gpui::VisualTestContext) {
+        for _ in 0..4 {
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            cx.run_until_parked();
+        }
+    }
+
+    /// A key press and release: a focused button activates on the release.
+    #[cfg(unix)]
+    fn press(cx: &mut gpui::VisualTestContext, key: &'static str) {
+        // Draw first: the button listens for the key only if the last frame saw it focused.
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        cx.simulate_keystrokes(key);
+        cx.simulate_event(gpui::KeyUpEvent {
+            keystroke: gpui::Keystroke::parse(key).unwrap(),
+        });
+    }
+
+    #[cfg(unix)]
+    fn focused(cx: &mut gpui::VisualTestContext) -> Option<gpui::FocusHandle> {
+        cx.update(|window, cx| window.focused(cx))
+    }
+
+    #[cfg(unix)]
+    fn workspace_has_focus(
+        multi: &gpui::Entity<workspace::MultiWorkspace>,
+        cx: &mut gpui::VisualTestContext,
+    ) -> bool {
+        let handle = multi.read_with(cx, |multi, cx| {
+            gpui::Focusable::focus_handle(multi.workspace().read(cx), cx)
+        });
+        cx.update(|window, _| handle.is_focused(window))
     }
 
     #[cfg(unix)]
     #[gpui::test]
-    async fn test_tab_moves_focus_between_the_status_buttons(cx: &mut gpui::TestAppContext) {
+    async fn test_tab_cycles_focus_inside_the_status_popover(cx: &mut gpui::TestAppContext) {
         let (_tools, _dir, status, _multi, cx) = open_status_popover(cx).await;
         cx.run_until_parked();
-        let focused = |cx: &mut gpui::VisualTestContext| cx.update(|window, cx| window.focused(cx));
-        let first = focused(cx);
-        // The base keymap binds Tab to `menu::SelectNext`.
-        cx.dispatch_action(menu::SelectNext);
-        let second = focused(cx);
-        assert!(first.is_some() && second.is_some() && first != second);
+        let settings = focused(cx).expect("focus starts inside the popover");
+        cx.simulate_keystrokes("tab");
+        let copy = focused(cx).unwrap();
+        cx.simulate_keystrokes("tab");
+        let more = focused(cx).unwrap();
+        assert!(settings != copy && copy != more && settings != more);
+        // Past the last control it wraps, it does not leave the popover.
+        cx.simulate_keystrokes("tab");
+        assert!(
+            focused(cx) == Some(settings.clone()),
+            "wraps to the first button"
+        );
+        cx.simulate_keystrokes("shift-tab");
+        assert!(
+            focused(cx).is_some(),
+            "Shift-Tab from the first button stays in the view"
+        );
+        // Up and Down are not Tab.
+        cx.simulate_keystrokes("down");
+        assert!(focused(cx).is_some());
         assert!(status.read_with(cx, |status, _| status.popover.is_deployed()));
+    }
+
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn test_space_on_copy_copies_and_escape_returns_focus(cx: &mut gpui::TestAppContext) {
+        let (tools, dir, status, multi, cx) = open_status_popover(cx).await;
+        cx.run_until_parked();
+        cx.simulate_keystrokes("tab");
+        press(cx, "space");
+        let copied = cx.read_from_clipboard().and_then(|item| item.text());
+        assert_eq!(
+            copied,
+            Some(format!(
+                "Project: PHP\nPHP 8.5.0: {}\nphpcs: project, {}\nphpcbf: not found\nphpstan: not found\npint: not found\nphp-cs-fixer: not found",
+                tools.path().join("php").display(),
+                dir.path().join("vendor/bin/phpcs").display()
+            ))
+        );
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        assert!(!status.read_with(cx, |status, _| status.popover.is_deployed()));
+        assert!(
+            workspace_has_focus(&multi, cx),
+            "focus returns to where it was before the popover opened"
+        );
+    }
+
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn test_clicking_outside_closes_the_status_popover(cx: &mut gpui::TestAppContext) {
+        let (_tools, _dir, status, _multi, cx) = open_status_popover(cx).await;
+        cx.simulate_click(
+            gpui::point(gpui::px(5.), gpui::px(5.)),
+            gpui::Modifiers::none(),
+        );
+        cx.run_until_parked();
+        assert!(!status.read_with(cx, |status, _| status.popover.is_deployed()));
+    }
+
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn test_status_action_opens_a_modal_when_the_status_bar_is_hidden(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let tools = tempfile::tempdir().unwrap();
+        let (_dir, _status, multi, cx) =
+            php_window_multi(cx, vec![fake_php(tools.path(), "PHP 8.5.0 (cli)")]).await;
+        // Drawn once, so the popover handle is set (and stale after the bar is hidden).
+        wait_for_window(cx, |cx| cx.debug_bounds("zenith-php-status").is_some());
+        cx.update(|_, cx| {
+            let bar = workspace::StatusBarSettings::get_global(cx);
+            let hidden = workspace::StatusBarSettings {
+                show: false,
+                show_active_file: bar.show_active_file,
+                active_language_button: bar.active_language_button,
+                cursor_position_button: bar.cursor_position_button,
+                line_endings_button: bar.line_endings_button,
+                active_encoding_button: bar.active_encoding_button,
+                pending_keystrokes_indicator: bar.pending_keystrokes_indicator,
+            };
+            cx.update_global::<settings::SettingsStore, _>(|store, _| {
+                store.override_global(hidden)
+            });
+        });
+        cx.run_until_parked();
+        assert!(!multi.read_with(cx, |m, cx| m.workspace().read(cx).status_bar_visible(cx)));
+        cx.dispatch_action(Status);
+        cx.run_until_parked();
+        assert!(multi.read_with(cx, |multi, cx| {
+            multi
+                .workspace()
+                .read(cx)
+                .active_modal::<status_view::PhpStatusView>(cx)
+                .is_some()
+        }));
     }
 
     #[cfg(unix)]

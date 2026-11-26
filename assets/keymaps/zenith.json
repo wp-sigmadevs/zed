@@ -75,6 +75,15 @@
     },
   },
   {
+    // The PHP tools status popover. Tab and Shift-Tab move focus inside it (and wrap); without
+    // this the base keymap's "tab" (menu::SelectNext) does nothing here, and Up/Down stay inert.
+    "context": "ZenithPhpStatus",
+    "bindings": {
+      "tab": "zenith_php_tools::FocusNextControl",
+      "shift-tab": "zenith_php_tools::FocusPreviousControl",
+    },
+  },
+  {
     // Collapse / expand a hook in the WordPress Hooks tool window.
     "context": "WpHooksPanel",
     "bindings": {
