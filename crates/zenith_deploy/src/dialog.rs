@@ -6,14 +6,18 @@ use std::collections::HashMap;
 
 use editor::{Editor, EditorEvent};
 use gpui::{
-    App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, SharedString,
-    Subscription, Task, WeakEntity, Window, actions,
+    App, Context, DismissEvent, Div, Entity, EventEmitter, FocusHandle, Focusable,
+    PathPromptOptions, Role, SharedString, Stateful, Subscription, Task, WeakEntity, Window,
+    actions,
 };
 use ui::{Callout, Checkbox, Disclosure, IconButton, ListItem, Tooltip, prelude::*};
 use util::ResultExt as _;
 use workspace::{ModalView, Toast, Workspace, notifications::NotificationId};
 
-use crate::{Password, ServerConfig, ServerStore, ServerType, Servers, secrets, spawn_operation};
+use crate::{
+    Password, ServerConfig, ServerStore, ServerType, Servers, config::Mapping, on_save, secrets,
+    spawn_operation,
+};
 
 actions!(
     zenith_deploy,
@@ -72,6 +76,41 @@ impl Fields {
     }
 }
 
+/// The tabs of the right-hand side: each edits the selected server.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DialogTab {
+    Connection,
+    Mappings,
+    ExcludedPaths,
+}
+
+impl DialogTab {
+    const ALL: [Self; 3] = [Self::Connection, Self::Mappings, Self::ExcludedPaths];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Connection => "Connection",
+            Self::Mappings => "Mappings",
+            Self::ExcludedPaths => "Excluded Paths",
+        }
+    }
+
+    fn id(self) -> &'static str {
+        match self {
+            Self::Connection => "zenith-deploy-tab-connection",
+            Self::Mappings => "zenith-deploy-tab-mappings",
+            Self::ExcludedPaths => "zenith-deploy-tab-excluded",
+        }
+    }
+}
+
+/// One mapping of the selected server, as two editors. Dropping a row drops its subscriptions.
+struct MappingRow {
+    local: Entity<Editor>,
+    remote: Entity<Editor>,
+    _subscriptions: [Subscription; 2],
+}
+
 #[derive(Clone)]
 enum TestStatus {
     Running,
@@ -93,6 +132,11 @@ pub struct DeploymentDialog {
     selected: Option<usize>,
     project: Option<String>,
     fields: Fields,
+    tab: DialogTab,
+    /// The selected server's mappings, rebuilt when the selection or the row count changes.
+    mapping_rows: Vec<MappingRow>,
+    /// The selected server's `excluded_local`, one pattern per line.
+    excluded: Entity<Editor>,
     port_invalid: bool,
     advanced_open: bool,
     test_status: Option<TestStatus>,
@@ -102,6 +146,7 @@ pub struct DeploymentDialog {
     workspace: WeakEntity<Workspace>,
     _test: Option<Task<()>>,
     _save: Option<Task<()>>,
+    _browse: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -196,6 +241,29 @@ impl DeploymentDialog {
                 })
             })
             .collect();
+        let excluded = cx.new(|cx| {
+            // The feedback editor of `edit_prediction_ui`'s rate modal, minus its completions.
+            let mut editor = Editor::multi_line(window, cx);
+            editor.disable_scrollbars_and_minimap(window, cx);
+            editor.set_soft_wrap_mode(language::language_settings::SoftWrap::EditorWidth, cx);
+            editor.set_show_gutter(false, cx);
+            editor.set_show_line_numbers(false, cx);
+            editor.set_show_git_diff_gutter(false, cx);
+            editor.set_show_code_actions(false, cx);
+            editor.set_show_runnables(false, cx);
+            editor.set_show_bookmarks(false, cx);
+            editor.set_show_breakpoints(false, cx);
+            editor.set_show_wrap_guides(false, cx);
+            editor.set_show_indent_guides(false, cx);
+            editor.set_show_edit_predictions(Some(false), window, cx);
+            editor.set_placeholder_text("vendor\n*.log", window, cx);
+            editor
+        });
+        subscriptions.push(cx.subscribe(&excluded, |this, _, event: &EditorEvent, cx| {
+            if matches!(event, EditorEvent::BufferEdited) {
+                this.read_excluded(cx);
+            }
+        }));
         subscriptions.push(cx.observe_in(&store, window, |this, store, window, cx| {
             if !this.loaded && store.read(cx).is_loaded() {
                 this.copy_from_store(None, window, cx);
@@ -211,6 +279,9 @@ impl DeploymentDialog {
             selected: None,
             project,
             fields,
+            tab: DialogTab::Connection,
+            mapping_rows: Vec::new(),
+            excluded,
             port_invalid: false,
             advanced_open: false,
             test_status: None,
@@ -219,6 +290,7 @@ impl DeploymentDialog {
             workspace,
             _test: None,
             _save: None,
+            _browse: None,
             _subscriptions: subscriptions,
         };
         if this.store.read(cx).is_loaded() {
@@ -292,7 +364,160 @@ impl DeploymentDialog {
         for (editor, text) in texts {
             editor.update(cx, |editor, cx| editor.set_text(text, window, cx));
         }
+        let excluded = server.excluded_local.join("\n");
+        self.excluded
+            .update(cx, |editor, cx| editor.set_text(excluded, window, cx));
+        self.rebuild_mapping_rows(window, cx);
         cx.notify();
+    }
+
+    fn set_tab(&mut self, tab: DialogTab, cx: &mut Context<Self>) {
+        self.tab = tab;
+        cx.notify();
+    }
+
+    fn mapping_row(mapping: &Mapping, window: &mut Window, cx: &mut Context<Self>) -> MappingRow {
+        let editor =
+            |text: &str, placeholder: &str, window: &mut Window, cx: &mut Context<Self>| {
+                cx.new(|cx| {
+                    let mut editor = Editor::single_line(window, cx);
+                    editor.set_placeholder_text(placeholder, window, cx);
+                    editor.set_text(text, window, cx);
+                    editor
+                })
+            };
+        let local = editor(&mapping.local, "/path/to/folder", window, cx);
+        let remote = editor(&mapping.remote, "Relative to the root path", window, cx);
+        let on_edit = |this: &mut Self, _, event: &EditorEvent, cx: &mut Context<Self>| {
+            if matches!(event, EditorEvent::BufferEdited) {
+                this.read_mappings(cx);
+            }
+        };
+        let _subscriptions = [
+            cx.subscribe(&local, on_edit),
+            cx.subscribe(&remote, on_edit),
+        ];
+        MappingRow {
+            local,
+            remote,
+            _subscriptions,
+        }
+    }
+
+    /// One row per mapping of the selected server (none without one).
+    fn rebuild_mapping_rows(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let mappings = self
+            .selected_server()
+            .map(|server| server.mappings.clone())
+            .unwrap_or_default();
+        self.mapping_rows = mappings
+            .iter()
+            .map(|mapping| Self::mapping_row(mapping, window, cx))
+            .collect();
+        cx.notify();
+    }
+
+    /// Copies the mapping editors into the selected server.
+    fn read_mappings(&mut self, cx: &mut Context<Self>) {
+        let text = |editor: &Entity<Editor>| editor.read(cx).text(cx).trim().to_string();
+        let mappings: Vec<Mapping> = self
+            .mapping_rows
+            .iter()
+            .map(|row| Mapping {
+                local: text(&row.local),
+                remote: text(&row.remote),
+            })
+            .collect();
+        if let Some(server) = self.selected_server_mut() {
+            server.mappings = mappings;
+            cx.notify();
+        }
+    }
+
+    /// Copies the excluded-paths editor into the selected server: one pattern per line, blank
+    /// lines dropped.
+    fn read_excluded(&mut self, cx: &mut Context<Self>) {
+        let patterns: Vec<String> = self
+            .excluded
+            .read(cx)
+            .text(cx)
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(String::from)
+            .collect();
+        if let Some(server) = self.selected_server_mut() {
+            server.excluded_local = patterns;
+            cx.notify();
+        }
+    }
+
+    /// A new mapping starts at the project folder; the remote folder is the one to type.
+    pub(crate) fn add_mapping(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let local = self.project.clone().unwrap_or_default();
+        let Some(server) = self.selected_server_mut() else {
+            return;
+        };
+        server.mappings.push(Mapping {
+            local,
+            remote: String::new(),
+        });
+        self.rebuild_mapping_rows(window, cx);
+        if let Some(row) = self.mapping_rows.last() {
+            window.focus(&row.remote.focus_handle(cx), cx);
+        }
+    }
+
+    pub(crate) fn remove_mapping(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(server) = self.selected_server_mut() else {
+            return;
+        };
+        if index < server.mappings.len() {
+            server.mappings.remove(index);
+            self.rebuild_mapping_rows(window, cx);
+        }
+    }
+
+    /// Asks for a local folder with the system's folder dialog and types it into the row. Not
+    /// `Workspace::prompt_for_open_path`: its in-app fallback is a modal, which would replace
+    /// this dialog and drop what is typed in it.
+    pub(crate) fn browse_mapping(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(editor) = self.mapping_rows.get(index).map(|row| row.local.clone()) else {
+            return;
+        };
+        let paths = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: None,
+        });
+        self._browse = Some(cx.spawn_in(window, async move |this, cx| {
+            let folder = paths
+                .await
+                .ok()
+                .and_then(|result| result.log_err())
+                .flatten()
+                .and_then(|paths| paths.into_iter().next());
+            let Some(folder) = folder else {
+                return;
+            };
+            this.update_in(cx, |_, window, cx| {
+                editor.update(cx, |editor, cx| {
+                    editor.set_text(folder.to_string_lossy().into_owned(), window, cx)
+                })
+            })
+            .log_err();
+        }));
     }
 
     /// Copies the editors into the selected server.
@@ -771,6 +996,197 @@ impl DeploymentDialog {
             )
     }
 
+    /// A bordered editor that screen readers can name: the fork's editors expose no node of
+    /// their own (the pattern of `settings_ui`'s input field).
+    fn labeled_field(
+        id: impl Into<gpui::ElementId>,
+        label: impl Into<SharedString>,
+        role: Role,
+        editor: &Entity<Editor>,
+        cx: &App,
+    ) -> Stateful<Div> {
+        div()
+            .id(id)
+            .role(role)
+            .aria_label(label)
+            .aria_value(editor.read(cx).text(cx))
+            .track_focus(&editor.focus_handle(cx))
+            .min_w_0()
+            .px_2()
+            .border_1()
+            .border_color(cx.theme().colors().border)
+            .rounded_sm()
+            .child(editor.clone())
+    }
+
+    fn render_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = cx.theme().colors();
+        h_flex()
+            .id("zenith-deploy-tabs")
+            .debug_selector(|| "zenith-deploy-tabs".to_string())
+            .role(Role::TabList)
+            .aria_label("Server settings")
+            // The tabs are tab stops 0..2 of this group; the panel and the footer follow in
+            // document order.
+            .tab_group()
+            .gap_1()
+            .children(DialogTab::ALL.into_iter().enumerate().map(|(index, tab)| {
+                let selected = self.tab == tab;
+                h_flex()
+                    .id(tab.id())
+                    .debug_selector(|| tab.id().to_string())
+                    .role(Role::Tab)
+                    .aria_label(tab.label())
+                    .aria_selected(selected)
+                    .tab_index(index as isize)
+                    .px_2()
+                    .py_0p5()
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .when(selected, |this| this.bg(colors.element_selected))
+                    .hover(|style| style.bg(colors.element_hover))
+                    .focus_visible(|style| style.border_1().border_color(colors.border_focused))
+                    .child(Label::new(tab.label()).color(if selected {
+                        Color::Default
+                    } else {
+                        Color::Muted
+                    }))
+                    .on_click(cx.listener(move |this, _, _, cx| this.set_tab(tab, cx)))
+            }))
+    }
+
+    fn render_mappings(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let rows = self.mapping_rows.iter().enumerate().map(|(index, row)| {
+            let number = index + 1;
+            let side = |label: &'static str| {
+                div()
+                    .w(rems(5.))
+                    .child(Label::new(label).color(Color::Muted))
+            };
+            let button_box = || div().w(rems(6.)).flex_none();
+            v_flex()
+                .id(("zenith-deploy-mapping", index))
+                .debug_selector(move || format!("zenith-deploy-mapping-{index}"))
+                .gap_1()
+                .pb_1p5()
+                .border_b_1()
+                .border_color(cx.theme().colors().border_variant)
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .child(side("Local"))
+                        .child(
+                            Self::labeled_field(
+                                ("zenith-deploy-map-local", index),
+                                format!("Local folder, mapping {number}"),
+                                Role::TextInput,
+                                &row.local,
+                                cx,
+                            )
+                            .debug_selector(move || format!("zenith-deploy-map-local-{index}"))
+                            .flex_1(),
+                        )
+                        .child(
+                            button_box().child(
+                                Button::new(("zenith-deploy-map-browse", index), "Browse…")
+                                    .full_width()
+                                    .tooltip(Tooltip::text("Choose the local folder"))
+                                    .aria_label(format!(
+                                        "Browse for the local folder, mapping {number}"
+                                    ))
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.browse_mapping(index, window, cx)
+                                    })),
+                            ),
+                        ),
+                )
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .child(side("Remote"))
+                        .child(
+                            Self::labeled_field(
+                                ("zenith-deploy-map-remote", index),
+                                format!("Remote folder, mapping {number}"),
+                                Role::TextInput,
+                                &row.remote,
+                                cx,
+                            )
+                            .debug_selector(move || format!("zenith-deploy-map-remote-{index}"))
+                            .flex_1(),
+                        )
+                        .child(
+                            button_box().child(
+                                Button::new(("zenith-deploy-map-remove", index), "Remove")
+                                    .full_width()
+                                    .tooltip(Tooltip::text("Remove this mapping"))
+                                    .aria_label(format!("Remove mapping {number}"))
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.remove_mapping(index, window, cx)
+                                    })),
+                            ),
+                        ),
+                )
+        });
+        v_flex()
+            .debug_selector(|| "zenith-deploy-mappings".to_string())
+            .flex_1()
+            .min_w_0()
+            .gap_1p5()
+            .child(
+                Label::new("A local folder and the folder under the root path it uploads to. A saved file goes by the longest mapping that contains it.")
+                    .color(Color::Muted)
+                    .size(LabelSize::Small),
+            )
+            .children(rows)
+            .when(self.mapping_rows.is_empty(), |panel| {
+                panel.child(Label::new("No mappings. Add one with Add Mapping.").color(Color::Muted))
+            })
+            .child(
+                div().child(
+                    Button::new("zenith-deploy-map-add", "Add Mapping")
+                        .tooltip(Tooltip::text("Add a mapping, starting at the project folder"))
+                        .on_click(cx.listener(|this, _, window, cx| this.add_mapping(window, cx))),
+                ),
+            )
+    }
+
+    fn render_excluded(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
+            .debug_selector(|| "zenith-deploy-excluded".to_string())
+            .flex_1()
+            .min_w_0()
+            .gap_1p5()
+            .child(
+                Label::new("One pattern per line, for example vendor, *.log or build/**. Matching local files and folders are not uploaded on save.")
+                    .color(Color::Muted)
+                    .size(LabelSize::Small),
+            )
+            .child(
+                Self::labeled_field(
+                    "zenith-deploy-excluded-field",
+                    "Excluded paths, one pattern per line",
+                    Role::MultilineTextInput,
+                    &self.excluded,
+                    cx,
+                )
+                .debug_selector(|| "zenith-deploy-excluded-field".to_string())
+                .h(rems(10.)),
+            )
+            .child(
+                div()
+                    .debug_selector(|| "zenith-deploy-excluded-fixed".to_string())
+                    .child(
+                        Label::new(format!(
+                            "Always skipped, whatever is listed here: {}",
+                            on_save::fixed_exclusions_text()
+                        ))
+                        .color(Color::Muted)
+                        .size(LabelSize::Small),
+                    ),
+            )
+    }
+
     fn render_form(&self, server: &ServerConfig, cx: &mut Context<Self>) -> impl IntoElement {
         let types = h_flex()
             .gap_1()
@@ -1038,8 +1454,12 @@ impl DeploymentDialog {
 
 impl Render for DeploymentDialog {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let form = match self.selected_server().cloned() {
-            Some(server) => self.render_form(&server, cx).into_any_element(),
+        let content = match self.selected_server().cloned() {
+            Some(server) => match self.tab {
+                DialogTab::Connection => self.render_form(&server, cx).into_any_element(),
+                DialogTab::Mappings => self.render_mappings(cx).into_any_element(),
+                DialogTab::ExcludedPaths => self.render_excluded(cx).into_any_element(),
+            },
             None => v_flex()
                 .flex_1()
                 .items_center()
@@ -1054,6 +1474,13 @@ impl Render for DeploymentDialog {
                 )
                 .into_any_element(),
         };
+        let panel = v_flex()
+            .id("zenith-deploy-tab-panel")
+            .role(Role::TabPanel)
+            .aria_label(self.tab.label())
+            .flex_1()
+            .min_w_0()
+            .child(content);
         // Never wider than the window: a percentage here would resolve against
         // the modal layer's shrink-wrapped row, not the window.
         let width = rems(48.)
@@ -1070,16 +1497,18 @@ impl Render for DeploymentDialog {
             .gap_2()
             .child(Label::new("Deployment").weight(gpui::FontWeight::BOLD))
             .child(
-                Label::new("Connection")
-                    .color(Color::Muted)
-                    .size(LabelSize::Small),
-            )
-            .child(
                 h_flex()
                     .items_start()
                     .gap_3()
                     .child(self.render_server_list(cx))
-                    .child(form),
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .gap_2()
+                            .child(self.render_tabs(cx))
+                            .child(panel),
+                    ),
             )
             .child(self.render_footer(cx))
     }
@@ -2156,8 +2585,366 @@ mod tests {
                     }
                 }
             }
+            // The tabs: the strip is always drawn, each panel only on its own tab. Two mappings
+            // with long folders must wrap or shrink, not run past the edge.
+            dialog.update_in(cx, |dialog, window, cx| {
+                dialog.tab = DialogTab::Connection;
+                dialog.update_selected(cx, |server| server.server_type = ServerType::Ftps);
+                for _ in 0..2 {
+                    dialog.add_mapping(window, cx);
+                }
+                for row in &dialog.mapping_rows {
+                    let long = "a-folder-with-a-rather-long-name/".repeat(6);
+                    row.local.update(cx, |editor, cx| {
+                        editor.set_text(format!("/p/{long}"), window, cx)
+                    });
+                    row.remote
+                        .update(cx, |editor, cx| editor.set_text(long.clone(), window, cx));
+                }
+            });
+            for tab in DialogTab::ALL {
+                dialog.update(cx, |dialog, cx| dialog.set_tab(tab, cx));
+                cx.run_until_parked();
+                let limit = cx
+                    .debug_bounds("zenith-deploy-dialog")
+                    .expect("the dialog is drawn")
+                    .right();
+                let mut ids: Vec<(String, bool)> = vec![("zenith-deploy-tabs".into(), true)];
+                for other in DialogTab::ALL {
+                    ids.push((other.id().into(), true));
+                }
+                ids.push(("zenith-deploy-form".into(), tab == DialogTab::Connection));
+                let mappings = tab == DialogTab::Mappings;
+                ids.push(("zenith-deploy-mappings".into(), mappings));
+                for index in 0..2 {
+                    for part in ["mapping", "map-local", "map-remote"] {
+                        ids.push((format!("zenith-deploy-{part}-{index}"), mappings));
+                    }
+                }
+                let excluded = tab == DialogTab::ExcludedPaths;
+                for id in ["excluded", "excluded-field", "excluded-fixed"] {
+                    ids.push((format!("zenith-deploy-{id}"), excluded));
+                }
+                for (id, drawn) in ids {
+                    let bounds = cx.debug_bounds(Box::leak(id.clone().into_boxed_str()));
+                    if bounds.is_some() != drawn {
+                        problems.push(format!(
+                            "{tab:?}: {id} drawn = {}, expected {drawn}",
+                            bounds.is_some()
+                        ));
+                    }
+                    if let Some(bounds) = bounds
+                        && bounds.right() > limit + px(0.5)
+                    {
+                        problems.push(format!(
+                            "window {:?} {tab:?}: {id} right {:?} is past the dialog edge {limit:?}",
+                            viewport.width,
+                            bounds.right()
+                        ));
+                    }
+                }
+            }
+            dialog.update_in(cx, |dialog, window, cx| {
+                dialog.tab = DialogTab::Connection;
+                dialog.update_selected(cx, |server| server.mappings.clear());
+                dialog.rebuild_mapping_rows(window, cx);
+            });
         }
         assert!(problems.is_empty(), "{}", problems.join("\n"));
+    }
+
+    fn set_text(editor: &Entity<Editor>, text: &str, cx: &mut VisualTestContext) {
+        editor.update_in(cx, |editor, window, cx| editor.set_text(text, window, cx));
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    async fn switching_tabs_keeps_edits(cx: &mut TestAppContext) {
+        let servers = Servers {
+            servers: vec![server("Live", None)],
+            ..Servers::default()
+        };
+        let (_, dialog, cx) = open_dialog(servers, &FakeRemote::default(), cx).await;
+        let (host, excluded) = dialog.read_with(cx, |dialog, _| {
+            (dialog.fields.host.clone(), dialog.excluded.clone())
+        });
+        set_text(&host, "edited.example.com", cx);
+        dialog.update(cx, |dialog, cx| dialog.set_tab(DialogTab::Mappings, cx));
+        dialog.update_in(cx, |dialog, window, cx| dialog.add_mapping(window, cx));
+        cx.run_until_parked();
+        let remote = dialog.read_with(cx, |dialog, _| dialog.mapping_rows[0].remote.clone());
+        set_text(&remote, "sub", cx);
+        dialog.update(cx, |dialog, cx| {
+            dialog.set_tab(DialogTab::ExcludedPaths, cx)
+        });
+        set_text(&excluded, "vendor\n*.log", cx);
+
+        for tab in [
+            DialogTab::Connection,
+            DialogTab::Mappings,
+            DialogTab::ExcludedPaths,
+            DialogTab::Connection,
+        ] {
+            dialog.update(cx, |dialog, cx| dialog.set_tab(tab, cx));
+            cx.run_until_parked();
+            assert_eq!(text_of(&host, cx), "edited.example.com", "{tab:?}");
+            assert_eq!(text_of(&remote, cx), "sub", "{tab:?}");
+            assert_eq!(text_of(&excluded, cx), "vendor\n*.log", "{tab:?}");
+            dialog.read_with(cx, |dialog, _| {
+                let server = dialog.selected_server().expect("selected");
+                assert_eq!(server.host, "edited.example.com", "{tab:?}");
+                assert_eq!(
+                    server.mappings,
+                    [Mapping {
+                        local: "/p".into(),
+                        remote: "sub".into()
+                    }],
+                    "{tab:?}: a new mapping starts at the project folder"
+                );
+                assert_eq!(server.excluded_local, ["vendor", "*.log"], "{tab:?}");
+            });
+        }
+    }
+
+    #[gpui::test]
+    async fn mappings_and_exclusions_round_trip_to_the_store(cx: &mut TestAppContext) {
+        let servers = Servers {
+            servers: vec![server("Live", None)],
+            ..Servers::default()
+        };
+        let (workspace, dialog, cx) = open_dialog(servers, &FakeRemote::default(), cx).await;
+        dialog.update_in(cx, |dialog, window, cx| {
+            dialog.add_mapping(window, cx);
+            dialog.add_mapping(window, cx);
+        });
+        cx.run_until_parked();
+        let (local, remote, second, excluded) = dialog.read_with(cx, |dialog, _| {
+            (
+                dialog.mapping_rows[0].local.clone(),
+                dialog.mapping_rows[0].remote.clone(),
+                dialog.mapping_rows[1].local.clone(),
+                dialog.excluded.clone(),
+            )
+        });
+        set_text(&local, "/p/theme", cx);
+        set_text(&remote, " wp-content/themes/x ", cx);
+        set_text(&second, "/p/plugin", cx);
+        set_text(&excluded, "vendor\n\n  *.log \n", cx);
+        // A row removed before OK is not saved.
+        dialog.update_in(cx, |dialog, window, cx| {
+            dialog.remove_mapping(1, window, cx)
+        });
+        cx.run_until_parked();
+        dialog.update(cx, |dialog, cx| dialog.save(cx));
+        cx.run_until_parked();
+
+        let saved = cx.update(|_, cx| ServerStore::global(cx).read(cx).servers().clone());
+        assert_eq!(
+            saved.servers[0].mappings,
+            [Mapping {
+                local: "/p/theme".into(),
+                remote: "wp-content/themes/x".into()
+            }]
+        );
+        assert_eq!(saved.servers[0].excluded_local, ["vendor", "*.log"]);
+
+        let dialog = reopen(&workspace, cx);
+        let (rows, texts) = dialog.read_with(cx, |dialog, cx| {
+            let rows = dialog.mapping_rows.len();
+            let texts: Vec<String> = [
+                &dialog.mapping_rows[0].local,
+                &dialog.mapping_rows[0].remote,
+                &dialog.excluded,
+            ]
+            .map(|editor| editor.read(cx).text(cx))
+            .into();
+            (rows, texts)
+        });
+        assert_eq!(rows, 1);
+        assert_eq!(texts, ["/p/theme", "wp-content/themes/x", "vendor\n*.log"]);
+    }
+
+    #[gpui::test]
+    async fn an_invalid_glob_is_refused_before_any_keychain_call(cx: &mut TestAppContext) {
+        let saved = server("Live", None);
+        let servers = Servers {
+            servers: vec![saved.clone()],
+            ..Servers::default()
+        };
+        let keychain = std::sync::Arc::new(crate::secrets::fake::FakeKeychain::default());
+        keychain.put(&saved, "not-a-real-value-0");
+        let (_, dialog, cx) = open_dialog(servers, &FakeRemote::default(), cx).await;
+        let store = cx.update(|_, cx| ServerStore::global(cx));
+        store.update(cx, |store, _| store.keychain = keychain.clone());
+        let excluded = dialog.read_with(cx, |dialog, _| dialog.excluded.clone());
+        set_text(&excluded, "vendor\n[unclosed", cx);
+        dialog.read_with(cx, |dialog, _| {
+            assert_eq!(
+                dialog.servers.servers[0].excluded_local,
+                ["vendor", "[unclosed"],
+                "the editor feeds the server"
+            );
+        });
+        // Each would change the Keychain (a write, a delete) if the pattern got that far.
+        type Edit = fn(&mut DeploymentDialog);
+        let cases: [(&str, Edit); 3] = [
+            ("typed password", |dialog| {
+                let id = dialog.servers.servers[0].id.clone();
+                dialog.passwords.insert(id, fake_secret());
+            }),
+            ("host change, nothing typed", |dialog| {
+                dialog.servers.servers[0].host = "elsewhere.example.com".into();
+            }),
+            ("save password off", |dialog| {
+                dialog.servers.servers[0].save_password = false;
+            }),
+        ];
+        for (case, edit) in cases {
+            dialog.update(cx, |dialog, cx| {
+                dialog.servers = dialog.base.clone();
+                dialog.passwords.clear();
+                dialog.servers.servers[0].excluded_local =
+                    vec!["vendor".into(), "[unclosed".into()];
+                edit(dialog);
+                dialog.save(cx);
+            });
+            cx.run_until_parked();
+            let message = error_text(&dialog, cx);
+            assert!(
+                message.contains("Live") && message.contains("[unclosed"),
+                "{case}: {message}"
+            );
+            assert_eq!(
+                keychain.account_of(&saved),
+                Some(crate::secrets::target_account(&saved)),
+                "{case}: the saved entry is untouched"
+            );
+            let entries = keychain.entries.lock().expect("lock");
+            assert_eq!(entries.len(), 1, "{case}: no entry written");
+            assert_eq!(
+                entries.values().next().map(|(_, secret)| secret.as_slice()),
+                Some(b"not-a-real-value-0".as_slice()),
+                "{case}: the saved secret is untouched"
+            );
+        }
+        store.read_with(cx, |store, _| {
+            assert_eq!(
+                store.servers().servers[0].excluded_local,
+                saved.excluded_local
+            );
+        });
+        // Corrected, the same dialog saves: nothing was left locked.
+        dialog.update(cx, |dialog, _| {
+            dialog.servers = dialog.base.clone();
+            dialog.passwords.clear();
+        });
+        set_text(&excluded, "vendor\n[ab]c", cx);
+        dialog.update(cx, |dialog, cx| dialog.save(cx));
+        cx.run_until_parked();
+        store.read_with(cx, |store, _| {
+            assert_eq!(
+                store.servers().servers[0].excluded_local,
+                ["vendor", "[ab]c"]
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn changing_the_exclusions_asks_for_the_upload_confirmation_again(
+        cx: &mut TestAppContext,
+    ) {
+        let mut confirmed = server("Live", None);
+        confirmed.upload_on_save = true;
+        confirmed.upload_on_save_confirmed = true;
+        let servers = Servers {
+            servers: vec![confirmed],
+            ..Servers::default()
+        };
+        let (workspace, dialog, cx) = open_dialog(servers, &FakeRemote::default(), cx).await;
+        let confirmed_in_store = |cx: &mut VisualTestContext| {
+            cx.update(|_, cx| {
+                ServerStore::global(cx).read(cx).servers().servers[0].upload_on_save_confirmed
+            })
+        };
+        // Control: an edit that is not part of the fingerprint keeps the confirmation.
+        let name = dialog.read_with(cx, |dialog, _| dialog.fields.name.clone());
+        set_text(&name, "Renamed", cx);
+        dialog.update(cx, |dialog, cx| dialog.save(cx));
+        cx.run_until_parked();
+        assert!(confirmed_in_store(cx), "a rename needs no new confirmation");
+
+        let dialog = reopen(&workspace, cx);
+        let excluded = dialog.read_with(cx, |dialog, _| dialog.excluded.clone());
+        let current = text_of(&excluded, cx);
+        set_text(&excluded, &format!("{current}\nstorage"), cx);
+        dialog.update(cx, |dialog, cx| dialog.save(cx));
+        cx.run_until_parked();
+        assert!(
+            !confirmed_in_store(cx),
+            "other excluded paths: the confirmation is asked for again"
+        );
+    }
+
+    #[gpui::test]
+    async fn browse_asks_for_one_folder_and_fills_the_local_field(cx: &mut TestAppContext) {
+        let servers = Servers {
+            servers: vec![server("Live", None)],
+            ..Servers::default()
+        };
+        let (_, dialog, cx) = open_dialog(servers, &FakeRemote::default(), cx).await;
+        dialog.update_in(cx, |dialog, window, cx| {
+            dialog.add_mapping(window, cx);
+            dialog.browse_mapping(0, window, cx);
+        });
+        let mut asked = None;
+        cx.simulate_path_prompt_response(|options| {
+            asked = Some((options.files, options.directories, options.multiple));
+            Some(vec!["/p/chosen".into()])
+        });
+        cx.run_until_parked();
+        assert_eq!(asked, Some((false, true, false)), "one folder, no files");
+        let local = dialog.read_with(cx, |dialog, _| dialog.mapping_rows[0].local.clone());
+        assert_eq!(text_of(&local, cx), "/p/chosen");
+        dialog.read_with(cx, |dialog, _| {
+            assert_eq!(
+                dialog.selected_server().expect("selected").mappings[0].local,
+                "/p/chosen"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn the_tabs_are_tab_stops_in_order(cx: &mut TestAppContext) {
+        let servers = Servers {
+            servers: vec![server("Live", None)],
+            ..Servers::default()
+        };
+        let (_, _, cx) = open_dialog(servers, &FakeRemote::default(), cx).await;
+        cx.run_until_parked();
+        // Clicking a tab focuses it: collect the three tabs' focus handles.
+        let mut handles = Vec::new();
+        for tab in DialogTab::ALL {
+            let bounds = cx.debug_bounds(tab.id()).expect("the tab is drawn");
+            cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+            cx.run_until_parked();
+            handles.push(cx.update(|window, cx| window.focused(cx)).expect("focused"));
+        }
+        assert_eq!(handles.len(), 3);
+        assert!(
+            handles[0] != handles[1] && handles[1] != handles[2] && handles[0] != handles[2],
+            "each tab has its own focus handle"
+        );
+        // Tab from the first one visits the second, then the third.
+        cx.update(|window, cx| window.focus(&handles[0], cx));
+        for (step, expected) in [(1, &handles[1]), (2, &handles[2])] {
+            cx.update(|window, cx| window.focus_next(cx));
+            let focused = cx.update(|window, cx| window.focused(cx));
+            assert_eq!(
+                focused.as_ref(),
+                Some(expected),
+                "step {step} of Tab from the first tab"
+            );
+        }
     }
 
     #[gpui::test]
