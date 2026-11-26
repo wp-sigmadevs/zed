@@ -8,9 +8,9 @@ use project::ProjectGroupKey;
 use util::paths::PathExt as _;
 use workspace::RecentWorkspace;
 
-/// Badge colours, FNV-1a indexed. White text reads on every one.
+/// Badge colours, FNV-1a indexed. White text on each has a WCAG contrast of at least 4.5.
 const PALETTE: [u32; 8] = [
-    0x4a5b8c, 0x2f7d6b, 0x8a4f9e, 0xb0573a, 0x3e7cb1, 0x66742a, 0xa8436b, 0x5f6b7a,
+    0x4a5b8c, 0x2f7d6b, 0x8a4f9e, 0xb0573a, 0x3670a4, 0x66742a, 0xa8436b, 0x5f6b7a,
 ];
 
 /// Words of a project name: split on anything that is not alphanumeric and on
@@ -79,6 +79,12 @@ pub fn badge_color(name: &str) -> Hsla {
     gpui::rgb(PALETTE[badge_index(name)]).into()
 }
 
+/// Letters and colour of a project's badge, from the same input everywhere (title bar
+/// and switcher rows). `None` when no name has a letter or digit (emoji-only): no badge.
+pub fn badge_for(names: &[&str]) -> Option<(String, Hsla)> {
+    Some((initials(names)?, badge_color(&names.join(", "))))
+}
+
 /// `~/code/app` for paths under the home directory.
 pub fn display_path(path: &Path) -> String {
     path.compact().to_string_lossy().into_owned()
@@ -94,6 +100,24 @@ pub enum Entry<O> {
     /// Footer rows; the switcher adds them after [`entries`].
     OpenRemote,
     More,
+}
+
+impl<O> Entry<O> {
+    /// Identity of the row, stable while the list around it changes (element ids, selection).
+    pub fn id(&self) -> u64 {
+        use std::hash::{Hash as _, Hasher as _};
+        let mut hasher = std::hash::DefaultHasher::new();
+        match self {
+            Entry::Open => 0u8.hash(&mut hasher),
+            Entry::Clone => 1u8.hash(&mut hasher),
+            Entry::Header(title) => (2u8, title).hash(&mut hasher),
+            Entry::OpenProject(key, _) => (3u8, key).hash(&mut hasher),
+            Entry::Recent(project) => (4u8, project.project_group_key()).hash(&mut hasher),
+            Entry::OpenRemote => 5u8.hash(&mut hasher),
+            Entry::More => 6u8.hash(&mut hasher),
+        }
+        hasher.finish()
+    }
 }
 
 /// Open…, Clone…, then the open projects, then recent projects without the open ones
@@ -179,6 +203,64 @@ mod tests {
         ];
         let distinct: std::collections::HashSet<_> = names.iter().map(|n| badge_index(n)).collect();
         assert!(distinct.len() >= 4, "{distinct:?}");
+    }
+
+    /// WCAG relative luminance contrast of white on `rgb`.
+    fn white_contrast(rgb: u32) -> f64 {
+        let linear = |shift: u32| {
+            let c = f64::from((rgb >> shift) & 0xff) / 255.0;
+            if c <= 0.03928 {
+                c / 12.92
+            } else {
+                ((c + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        let luminance = 0.2126 * linear(16) + 0.7152 * linear(8) + 0.0722 * linear(0);
+        1.05 / (luminance + 0.05)
+    }
+
+    #[test]
+    fn test_white_text_reads_on_every_badge_colour() {
+        for rgb in PALETTE {
+            assert!(
+                white_contrast(rgb) >= 4.5,
+                "{rgb:06x}: {}",
+                white_contrast(rgb)
+            );
+        }
+    }
+
+    #[test]
+    fn test_badge_for_is_one_function_for_letters_and_colour() {
+        let (letters, color) = badge_for(&["easy-demo-importer"]).expect("badge");
+        assert_eq!(letters, "EI");
+        assert_eq!(color, badge_color("easy-demo-importer"));
+        // Multi-root: the colour comes from the names joined.
+        let (letters, color) = badge_for(&["alpha", "beta"]).expect("badge");
+        assert_eq!(letters, "AB");
+        assert_eq!(color, badge_color("alpha, beta"));
+        // Emoji-only: no empty coloured box.
+        assert!(badge_for(&["🚀"]).is_none());
+        assert!(badge_for(&[]).is_none());
+    }
+
+    #[test]
+    fn test_row_ids_follow_the_row_not_its_position() {
+        let ids = |rows: &[Entry<u8>]| rows.iter().map(Entry::id).collect::<Vec<_>>();
+        let few = entries(vec![(key("/code/a"), 1)], vec![recent(2, "/code/b")]);
+        let more = entries(
+            vec![(key("/code/a"), 1)],
+            vec![recent(3, "/code/c"), recent(2, "/code/b")],
+        );
+        let (few, more) = (ids(&few), ids(&more));
+        // `a` and `b` keep their ids when `c` lands above `b`.
+        for id in &few {
+            assert!(more.contains(id));
+        }
+        let mut unique = more.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), more.len());
     }
 
     #[test]

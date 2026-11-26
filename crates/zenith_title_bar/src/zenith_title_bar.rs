@@ -11,8 +11,15 @@ use project::Project;
 use settings::{RegisterSetting, Settings, SettingsContent};
 use ui::{ButtonLike, IconButton, Tooltip, Vector, VectorName, prelude::*};
 
-pub use project_switcher::{ProjectSwitcher, open_recent_paths, project_switcher};
-pub use run::{DebugSelected, RerunLast, RunConfig, RunModel, RunSelected, StopRun, init};
+pub use project_switcher::{
+    ProjectSwitcher, ToggleProjectSwitcher, open_recent_paths, project_switcher,
+};
+pub use run::{DebugSelected, RerunLast, RunConfig, RunModel, RunSelected, StopRun};
+
+pub fn init(cx: &mut gpui::App) {
+    run::init(cx);
+    project_switcher::init(cx);
+}
 
 /// `zenith.title_bar.enabled`: off, the title bar is upstream's. Read on every render.
 #[derive(Clone, Copy, RegisterSetting)]
@@ -40,8 +47,9 @@ pub fn project_badge(project_name: &str, cx: &App) -> Option<impl IntoElement + 
     if !ZenithTitleBarSettings::get_global(cx).enabled {
         return None;
     }
-    let initials = switcher_rows::initials(&[project_name])?;
-    let color = switcher_rows::badge_color(project_name);
+    // The title bar shows `repo/subfolder` for a project opened in a repo subfolder: the repo
+    // name is the project, as in the switcher's rows.
+    let (initials, color) = switcher_rows::badge_for(&[badge_name(project_name)])?;
     // Board: 22 px mark, then a 20 px badge.
     let mark = show_mark(cx).then(|| Vector::square(VectorName::ZedLogo, rems_from_px(22_f32)));
     Some(
@@ -51,6 +59,14 @@ pub fn project_badge(project_name: &str, cx: &App) -> Option<impl IntoElement + 
             .children(mark)
             .child(badge(&initials, color)),
     )
+}
+
+/// The repo name of `repo/subfolder`: what the badge is made from.
+fn badge_name(project_name: &str) -> &str {
+    project_name
+        .split(['/', '\\'])
+        .next()
+        .unwrap_or(project_name)
 }
 
 /// The project-name button's chevron under Zenith's switcher: always shown (upstream shows
@@ -74,7 +90,7 @@ fn badge(initials: &str, color: Hsla) -> impl IntoElement + use<> {
         .rounded(px(5.))
         .bg(color)
         .text_color(gpui::white())
-        .text_size(px(9.5))
+        .text_size(rems_from_px(9.5_f32))
         .font_weight(FontWeight::BOLD)
         .child(SharedString::from(initials.to_string()))
 }
@@ -303,7 +319,9 @@ fn dispatch(action: Box<dyn Action>) -> impl Fn(&gpui::ClickEvent, &mut Window, 
 
 #[cfg(test)]
 mod tests {
-    use super::{AgentChip, AgentCounts, agent_chip_aria_label, agent_chip_label, show_mark};
+    use super::{
+        AgentChip, AgentCounts, agent_chip_aria_label, agent_chip_label, badge_name, show_mark,
+    };
     use gpui::{EntityId, TestAppContext};
 
     #[gpui::test]
@@ -317,6 +335,26 @@ mod tests {
     fn test_mark_hidden_under_rails(cx: &mut TestAppContext) {
         cx.update(|cx| cx.set_global(workspace::dock::RailsActive));
         cx.update(|cx| assert!(!show_mark(cx)));
+    }
+
+    #[test]
+    fn test_badge_is_made_from_the_repo_name() {
+        assert_eq!(
+            badge_name("easy-demo-importer/src/lib"),
+            "easy-demo-importer"
+        );
+        assert_eq!(badge_name("easy-demo-importer\\src"), "easy-demo-importer");
+        assert_eq!(badge_name("zenith"), "zenith");
+    }
+
+    #[gpui::test]
+    fn test_emoji_only_name_gets_no_badge(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let store = settings::SettingsStore::test(cx);
+            cx.set_global(store);
+            assert!(super::project_badge("🚀", cx).is_none());
+            assert!(super::project_badge("rocket", cx).is_some());
+        });
     }
 
     #[gpui::test]

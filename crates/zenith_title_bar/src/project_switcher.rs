@@ -6,18 +6,20 @@ use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
 use fuzzy_nucleo::{MaxResults, StringMatchCandidate, StringMatchOptions, match_strings};
 use gpui::{
-    Action as _, AnyElement, App, AppContext as _, Context, DismissEvent, Entity, EventEmitter,
-    FocusHandle, Focusable, FontWeight, Hsla, IntoElement, Render, Role, Subscription, Task,
-    WeakEntity, Window, WindowHandle,
+    Action as _, AnyElement, App, AppContext as _, Context, DismissEvent, ElementId, Entity,
+    EventEmitter, FocusHandle, Focusable, FontWeight, Hsla, IntoElement, Render, Role,
+    Subscription, Task, WeakEntity, Window, WindowHandle, actions,
 };
 use picker::{Picker, PickerDelegate};
 use project::ProjectGroupKey;
-use recent_projects::RecentProjects;
+use recent_projects::{RecentProjects, RemoteSettings, open_remote_project};
+use remote::RemoteConnectionOptions;
 use settings::Settings as _;
 use ui::{ListItem, ListItemSpacing, prelude::*};
 use util::ResultExt as _;
 use workspace::{
-    MultiWorkspace, OpenMode, RecentWorkspace, SerializedWorkspaceLocation, Workspace, WorkspaceDb,
+    ModalView, MultiWorkspace, OpenMode, OpenOptions, RecentWorkspace, SerializedWorkspaceLocation,
+    Workspace, WorkspaceDb, notifications::DetachAndPromptErr as _,
 };
 use zenith_welcome::{
     DetectCache,
@@ -26,8 +28,52 @@ use zenith_welcome::{
 
 use crate::{
     ZenithTitleBarSettings, badge,
-    switcher_rows::{Entry, badge_color, display_path, entries, initials},
+    switcher_rows::{Entry, badge_for, display_path, entries},
 };
+
+actions!(
+    zenith_title_bar,
+    [
+        /// Opens the project switcher, or closes it when it is open.
+        ToggleProjectSwitcher,
+    ]
+);
+
+/// Opens the switcher from the keyboard, as a modal. The popover under the project-name
+/// button needs a handle held by the upstream title bar, which would cost upstream lines.
+pub(crate) fn init(cx: &mut App) {
+    cx.observe_new(
+        |workspace: &mut Workspace, _: Option<&mut Window>, _: &mut Context<Workspace>| {
+            workspace.register_action(|workspace, _: &ToggleProjectSwitcher, window, cx| {
+                if !ZenithTitleBarSettings::get_global(cx).enabled {
+                    cx.propagate();
+                    return;
+                }
+                if workspace.active_modal::<ProjectSwitcher>(cx).is_some() {
+                    workspace.hide_modal(window, cx);
+                    return;
+                }
+                let weak = cx.weak_entity();
+                let focus = workspace.focus_handle(cx);
+                // The workspace is being updated: its projects are read after this returns.
+                window.defer(cx, move |window, cx| {
+                    let open = open_projects(window, cx);
+                    let fs = weak
+                        .upgrade()
+                        .map(|workspace| workspace.read(cx).app_state().fs.clone());
+                    weak.update(cx, |workspace, cx| {
+                        let weak = cx.weak_entity();
+                        workspace.toggle_modal(window, cx, |window, cx| {
+                            ProjectSwitcher::zenith(weak, open, fs, focus, window, cx)
+                        });
+                    })
+                    .log_err();
+                });
+            });
+        },
+    )
+    .detach();
+}
 
 /// Detection runs for this many rows per open; the list shows what is cached for the rest.
 const MAX_DETECT_ROOTS: usize = 30;
@@ -55,10 +101,17 @@ impl Focusable for ProjectSwitcher {
     }
 }
 
+impl ModalView for ProjectSwitcher {}
+
 impl Render for ProjectSwitcher {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         match &self.body {
-            Body::Zenith(picker) => picker.clone().into_any_element(),
+            Body::Zenith(picker) => div()
+                .id("zenith-project-switcher")
+                .role(Role::Dialog)
+                .aria_label("Switch Project")
+                .child(picker.clone())
+                .into_any_element(),
             Body::Upstream(recent) => recent.clone().into_any_element(),
         }
     }
@@ -91,20 +144,21 @@ pub fn project_switcher(
         });
     }
     let open = open_projects(window, cx);
-    cx.new(|cx| ProjectSwitcher::zenith(workspace, open, focus_handle, window, cx))
+    let fs = workspace
+        .upgrade()
+        .map(|workspace| workspace.read(cx).app_state().fs.clone());
+    cx.new(|cx| ProjectSwitcher::zenith(workspace, open, fs, focus_handle, window, cx))
 }
 
 impl ProjectSwitcher {
     fn zenith(
         workspace: WeakEntity<Workspace>,
         open: Vec<(ProjectGroupKey, OpenTarget)>,
+        fs: Option<Arc<dyn fs::Fs>>,
         focus_handle: FocusHandle,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let fs = workspace
-            .upgrade()
-            .map(|workspace| workspace.read(cx).app_state().fs.clone());
         let info = cx
             .try_global::<DetectCache>()
             .map(|cache| cache.0.clone())
@@ -186,11 +240,12 @@ impl ProjectSwitcher {
     }
 }
 
-/// What activating an open project needs.
+/// What activating an open project needs. The workspace is only a fallback and is held
+/// weakly: a popover that owned it could re-insert a workspace closed in the meantime.
 #[derive(Clone)]
 struct OpenTarget {
     window: WindowHandle<MultiWorkspace>,
-    workspace: Entity<Workspace>,
+    fallback: WeakEntity<Workspace>,
 }
 
 /// Every project open in any window, one row per project group. Windows without a
@@ -206,7 +261,7 @@ fn open_projects(window: &mut Window, cx: &mut App) -> Vec<(ProjectGroupKey, Ope
             }
             let target = OpenTarget {
                 window: handle,
-                workspace: workspace.clone(),
+                fallback: workspace.downgrade(),
             };
             open.push((key, target));
         }
@@ -245,6 +300,8 @@ pub struct SwitcherDelegate {
     shown: Vec<usize>,
     info: HashMap<PathBuf, ProjectInfo>,
     fs: Option<Arc<dyn fs::Fs>>,
+    /// The query `shown` was built for: the same query keeps the selected row on a rebuild.
+    query: String,
     selected_index: usize,
 }
 
@@ -253,8 +310,8 @@ struct Row {
     names: String,
     path: String,
     branch: Option<String>,
-    initials: String,
-    color: Hsla,
+    /// Letters and colour; `None` for a name with no letter (no empty coloured box).
+    badge: Option<(String, Hsla)>,
     /// What a screen reader says: `<names>, <path>, branch <b>`.
     label: String,
 }
@@ -276,6 +333,7 @@ impl SwitcherDelegate {
             shown: Vec::new(),
             info,
             fs,
+            query: String::new(),
             selected_index: 0,
         };
         this.rebuild("");
@@ -288,19 +346,31 @@ impl SwitcherDelegate {
 
     /// The row list for an empty query; `shown` is then filtered by [`Self::rebuild`].
     fn rebuild(&mut self, query: &str) {
+        let query = query.trim();
+        // The recent list landing (same query) must not throw the user's selection to row 0.
+        let keep = (query == self.query)
+            .then(|| {
+                self.shown
+                    .get(self.selected_index)
+                    .map(|&ix| self.rows[ix].id())
+            })
+            .flatten();
         self.rows = entries(self.open.clone(), self.recent.clone());
         self.rows.push(Entry::OpenRemote);
         self.rows.push(Entry::More);
-        let query = query.trim();
         self.shown = if query.is_empty() {
             (0..self.rows.len()).collect()
         } else {
             self.filter(query)
         };
-        self.selected_index = self
-            .shown
-            .iter()
-            .position(|&ix| !matches!(self.rows[ix], Entry::Header(_)))
+        self.query = query.to_string();
+        self.selected_index = keep
+            .and_then(|id| self.shown.iter().position(|&ix| self.rows[ix].id() == id))
+            .or_else(|| {
+                self.shown
+                    .iter()
+                    .position(|&ix| !matches!(self.rows[ix], Entry::Header(_)))
+            })
             .unwrap_or(0);
     }
 
@@ -387,6 +457,7 @@ impl SwitcherDelegate {
             .map(|name| name.to_string_lossy().into_owned())
             .collect();
         let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let badge = badge_for(&name_refs);
         let names = names.join(", ");
         let mut path = paths
             .iter()
@@ -405,8 +476,7 @@ impl SwitcherDelegate {
             None => format!("{names}, {path}"),
         };
         Some(Row {
-            initials: initials(&name_refs).unwrap_or_default(),
-            color: badge_color(&names),
+            badge,
             names,
             path,
             branch,
@@ -453,19 +523,68 @@ pub fn open_recent_paths(
         .log_err();
 }
 
-fn activate(target: &OpenTarget, window: &mut Window, cx: &mut App) {
-    let workspace = target.workspace.clone();
-    if target.window.window_id() == window.window_handle().window_id() {
-        if let Some(Some(multi)) = window.root::<MultiWorkspace>() {
-            multi.update(cx, |multi, cx| multi.activate(workspace, None, window, cx));
-        }
-        return;
-    }
-    target
-        .window
-        .update(cx, |multi, window, cx| {
-            multi.activate(workspace, None, window, cx);
-            window.activate_window();
+/// Brings a project group forward. Like upstream, the group's last active workspace wins
+/// over the first one with its key (a repo and its linked worktrees share a key), and the
+/// work runs deferred, after the popover's own update. `new_window` (cmd-enter) moves a
+/// local group to its own window when its window holds several.
+fn activate(key: &ProjectGroupKey, target: &OpenTarget, new_window: bool, cx: &mut App) {
+    let (key, target) = (key.clone(), target.clone());
+    // `cx.defer`, not `window.defer`: that one runs inside an update of this very window.
+    cx.defer(move |cx| {
+        target
+            .window
+            .update(cx, |multi, window, cx| {
+                if new_window && key.host().is_none() && multi.project_group_keys().len() >= 2 {
+                    multi
+                        .open_project_group_in_new_window(&key, window, cx)
+                        .detach_and_log_err(cx);
+                    return;
+                }
+                let workspace = multi.last_active_workspace_for_group(&key, cx).or_else(|| {
+                    // Only a workspace the window still holds: activating re-inserts it.
+                    let fallback = target.fallback.upgrade()?;
+                    multi
+                        .workspaces()
+                        .any(|held| *held == fallback)
+                        .then_some(fallback)
+                });
+                if let Some(workspace) = workspace {
+                    multi.activate(workspace, None, window, cx);
+                    window.activate_window();
+                }
+            })
+            .log_err();
+    });
+}
+
+/// A recent project on another machine, through upstream's remote open path: the open
+/// mode and cmd-enter choose between this window and a new one, as for local projects.
+fn open_remote_recent(
+    workspace: &WeakEntity<Workspace>,
+    mut connection: RemoteConnectionOptions,
+    paths: Vec<PathBuf>,
+    new_window: bool,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let replace_window = (!new_window
+        && matches!(zenith_welcome::open_mode(cx), OpenMode::Activate))
+    .then(|| window.window_handle().downcast::<MultiWorkspace>())
+    .flatten();
+    workspace
+        .update(cx, |workspace, cx| {
+            let app_state = workspace.app_state().clone();
+            let open_options = OpenOptions {
+                requesting_window: replace_window,
+                ..Default::default()
+            };
+            if let RemoteConnectionOptions::Ssh(connection) = &mut connection {
+                RemoteSettings::get_global(cx).fill_connection_options_from_settings(connection);
+            }
+            cx.spawn_in(window, async move |_, cx| {
+                open_remote_project(connection, paths, app_state, open_options, cx).await
+            })
+            .detach_and_prompt_err("Failed to open project", window, cx, |_, _, _| None);
         })
         .log_err();
 }
@@ -553,19 +672,26 @@ impl PickerDelegate for SwitcherDelegate {
             Entry::More => {
                 self.dispatch(zed_actions::OpenRecent::default().boxed_clone(), window, cx)
             }
-            Entry::OpenProject(_, target) => {
-                activate(target, window, cx);
+            Entry::OpenProject(key, target) => {
+                activate(key, target, secondary, cx);
                 cx.emit(DismissEvent);
             }
             Entry::Recent(project) => {
-                if matches!(project.location, SerializedWorkspaceLocation::Local) {
-                    let paths = project.paths.paths().to_vec();
-                    open_recent_paths(&self.workspace, paths, secondary, window, cx);
-                    cx.emit(DismissEvent);
-                } else {
-                    // Remote projects need upstream's connection flow.
-                    self.dispatch(zed_actions::OpenRecent::default().boxed_clone(), window, cx);
+                let paths = project.paths.paths().to_vec();
+                match &project.location {
+                    SerializedWorkspaceLocation::Local => {
+                        open_recent_paths(&self.workspace, paths, secondary, window, cx)
+                    }
+                    SerializedWorkspaceLocation::Remote(connection) => open_remote_recent(
+                        &self.workspace,
+                        connection.clone(),
+                        paths,
+                        secondary,
+                        window,
+                        cx,
+                    ),
                 }
+                cx.emit(DismissEvent);
             }
         }
     }
@@ -582,12 +708,16 @@ impl PickerDelegate for SwitcherDelegate {
         _: &mut Context<Picker<Self>>,
     ) -> Option<Self::ListItem> {
         let entry = &self.rows[*self.shown.get(ix)?];
+        // Ids follow the row, not its position, so they hold when the list loads.
+        let row_id = ElementId::from(format!("zenith-switcher-row-{:x}", entry.id()));
         let action_row = |icon: IconName, label: &'static str| {
-            ListItem::new(ix)
+            ListItem::new(row_id.clone())
                 .inset(true)
                 .spacing(ListItemSpacing::Sparse)
                 .toggle_state(selected)
                 .aria_role(Role::ListItem)
+                // Until gpui exposes the active descendant this has no effect.
+                .when(selected, |item| item.aria_active_descendant())
                 .aria_label(label)
                 .start_slot(Icon::new(icon).size(IconSize::Small).color(Color::Muted))
                 .child(Label::new(label))
@@ -599,7 +729,10 @@ impl PickerDelegate for SwitcherDelegate {
             Entry::OpenRemote => action_row(IconName::Server, "Open Remote…"),
             Entry::More => action_row(IconName::Ellipsis, "More…"),
             Entry::Header(title) => div()
-                .id(("zenith-switcher-header", ix))
+                .id(ElementId::from(format!(
+                    "zenith-switcher-row-{:x}",
+                    entry.id()
+                )))
                 .role(Role::Heading)
                 .aria_label(*title)
                 .px_3()
@@ -613,17 +746,23 @@ impl PickerDelegate for SwitcherDelegate {
                 .into_any_element(),
             Entry::OpenProject(..) | Entry::Recent(_) => {
                 let row = self.row(entry)?;
-                ListItem::new(ix)
+                ListItem::new(row_id)
                     .inset(true)
                     .spacing(ListItemSpacing::Sparse)
                     .toggle_state(selected)
                     .aria_role(Role::ListItem)
+                    // Until gpui exposes the active descendant this has no effect.
+                    .when(selected, |item| item.aria_active_descendant())
                     .aria_label(row.label.clone())
                     .child(
                         h_flex()
                             .gap_2()
                             .min_w_0()
-                            .child(badge(&row.initials, row.color))
+                            // No letters, no badge; the spacer keeps the names aligned.
+                            .child(match &row.badge {
+                                Some((letters, color)) => badge(letters, *color).into_any_element(),
+                                None => div().flex_none().size(px(20.)).into_any_element(),
+                            })
                             .child(
                                 v_flex()
                                     .min_w_0()
@@ -697,6 +836,7 @@ mod tests {
             cx.set_global(store);
             theme_settings::init(theme::LoadThemes::JustBase, cx);
             editor::init(cx);
+            init(cx);
         });
     }
 
@@ -804,6 +944,14 @@ mod tests {
             cx.on_action(move |_: &workspace::Open, _| log.borrow_mut().push("workspace::Open"));
             let log = seen.clone();
             cx.on_action(move |_: &git::Clone, _| log.borrow_mut().push("git::Clone"));
+            let log = seen.clone();
+            cx.on_action(move |_: &zed_actions::OpenRemote, _| {
+                log.borrow_mut().push("projects::OpenRemote")
+            });
+            let log = seen.clone();
+            cx.on_action(move |_: &zed_actions::OpenRecent, _| {
+                log.borrow_mut().push("projects::OpenRecent")
+            });
         });
         seen
     }
@@ -974,5 +1122,189 @@ mod tests {
             ["# Recent Projects", "charlie, /code/charlie"]
         );
         assert_eq!(selected(&workspace, cx), 1);
+    }
+
+    fn windows(cx: &mut VisualTestContext) -> usize {
+        cx.cx.update(|cx| cx.windows().len())
+    }
+
+    fn multi(cx: &mut VisualTestContext) -> Entity<MultiWorkspace> {
+        cx.update(|window, _| {
+            window
+                .root::<MultiWorkspace>()
+                .flatten()
+                .expect("multi workspace")
+        })
+    }
+
+    fn close(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) {
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.hide_modal(window, cx);
+        });
+    }
+
+    /// Arrows down (headers are skipped) until row `index` is selected.
+    fn select_row(workspace: &Entity<Workspace>, index: usize, cx: &mut VisualTestContext) {
+        for _ in 0..12 {
+            if selected(workspace, cx) == index {
+                return;
+            }
+            cx.dispatch_action(menu::SelectNext);
+        }
+        panic!("row {index} not reached");
+    }
+
+    #[gpui::test]
+    async fn test_group_row_keeps_the_last_active_workspace(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let second_project = Project::test(fs.clone(), [Path::new("/code/app")], cx).await;
+        let (first, cx) = open_switcher(fs, cx).await;
+        close(&first, cx);
+        let multi = multi(cx);
+        // A repo and a linked worktree share a project group key: two workspaces, one row.
+        let second = multi.update_in(cx, |multi, window, cx| {
+            multi.test_add_workspace(second_project, window, cx)
+        });
+        assert!(multi.read_with(cx, |multi, _| multi.workspace() == &second));
+        assert!(multi.read_with(cx, |multi, _| multi.workspaces().count() == 2));
+        show(&second, cx);
+        assert_eq!(
+            rows(&second, cx)[..4],
+            ["Open…", "Clone", "# Open Projects", "app, /code/app"]
+        );
+        select_row(&second, 3, cx);
+        cx.dispatch_action(menu::Confirm);
+        cx.run_until_parked();
+        assert!(multi.read_with(cx, |multi, _| multi.workspace() == &second));
+    }
+
+    #[gpui::test]
+    async fn test_cmd_enter_on_a_group_moves_it_to_its_own_window(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/code", serde_json::json!({ "app": {}, "other": {} }))
+            .await;
+        let other = Project::test(fs.clone(), [Path::new("/code/other")], cx).await;
+        let (first, cx) = open_switcher(fs, cx).await;
+        close(&first, cx);
+        let second = multi(cx).update_in(cx, |multi, window, cx| {
+            multi.test_add_workspace(other, window, cx)
+        });
+        show(&second, cx);
+        let before = windows(cx);
+        select_row(&second, 3, cx);
+        cx.dispatch_action(menu::SecondaryConfirm);
+        cx.run_until_parked();
+        assert_eq!(windows(cx), before + 1);
+    }
+
+    #[gpui::test]
+    async fn test_cmd_enter_on_a_recent_row_opens_a_new_window(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/code", serde_json::json!({ "app": {}, "b": {} }))
+            .await;
+        let (workspace, cx) = open_switcher(fs, cx).await;
+        set_recent(&workspace, &["/code/b"], cx);
+        cx.run_until_parked();
+        let before = windows(cx);
+        select_row(&workspace, 5, cx);
+        cx.dispatch_action(menu::SecondaryConfirm);
+        cx.run_until_parked();
+        assert_eq!(windows(cx), before + 1);
+        assert!(project_open("/code/b", cx));
+    }
+
+    #[gpui::test]
+    async fn test_footer_rows_dispatch_remote_and_recent(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (workspace, cx) = open_switcher(FakeFs::new(cx.executor()), cx).await;
+        let seen = actions_seen(cx);
+        // Last row: More…; the one before: Open Remote….
+        cx.dispatch_action(menu::SelectPrevious);
+        cx.dispatch_action(menu::Confirm);
+        cx.run_until_parked();
+        assert_eq!(*seen.borrow(), ["projects::OpenRecent"]);
+        show(&workspace, cx);
+        cx.dispatch_action(menu::SelectPrevious);
+        cx.dispatch_action(menu::SelectPrevious);
+        cx.dispatch_action(menu::Confirm);
+        cx.run_until_parked();
+        assert_eq!(
+            *seen.borrow(),
+            ["projects::OpenRecent", "projects::OpenRemote"]
+        );
+    }
+
+    #[gpui::test]
+    async fn test_escape_closes_and_returns_focus(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (workspace, cx) = open_switcher(FakeFs::new(cx.executor()), cx).await;
+        let switcher_focus = switcher(&workspace, cx).read_with(cx, |s, cx| s.focus_handle(cx));
+        cx.update(|window, cx| assert!(switcher_focus.contains_focused(window, cx)));
+        cx.dispatch_action(menu::Cancel);
+        cx.run_until_parked();
+        assert!(workspace.read_with(cx, |w, cx| w.active_modal::<TestModal>(cx).is_none()));
+        // Focus left the switcher, back inside the workspace.
+        let workspace_focus = workspace.read_with(cx, |w, cx| w.focus_handle(cx));
+        cx.update(|window, cx| {
+            assert!(!switcher_focus.contains_focused(window, cx));
+            assert!(workspace_focus.contains_focused(window, cx));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_selection_survives_the_recent_list_landing(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (workspace, cx) = open_switcher(FakeFs::new(cx.executor()), cx).await;
+        // The user moved to the last row (More…) before the database answered.
+        cx.dispatch_action(menu::SelectPrevious);
+        assert_eq!(selected(&workspace, cx), 5);
+        set_recent(&workspace, &["/code/b", "/code/c"], cx);
+        cx.run_until_parked();
+        assert_eq!(selected(&workspace, cx), 8);
+        assert_eq!(rows(&workspace, cx)[8], "More");
+    }
+
+    #[gpui::test]
+    async fn test_remote_recent_row_opens_without_the_recent_modal(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (workspace, cx) = open_switcher(FakeFs::new(cx.executor()), cx).await;
+        let mut remote = recent("/srv/site");
+        remote.location = SerializedWorkspaceLocation::Remote(RemoteConnectionOptions::Mock(
+            remote::MockConnectionOptions { id: 7 },
+        ));
+        switcher(&workspace, cx).update_in(cx, |switcher, window, cx| {
+            switcher.set_recent(vec![remote], window, cx)
+        });
+        cx.run_until_parked();
+        let seen = actions_seen(cx);
+        select_row(&workspace, 5, cx);
+        cx.dispatch_action(menu::Confirm);
+        cx.run_until_parked();
+        // Upstream's remote open path ran; the Recent Projects modal was not asked for.
+        assert_eq!(*seen.borrow(), Vec::<&str>::new());
+        assert!(workspace.read_with(cx, |w, cx| w.active_modal::<TestModal>(cx).is_none()));
+    }
+
+    #[gpui::test]
+    async fn test_toggle_action_opens_and_closes_the_switcher(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [Path::new("/code/app")], cx).await;
+        let (multi, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        let workspace = multi.read_with(cx, |multi, _| multi.workspace().clone());
+        let open = |cx: &mut VisualTestContext| {
+            workspace.read_with(cx, |w, cx| w.active_modal::<ProjectSwitcher>(cx).is_some())
+        };
+        assert!(!open(cx));
+        cx.dispatch_action(ToggleProjectSwitcher);
+        cx.run_until_parked();
+        assert!(open(cx));
+        cx.dispatch_action(ToggleProjectSwitcher);
+        cx.run_until_parked();
+        assert!(!open(cx));
     }
 }

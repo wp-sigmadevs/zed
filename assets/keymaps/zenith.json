@@ -33,6 +33,9 @@
       "secondary-shift-0": "zenith_agent_review::ToggleFocus",
       // New Scratch File, as in PhpStorm (⌘⇧N); overrides Go to File and New Window.
       "secondary-shift-n": "zenith_scratches::NewScratchFile",
+      // Switch Project: the project switcher from the keyboard (⌘⌥⇧K). No JetBrains default
+      // key; unbound in every base keymap.
+      "secondary-alt-shift-k": "zenith_title_bar::ToggleProjectSwitcher",
       "secondary-shift-f": "zenith_search::FindInFiles",
       "secondary-shift-r": "zenith_search::ReplaceInFiles",
       // Show History (local history of the file), PhpStorm has no default key for it.
