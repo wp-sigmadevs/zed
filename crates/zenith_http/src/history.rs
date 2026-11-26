@@ -243,12 +243,21 @@ fn mask_secret_body_cut(body: &str, content_type: Option<&str>, truncated: bool)
             Some(masked) => masked,
             // Not a run of JSON values (a PHP notice before the JSON, a trailing comma, a number
             // out of range): serde cannot mask it, so one that names a secret is not stored. A
-            // lines type is cut per record below, as a line is its own value.
+            // lines type is cut per record below, or whole when a record opens a block.
             None if !lines_type && has_secret_key(text) => Some(UNPARSEABLE.to_string()),
             None => mask_json_records(body, false, '\n'),
         };
     }
-    None
+    // Any other type (HTML, plain text, JSONP, none) that carried JSON a parser rejected, as a PHP
+    // notice or a stray `0` after it does on WordPress `admin-ajax`, or that holds a secret as
+    // `key=value`: masked as pairs when it is one line of them, else not stored if it names one.
+    if !body.contains('\n')
+        && body.contains('=')
+        && let Some(masked) = mask_secret_pairs(body)
+    {
+        return Some(masked);
+    }
+    has_secret_key(text).then(|| UNPARSEABLE.to_string())
 }
 
 /// Stored in place of a line of a cut-off JSON lines body that cannot be parsed.
@@ -417,7 +426,13 @@ fn mask_json_records(body: &str, truncated: bool, separator: char) -> Option<Str
             // Several values in one record (json-seq without U+001E) are masked one by one.
             None => match mask_json_stream(content) {
                 Some(stream) => stream,
-                None if !truncated => has_secret_key(content).then(|| UNPARSEABLE.to_string()),
+                None if !truncated && !has_secret_key(content) => None,
+                // A key that opens a block (`"token": {`, `"secrets": [`): the lines after it
+                // are its value, so no line can be cut alone.
+                None if !truncated && content.trim_end().ends_with(['{', '[', ':']) => {
+                    return Some(UNPARSEABLE.to_string());
+                }
+                None if !truncated => Some(UNPARSEABLE.to_string()),
                 None if Some(ix) == last => Some(UNMASKABLE_LINE.to_string()),
                 None => return None,
             },
@@ -438,38 +453,78 @@ fn mask_json_records(body: &str, truncated: bool, separator: char) -> Option<Str
 /// secret: it cannot be masked, and it is not known to be cut.
 const UNPARSEABLE: &str = "[not stored: not valid JSON, secrets could not be masked]";
 
-/// Whether `text` holds a `"name":` with a secret `name`, found by scanning for quotes rather than
-/// parsing, so it works on text no JSON parser accepts. Every quote is tried as the start of a key
-/// (a stray quote in the text cannot throw the later ones off); a false hit only costs a marker.
+/// Longest key `has_secret_key` decodes; a longer one is no credential name, and the cap keeps
+/// the scan linear on a body of nothing but quotes.
+const MAX_KEY: usize = 256;
+
+/// Whether `text` holds a `name:` with a secret `name` (quoted with `"` or `'`, or bare), found by
+/// scanning rather than parsing, so it works on text no JSON parser accepts. Every quote is tried
+/// as the start of a key (a stray quote cannot throw the later ones off); a false hit only costs a
+/// marker.
 // shortcut: a key written with a surrogate pair escape is read as two replacement characters,
-// so an exotic name spelled that way is not caught.
+// so an exotic name spelled that way is not caught; a comment between a key and its colon hides it.
 fn has_secret_key(text: &str) -> bool {
-    text.match_indices('"').any(|(ix, _)| {
-        let Some(rest) = text.get(ix + 1..) else {
-            return false;
-        };
-        let (mut name, mut chars) = (String::new(), rest.chars());
-        loop {
-            match chars.next() {
-                Some('"') => break,
-                Some('\\') => match chars.next() {
-                    Some('u') => {
-                        let hex = chars.by_ref().take(4).collect::<String>();
-                        let decoded = u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32);
-                        name.push(decoded.unwrap_or('\u{fffd}'));
-                    }
-                    Some('n') => name.push('\n'),
-                    Some('t') => name.push('\t'),
-                    Some('r') => name.push('\r'),
-                    Some(other) => name.push(other),
-                    None => return false,
-                },
-                Some(c) => name.push(c),
-                None => return false,
+    let mut name = String::new();
+    let quoted = text
+        .char_indices()
+        .filter(|(_, c)| matches!(c, '"' | '\''))
+        .any(|(ix, quote)| {
+            let Some(rest) = text.get(ix + quote.len_utf8()..) else {
+                return false;
+            };
+            let mut chars = rest.chars();
+            name.clear();
+            loop {
+                match chars.next() {
+                    Some(c) if c == quote => break,
+                    Some('\\') => match chars.next() {
+                        Some('u') => {
+                            let hex = chars.by_ref().take(4).collect::<String>();
+                            let decoded =
+                                u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32);
+                            name.push(decoded.unwrap_or('\u{fffd}'));
+                        }
+                        Some('n') => name.push('\n'),
+                        Some('t') => name.push('\t'),
+                        Some('r') => name.push('\r'),
+                        Some(other) => name.push(other),
+                        None => return false,
+                    },
+                    // A key never spans lines.
+                    Some('\n') | None => return false,
+                    Some(c) => name.push(c),
+                }
+                if name.len() > MAX_KEY {
+                    return false;
+                }
             }
+            chars.as_str().trim_start().starts_with(':') && is_secret_name(&name)
+        });
+    if quoted {
+        return true;
+    }
+    // Bare keys (`{token: "s"}`, a header line): a run of name characters followed by a colon.
+    let mut start = None;
+    for (ix, c) in text.char_indices().chain([(text.len(), ' ')]) {
+        let in_name = c.is_alphanumeric() || matches!(c, '_' | '$' | '-');
+        match (in_name, start) {
+            (true, None) => start = Some(ix),
+            (false, Some(from)) => {
+                start = None;
+                if let Some(word) = text.get(from..ix)
+                    && word.len() <= MAX_KEY
+                    && text
+                        .get(ix..)
+                        .is_some_and(|rest| rest.trim_start().starts_with(':'))
+                    && is_secret_name(word)
+                {
+                    return true;
+                }
+            }
+            _ => {}
         }
-        chars.as_str().trim_start().starts_with(':') && is_secret_name(&name)
-    })
+    }
+    false
 }
 
 /// Stored in place of a cut-off JSON body: it cannot be parsed, so its secrets cannot be masked.
@@ -783,7 +838,8 @@ impl HistoryDir {
         ) {
             Some(body) => response.body = body,
             None if response.truncated
-                && may_be_json(&response.body, content_type(&response.headers)) =>
+                && (may_be_json(&response.body, content_type(&response.headers))
+                    || has_secret_key(&response.body)) =>
             {
                 response.body = UNMASKABLE_BODY.to_string();
             }
@@ -1504,6 +1560,114 @@ mod tests {
     }
 
     #[test]
+    fn test_has_secret_key_is_linear_on_a_body_of_escaped_quotes() {
+        let body = format!("{{\"html\":\"{}\",}}", "\\\"".repeat(100_000));
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            sender
+                .send(mask_secret_body(&body, Some("application/json")))
+                .ok();
+        });
+        let masked = receiver.recv_timeout(std::time::Duration::from_secs(20));
+        assert_eq!(masked.expect("scan did not finish"), None);
+    }
+
+    #[test]
+    fn test_mask_secret_lines_with_a_secret_that_opens_a_block_are_not_stored() {
+        let ndjson = Some("application/x-ndjson");
+        for body in [
+            "{\"a\":1}\n{\n  \"token\": {\n    \"value\": \"SECRETVAL\"\n  },\n}\n",
+            "{\"a\":1}\n{\n  \"secrets\": [\n    \"SECRETVAL\",\n    \"S2\"\n  ],\n}\n",
+            "{\"a\":1}\n{\n  \"token\":\n    \"SECRETVAL\",\n}\n",
+        ] {
+            let masked = mask_secret_body(body, ndjson);
+            assert_eq!(masked.as_deref(), Some(UNPARSEABLE), "{body}");
+        }
+        // A json-seq record spans its lines, so the record is replaced alone.
+        let seq = "\u{1e}{\"a\":1}\n\u{1e}{\n  \"token\": [\n    \"SECRETVAL\"\n  ],\n}\n";
+        assert_eq!(
+            mask_secret_body(seq, Some("application/json-seq")),
+            Some(format!("\u{1e}{{\"a\":1}}\n\u{1e}{UNPARSEABLE}\n"))
+        );
+    }
+
+    #[test]
+    fn test_has_secret_key_reads_single_quoted_and_bare_keys() {
+        let json = Some("application/json");
+        for body in [
+            "{'token': 'SECRETVAL'}",
+            "{token: \"SECRETVAL\"}",
+            "{ api_key : 'S' ,}",
+        ] {
+            assert_eq!(
+                mask_secret_body(body, json).as_deref(),
+                Some(UNPARSEABLE),
+                "{body}"
+            );
+        }
+        for body in ["{'a': 'b'}", "{name: \"token\"}", "{'token'}"] {
+            assert_eq!(mask_secret_body(body, json), None, "{body}");
+        }
+        // A key over the cap is no credential name and is not decoded.
+        let long = format!("{{\"{}token\": 1,}}", "a_".repeat(200));
+        assert_eq!(mask_secret_body(&long, json), None);
+    }
+
+    #[test]
+    fn test_mask_secret_body_of_other_types_that_carries_a_secret_key() {
+        for (content_type, body) in [
+            ("text/html", "{\"access_token\":\"SECRETVAL\"}0"),
+            (
+                "text/html",
+                "<br />\n<b>Warning</b>: x<br />\n{\"token\":\"SECRETVAL\"}",
+            ),
+            (
+                "application/javascript",
+                "/**/cb({\"token\":\"SECRETVAL\"})",
+            ),
+        ] {
+            let masked = mask_secret_body(body, Some(content_type));
+            assert_eq!(
+                masked.as_deref(),
+                Some(UNPARSEABLE),
+                "{content_type}: {body}"
+            );
+        }
+        // No content type at all.
+        let masked = mask_secret_body("{\"token\":\"SECRETVAL\"}0", None);
+        assert_eq!(masked.as_deref(), Some(UNPARSEABLE));
+        // An ordinary page, and one line that is not pairs, stay as they were.
+        let page = "<html><body class=\"main\">\n<p>It's a \"page\": a=b</p></body></html>\n";
+        assert_eq!(mask_secret_body(page, Some("text/html")), None);
+        assert_eq!(mask_secret_body("a=b&c=d", Some("text/plain")), None);
+    }
+
+    #[test]
+    fn test_mask_secret_body_of_plain_text_pairs() {
+        let masked = mask_secret_body(
+            "oauth_token=X&oauth_token_secret=SECRETVAL&b=2",
+            Some("text/plain"),
+        );
+        assert_eq!(
+            masked.as_deref(),
+            Some("oauth_token=***&oauth_token_secret=***&b=2")
+        );
+    }
+
+    #[test]
+    fn test_disk_history_drops_a_cut_page_that_names_a_secret() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let history = HistoryDir::new(temp.path().join("h"), 10, u64::MAX);
+        let page = typed(
+            "text/html",
+            "<br />\n<b>Warning</b>: x<br />\n{\"token\":\"SECRETVAL\",\"pad\":\"x",
+        )
+        .mark_truncated(MAX_RESPONSE_BYTES);
+        assert_eq!(stored_response(&history, page)?.body, UNMASKABLE_BODY);
+        Ok(())
+    }
+
+    #[test]
     fn test_mask_secret_json_seq_records_over_several_lines() {
         let seq = Some("application/json-seq");
         let body = "\u{1e}{\n  \"password\": \"SECRETVAL\"\n}\n";
@@ -2007,12 +2171,14 @@ mod tests {
         assert!(!stored.body.contains("SECRETVAL"));
         assert!(stored.body.contains("\"a\":1"));
 
-        // Not cut: plain text is stored as is (the documented shortcut).
-        let text = typed("text/plain", "token=SECRETVAL and more");
+        // Not cut: plain text is stored as is (the documented shortcut) unless it is pairs.
+        let text = typed("text/plain", "just words, no secrets");
         assert_eq!(
             stored_response(&history, text)?.body,
-            "token=SECRETVAL and more"
+            "just words, no secrets"
         );
+        let text = typed("text/plain", "token=SECRETVAL and more");
+        assert_eq!(stored_response(&history, text)?.body, "token=***");
 
         // Cut, but not JSON: stored with its truncation note.
         let page = typed("text/html", "<html>no secrets").mark_truncated(MAX_RESPONSE_BYTES);
