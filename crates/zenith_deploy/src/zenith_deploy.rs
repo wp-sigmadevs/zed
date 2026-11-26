@@ -328,6 +328,14 @@ impl ServerStore {
             if !confirmed_now && on_save::needs_reconfirm(old, server) {
                 server.upload_on_save_confirmed = false;
             }
+            // Only what the user is changing now: an old, unusable mapping must not block an
+            // edit of something else (it blocks its own uploads, see `on_save::resolve`).
+            let changed = old.is_none_or(|old| {
+                old.root_path != server.root_path || old.mappings != server.mappings
+            });
+            if changed && let Err(message) = on_save::validate_mappings(server) {
+                return Task::ready(Err(anyhow!("{}: {message}", server.name)));
+            }
         }
         if let Some(error) = &self.load_error {
             return Task::ready(Err(anyhow!(

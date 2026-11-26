@@ -11,7 +11,7 @@ use workspace::SaveIntent;
 
 use crate::{
     config::ServerConfig,
-    remote_path::{join_remote, validate_name},
+    remote_path::{join_remote, validate_name, validate_remote_path},
 };
 
 /// An explicit save by the user. Closing, skipping and "Save As" never upload. `SaveAll` is not
@@ -57,6 +57,45 @@ fn part(component: Component<'_>) -> Result<&str, String> {
     validate_name(name).map_err(|error| format!("{error:#}"))
 }
 
+/// Whether the server's root folder and mappings are safe to upload by, checked when they are
+/// saved and again before every upload (fail closed). A server without mappings is fine. Else the
+/// root is an absolute remote path without `..`; every local folder is absolute with plain parts;
+/// no two mappings name the same local folder (which of them would a file go by?); and every
+/// part of a remote folder is a plain name (`""`, `"/"` and `"a/b"` are fine, `..`, `.` and `\`
+/// are not). The message names the offending mapping.
+pub fn validate_mappings(server: &ServerConfig) -> Result<(), String> {
+    if server.mappings.is_empty() {
+        return Ok(());
+    }
+    validate_remote_path(&server.root_path)
+        .map_err(|error| format!("The root folder is not usable: {error:#}"))?;
+    let mut seen: Vec<PathBuf> = Vec::new();
+    for mapping in &server.mappings {
+        let label = format!("Mapping {:?} -> {:?}", mapping.local, mapping.remote);
+        let local = Path::new(&mapping.local);
+        if !local.is_absolute() {
+            return Err(format!("{label}: the local folder is not an absolute path"));
+        }
+        for component in local.components() {
+            if !matches!(component, Component::RootDir | Component::Prefix(_)) {
+                part(component).map_err(|error| format!("{label}: {error}"))?;
+            }
+        }
+        let normalised: PathBuf = local.components().collect();
+        if seen.contains(&normalised) {
+            return Err(format!(
+                "{label}: another mapping already uses this local folder"
+            ));
+        }
+        seen.push(normalised);
+        for name in mapping.remote.split('/').filter(|name| !name.is_empty()) {
+            join_remote("/", name)
+                .map_err(|error| format!("{label}: the remote folder is not usable: {error:#}"))?;
+        }
+    }
+    Ok(())
+}
+
 /// The remote path of the project file `local`, from the longest of the server's mappings that
 /// contains it (whole path parts, never a text prefix). `Ok(None)`: no mapping contains it.
 /// `Err`: the path or the matched mapping is unsafe, or the file is in the download cache.
@@ -86,6 +125,7 @@ pub fn resolve(
     if local.starts_with(cache_dir) {
         return Err("Files of the download cache are never uploaded by a mapping.".into());
     }
+    validate_mappings(server)?;
     // Every part of the file path is checked, also the ones above the mapping folder.
     for component in local.components() {
         if !matches!(component, Component::RootDir | Component::Prefix(_)) {
@@ -547,6 +587,60 @@ mod tests {
             ));
             assert!(result.is_ok(), "{result:?}");
         }
+    }
+
+    #[test]
+    fn mappings_are_validated() {
+        let ok: [&[(&str, &str)]; 5] = [
+            &[],
+            &[("/p", "")],
+            &[("/p", "/")],
+            &[("/p", "a/b"), ("/q", "a//c/")],
+            &[("/p", "wp-content"), ("/p/inner", "")],
+        ];
+        for mappings in ok {
+            assert_eq!(validate_mappings(&server(mappings)), Ok(()), "{mappings:?}");
+        }
+        // No mappings: nothing to check, whatever the root says.
+        let mut no_mappings = server(&[]);
+        no_mappings.root_path = "relative".into();
+        assert_eq!(validate_mappings(&no_mappings), Ok(()));
+
+        let bad: [(&str, &[(&str, &str)]); 11] = [
+            ("relative local", &[("p/q", "")]),
+            ("dot-dot local", &[("/p/../q", "")]),
+            ("backslash local", &[("/p/a\\b", "")]),
+            ("dot-dot remote", &[("/p", "..")]),
+            ("dot-dot in the middle", &[("/p", "a/../b")]),
+            ("dot remote", &[("/p", "./a")]),
+            ("backslash remote", &[("/p", "a\\b")]),
+            ("control remote", &[("/p", "a\u{7}b")]),
+            ("same folder twice", &[("/p", "x"), ("/p", "y")]),
+            ("same folder with a slash", &[("/p", "x"), ("/p/", "y")]),
+            ("second one bad", &[("/p", "x"), ("/q", "..")]),
+        ];
+        for (what, mappings) in bad {
+            let error = validate_mappings(&server(mappings)).expect_err(what);
+            assert!(
+                mappings
+                    .iter()
+                    .any(|(local, _)| error.contains(&format!("{local:?}"))),
+                "{what}: the message names no mapping: {error}"
+            );
+        }
+        let mut bad_root = server(&[("/p", "")]);
+        for root in ["var/www", "/a/../b", "/a\\b", ""] {
+            bad_root.root_path = root.into();
+            assert!(validate_mappings(&bad_root).is_err(), "{root:?}");
+        }
+    }
+
+    #[test]
+    fn two_mappings_of_one_folder_refuse_the_upload() {
+        let two = server(&[("/p", "x"), ("/p/", "y")]);
+        let error = resolve(&two, "/p/f.php").expect_err("ambiguous");
+        assert!(error.contains("/p"), "{error}");
+        assert!(resolve(&server(&[("/p", "x")]), "/p/f.php").is_ok());
     }
 
     #[test]

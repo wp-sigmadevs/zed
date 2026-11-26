@@ -3095,6 +3095,59 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn saving_an_invalid_mapping_is_refused_and_an_old_one_does_not_block_other_edits(
+        cx: &mut TestAppContext,
+    ) {
+        let f = mapped_fixture(cx, |_| {}).await;
+        let save = |cx: &mut TestAppContext, edit: fn(&mut Servers)| {
+            f.store.update(cx, |store, cx| {
+                let previous = store.servers().clone();
+                let mut servers = previous.clone();
+                edit(&mut servers);
+                store.save(previous, servers, Vec::new(), &Default::default(), cx)
+            })
+        };
+        // A changed mapping with `..` is refused, naming the server and the mapping.
+        let error = save(cx, |servers| {
+            servers.servers[0].mappings[0].remote = "../x".into()
+        })
+        .await
+        .expect_err("refused");
+        assert!(error.to_string().contains("Prod"), "{error}");
+        assert!(error.to_string().contains("../x"), "{error}");
+        // A new server with one is refused too.
+        let error = save(cx, |servers| {
+            let mut added = servers.servers[0].clone();
+            added.id = "new".into();
+            added.name = "New".into();
+            added.mappings[0].local = "relative".into();
+            servers.servers.push(added);
+        })
+        .await
+        .expect_err("refused");
+        assert!(error.to_string().contains("New"), "{error}");
+        f.store
+            .read_with(cx, |store, _| assert_eq!(store.servers().servers.len(), 1));
+
+        // An invalid mapping that is already saved does not block an edit of something else,
+        // but touching the mappings or the root asks for a valid one.
+        f.edit_servers(cx, |servers| {
+            servers.servers[0].mappings[0].remote = "..".into()
+        });
+        save(cx, |servers| servers.servers[0].name = "Renamed".into())
+            .await
+            .expect("an unrelated edit is not blocked");
+        save(cx, |servers| servers.servers[0].root_path = "/other".into())
+            .await
+            .expect_err("a root edit with a bad mapping is refused");
+        save(cx, |servers| {
+            servers.servers[0].mappings[0].remote = "ok".into()
+        })
+        .await
+        .expect("a repaired mapping saves");
+    }
+
+    #[gpui::test]
     async fn saving_a_server_that_points_elsewhere_clears_its_upload_confirmation(
         cx: &mut TestAppContext,
     ) {
