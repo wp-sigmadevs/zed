@@ -3054,6 +3054,23 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn a_skip_does_not_survive_a_switch_to_or_from_anonymous_sign_in(
+        cx: &mut TestAppContext,
+    ) {
+        let f = mapped_fixture(cx, |_| {}).await;
+        let id = f.server_id.clone();
+        f.store.update(cx, |store, _| {
+            let fingerprint = store.current_fingerprint(&id).expect("fingerprint");
+            assert!(store.set_skip_no_baseline_prompt(&id, &fingerprint, true));
+        });
+        f.edit_servers(cx, |servers| {
+            servers.servers[0].anonymous = !servers.servers[0].anonymous
+        });
+        f.store
+            .read_with(cx, |store, _| assert!(!store.skips_no_baseline_prompt(&id)));
+    }
+
+    #[gpui::test]
     async fn a_skip_for_a_prompt_built_before_a_root_change_is_not_recorded(
         cx: &mut TestAppContext,
     ) {
