@@ -492,7 +492,7 @@ fn mask_json_records(body: &str, truncated: bool, separator: char) -> Option<Str
 
 /// Stored in place of a JSON-typed body, or one of its records, that does not parse and names a
 /// secret: it cannot be masked, and it is not known to be cut.
-const UNPARSEABLE: &str = "[not stored: not valid JSON, secrets could not be masked]";
+const UNPARSEABLE: &str = "[not stored: secrets could not be masked]";
 
 /// Longest key `has_secret_key` decodes; a longer one is no credential name, and the cap keeps
 /// the scan linear on a body of nothing but quotes.
@@ -545,12 +545,16 @@ fn has_secret_key(text: &str) -> bool {
         return true;
     }
     // Bare keys (`{token: "s"}`): a run of name characters after `{` or `,`, then a colon.
-    let mut start = None;
+    // `line_blank`: nothing but spaces, tabs or `-` since the start of this line (kept as a flag,
+    // not searched back for, to stay linear on a body of one long line).
+    let (mut start, mut line_blank) = (None, true);
     for (ix, c) in text.char_indices().chain([(text.len(), ' ')]) {
         let in_name = c.is_alphanumeric() || matches!(c, '_' | '$' | '-');
+        let starts_line = line_blank;
+        line_blank = c == '\n' || (line_blank && matches!(c, ' ' | '\t' | '-'));
         match (in_name, start) {
-            (true, None) => start = Some(ix),
-            (false, Some(from)) => {
+            (true, None) => start = Some((ix, starts_line)),
+            (false, Some((from, from_line_blank))) => {
                 start = None;
                 if let Some(word) = text.get(from..ix)
                     && word.len() <= MAX_KEY
@@ -560,11 +564,7 @@ fn has_secret_key(text: &str) -> bool {
                     // A key follows `{` or `,`, or starts its line (a header, YAML, `- key:`);
                     // `a:hover`, `<b>Password:</b>`, `f(key:` do not.
                     && text.get(..from).is_some_and(|before| {
-                        before.trim_end().ends_with(['{', ','])
-                            || before
-                                .rsplit('\n')
-                                .next()
-                                .is_some_and(|line| line.trim_matches([' ', '\t', '-']).is_empty())
+                        from_line_blank || before.trim_end().ends_with(['{', ','])
                     })
                     && is_secret_name(word)
                 {
@@ -1620,6 +1620,25 @@ mod tests {
         });
         let masked = receiver.recv_timeout(std::time::Duration::from_secs(20));
         assert_eq!(masked.expect("scan did not finish"), None);
+    }
+
+    #[test]
+    fn test_has_secret_key_is_linear_on_one_long_line() {
+        let bodies = [
+            "a:".repeat(1 << 20),
+            "\n".repeat(2 << 20),
+            format!("{}{}", " ".repeat(500_000), "a:".repeat(250_000)),
+        ];
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let hits = bodies
+                .iter()
+                .map(|body| has_secret_key(body))
+                .collect::<Vec<_>>();
+            sender.send(hits).ok();
+        });
+        let hits = receiver.recv_timeout(std::time::Duration::from_secs(20));
+        assert_eq!(hits.expect("scan did not finish"), [false, false, false]);
     }
 
     #[test]
