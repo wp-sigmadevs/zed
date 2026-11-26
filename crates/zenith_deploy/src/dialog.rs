@@ -1382,26 +1382,53 @@ mod tests {
         let (_, dialog, cx) = open_dialog(servers, &FakeRemote::default(), cx).await;
         let store = cx.update(|_, cx| ServerStore::global(cx));
         store.update(cx, |store, _| store.keychain = keychain.clone());
-        dialog.update(cx, |dialog, cx| {
-            // A host change deletes the old entry, a typed password writes a new one: both
-            // would happen before the store refuses the root.
-            dialog.servers.servers[0].host = "elsewhere.example.com".into();
-            dialog.servers.servers[0].root_path = "relative".into();
-            dialog.passwords.insert(saved.id.clone(), fake_secret());
-            dialog.save(cx);
+        // Each of these would change the Keychain before the store refuses the root: a typed
+        // password writes an entry; a changed host (nothing typed) and a turned-off
+        // "save password" delete the saved one.
+        type Edit = fn(&mut DeploymentDialog);
+        let cases: [(&str, Edit); 3] = [
+            ("typed password", |dialog| {
+                let id = dialog.servers.servers[0].id.clone();
+                dialog.passwords.insert(id, fake_secret());
+            }),
+            ("host change, nothing typed", |dialog| {
+                dialog.servers.servers[0].host = "elsewhere.example.com".into();
+            }),
+            ("save password off", |dialog| {
+                dialog.servers.servers[0].save_password = false;
+            }),
+        ];
+        for (case, edit) in cases {
+            dialog.update(cx, |dialog, cx| {
+                dialog.servers = dialog.base.clone();
+                dialog.passwords.clear();
+                dialog.servers.servers[0].root_path = "relative".into();
+                edit(dialog);
+                dialog.save(cx);
+            });
+            cx.run_until_parked();
+            let message = error_text(&dialog, cx);
+            assert!(
+                message.contains("Live") && message.contains("root"),
+                "{case}: {message}"
+            );
+            assert_eq!(
+                keychain.account_of(&saved),
+                Some(crate::secrets::target_account(&saved)),
+                "{case}: the saved entry is untouched"
+            );
+            let entries = keychain.entries.lock().expect("lock");
+            assert_eq!(entries.len(), 1, "{case}: no entry written");
+            assert_eq!(
+                entries.values().next().map(|(_, secret)| secret.as_slice()),
+                Some(b"not-a-real-value-0".as_slice()),
+                "{case}: the saved secret is untouched"
+            );
+        }
+        dialog.update(cx, |dialog, _| {
+            dialog.servers = dialog.base.clone();
+            dialog.passwords.clear();
         });
-        cx.run_until_parked();
-        let message = error_text(&dialog, cx);
-        assert!(
-            message.contains("Live") && message.contains("root"),
-            "{message}"
-        );
-        assert_eq!(
-            keychain.account_of(&saved),
-            Some(crate::secrets::target_account(&saved)),
-            "the saved entry is untouched"
-        );
-        assert_eq!(keychain.entries.lock().expect("lock").len(), 1);
         dialog.read_with(cx, |dialog, _| assert!(!dialog.saving));
         store.read_with(cx, |store, _| {
             assert_eq!(store.servers().servers[0].host, saved.host);
