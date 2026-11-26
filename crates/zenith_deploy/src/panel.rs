@@ -864,7 +864,7 @@ impl RemoteHostPanel {
             name: shown(&server.name, 60),
             host: shown(&server.host, 100),
             server_type: server.server_type,
-            target: secrets::target_account(server),
+            target: secrets::upload_target(server),
         })
     }
 

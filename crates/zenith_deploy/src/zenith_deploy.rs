@@ -417,7 +417,7 @@ impl ServerStore {
                 .servers
                 .iter()
                 .find(|server| &server.id == id)
-                .map(secrets::target_account)
+                .map(secrets::upload_target)
         };
         self.upload_decisions
             .retain(|id, (target, _)| target_of(id).as_ref() == Some(target));

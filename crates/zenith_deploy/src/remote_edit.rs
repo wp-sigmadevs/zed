@@ -156,7 +156,7 @@ pub struct RemoteCopy {
     /// The newest save that arrived during an upload (older ones are replaced) and whether any
     /// of them was forced: one rerun follows, however many saves came.
     pub again: Option<(SavedText, bool)>,
-    /// The server target (`secrets::target_account`) this copy was downloaded from.
+    /// The server target (`secrets::upload_target`) this copy was downloaded from.
     target: String,
     /// A write to this file started in this session (it succeeded or failed). A missing
     /// baseline after that is a failed verification, not a first save: never "no baseline".
@@ -530,7 +530,7 @@ impl ServerStore {
             .servers
             .iter()
             .find(|server| server.id == server_id)
-            .map(secrets::target_account)
+            .map(secrets::upload_target)
     }
 
     /// The [`on_save::fingerprint`] of a saved server, as it is now.
@@ -552,7 +552,7 @@ impl ServerStore {
     }
 
     /// [`Self::set_upload_decision`] only while the server's target is still `expected_target`
-    /// (`secrets::target_account` taken when the prompt was built): an answer given for a host
+    /// (`secrets::upload_target` taken when the prompt was built): an answer given for a host
     /// the user saw is never recorded for a host they did not. False when it does not match.
     pub(crate) fn set_upload_decision_for_target(
         &mut self,
@@ -739,7 +739,7 @@ impl ServerStore {
         else {
             return UploadStart::Refused("This server was removed.".into());
         };
-        if let Some(message) = target_problem(&copy.target, Some(&secrets::target_account(&server)))
+        if let Some(message) = target_problem(&copy.target, Some(&secrets::upload_target(&server)))
         {
             return UploadStart::Refused(message.into());
         }
@@ -960,7 +960,7 @@ impl ServerStore {
             Ok(saved) => saved,
             Err(message) => return UploadStart::Refused(message),
         };
-        let target = secrets::target_account(&server);
+        let target = secrets::upload_target(&server);
         let same_target = |copy: &RemoteCopy| {
             copy.server_id == server.id
                 && copy.remote_path == resolved.remote
@@ -1905,6 +1905,32 @@ mod tests {
                 .read_with(cx, |store, _| store.upload_decision(&f.server_id)),
             UploadDecision::Ask
         );
+    }
+
+    #[gpui::test]
+    async fn switching_to_or_from_anonymous_forgets_allow_and_refuses_a_copy(
+        cx: &mut TestAppContext,
+    ) {
+        let f = fixture(cx).await;
+        f.store.update(cx, |store, cx| {
+            let mut servers = store.servers().clone();
+            servers.servers[0].anonymous = !servers.servers[0].anonymous;
+            store.apply(servers, Vec::new(), cx);
+        });
+        assert_eq!(
+            f.store
+                .read_with(cx, |store, _| store.upload_decision(&f.server_id)),
+            UploadDecision::Ask
+        );
+        f.store.update(cx, |store, _| {
+            store.set_upload_decision(&f.server_id, UploadDecision::Allow);
+        });
+        let UploadStart::Refused(message) = f.upload(true, true, cx) else {
+            panic!("a copy downloaded under the other login must refuse");
+        };
+        assert_eq!(message, TARGET_CHANGED);
+        cx.run_until_parked();
+        assert!(f.remote.log().is_empty());
     }
 
     #[gpui::test]

@@ -35,6 +35,13 @@ impl Keychain for SystemKeychain {
     }
 }
 
+/// What an upload answer or a downloaded copy is bound to: the Keychain target plus whether the
+/// login is anonymous. Changing to or from anonymous sends the files in as someone else, so it
+/// resets both. Memory only: never a Keychain account (those keep [`target_account`]).
+pub(crate) fn upload_target(server: &ServerConfig) -> String {
+    format!("{}|{}", target_account(server), server.anonymous)
+}
+
 fn keychain_key(server_id: &str) -> String {
     format!("zenith-deploy:{server_id}")
 }
