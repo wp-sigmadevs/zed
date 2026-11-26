@@ -8,6 +8,12 @@ pub use onboarding::show_onboarding_view;
 #[cfg(feature = "welcome")]
 pub use zenith_welcome::show_onboarding_view;
 
+#[cfg(not(feature = "welcome"))]
+pub use workspace::prompt_for_open_path_and_open;
+/// File > Open, its palette action and its keymap: asks which window a folder opens in.
+#[cfg(feature = "welcome")]
+pub use zenith_welcome::open_choice::prompt_for_open_path_and_open;
+
 /// Shows the startup card; call right after `release_channel::init`.
 pub fn show_splash(cx: &mut App) {
     #[cfg(feature = "splash")]
@@ -135,6 +141,7 @@ mod menu_actions {
             "zenith_laravel" => cfg!(feature = "laravel"),
             "zenith_markdown" => cfg!(feature = "markdown"),
             "zenith_nextjs" => cfg!(feature = "nextjs"),
+            "zenith_open_project" => cfg!(feature = "welcome"),
             "zenith_php_tools" => cfg!(feature = "php"),
             "zenith_postfix" => cfg!(feature = "postfix"),
             "zenith_problems" => cfg!(feature = "problems"),

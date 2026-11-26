@@ -350,12 +350,18 @@ const COMMAND_LINE_LAUNCHER: (&str, &str) = (
     "install_cli::InstallCliBinary",
 );
 
+/// Forgets "Don't ask again" of the Open Project dialog.
+const CONFIRM_OPEN_WINDOW: (&str, &str) = (
+    "Confirm Window to Open Project In",
+    "zenith_open_project::ConfirmWindow",
+);
+
 /// Every action name the Tools menu looks up, for tests that check they exist.
 pub fn tools_action_names() -> Vec<&'static str> {
     GROUPS
         .iter()
         .flat_map(|group| group.items.iter().map(|(_, name)| *name))
-        .chain([COMMAND_LINE_LAUNCHER.1])
+        .chain([CONFIRM_OPEN_WINDOW.1, COMMAND_LINE_LAUNCHER.1])
         .collect()
 }
 
@@ -429,9 +435,12 @@ pub(crate) fn tools_menu(
         });
     items.push(MenuItem::separator());
     items.push(MenuItem::submenu(Menu::new("IDE Features").items(ide)));
-    if let Some(launcher) = resolve(COMMAND_LINE_LAUNCHER.1) {
-        items.push(MenuItem::separator());
-        items.push(action(COMMAND_LINE_LAUNCHER.0, launcher));
+    // `tidy` drops the separators of a run left empty.
+    items.push(MenuItem::separator());
+    for (label, name) in [CONFIRM_OPEN_WINDOW, COMMAND_LINE_LAUNCHER] {
+        if let Some(resolved) = resolve(name) {
+            items.push(action(label, resolved));
+        }
     }
     Menu::new("Tools").items(tidy(items))
 }

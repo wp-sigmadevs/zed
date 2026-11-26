@@ -5,7 +5,7 @@ use chrono::{DateTime, Utc};
 use fuzzy_nucleo::{
     MaxResults, StringMatch, StringMatchCandidate, StringMatchOptions, match_strings,
 };
-use gpui::{Action as _, App, Context, Task, TaskExt as _, WeakEntity, Window};
+use gpui::{Action as _, App, Context, Task, WeakEntity, Window};
 use picker::{Picker, PickerDelegate};
 use settings::Settings as _;
 use ui::{HighlightedLabel, ListItem, ListItemSpacing, prelude::*};
@@ -166,12 +166,9 @@ impl PickerDelegate for ProjectsDelegate {
             return;
         }
         let paths = project.paths.paths().to_vec();
-        let open_mode = open_mode(cx);
         self.workspace
             .update(cx, |workspace, cx| {
-                workspace
-                    .open_workspace_for_paths(open_mode, paths, window, cx)
-                    .detach_and_log_err(cx);
+                crate::open_choice::open_with_choice(paths, workspace, window, cx);
             })
             .log_err();
     }

@@ -432,6 +432,7 @@ fn tools_menu_structure_and_order() {
             "-",
             "[IDE Features]",
             "-",
+            "zenith_open_project::ConfirmWindow",
             "install_cli::InstallCliBinary",
         ]
     );
@@ -451,8 +452,11 @@ fn tools_menu_structure_and_order() {
     assert_eq!(labels(ai).last().map(String::as_str), Some("Enabled"));
     assert_eq!(
         labels(&tools),
-        ["Create Command Line Launcher…"],
-        "the launcher is the only top-level action"
+        [
+            "Confirm Window to Open Project In",
+            "Create Command Line Launcher…"
+        ],
+        "the Open Project reset and the launcher are the only top-level actions"
     );
 }
 
@@ -598,6 +602,7 @@ const UNLINKED_TOOLS: &[&str] = &[
     "zenith_postfix::",
     "zenith_http::",
     "zenith_markdown::",
+    "zenith_open_project::",
     "install_cli::",
 ];
 

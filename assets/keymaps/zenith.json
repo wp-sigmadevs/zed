@@ -78,6 +78,16 @@
     },
   },
   {
+    // The Open Project dialog (This Window / New Window / Attach / Cancel). Tab and Shift-Tab
+    // move between its controls; the base keymap's context-less "tab" (menu::SelectNext) would
+    // do nothing here. Enter presses the focused button and Escape is menu::Cancel: no binding.
+    "context": "ZenithOpenProject",
+    "bindings": {
+      "tab": "zenith_open_project::FocusNextControl",
+      "shift-tab": "zenith_open_project::FocusPreviousControl",
+    },
+  },
+  {
     // The PHP tools status popover. Tab and Shift-Tab move focus inside it (and wrap); without
     // this the base keymap's "tab" (menu::SelectNext) does nothing here, and Up/Down stay inert.
     "context": "ZenithPhpStatus",

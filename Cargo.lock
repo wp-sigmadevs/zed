@@ -23687,6 +23687,7 @@ dependencies = [
  "language",
  "menu",
  "onboarding",
+ "paths",
  "picker",
  "project",
  "serde_json",

@@ -22,6 +22,7 @@ futures.workspace = true
 fuzzy_nucleo.workspace = true
 git.workspace = true
 gpui.workspace = true
+menu.workspace = true
 onboarding.workspace = true
 picker.workspace = true
 project.workspace = true
@@ -33,7 +34,7 @@ zed_actions.workspace = true
 
 [dev-dependencies]
 language.workspace = true
-menu.workspace = true
+paths.workspace = true
 assets.workspace = true
 client.workspace = true
 editor = { workspace = true, features = ["test-support"] }

@@ -1,6 +1,7 @@
 mod customize;
 pub mod detect;
 mod learn;
+pub mod open_choice;
 mod plugins;
 mod projects;
 mod view;
@@ -44,6 +45,7 @@ impl Settings for ZenithWelcomeSettings {
 
 pub fn init(cx: &mut App) {
     ZenithWelcomeSettings::register(cx);
+    open_choice::init(cx);
     cx.set_global(WelcomeOverride(welcome_override));
 
     // Registered after `onboarding::init`, so this listener runs first.

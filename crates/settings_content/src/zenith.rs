@@ -56,6 +56,32 @@ pub struct ZenithSettingsContent {
     pub tab_menu: Option<ZenithTabMenuSettingsContent>,
     /// Settings for the inspection widget at the end of the tab bar.
     pub inspection_widget: Option<ZenithInspectionWidgetSettingsContent>,
+    /// Settings for opening a project from the file dialog.
+    pub open_project: Option<ZenithOpenProjectSettingsContent>,
+}
+
+/// Settings for opening a project from the file dialog.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+pub struct ZenithOpenProjectSettingsContent {
+    /// Where a folder opened with Open goes when this window already has a project. Unset: ask.
+    /// "Tools > Confirm Window to Open Project In" forgets a saved choice.
+    ///
+    /// Default: null
+    pub window: Option<ZenithOpenProjectWindow>,
+}
+
+/// Where a folder opened from a window that already has a project goes.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+#[serde(rename_all = "snake_case")]
+pub enum ZenithOpenProjectWindow {
+    /// Ask every time.
+    Ask,
+    /// Add the folder and switch to it in this window.
+    ThisWindow,
+    /// Open the folder in a new window.
+    NewWindow,
+    /// Add the folder to this window's project.
+    Attach,
 }
 
 /// Settings for the inspection widget at the end of the tab bar.
