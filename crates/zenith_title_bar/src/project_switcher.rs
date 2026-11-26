@@ -672,7 +672,11 @@ mod tests {
     use workspace::ModalView;
 
     /// Hosts the switcher in the workspace's modal layer: focus and key dispatch as in a window.
-    struct TestModal(Entity<ProjectSwitcher>, Subscription);
+    struct TestModal(
+        Entity<ProjectSwitcher>,
+        // Held so the forwarded DismissEvent keeps flowing.
+        #[allow(dead_code)] Subscription,
+    );
 
     impl ModalView for TestModal {}
     impl EventEmitter<DismissEvent> for TestModal {}
