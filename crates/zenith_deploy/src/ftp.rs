@@ -315,17 +315,32 @@ impl<T: SmolTlsStream + Send + 'static> Transport for FtpSession<T> {
             // 421 (the server is closing the connection) and I/O errors are real failures.
             Err(error) => return Err(refusal(error)),
         };
-        // Without MDTM the parent listing's date is the stamp; a listing failure only costs it.
+        // Without MDTM an MLSD listing's date (seconds, UTC) is the stamp. LIST dates are minute
+        // or day resolution, which cannot prove "unchanged", so LIST mode keeps None (asks).
         let stamp = match stamp {
             Some(stamp) => Some(stamp),
-            None => async {
+            None if self.use_list => None,
+            None => match async {
                 let (parent, name) = split_remote(path)?;
                 let entries = self.list_dir(parent).await?;
                 anyhow::Ok(listing_stamp(&entries, name))
             }
             .await
-            .log_err()
-            .flatten(),
+            {
+                Ok(stamp) => stamp,
+                // A broken data or control channel may have left the session out of step.
+                Err(error)
+                    if error.downcast_ref::<suppaftp::FtpError>().is_some()
+                        || error.downcast_ref::<std::io::Error>().is_some() =>
+                {
+                    return Err(error);
+                }
+                // A refused, oversized or too-long listing only costs the stamp.
+                Err(error) => {
+                    log::warn!("deploy: no listing stamp for {path}: {error:#}");
+                    None
+                }
+            },
         };
         Ok(Some(RemoteStat { size, stamp }))
     }
@@ -448,6 +463,10 @@ mod tests {
         mdtm: Option<&'static str>,
         /// MDTM answers 421 (the server is closing the control connection).
         mdtm_closing: bool,
+        /// Answers the listing command (`LIST`/`MLSD`) with this instead of `150`.
+        list_reply: Option<&'static str>,
+        /// Opens the listing data connection, closes it unread and answers `426`.
+        list_drops_data: bool,
     }
 
     impl Default for FakeFtp {
@@ -458,6 +477,8 @@ mod tests {
                 size: None,
                 mdtm: None,
                 mdtm_closing: false,
+                list_reply: None,
+                list_drops_data: false,
             }
         }
     }
@@ -509,11 +530,21 @@ mod tests {
                         ));
                         data = Some(listener);
                     }
-                    "MLSD" | "RETR" => {
+                    "MLSD" | "LIST" | "RETR" => {
+                        let listing = verb != "RETR";
+                        if let Some(text) = script.list_reply.filter(|_| listing) {
+                            reply(&format!("{text}\r\n"));
+                            continue;
+                        }
                         reply("150 opening\r\n");
                         let (mut stream, _) =
                             data.take().expect("PASV first").accept().expect("data");
-                        let body = if verb == "MLSD" {
+                        if listing && script.list_drops_data {
+                            drop(stream);
+                            reply("426 aborted\r\n");
+                            continue;
+                        }
+                        let body = if listing {
                             &script.listing
                         } else {
                             &script.file
@@ -826,6 +857,71 @@ mod tests {
                 stamp: Some("list:1735732800".into())
             })
         );
+    }
+
+    /// `stat("/www/index.php")` of a server without MDTM, SIZE 12, in MLSD or LIST mode.
+    fn stat_without_mdtm(script: FakeFtp, use_list: bool) -> Result<Option<RemoteStat>> {
+        let (port, server_thread) = fake_ftp_server_with(FakeFtp {
+            size: Some(12),
+            ..script
+        });
+        let mut server = plain_server(port);
+        server.advanced.use_list = use_list;
+        let result = smol::block_on(async {
+            let mut transport = connect(&server).await.expect("connect");
+            transport.stat("/www/index.php").await
+        });
+        server_thread.join().expect("server thread");
+        result
+    }
+
+    #[test]
+    fn list_mode_never_takes_a_stamp_from_minute_resolution_dates() {
+        let listing = b"-rw-r--r--   1 u g   12 Jan 01 12:00 index.php\r\n".to_vec();
+        let stat = stat_without_mdtm(
+            FakeFtp {
+                listing,
+                ..FakeFtp::default()
+            },
+            true,
+        )
+        .expect("stat")
+        .expect("exists");
+        assert_eq!(stat.stamp, None);
+    }
+
+    #[test]
+    fn a_broken_listing_channel_fails_the_stat_but_a_refused_or_huge_listing_does_not() {
+        for script in [
+            FakeFtp {
+                list_reply: Some("421 closing"),
+                ..FakeFtp::default()
+            },
+            FakeFtp {
+                list_drops_data: true,
+                ..FakeFtp::default()
+            },
+        ] {
+            assert!(stat_without_mdtm(script, false).is_err());
+        }
+        let too_many = (0..=MAX_LISTING_ENTRIES)
+            .map(|index| format!("type=file;size=1;modify=20250101120000; f{index}\r\n"))
+            .collect::<String>();
+        for script in [
+            FakeFtp {
+                list_reply: Some("550 denied"),
+                ..FakeFtp::default()
+            },
+            FakeFtp {
+                listing: too_many.into_bytes(),
+                ..FakeFtp::default()
+            },
+        ] {
+            let stat = stat_without_mdtm(script, false)
+                .expect("stat")
+                .expect("exists");
+            assert_eq!(stat.stamp, None);
+        }
     }
 
     #[test]
