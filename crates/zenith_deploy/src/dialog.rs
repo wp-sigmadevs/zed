@@ -708,8 +708,20 @@ impl DeploymentDialog {
         }
         let count = server.mappings.len();
         let message = format!("Upload changed files to \"{}\" when you save?", server.name);
+        let who = if server.anonymous {
+            "anonymous login at ".to_string()
+        } else {
+            format!("{}@", server.username)
+        };
         let mut detail = format!(
-            "Root folder: {}\n{count} {}\n\nEvery time you save a mapped file of this project with Save, it is written to this server over the file that is there. Closing, Save As and files you excluded never upload.",
+            "Target: {who}{}:{} ({})\nRoot folder: {}\n{count} {}\n\nEvery time you save a mapped file with Save, it is written to this server over the file that is there. Closing, Save As and files you excluded never upload.",
+            server.host,
+            server.port,
+            match server.server_type {
+                ServerType::Ftps => "FTPS",
+                ServerType::Ftp => "FTP",
+                ServerType::Sftp => "SFTP",
+            },
             server.root_path,
             if count == 1 { "mapping" } else { "mappings" },
         );
@@ -1315,6 +1327,7 @@ impl DeploymentDialog {
             toggle,
             cx,
         )
+        .debug_selector(|| format!("{id}-checkbox"))
         .role(Role::CheckBox)
         .aria_label(label)
         .aria_toggled(if checked {
@@ -1509,11 +1522,12 @@ impl DeploymentDialog {
                 "Upload changed files to default server on explicit save",
                 active,
                 disabled,
-                blocker.filter(|_| disabled),
+                blocker,
                 |this, window, cx| this.toggle_upload_on_save(window, cx),
                 cx,
             ))
-            .when_some(blocker.filter(|_| disabled), |panel, reason| {
+            // Also while the box is on: the server stopped being the default or lost its mapping.
+            .when_some(blocker, |panel, reason| {
                 panel.child(
                     div()
                         .debug_selector(|| "zenith-deploy-upload-on-save-note".to_string())
@@ -4410,9 +4424,12 @@ mod tests {
             "only an allowed server asks"
         );
         if note.is_none() {
-            cx.simulate_prompt_answer("Cancel");
+            // An allowed server turns on when accepted, so "still off" proves the blocked
+            // ones did nothing.
+            cx.simulate_prompt_answer("Turn on");
+            cx.run_until_parked();
         }
-        assert_eq!(upload_flags(&dialog, cx), (false, false));
+        assert_eq!(upload_flags(&dialog, cx), (note.is_none(), note.is_none()));
     }
 
     #[gpui::test]
@@ -4452,6 +4469,14 @@ mod tests {
         assert!(
             detail.contains("1 mapping"),
             "counts the mappings: {detail}"
+        );
+        assert!(
+            detail.contains("Target: deploy@live.example.com:21 (FTPS)"),
+            "names the target: {detail}"
+        );
+        assert!(
+            !detail.contains("this project"),
+            "the answer is per server: {detail}"
         );
         cx.simulate_prompt_answer("Cancel");
         cx.run_until_parked();
@@ -4628,5 +4653,110 @@ mod tests {
             "focus did not fall out of the dialog"
         );
         assert!(focus_is_inside(&dialog, cx));
+    }
+
+    #[gpui::test]
+    async fn the_prompt_says_when_the_login_is_anonymous(cx: &mut TestAppContext) {
+        let (_, dialog, cx) = open_upload(true, true, cx).await;
+        dialog.update_in(cx, |dialog, window, cx| {
+            dialog.update_selected(cx, |server| server.anonymous = true);
+            dialog.toggle_upload_on_save(window, cx)
+        });
+        cx.run_until_parked();
+        let (_, detail) = cx.pending_prompt().expect("the confirmation");
+        assert!(
+            detail.contains("Target: anonymous login at live.example.com:21 (FTPS)"),
+            "{detail}"
+        );
+        cx.simulate_prompt_answer("Cancel");
+    }
+
+    #[gpui::test]
+    async fn a_change_while_the_prompt_is_open_makes_the_answer_void(cx: &mut TestAppContext) {
+        let (_, dialog, cx) = open_upload(true, true, cx).await;
+        dialog.update_in(cx, |dialog, window, cx| {
+            dialog.toggle_upload_on_save(window, cx)
+        });
+        cx.run_until_parked();
+        assert!(cx.has_pending_prompt());
+        // The prompt named another root folder than the one the server has now.
+        dialog.update(cx, |dialog, cx| {
+            dialog.update_selected(cx, |server| server.root_path = "/elsewhere".into())
+        });
+        cx.simulate_prompt_answer("Turn on");
+        cx.run_until_parked();
+        assert_eq!(upload_flags(&dialog, cx), (false, false));
+        dialog.read_with(cx, |dialog, _| assert!(dialog.reconfirmed.is_empty()));
+    }
+
+    #[gpui::test]
+    async fn a_second_toggle_while_the_prompt_is_open_opens_no_second_prompt(
+        cx: &mut TestAppContext,
+    ) {
+        let (_, dialog, cx) = open_upload(true, true, cx).await;
+        for _ in 0..2 {
+            dialog.update_in(cx, |dialog, window, cx| {
+                dialog.toggle_upload_on_save(window, cx)
+            });
+            cx.run_until_parked();
+        }
+        cx.simulate_prompt_answer("Turn on");
+        cx.run_until_parked();
+        assert_eq!(upload_flags(&dialog, cx), (true, true));
+        assert!(!cx.has_pending_prompt(), "only one prompt was opened");
+    }
+
+    #[gpui::test]
+    async fn a_mouse_click_on_the_checkbox_asks(cx: &mut TestAppContext) {
+        let (_, dialog, cx) = open_upload(true, true, cx).await;
+        let bounds = cx
+            .debug_bounds("zenith-deploy-upload-on-save-checkbox")
+            .expect("the checkbox is drawn");
+        // The box sits at the left edge of its row.
+        let point = bounds.origin + gpui::point(px(8.), bounds.size.height / 2.);
+        cx.simulate_click(point, gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(cx.has_pending_prompt(), "a click asks first");
+        assert_eq!(upload_flags(&dialog, cx), (false, false), "not yet on");
+        cx.simulate_prompt_answer("Turn on");
+        cx.run_until_parked();
+        assert_eq!(upload_flags(&dialog, cx), (true, true));
+    }
+
+    #[gpui::test]
+    async fn unchecking_then_saving_stores_both_flags_off(cx: &mut TestAppContext) {
+        let (workspace, dialog, cx) = open_upload(true, true, cx).await;
+        turn_on(&dialog, "Turn on", cx);
+        dialog.update(cx, |dialog, cx| dialog.save(cx));
+        cx.run_until_parked();
+        assert_eq!(saved_flags(cx), (true, true));
+        let dialog = reopen(&workspace, cx);
+        dialog.update_in(cx, |dialog, window, cx| {
+            dialog.toggle_upload_on_save(window, cx)
+        });
+        dialog.update(cx, |dialog, cx| dialog.save(cx));
+        cx.run_until_parked();
+        assert_eq!(saved_flags(cx), (false, false));
+    }
+
+    #[gpui::test]
+    async fn the_note_stays_when_a_box_that_is_on_loses_the_default(cx: &mut TestAppContext) {
+        let (_, dialog, cx) = open_upload(true, true, cx).await;
+        turn_on(&dialog, "Turn on", cx);
+        assert!(
+            cx.debug_bounds("zenith-deploy-upload-on-save-note")
+                .is_none()
+        );
+        dialog.update(cx, |dialog, cx| {
+            dialog.servers.project_defaults.clear();
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert_eq!(upload_flags(&dialog, cx), (true, true), "still on");
+        assert!(
+            cx.debug_bounds("zenith-deploy-upload-on-save-note")
+                .is_some(),
+            "the reason is shown although the box is on"
+        );
     }
 }

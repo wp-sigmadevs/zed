@@ -53,9 +53,10 @@ pub fn needs_reconfirm(old: Option<&ServerConfig>, new: &ServerConfig) -> bool {
 /// Whether `new` may be saved with `upload_on_save_confirmed` on, over `old` (the saved server, if
 /// any). The flag becomes true only when the user confirmed these very settings now
 /// (`reconfirmed` is the [`fingerprint`] they confirmed) or it was already true and nothing the
-/// fingerprint covers changed. A flag turned on any other way (a hand-edited list, a stale
-/// confirmation) does not hold. The store applies this on every save; the dialog uses it to show
-/// the checkbox.
+/// fingerprint covers changed. A flag turned on any other way (a stale confirmation, a flag the
+/// caller set without asking) does not hold. This is checked only when a save goes through the
+/// store; a `servers.json` edited by hand is trusted as it is at load. The store applies this on
+/// every save; the dialog uses it to show the checkbox.
 pub(crate) fn confirmation_holds(
     old: Option<&ServerConfig>,
     new: &ServerConfig,

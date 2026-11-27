@@ -334,9 +334,9 @@ impl ServerStore {
     ///
     /// `reconfirmed` maps the id of a server whose "upload on save" confirmation the user has
     /// just given again to the [`on_save::fingerprint`] of the settings they confirmed; the
-    /// store keeps the flag only while the server being saved still has that fingerprint, and
-    /// clears it for any other server that needs a new confirmation
-    /// ([`on_save::needs_reconfirm`]).
+    /// store keeps `upload_on_save_confirmed` only when [`on_save::confirmation_holds`] says so
+    /// (confirmed now for these settings, or already on and unchanged) and clears it on every
+    /// server where that fails, whatever the caller sent.
     fn save(
         &mut self,
         previous: Servers,
