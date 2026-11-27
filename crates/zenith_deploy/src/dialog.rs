@@ -165,6 +165,20 @@ impl RemoteBrowser {
         }
     }
 
+    /// The line under the path: loading, an error, or that the folder has no subfolders (the
+    /// parent row does not count as one).
+    fn status(&self) -> Option<(Role, SharedString, Color)> {
+        if self.loading {
+            Some((Role::Status, "Loading folders…".into(), Color::Muted))
+        } else if let Some(error) = &self.error {
+            Some((Role::Alert, error.clone(), Color::Error))
+        } else if self.listed && self.folders.is_empty() {
+            Some((Role::Status, "No folders here.".into(), Color::Muted))
+        } else {
+            None
+        }
+    }
+
     /// What row `index` says: "Parent folder", or the folder's name made safe to show.
     fn label(&self, index: usize) -> Option<String> {
         if self.has_parent() {
@@ -251,9 +265,13 @@ pub struct DeploymentDialog {
     _save: Option<Task<()>>,
     _browse: Option<Task<()>>,
     /// Autodetect or a Browse listing, and the login they wait on. Dropping it cancels the
-    /// work and closes the connection: it is dropped when the dialog closes and when the
-    /// selected server's host, port, type or username changes.
+    /// work and closes the connection. It is dropped when the selected server stops being
+    /// [`Self::remote_target`] (another server, or a changed host, port, type or username), when
+    /// the picker is closed (Close, Escape), when Autodetect and Browse replace each other, and
+    /// with the dialog.
     _remote: Option<Task<()>>,
+    /// The status line shows an Autodetect that is still running (Test Connection has its own).
+    autodetecting: bool,
     /// The server (no password) that [`Self::_remote`] and the browser connect to.
     remote_target: Option<ServerConfig>,
     remote_browser: Option<RemoteBrowser>,
@@ -416,6 +434,7 @@ impl DeploymentDialog {
             _save: None,
             _browse: None,
             _remote: None,
+            autodetecting: false,
             remote_target: None,
             remote_browser: None,
             _subscriptions: subscriptions,
@@ -813,7 +832,8 @@ impl DeploymentDialog {
                 ServerType::Ftp => "FTP",
                 ServerType::Sftp => "SFTP",
             },
-            server.root_path,
+            // The root path may have been typed or detected from a server: no escapes or newlines.
+            shown(&server.root_path, 200),
             if count == 1 { "mapping" } else { "mappings" },
         );
         if server.server_type == ServerType::Ftp {
@@ -1022,6 +1042,10 @@ impl DeploymentDialog {
             server.id == target.id && !target.credentials_target_changed(server)
         });
         if !same {
+            // An Autodetect cancelled here would leave "Connecting…" on screen for good.
+            if std::mem::take(&mut self.autodetecting) {
+                self.test_status = None;
+            }
             self._remote = None;
             self.remote_target = None;
             self.remote_browser = None;
@@ -1045,6 +1069,7 @@ impl DeploymentDialog {
         };
         self.remote_browser = None;
         self.remote_target = Some(target);
+        self.autodetecting = true;
         self.test_status = Some(TestStatus::Running);
         cx.notify();
         self._remote = Some(cx.spawn_in(window, async move |this, cx| {
@@ -1079,6 +1104,7 @@ impl DeploymentDialog {
                 });
                 // The connection was closed above: nothing is left to cancel.
                 this.remote_target = None;
+                this.autodetecting = false;
                 cx.notify();
             })
             .log_err();
@@ -1105,6 +1131,7 @@ impl DeploymentDialog {
             scroll: UniformListScrollHandle::new(),
         };
         let focus = browser.focus.clone();
+        self.autodetecting = false;
         self.test_status = None;
         self.remote_browser = Some(browser);
         // A refused login says why in the status line and opens nothing.
@@ -1118,10 +1145,10 @@ impl DeploymentDialog {
         }
     }
 
-    /// Lists `path` (the server's start folder when `None`) on the browser's connection,
-    /// logging in first when there is none.
+    /// Starts listing `path` (the server's start folder when `None`) on the browser's
+    /// connection, logging in first when there is none; the result arrives later.
     ///
-    /// Fails, changing nothing, when the credentials gate refuses the login.
+    /// Fails, starting nothing, when the credentials gate refuses the login.
     fn load_folder(
         &mut self,
         path: Option<String>,
@@ -1246,7 +1273,7 @@ impl DeploymentDialog {
         }
     }
 
-    /// Moves the picker's selection by `step` rows (Down and Up).
+    /// Moves the picker's selection one row down (`forward`) or up, keeping it in view.
     fn move_remote_selection(&mut self, forward: bool, cx: &mut Context<Self>) {
         let Some(browser) = &mut self.remote_browser else {
             return;
@@ -1259,7 +1286,7 @@ impl DeploymentDialog {
         };
         browser
             .scroll
-            .scroll_to_item(browser.selected, gpui::ScrollStrategy::Top);
+            .scroll_to_item(browser.selected, gpui::ScrollStrategy::Nearest);
         cx.notify();
     }
 
@@ -1659,7 +1686,6 @@ impl DeploymentDialog {
         let colors = cx.theme().colors();
         let count = browser.row_count();
         let path = shown(&browser.path, 200);
-        let selected = browser.selected;
         let list = uniform_list(
             "zenith-deploy-remote-rows",
             count,
@@ -1680,8 +1706,15 @@ impl DeploymentDialog {
                                     format!("{label}, folder")
                                 })
                                 .aria_selected(index == browser.selected)
+                                .when(index == browser.selected, |row| {
+                                    row.aria_active_descendant()
+                                })
                                 .aria_position_in_set(index + 1)
                                 .aria_size_of_set(browser.row_count())
+                                // On the node a screen reader activates, not on the item inside.
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.open_remote_folder(index, window, cx)
+                                }))
                                 .child(
                                     ListItem::new(("zenith-deploy-remote-item", index))
                                         .toggle_state(index == browser.selected)
@@ -1694,10 +1727,7 @@ impl DeploymentDialog {
                                             .size(IconSize::Small)
                                             .color(Color::Muted),
                                         )
-                                        .child(Label::new(label))
-                                        .on_click(cx.listener(move |this, _, window, cx| {
-                                            this.open_remote_folder(index, window, cx)
-                                        })),
+                                        .child(Label::new(label)),
                                 ),
                         )
                     })
@@ -1706,15 +1736,7 @@ impl DeploymentDialog {
         )
         .track_scroll(&browser.scroll)
         .h(rems(12.));
-        let status: Option<(Role, SharedString, Color)> = if browser.loading {
-            Some((Role::Status, "Loading folders…".into(), Color::Muted))
-        } else if let Some(error) = &browser.error {
-            Some((Role::Alert, error.clone(), Color::Error))
-        } else if browser.listed && count == 0 {
-            Some((Role::Status, "No folders here.".into(), Color::Muted))
-        } else {
-            None
-        };
+        let status = browser.status();
         let list_label = format!("Folders in {path}");
         Some(
             v_flex()
@@ -1765,8 +1787,11 @@ impl DeploymentDialog {
                         }))
                         // Enter opens the selected folder; it must not reach the dialog's own
                         // Confirm, which saves.
-                        .on_action(cx.listener(move |this, _: &menu::Confirm, window, cx| {
-                            this.open_remote_folder(selected, window, cx)
+                        .on_action(cx.listener(|this, _: &menu::Confirm, window, cx| {
+                            let selected = this.remote_browser.as_ref().map(|b| b.selected);
+                            if let Some(selected) = selected {
+                                this.open_remote_folder(selected, window, cx)
+                            }
                         }))
                         .child(list),
                 )
@@ -2265,7 +2290,7 @@ impl DeploymentDialog {
                             Button::new("zenith-deploy-remote-autodetect", "Autodetect")
                                 .tab_index(0isize)
                                 .tooltip(Tooltip::text("Use the server's start folder"))
-                                .aria_label("Detect the root path from the server's start folder")
+                                .aria_label("Autodetect the root path from the server's start folder")
                                 .on_click(on_click)
                         },
                         cx,
@@ -6122,6 +6147,151 @@ mod tests {
             cx.update(|_, cx| ServerStore::global(cx).read(cx).servers().clone()),
             before,
             "nothing was saved"
+        );
+    }
+
+    #[gpui::test]
+    async fn a_cancelled_autodetect_does_not_leave_connecting_on_screen(cx: &mut TestAppContext) {
+        let remote = remote_tree();
+        let (dialog, cx) = open_remote(&remote, cx).await;
+        let (hold, gate) = futures::channel::oneshot::channel::<()>();
+        *remote.pwd_gate.lock().expect("lock") = Some(gate);
+        dialog.update_in(cx, |dialog, window, cx| dialog.autodetect_root(window, cx));
+        cx.run_until_parked();
+        assert_eq!(status_text(&dialog, cx), "running", "waiting on the server");
+        let host = dialog.read_with(cx, |dialog, _| dialog.fields.host.clone());
+        types_into(&host, "elsewhere.example.com", cx);
+        cx.run_until_parked();
+        assert!(hold.is_canceled(), "the work is cancelled");
+        assert_eq!(status_text(&dialog, cx), "", "no stale Connecting…");
+    }
+
+    #[gpui::test]
+    async fn dropping_a_picker_leaves_a_running_test_connection_alone(cx: &mut TestAppContext) {
+        let remote = remote_tree();
+        let (dialog, cx) = open_remote(&remote, cx).await;
+        let (_list_hold, list_gate) = futures::channel::oneshot::channel::<()>();
+        remote
+            .list_gates
+            .lock()
+            .expect("lock")
+            .insert("/other".into(), list_gate);
+        browse(&dialog, cx);
+        let (_pwd_hold, pwd_gate) = futures::channel::oneshot::channel::<()>();
+        *remote.pwd_gate.lock().expect("lock") = Some(pwd_gate);
+        dialog.update(cx, |dialog, cx| dialog.test_connection(cx));
+        cx.run_until_parked();
+        assert_eq!(status_text(&dialog, cx), "running");
+        // The host change drops the picker; the Test Connection that still waits is not its.
+        let host = dialog.read_with(cx, |dialog, _| dialog.fields.host.clone());
+        types_into(&host, "elsewhere.example.com", cx);
+        cx.run_until_parked();
+        dialog.read_with(cx, |dialog, _| assert!(dialog.remote_browser.is_none()));
+        assert_eq!(status_text(&dialog, cx), "running", "its line stays");
+    }
+
+    #[gpui::test]
+    async fn an_empty_folder_says_so_although_it_has_a_parent_row(cx: &mut TestAppContext) {
+        let remote = remote_tree();
+        let (dialog, cx) = open_remote(&remote, cx).await;
+        types_into(
+            &dialog.read_with(cx, |dialog, _| dialog.fields.root_path.clone()),
+            "/www/wp-admin",
+            cx,
+        );
+        browse(&dialog, cx);
+        dialog.read_with(cx, |dialog, _| {
+            let browser = dialog.remote_browser.as_ref().expect("open");
+            assert_eq!(browser.row_count(), 1, "only the parent row");
+            let (_, message, _) = browser.status().expect("a notice");
+            assert_eq!(message, "No folders here.");
+        });
+        open_row(&dialog, 0, cx);
+        dialog.read_with(cx, |dialog, _| {
+            let browser = dialog.remote_browser.as_ref().expect("open");
+            assert!(browser.status().is_none(), "/www has folders");
+        });
+    }
+
+    #[gpui::test]
+    async fn tab_walks_list_use_close_and_on_to_the_next_field(cx: &mut TestAppContext) {
+        let remote = remote_tree();
+        let (dialog, cx) = open_remote(&remote, cx).await;
+        let root = dialog.read_with(cx, |dialog, cx| dialog.fields.root_path.focus_handle(cx));
+        let web = dialog.read_with(cx, |dialog, cx| dialog.fields.web_url.focus_handle(cx));
+        types_into(
+            &dialog.read_with(cx, |dialog, _| dialog.fields.root_path.clone()),
+            "/www",
+            cx,
+        );
+        let is_focused = |handle: &FocusHandle, cx: &mut VisualTestContext| {
+            cx.update(|window, _| handle.is_focused(window))
+        };
+
+        // List, Use This Folder, Close, then the next field (Web URL).
+        browse(&dialog, cx);
+        let list = dialog.read_with(cx, |dialog, _| {
+            dialog.remote_browser.as_ref().expect("open").focus.clone()
+        });
+        assert!(is_focused(&list, cx), "the list has focus when it opens");
+        cx.simulate_keystrokes("tab tab tab");
+        assert!(is_focused(&web, cx), "past Use and Close, on Web URL");
+        // Back to Close; Escape there closes only the picker.
+        cx.simulate_keystrokes("shift-tab");
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        dialog.read_with(cx, |dialog, _| assert!(dialog.remote_browser.is_none()));
+        assert!(
+            cx.debug_bounds("zenith-deploy-dialog").is_some(),
+            "dialog open"
+        );
+        assert!(is_focused(&root, cx), "focus is back on Root path");
+
+        // Tab then Enter is Use This Folder.
+        browse(&dialog, cx);
+        cx.simulate_keystrokes("down enter");
+        cx.run_until_parked();
+        assert_eq!(browser_path(&dialog, cx), "/www/public");
+        cx.simulate_keystrokes("tab enter");
+        cx.run_until_parked();
+        assert_eq!(root_text(&dialog, cx), "/www/public");
+        dialog.read_with(cx, |dialog, _| assert!(dialog.remote_browser.is_none()));
+        assert!(is_focused(&root, cx));
+
+        // Tab Tab Enter is Close; Root path is not changed.
+        browse(&dialog, cx);
+        cx.simulate_keystrokes("tab tab enter");
+        cx.run_until_parked();
+        dialog.read_with(cx, |dialog, _| assert!(dialog.remote_browser.is_none()));
+        assert_eq!(root_text(&dialog, cx), "/www/public");
+        assert!(is_focused(&root, cx));
+    }
+
+    #[gpui::test]
+    async fn the_upload_prompt_shows_the_root_folder_without_escapes(cx: &mut TestAppContext) {
+        let (_, dialog, cx) = open_upload(true, true, cx).await;
+        let root = dialog.read_with(cx, |dialog, _| dialog.fields.root_path.clone());
+        types_into(&root, "/a\u{202E}b\u{1b}[31m\u{2028}fake: 99 mappings", cx);
+        dialog.update_in(cx, |dialog, window, cx| {
+            dialog.toggle_upload_on_save(window, cx)
+        });
+        cx.run_until_parked();
+        let (_, detail) = cx.pending_prompt().expect("the confirmation");
+        let line = detail
+            .lines()
+            .find(|line| line.starts_with("Root folder:"))
+            .expect("a root folder line");
+        assert!(
+            !detail.contains(['\u{202E}', '\u{1b}', '\u{2028}']),
+            "{detail:?}"
+        );
+        assert!(
+            line.contains("fake: 99 mappings"),
+            "shown, but as one line: {line}"
+        );
+        assert!(
+            detail.lines().any(|line| line.starts_with("1 mapping")),
+            "the real count follows on its own line: {detail:?}"
         );
     }
 

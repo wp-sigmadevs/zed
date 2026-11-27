@@ -672,6 +672,8 @@ pub(crate) mod test_support {
         pub put_keeps_stat: Arc<Mutex<bool>>,
         /// What `pwd` answers; `None` is `/www`.
         pub pwd_reply: Arc<Mutex<Option<String>>>,
+        /// `pwd` waits (once) until this sender fires or is dropped.
+        pub pwd_gate: Arc<Mutex<Option<futures::channel::oneshot::Receiver<()>>>>,
     }
 
     impl FakeRemote {
@@ -729,6 +731,10 @@ pub(crate) mod test_support {
     #[async_trait]
     impl Transport for FakeRemote {
         async fn pwd(&mut self) -> Result<String> {
+            let gate = self.pwd_gate.lock().ok().and_then(|mut gate| gate.take());
+            if let Some(gate) = gate {
+                gate.await.ok();
+            }
             Ok(self
                 .pwd_reply
                 .lock()

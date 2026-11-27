@@ -118,7 +118,10 @@ async fn open<T: SmolTlsStream + Send + 'static>(
     // The PASV reply names an address; a hostile or misconfigured server could point the data
     // connection anywhere (FTP bounce). Always connect back to the control connection's host.
     stream.set_passive_nat_workaround(true);
-    stream.login(user, password).await?;
+    stream
+        .login(user, password)
+        .await
+        .map_err(|error| redact_password(&error.to_string(), password))?;
     // The default transfer type is ASCII, which rewrites line endings of downloads.
     stream.transfer_type(FileType::Binary).await?;
     Ok(FtpSession {
@@ -127,6 +130,17 @@ async fn open<T: SmolTlsStream + Send + 'static>(
         list_compat: server.advanced.use_list && server.advanced.list_compat,
         hidden_files: server.advanced.hidden_files,
     })
+}
+
+/// A login failure as an error, with the password blanked out: a server may echo what it was
+/// sent (`530 bad password hunter2`), and the text reaches the screen. Passwords under four
+/// characters are left alone, or every `a` of the message would be blanked.
+fn redact_password(message: &str, password: &str) -> anyhow::Error {
+    if password.len() >= 4 {
+        anyhow::anyhow!(message.replace(password, "••••"))
+    } else {
+        anyhow::anyhow!(message.to_string())
+    }
 }
 
 fn to_entry(file: &ListedFile) -> RemoteEntry {
@@ -484,6 +498,8 @@ mod tests {
         list_resets_data: bool,
         /// The answer to `CWD`.
         cwd_reply: &'static str,
+        /// `PASS` is refused with a `530` that repeats the password it got.
+        pass_echo: bool,
     }
 
     /// Closes `stream` with a TCP reset (SO_LINGER 0) instead of a FIN.
@@ -529,6 +545,7 @@ mod tests {
                 list_drops_data: false,
                 list_resets_data: false,
                 cwd_reply: "250 ok",
+                pass_echo: false,
             }
         }
     }
@@ -567,6 +584,10 @@ mod tests {
                 let verb = command.split(' ').next().unwrap_or("").to_uppercase();
                 match verb.as_str() {
                     "USER" => reply("331 password\r\n"),
+                    "PASS" if script.pass_echo => {
+                        let given = command.strip_prefix("PASS ").unwrap_or_default();
+                        reply(&format!("530 Login incorrect for password {given}\r\n"))
+                    }
                     "PASS" => reply("230 in\r\n"),
                     "TYPE" => reply("200 ok\r\n"),
                     "PWD" => reply("257 \"/www\" is the directory\r\n"),
@@ -642,6 +663,36 @@ mod tests {
             commands
         });
         (port, handle)
+    }
+
+    #[test]
+    fn a_login_error_never_repeats_the_password() {
+        let (port, server_thread) = fake_ftp_server_with(FakeFtp {
+            pass_echo: true,
+            ..FakeFtp::default()
+        });
+        let mut server = plain_server(port);
+        server.password = Some(crate::config::Password("hunter2-secret".into()));
+        let error = smol::block_on(connect(&server))
+            .err()
+            .expect("the login is refused");
+        let text = format!("{error:#}");
+        assert!(text.contains("530"), "still says what happened: {text}");
+        assert!(!text.contains("hunter2-secret"), "{text}");
+        assert!(text.contains("••••"), "{text}");
+        server_thread.join().expect("server thread");
+    }
+
+    #[test]
+    fn short_passwords_are_not_redacted_so_the_message_stays_readable() {
+        assert_eq!(
+            redact_password("530 bad abc", "abc").to_string(),
+            "530 bad abc"
+        );
+        assert_eq!(
+            redact_password("530 bad abcd!", "abcd").to_string(),
+            "530 bad ••••!"
+        );
     }
 
     #[test]

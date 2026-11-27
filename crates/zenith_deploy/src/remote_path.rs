@@ -50,8 +50,13 @@ pub(crate) fn validate_root(path: &str) -> Result<String> {
     if validate_remote_path(path).is_err() {
         bail!("the remote path is not an absolute path without control characters or `..`");
     }
-    if path.chars().any(|c| is_invisible(c) || c == '"') {
-        bail!("the remote path contains an invisible character or a quote");
+    // Whitespace other than a plain space (line and paragraph separators, no-break and wide
+    // spaces) can fake a break or a gap when shown.
+    if path
+        .chars()
+        .any(|c| is_invisible(c) || c == '"' || (c.is_whitespace() && c != ' '))
+    {
+        bail!("the remote path contains an invisible character, odd whitespace or a quote");
     }
     let trimmed = path.strip_suffix('/').unwrap_or(path);
     if trimmed.is_empty() {
@@ -183,6 +188,11 @@ mod tests {
             "/a\u{1b}[31m",
             "/a\u{202E}b",
             "/a\u{200B}b",
+            "/a\u{2028}b",
+            "/a\u{2029}b",
+            "/a\u{00A0}b",
+            "/a\u{2003}b",
+            "/a\u{3000}b",
             "/www\" is \"x",
             "/a/./b",
             "/./a",
