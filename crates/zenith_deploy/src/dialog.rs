@@ -54,6 +54,7 @@ pub(crate) const PASSWORD_REMOVED_NOTE: &str =
 const PASSWORD_NOTE_ID: &str = "zenith-deploy-password-removed";
 const OUTDATED: &str = "The saved servers changed while this dialog was open (another save finished). Close it and reopen Deployment settings to continue from the saved list.";
 const PASSWORD_CLEARED: &str = "Saved. The saved password was removed because the host, port, type or username changed; type a new one.";
+const PORT_INVALID: &str = "Port must be a number from 1 to 65535.";
 pub(crate) const NO_USERNAME: &str = "Username is not specified";
 
 struct Fields {
@@ -142,6 +143,10 @@ pub struct DeploymentDialog {
     focus_handle: FocusHandle,
     /// The Add Mapping button: where focus goes when the last mapping row is removed.
     add_mapping_focus: FocusHandle,
+    /// The Add Server button: where Tab starts when there is no server to edit.
+    add_server_focus: FocusHandle,
+    /// Counts removed mappings: a Browse answer for a row that has since moved is dropped.
+    mapping_removals: u64,
     /// The selected server's mappings, rebuilt when the selection or the row count changes.
     mapping_rows: Vec<MappingRow>,
     /// The selected server's `excluded_local`, one pattern per line.
@@ -191,8 +196,14 @@ fn keychain_error(applied: usize, what: &str, error: anyhow::Error) -> anyhow::E
 }
 
 impl Focusable for DeploymentDialog {
+    /// The name field when the form is drawn; else the dialog itself, so that Tab and Escape
+    /// still reach its key context (an undrawn field is not in the dispatch path).
     fn focus_handle(&self, cx: &App) -> FocusHandle {
-        self.fields.name.focus_handle(cx)
+        if self.selected.is_some() {
+            self.fields.name.focus_handle(cx)
+        } else {
+            self.focus_handle.clone()
+        }
     }
 }
 
@@ -290,7 +301,10 @@ impl DeploymentDialog {
             fields,
             tab: DialogTab::Connection,
             focus_handle: cx.focus_handle(),
-            add_mapping_focus: cx.focus_handle(),
+            // Tracked by a button, so the handle itself must be a tab stop.
+            add_mapping_focus: cx.focus_handle().tab_index(0).tab_stop(true),
+            add_server_focus: cx.focus_handle().tab_index(0).tab_stop(true),
+            mapping_removals: 0,
             mapping_rows: Vec::new(),
             excluded,
             port_invalid: false,
@@ -337,6 +351,11 @@ impl DeploymentDialog {
             })
             .or_else(|| (!self.servers.servers.is_empty()).then_some(0));
         self.select(index, window, cx);
+        // Opened before the servers were read, focus is on the dialog itself: now there is a
+        // form, start in its name field.
+        if self.selected.is_some() && self.focus_handle.is_focused(window) {
+            window.focus(&self.fields.name.focus_handle(cx), cx);
+        }
     }
 
     #[cfg(test)]
@@ -448,25 +467,19 @@ impl DeploymentDialog {
     /// Copies the excluded-paths editor into the selected server: one pattern per line, blank
     /// lines dropped.
     fn read_excluded(&mut self, cx: &mut Context<Self>) {
-        let patterns: Vec<String> = self
-            .excluded
-            .read(cx)
-            .text(cx)
+        let text = self.excluded.read(cx).text(cx);
+        let patterns: Vec<String> = text
             .lines()
             .map(str::trim)
             .filter(|line| !line.is_empty())
             .map(String::from)
             .collect();
         if let Some(server) = self.selected_server_mut() {
-            // Showing a server's patterns fires this too: a hand-edited list with blank or
-            // padded entries must stay as it is until the user edits it, or OK would count it
-            // as changed and ask for the upload-on-save confirmation again.
-            let tidy = server
-                .excluded_local
-                .iter()
-                .map(|pattern| pattern.trim())
-                .filter(|pattern| !pattern.is_empty());
-            if !tidy.eq(patterns.iter().map(String::as_str)) {
+            // Showing a server's patterns fires this too: while the box holds exactly what the
+            // server has, a hand-edited list with blank or padded entries must stay as it is, or
+            // OK would count it as changed and ask for the upload-on-save confirmation again.
+            // Any other text is the user's: store it tidied (a padded pattern matches nothing).
+            if text != server.excluded_local.join("\n") {
                 server.excluded_local = patterns;
             }
             cx.notify();
@@ -500,6 +513,7 @@ impl DeploymentDialog {
         };
         if index < server.mappings.len() {
             server.mappings.remove(index);
+            self.mapping_removals += 1;
             self.rebuild_mapping_rows(window, cx);
             // The row that had focus is gone: hand it to the one that took its place (or the
             // one before it), else to Add Mapping, so the keyboard stays inside the dialog.
@@ -530,6 +544,7 @@ impl DeploymentDialog {
         if index >= self.mapping_rows.len() {
             return;
         }
+        let removals = self.mapping_removals;
         let paths = cx.prompt_for_paths(PathPromptOptions {
             files: false,
             directories: true,
@@ -547,9 +562,12 @@ impl DeploymentDialog {
                 return;
             };
             // The rows may have been rebuilt while the prompt was open: find the row again, and
-            // drop the answer if another server is showing.
+            // drop the answer if another server is showing or a mapping was removed (the index
+            // may now name another row).
             this.update_in(cx, |this, window, cx| {
-                if this.selected_server().map(|server| &server.id) != Some(&server_id) {
+                if this.selected_server().map(|server| &server.id) != Some(&server_id)
+                    || this.mapping_removals != removals
+                {
                     return;
                 }
                 if let Some(row) = this.mapping_rows.get(index) {
@@ -1021,6 +1039,7 @@ impl DeploymentDialog {
                 |this, window, cx| this.add_server(window, cx),
                 |on_click| {
                     IconButton::new("zenith-deploy-add", IconName::Plus)
+                        .track_focus(&self.add_server_focus)
                         .icon_size(IconSize::Small)
                         .tab_index(0isize)
                         .tooltip(Tooltip::text("Add Server"))
@@ -1056,6 +1075,7 @@ impl DeploymentDialog {
                 cx,
             ));
         let border = cx.theme().colors().border;
+        let server_count = self.servers.servers.len();
         let rows =
             self.servers
                 .servers
@@ -1078,8 +1098,14 @@ impl DeploymentDialog {
                     )
                     .debug_selector(move || format!("zenith-deploy-server-{index}"))
                     .role(Role::ListBoxOption)
-                    .aria_label(label.clone())
+                    .aria_label(if is_default {
+                        format!("{label}, default")
+                    } else {
+                        label.clone()
+                    })
                     .aria_selected(selected)
+                    .aria_position_in_set(index + 1)
+                    .aria_size_of_set(server_count)
                     .child(
                         ListItem::new(("zenith-deploy-server", index))
                             .toggle_state(selected)
@@ -1122,6 +1148,7 @@ impl DeploymentDialog {
     fn row(
         label: &'static str,
         role: Role,
+        description: Option<&'static str>,
         editor: &Entity<Editor>,
         window: &Window,
         cx: &App,
@@ -1144,6 +1171,7 @@ impl DeploymentDialog {
                     cx,
                 )
                 .debug_selector(|| format!("zenith-deploy-field-{label}"))
+                .when_some(description, |field, text| field.aria_description(text))
                 .flex_1(),
             )
     }
@@ -1222,7 +1250,7 @@ impl DeploymentDialog {
             .role(Role::TabList)
             .aria_label("Server settings")
             .gap_1()
-            .children(DialogTab::ALL.into_iter().map(|tab| {
+            .children(DialogTab::ALL.into_iter().enumerate().map(|(index, tab)| {
                 let selected = self.tab == tab;
                 // The selected tab has a bar under it as well as a background, so the choice
                 // does not rest on colour alone.
@@ -1232,6 +1260,8 @@ impl DeploymentDialog {
                     .role(Role::Tab)
                     .aria_label(tab.label())
                     .aria_selected(selected)
+                    .aria_position_in_set(index + 1)
+                    .aria_size_of_set(DialogTab::ALL.len())
                     .tab_index(0isize)
                     .px_2()
                     .pt_0p5()
@@ -1456,14 +1486,27 @@ impl DeploymentDialog {
             .flex_1()
             .min_w_0()
             .gap_1p5()
-            .child(Self::row("Name", Role::TextInput, &self.fields.name, window, cx))
+            .child(Self::row("Name", Role::TextInput, None, &self.fields.name, window, cx))
             .child(types)
-            .child(Self::row("Host", Role::TextInput, &self.fields.host, window, cx))
-            .child(Self::row("Port", Role::TextInput, &self.fields.port, window, cx))
+            .child(Self::row("Host", Role::TextInput, None, &self.fields.host, window, cx))
+            .child(Self::row(
+                "Port",
+                Role::TextInput,
+                self.port_invalid.then_some(PORT_INVALID),
+                &self.fields.port,
+                window,
+                cx,
+            ))
             .when(self.port_invalid, |form| {
-                form.child(Label::new("Port must be a number from 1 to 65535.").color(Color::Error))
+                form.child(
+                    div()
+                        .id("zenith-deploy-port-error")
+                        .role(Role::Alert)
+                        .aria_label(PORT_INVALID)
+                        .child(Label::new(PORT_INVALID).color(Color::Error)),
+                )
             })
-            .child(Self::row("Username", Role::TextInput, &self.fields.username, window, cx))
+            .child(Self::row("Username", Role::TextInput, None, &self.fields.username, window, cx))
             .when(is_ftp, |form| {
                 form.child(Self::checkbox(
                     "zenith-deploy-anonymous",
@@ -1478,7 +1521,7 @@ impl DeploymentDialog {
                 ))
             })
             .when(is_ftp && !server.anonymous, |form| {
-                form.child(Self::row("Password", Role::PasswordInput, &self.fields.password, window, cx))
+                form.child(Self::row("Password", Role::PasswordInput, None, &self.fields.password, window, cx))
                     .child(Self::checkbox(
                         "zenith-deploy-save-password",
                         "Save password in the Keychain",
@@ -1508,8 +1551,8 @@ impl DeploymentDialog {
                         .size(LabelSize::Small),
                 )
             })
-            .child(Self::row("Root path", Role::TextInput, &self.fields.root_path, window, cx))
-            .child(Self::row("Web URL", Role::TextInput, &self.fields.web_url, window, cx))
+            .child(Self::row("Root path", Role::TextInput, None, &self.fields.root_path, window, cx))
+            .child(Self::row("Web URL", Role::TextInput, None, &self.fields.web_url, window, cx))
             .child(Self::checkbox(
                 "zenith-deploy-project-only",
                 "Visible only for this project",
@@ -1709,6 +1752,9 @@ impl DeploymentDialog {
             .when(self.saving, |footer| {
                 footer.child(
                     div()
+                        .id("zenith-deploy-saving-line")
+                        .role(Role::Status)
+                        .aria_label("Saving…")
                         .debug_selector(|| "zenith-deploy-saving".to_string())
                         .child(Label::new("Saving…").color(Color::Muted)),
                 )
@@ -1788,6 +1834,9 @@ impl Render for DeploymentDialog {
         v_flex()
             .debug_selector(|| "zenith-deploy-dialog".to_string())
             .key_context("DeploymentDialog")
+            // One tab group for the whole dialog: its controls (all tab index 0) go in document
+            // order, and `tab_group` gives the container index 0, which is what keeps them
+            // together in the window's tab order.
             .tab_group()
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::confirm))
@@ -3558,6 +3607,138 @@ mod tests {
             "opening and pressing OK changed nothing, so nothing is asked again"
         );
         assert_eq!(saved.excluded_local, confirmed.excluded_local);
+    }
+
+    #[gpui::test]
+    async fn trimming_a_padded_pattern_stores_it_trimmed_and_asks_again(cx: &mut TestAppContext) {
+        let mut padded = server("Live", None);
+        padded.upload_on_save = true;
+        padded.upload_on_save_confirmed = true;
+        padded.excluded_local = vec!["  *.log ".into()];
+        let servers = Servers {
+            servers: vec![padded],
+            ..Servers::default()
+        };
+        let (_, dialog, cx) = open_dialog(servers, &FakeRemote::default(), cx).await;
+        let excluded = dialog.read_with(cx, |dialog, _| dialog.excluded.clone());
+        assert_eq!(
+            text_of(&excluded, cx),
+            "  *.log ",
+            "the box shows what is stored"
+        );
+        set_text(&excluded, "*.log", cx);
+        dialog.update(cx, |dialog, cx| dialog.save(cx));
+        cx.run_until_parked();
+        let saved =
+            cx.update(|_, cx| ServerStore::global(cx).read(cx).servers().servers[0].clone());
+        // A padded pattern matches nothing: the trimmed one must be what is stored.
+        assert_eq!(saved.excluded_local, ["*.log"]);
+        assert!(
+            !saved.upload_on_save_confirmed,
+            "the exclusions changed: the confirmation is asked for again"
+        );
+    }
+
+    #[gpui::test]
+    async fn without_servers_tab_and_escape_still_reach_the_dialog(cx: &mut TestAppContext) {
+        let (workspace, dialog, cx) =
+            open_dialog(Servers::default(), &FakeRemote::default(), cx).await;
+        load_keymaps(cx);
+        cx.run_until_parked();
+        cx.simulate_keystrokes("tab");
+        let add = dialog.read_with(cx, |dialog, _| dialog.add_server_focus.clone());
+        assert!(
+            focus_is_inside(&dialog, cx),
+            "Tab keeps focus in the dialog"
+        );
+        assert_eq!(focused(cx), Some(add), "Tab reached Add Server");
+        cx.simulate_keystrokes("escape");
+        assert!(!is_open(&workspace, cx), "Escape closes the dialog");
+    }
+
+    #[gpui::test]
+    async fn a_browse_answer_is_dropped_when_a_mapping_was_removed(cx: &mut TestAppContext) {
+        let mut one = server("One", None);
+        one.mappings = ["/a", "/b", "/c"]
+            .map(|local| Mapping {
+                local: local.into(),
+                remote: local.trim_start_matches('/').into(),
+            })
+            .into();
+        let servers = Servers {
+            servers: vec![one],
+            ..Servers::default()
+        };
+        let (_, dialog, cx) = open_dialog(servers, &FakeRemote::default(), cx).await;
+        // Browse on the second row; before the answer the first row is removed, so index 1 is
+        // now the third mapping.
+        dialog.update_in(cx, |dialog, window, cx| {
+            dialog.browse_mapping(1, window, cx)
+        });
+        dialog.update_in(cx, |dialog, window, cx| {
+            dialog.remove_mapping(0, window, cx)
+        });
+        cx.simulate_path_prompt_response(|_| Some(vec!["/chosen".into()]));
+        cx.run_until_parked();
+        let locals = dialog.read_with(cx, |dialog, _| {
+            dialog.servers.servers[0]
+                .mappings
+                .iter()
+                .map(|mapping| mapping.local.clone())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(locals, ["/b", "/c"], "no mapping took the answer");
+    }
+
+    #[gpui::test]
+    async fn tab_reaches_add_mapping_after_the_tabs(cx: &mut TestAppContext) {
+        let (dialog, cx) = open_with_one_server(cx).await;
+        let tabs = tab_handles(cx);
+        dialog.update(cx, |dialog, cx| dialog.set_tab(DialogTab::Mappings, cx));
+        cx.run_until_parked();
+        focus(&tabs[2], cx);
+        cx.simulate_keystrokes("tab");
+        let add = dialog.read_with(cx, |dialog, _| dialog.add_mapping_focus.clone());
+        assert_eq!(focused(cx), Some(add), "no rows: Add Mapping is next");
+    }
+
+    #[gpui::test]
+    async fn enter_on_ok_saves_and_closes(cx: &mut TestAppContext) {
+        let servers = Servers {
+            servers: vec![server("Live", None)],
+            ..Servers::default()
+        };
+        let (workspace, dialog, cx) = open_dialog(servers, &FakeRemote::default(), cx).await;
+        load_keymaps(cx);
+        let name = dialog.read_with(cx, |dialog, _| dialog.fields.name.clone());
+        set_text(&name, "Edited", cx);
+        // Add Server is the first control, so Shift-Tab wraps to the last one: OK.
+        let add = dialog.read_with(cx, |dialog, _| dialog.add_server_focus.clone());
+        focus(&add, cx);
+        cx.simulate_keystrokes("shift-tab enter");
+        cx.run_until_parked();
+        let saved = cx.update(|_, cx| ServerStore::global(cx).read(cx).servers().clone());
+        assert_eq!(saved.servers[0].name, "Edited", "Enter on OK saved");
+        assert!(!is_open(&workspace, cx), "and closed the dialog");
+    }
+
+    #[gpui::test]
+    async fn enter_in_a_single_line_field_saves_and_closes(cx: &mut TestAppContext) {
+        let servers = Servers {
+            servers: vec![server("Live", None)],
+            ..Servers::default()
+        };
+        let (workspace, dialog, cx) = open_dialog(servers, &FakeRemote::default(), cx).await;
+        load_keymaps(cx);
+        let name = dialog.read_with(cx, |dialog, _| dialog.fields.name.clone());
+        set_text(&name, "Edited", cx);
+        let handle = cx.update(|_, cx| name.focus_handle(cx));
+        focus(&handle, cx);
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        let saved = cx.update(|_, cx| ServerStore::global(cx).read(cx).servers().clone());
+        assert_eq!(saved.servers[0].name, "Edited", "Enter in a field saved");
+        assert!(!is_open(&workspace, cx), "and closed the dialog");
     }
 
     #[gpui::test]
