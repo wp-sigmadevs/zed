@@ -58,7 +58,7 @@ actions!(
         CollapseAll,
         /// Uploads the saved text of the open remote file to its host.
         UploadRemoteCopy,
-        /// Selects the active editor's file in the Remote Host tool window, through the shown server's mappings.
+        /// Selects the active editor's file in the Remote Host tool window, through the mappings of the shown host (the project's default host when none is shown).
         SelectOpenedFileInRemoteHost,
     ]
 );
@@ -413,7 +413,9 @@ impl RemoteHostPanel {
     /// "Select Opened File": lists the folders down to the active file's place on the server
     /// (each at most once, the one holding it always again) and selects its row when it shows
     /// up. Only listings: nothing is downloaded, opened or uploaded. A remote copy goes to its
-    /// own server and path, any other file through the project's default server's mappings.
+    /// own server and path (the shown host must be that one, or none); any other file goes
+    /// through the mappings of the shown host, or of the project's default host when none is
+    /// shown.
     pub(crate) fn select_opened(&mut self, buffer: Option<Entity<Buffer>>, cx: &mut Context<Self>) {
         let Some(path) = buffer.and_then(|buffer| buffer_path(buffer.read(cx), cx)) else {
             self.say("The active tab is not a local file.", None, true, cx);
@@ -462,26 +464,33 @@ impl RemoteHostPanel {
         let store = self.store.read(cx);
         let project = self.project.as_deref();
         let file = shown(&path.file_name().unwrap_or_default().to_string_lossy(), 100);
-        if let Some(copy) = store.copy_ref(path) {
+        // Only a real cache copy knows its own place. A mapped project file is in the store
+        // too, but it goes through the mappings like any other.
+        if let Some(copy) = store.copies.get(path) {
             let server = store
                 .server_for(project, &copy.server_id)
                 .ok_or("The server of this copy is not available in this project.")?;
+            if self
+                .server_id
+                .as_ref()
+                .is_some_and(|shown| *shown != server.id)
+            {
+                let name = shown(&server.name, 60);
+                return Err(format!(
+                    "{file} is on {name}, not the host shown here. Select {name} first."
+                ));
+            }
             return Ok((server, copy.remote_path.clone()));
         }
-        let server = project
-            .and_then(|project| store.default_for(project))
-            .and_then(|id| store.server_for(project, id))
+        let server = self
+            .server(cx)
+            .or_else(|| {
+                project
+                    .and_then(|project| store.default_for(project))
+                    .and_then(|id| store.server_for(project, id))
+            })
             .ok_or("Choose a host for this project first.")?;
         let name = shown(&server.name, 60);
-        if self
-            .server_id
-            .as_ref()
-            .is_some_and(|shown| *shown != server.id)
-        {
-            return Err(format!(
-                "{file} is mapped through {name}, not the host shown here. Select {name} first."
-            ));
-        }
         match on_save::resolve(&server, path, &store.cache_dir) {
             Ok(Some(resolved)) => Ok((server, resolved.remote)),
             Ok(None) => Err(format!("{file} is not in a mapped folder of {name}.")),
@@ -501,17 +510,19 @@ impl RemoteHostPanel {
                 .iter()
                 .position(|row| row.path().as_deref() == Some(path))
         };
-        if let Some(index) = row_of(self, &target) {
-            self.locating = None;
-            self.reveal(index, cx);
-            return;
-        }
         let chain = self.root(cx).and_then(|root| chain_to(&root, &target));
         let Some(chain) = chain else {
             self.locating = None;
             return;
         };
+        // Always the fresh listing of the folders on the way: an old one may still show a file
+        // that is gone.
         if chain.iter().any(|folder| self.loading.contains(folder)) {
+            return;
+        }
+        if let Some(index) = row_of(self, &target) {
+            self.locating = None;
+            self.reveal(index, cx);
             return;
         }
         self.locating = None;
@@ -523,16 +534,18 @@ impl RemoteHostPanel {
         {
             return;
         }
-        if let Some(index) = chain.iter().rev().find_map(|folder| row_of(self, folder)) {
+        let deepest = chain.iter().rev().find_map(|folder| row_of(self, folder));
+        let file = shown(target.rsplit('/').next().unwrap_or_default(), 100);
+        let message =
+            if deepest.is_some_and(|index| self.rows[index].entry.kind == EntryKind::Symlink) {
+                format!("{file} is behind a symbolic link, which is not followed.")
+            } else {
+                let server = self.server(cx).map(|server| shown(&server.name, 60));
+                format!("{file} is not on {}.", server.unwrap_or_default())
+            };
+        if let Some(index) = deepest {
             self.reveal(index, cx);
         }
-        let message = format!(
-            "{} is not on {}.",
-            shown(target.rsplit('/').next().unwrap_or_default(), 100),
-            self.server(cx)
-                .map(|server| shown(&server.name, 60))
-                .unwrap_or_default()
-        );
         self.say(&message, None, true, cx);
     }
 
@@ -1588,8 +1601,10 @@ impl RemoteHostPanel {
 
     /// A toolbar control whose Enter does what its click does. Without this the base keymap's
     /// Enter (`menu::Confirm`) reaches the panel and opens the selected row. `button` receives
-    /// the click handler.
+    /// the click handler. A disabled control keeps the handler and does nothing: Enter on it
+    /// (focus stays when a button turns disabled) must not fall through to the panel either.
     fn pressed<B: IntoElement>(
+        enabled: bool,
         press: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + Clone + 'static,
         button: impl FnOnce(Box<dyn Fn(&ClickEvent, &mut Window, &mut App)>) -> B,
         cx: &mut Context<Self>,
@@ -1597,9 +1612,11 @@ impl RemoteHostPanel {
         let on_enter = press.clone();
         let on_click = cx.listener(move |this, _: &ClickEvent, window, cx| press(this, window, cx));
         div()
-            .on_action(
-                cx.listener(move |this, _: &menu::Confirm, window, cx| on_enter(this, window, cx)),
-            )
+            .on_action(cx.listener(move |this, _: &menu::Confirm, window, cx| {
+                if enabled {
+                    on_enter(this, window, cx)
+                }
+            }))
             .child(button(Box::new(on_click)))
     }
 
@@ -1654,6 +1671,7 @@ impl RemoteHostPanel {
                     )
                     .child(
                         Self::pressed(
+                            true,
                             |this, window, cx| this.open_dialog(window, cx),
                             |on_click| {
                                 IconButton::new("zenith-deploy-open-dialog", IconName::Ellipsis)
@@ -1672,6 +1690,7 @@ impl RemoteHostPanel {
                 h_flex()
                     .gap_0p5()
                     .child(Self::pressed(
+                        !self.expanded.is_empty(),
                         |this, _, cx| this.collapse_all(cx),
                         |on_click| {
                             IconButton::new("zenith-deploy-collapse", IconName::ListCollapse)
@@ -1685,6 +1704,7 @@ impl RemoteHostPanel {
                         cx,
                     ))
                     .child(Self::pressed(
+                        has_server,
                         |this, _, cx| this.refresh(cx),
                         |on_click| {
                             IconButton::new("zenith-deploy-refresh", IconName::RotateCw)
@@ -1699,6 +1719,7 @@ impl RemoteHostPanel {
                         cx,
                     ))
                     .child(Self::pressed(
+                        connected,
                         |this, _, cx| this.disconnect(cx),
                         |on_click| {
                             IconButton::new("zenith-deploy-disconnect", IconName::Close)
@@ -1713,6 +1734,7 @@ impl RemoteHostPanel {
                         cx,
                     ))
                     .child(Self::pressed(
+                        true,
                         |this, _, cx| {
                             let buffer = this.active_buffer(cx);
                             this.select_opened(buffer, cx)
@@ -1720,7 +1742,6 @@ impl RemoteHostPanel {
                         |on_click| {
                             IconButton::new("zenith-deploy-select-opened", IconName::Crosshair)
                                 .icon_size(IconSize::Small)
-                                .disabled(!has_server)
                                 .tab_index(0isize)
                                 .tooltip(Tooltip::for_action_title(
                                     "Select Opened File",
@@ -2282,6 +2303,7 @@ impl RemoteHostPanel {
         Some(
             div()
                 .id("remote-host-root")
+                .role(gpui::Role::Label)
                 .aria_label(label.clone())
                 .debug_selector(|| "remote-host-root".into())
                 .child(
@@ -2294,7 +2316,12 @@ impl RemoteHostPanel {
                                 .flex_none()
                                 .child(Icon::new(IconName::Server).size(IconSize::Small)),
                         )
-                        .child(div().min_w_0().child(Label::new(label).truncate())),
+                        .child(
+                            div()
+                                .debug_selector(|| "remote-host-root-label".into())
+                                .min_w_0()
+                                .child(Label::new(label).truncate()),
+                        ),
                 ),
         )
     }
@@ -5122,12 +5149,8 @@ mod tests {
         assert_eq!(remote.log().len(), before);
     }
 
-    #[gpui::test]
-    async fn select_opened_file_does_not_switch_away_from_another_shown_host(
-        cx: &mut TestAppContext,
-    ) {
-        let remote = locate_remote(&[file("a.php")]);
-        let mut m = mapped_panel(&remote, cx, |_| {}).await;
+    /// A second server of the mapped fixture, shown in the panel.
+    async fn show_staging(m: &mut MappedPanel<'_>) -> String {
         let mut other = server("Staging", None);
         other.anonymous = true;
         let other_id = other.id.clone();
@@ -5137,14 +5160,138 @@ mod tests {
             panel.select_server(Some(other_id.clone()), cx)
         });
         m.show_panel();
+        other_id
+    }
+
+    #[gpui::test]
+    async fn select_opened_file_uses_the_shown_hosts_mappings_and_never_switches(
+        cx: &mut TestAppContext,
+    ) {
+        let remote = locate_remote(&[file("a.php")]);
+        let mut m = mapped_panel(&remote, cx, |_| {}).await;
+        let other_id = show_staging(&mut m).await;
+        // A running operation: a switch would reset the panel and drop it.
+        m.panel.update(m.cx, |panel, _| {
+            panel.operations.insert("open:/x".into(), Task::ready(()));
+        });
         let before = remote.log().len();
         m.open("inc/a.php").await;
         m.select_opened();
-        let shown = m.panel.read_with(m.cx, |panel, _| panel.server_id.clone());
+        let (shown, running) = m.panel.read_with(m.cx, |panel, _| {
+            (
+                panel.server_id.clone(),
+                panel.operations.contains_key("open:/x"),
+            )
+        });
         assert_eq!(shown, Some(other_id), "the shown host stays");
+        assert!(running, "nothing was reset");
         let notice = m.notice().expect("a message");
-        assert!(notice.contains("Select Prod first"), "{notice}");
+        assert!(
+            notice.contains("not in a mapped folder of Staging"),
+            "Staging has no mapping: {notice}"
+        );
         assert_eq!(remote.log().len(), before);
+    }
+
+    #[gpui::test]
+    async fn a_file_mapped_by_the_shown_host_is_found_through_it(cx: &mut TestAppContext) {
+        let remote = locate_remote(&[file("a.php")]);
+        let mut m = mapped_panel(&remote, cx, |_| {}).await;
+        let other_id = show_staging(&mut m).await;
+        let project = m.project.to_string_lossy().into_owned();
+        let store = m.panel.read_with(m.cx, |panel, _| panel.store.clone());
+        store.update(m.cx, |store, _| {
+            let staging = store
+                .servers
+                .servers
+                .iter_mut()
+                .find(|server| server.id == other_id)
+                .expect("staging");
+            staging.root_path = "/var/www".into();
+            staging.mappings = vec![crate::config::Mapping {
+                local: project,
+                remote: "t".into(),
+            }];
+        });
+        m.cx.run_until_parked();
+        m.open("inc/a.php").await;
+        m.select_opened();
+        let shown = m.panel.read_with(m.cx, |panel, _| panel.server_id.clone());
+        assert_eq!(shown, Some(other_id), "the default host did not take over");
+        assert_eq!(m.located().0.as_deref(), Some(MAPPED_REMOTE));
+    }
+
+    #[gpui::test]
+    async fn an_uploaded_mapped_file_is_not_taken_for_a_remote_copy(cx: &mut TestAppContext) {
+        let remote = locate_remote(&[file("a.php")]);
+        let mut m = mapped_panel(&remote, cx, |_| {}).await;
+        m.edit("inc/a.php", "<?php echo 1;").await;
+        m.save(SaveIntent::Save).await;
+        assert_eq!(m.puts().len(), 1, "the file is a known mapped file now");
+        let other_id = show_staging(&mut m).await;
+        let before = remote.log().len();
+        m.select_opened();
+        let shown = m.panel.read_with(m.cx, |panel, _| panel.server_id.clone());
+        assert_eq!(shown, Some(other_id));
+        let notice = m.notice().expect("a message");
+        assert!(
+            notice.contains("not in a mapped folder of Staging"),
+            "{notice}"
+        );
+        assert_eq!(remote.log().len(), before);
+    }
+
+    #[gpui::test]
+    async fn a_file_removed_on_the_server_is_not_selected_from_an_old_listing(
+        cx: &mut TestAppContext,
+    ) {
+        let remote = locate_remote(&[file("a.php"), file("b.php")]);
+        let mut m = mapped_panel(&remote, cx, |_| {}).await;
+        m.open("inc/a.php").await;
+        m.select_opened();
+        assert_eq!(m.located().0.as_deref(), Some(MAPPED_REMOTE));
+        // The file goes away on the server: the folder lists as empty from now on.
+        remote
+            .emptied
+            .lock()
+            .expect("lock")
+            .push("/var/www/t/inc".into());
+        m.select_opened();
+        let (selected, _, locating) = m.located();
+        assert_eq!(locating, None);
+        assert_eq!(
+            selected.as_deref(),
+            Some("/var/www/t/inc"),
+            "not the file of the old listing"
+        );
+        let notice = m.notice().expect("a message");
+        assert!(notice.contains("a.php is not on Prod"), "{notice}");
+    }
+
+    #[gpui::test]
+    async fn a_symbolic_link_on_the_way_is_named_not_called_a_missing_file(
+        cx: &mut TestAppContext,
+    ) {
+        let remote = FakeRemote::new(&[
+            ("/var/www", &[("t", EntryKind::Symlink)]),
+            ("/var/www/t", &[dir("inc")]),
+            ("/var/www/t/inc", &[file("a.php")]),
+        ]);
+        let mut m = mapped_panel(&remote, cx, |_| {}).await;
+        m.open("inc/a.php").await;
+        m.select_opened();
+        let (selected, _, locating) = m.located();
+        assert_eq!(locating, None);
+        assert_eq!(
+            selected.as_deref(),
+            Some("/var/www/t"),
+            "the link is selected"
+        );
+        let notice = m.notice().expect("a message");
+        assert!(
+            notice.contains("a.php is behind a symbolic link"),
+            "{notice}"
+        );
     }
 
     #[gpui::test]
@@ -5172,6 +5319,40 @@ mod tests {
         });
         assert_eq!(shown, Some(opened.server.id));
         assert_eq!(selected.as_deref(), Some(INDEX));
+    }
+
+    #[gpui::test]
+    async fn a_remote_copy_does_not_pull_another_shown_host_away(cx: &mut TestAppContext) {
+        let remote = remote_with_baseline();
+        let mut fixture = fixture(&remote, cx).await;
+        let opened = open_index(&mut fixture).await;
+        let here = fixture.servers[1].clone();
+        fixture.panel.update(fixture.cx, |panel, cx| {
+            panel.select_server(Some(here.id.clone()), cx)
+        });
+        fixture.cx.run_until_parked();
+        fixture.panel.update(fixture.cx, |panel, _| {
+            panel.operations.insert("open:/x".into(), Task::ready(()));
+        });
+        fixture.cx.dispatch_action(SelectOpenedFileInRemoteHost);
+        fixture.cx.run_until_parked();
+        let (shown, running, notice) = fixture.panel.read_with(fixture.cx, |panel, _| {
+            (
+                panel.server_id.clone(),
+                panel.operations.contains_key("open:/x"),
+                panel.notice.clone(),
+            )
+        });
+        assert_eq!(shown, Some(here.id), "the shown host stays");
+        assert!(running, "nothing was reset");
+        let notice = notice.expect("a message");
+        assert!(
+            notice.contains(&format!(
+                "index.php is on {}, not the host shown here. Select {} first.",
+                opened.server.name, opened.server.name
+            )),
+            "{notice}"
+        );
     }
 
     #[gpui::test]
@@ -5263,9 +5444,19 @@ mod tests {
                 .expect("the error row");
         assert!(root.bottom() <= error.top(), "{root:?} above {error:?}");
         let text = m.cx.debug_bounds("remote-host-error-text").expect("text");
-        assert!(text.left() > root.left(), "the error sits one level in");
+        let label = m.cx.debug_bounds("remote-host-root-label").expect("label");
+        let indent = f32::from(text.left() - label.left());
         assert!(
-            m.cx.debug_bounds("zenith-deploy-settings").is_none(),
+            // A pixel of slack: the two lines' icon boxes differ a little.
+            (indent - INDENT).abs() <= 1.5,
+            "the error sits one level in: {indent}"
+        );
+        assert!(
+            m.cx.debug_bounds("ICON-Ellipsis").is_some(),
+            "icon buttons are found by this selector"
+        );
+        assert!(
+            m.cx.debug_bounds("ICON-Settings").is_none(),
             "the second gear is gone"
         );
         // The tree rows keep their depths: the header is not one of them.
@@ -5438,5 +5629,43 @@ mod tests {
         assert!(chain_holds("/", "/a/b.php"));
         assert!(!chain_holds("/a", "/ab/c.php"));
         assert!(!chain_holds("/a/b.php", "/a/b.php"));
+    }
+
+    #[gpui::test]
+    async fn enter_on_a_button_that_turned_disabled_does_nothing_and_stays_off_the_row(
+        cx: &mut TestAppContext,
+    ) {
+        let remote = remote();
+        let mut fixture = fixture(&remote, cx).await;
+        focused_panel_with_a_selected_file(&mut fixture).await;
+        fixture.cx.simulate_keystrokes("tab tab tab enter");
+        fixture.cx.run_until_parked();
+        let expanded = fixture
+            .panel
+            .read_with(fixture.cx, |panel, _| panel.expanded.len());
+        assert_eq!(expanded, 0, "Collapse All ran, and is disabled now");
+        // The button keeps focus while disabled: Enter must not reach the panel's row.
+        fixture.cx.simulate_keystrokes("enter");
+        fixture.cx.run_until_parked();
+        assert_eq!(gets(&remote), 0, "the selected file was not opened");
+    }
+
+    #[gpui::test]
+    async fn tab_in_the_open_host_menu_keeps_the_menu_and_the_panel_focus(cx: &mut TestAppContext) {
+        let remote = remote();
+        let mut fixture = fixture(&remote, cx).await;
+        focused_panel_with_a_selected_file(&mut fixture).await;
+        fixture.cx.simulate_keystrokes("tab enter");
+        fixture.cx.run_until_parked();
+        let open = |fixture: &mut Fixture| {
+            fixture
+                .panel
+                .read_with(fixture.cx, |panel, _| panel.host_handle.is_deployed())
+        };
+        assert!(open(&mut fixture), "the menu is open");
+        fixture.cx.simulate_keystrokes("tab");
+        fixture.cx.run_until_parked();
+        assert!(open(&mut fixture), "Tab steps inside the menu");
+        assert!(panel_has_focus(&mut fixture), "focus stayed in the panel");
     }
 }

@@ -28,9 +28,9 @@ actions!(
     [
         /// Opens the Deployment dialog: servers and their connection settings.
         OpenDeployment,
-        /// Moves focus to the next control of the Deployment dialog.
+        /// Moves focus to the next control of the Deployment dialog or the Remote Host tool window.
         FocusNextControl,
-        /// Moves focus to the previous control of the Deployment dialog.
+        /// Moves focus to the previous control of the Deployment dialog or the Remote Host tool window.
         FocusPreviousControl,
     ]
 );
