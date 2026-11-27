@@ -645,6 +645,8 @@ pub(crate) mod test_support {
         pub tree: Arc<HashMap<String, Vec<RemoteEntry>>>,
         pub log: Arc<Mutex<Vec<String>>>,
         pub fail_connect: bool,
+        /// Makes every connect fail with this text (a server's own words); wins over `fail_connect`.
+        pub connect_error: Option<String>,
         /// Folders whose listing fails like a dead connection, not a refusal.
         pub broken: Vec<String>,
         /// Folders that refuse the listing (like a 550) even though the tree has them.
@@ -668,6 +670,8 @@ pub(crate) mod test_support {
         pub put_gate: Arc<Mutex<Option<futures::channel::oneshot::Receiver<()>>>>,
         /// A put does not change the server's stat (a server that rewrites the file).
         pub put_keeps_stat: Arc<Mutex<bool>>,
+        /// What `pwd` answers; `None` is `/www`.
+        pub pwd_reply: Arc<Mutex<Option<String>>>,
     }
 
     impl FakeRemote {
@@ -710,6 +714,9 @@ pub(crate) mod test_support {
                 Box::pin(async move {
                     let password = server.password.map(|password| password.0);
                     remote.push(format!("connect {} password={password:?}", server.host));
+                    if let Some(error) = &remote.connect_error {
+                        return Err(anyhow!(error.clone()));
+                    }
                     if remote.fail_connect {
                         return Err(anyhow!("530 Login incorrect"));
                     }
@@ -722,7 +729,12 @@ pub(crate) mod test_support {
     #[async_trait]
     impl Transport for FakeRemote {
         async fn pwd(&mut self) -> Result<String> {
-            Ok("/www".into())
+            Ok(self
+                .pwd_reply
+                .lock()
+                .ok()
+                .and_then(|reply| reply.clone())
+                .unwrap_or_else(|| "/www".into()))
         }
         async fn list_dir(&mut self, path: &str) -> Result<Vec<RemoteEntry>> {
             self.push(format!("list {path}"));

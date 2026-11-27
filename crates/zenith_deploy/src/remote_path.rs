@@ -27,6 +27,53 @@ pub fn validate_remote_path(path: &str) -> Result<&str> {
     Ok(path)
 }
 
+/// Characters that show nothing or reorder text: format characters (zero-width, bidi
+/// overrides and isolates, tags, soft hyphen, BOM).
+pub(crate) fn is_invisible(c: char) -> bool {
+    matches!(u32::from(c),
+        0xAD | 0x34F | 0x61C | 0x115F | 0x1160 | 0x180E | 0x200B | 0x200E..=0x200F
+        | 0x202A..=0x202E | 0x2060..=0x206F | 0x3164 | 0xFEFF | 0xFFA0 | 0xFFF9..=0xFFFB
+        | 0xE0000..=0xE007F)
+}
+
+/// The longest remote root or folder path the dialog accepts, in bytes.
+pub(crate) const MAX_REMOTE_PATH: usize = 1024;
+
+/// A remote root folder from the server (its `pwd`, a listing) or from the user, strict enough
+/// to show and to store: absolute, no `..`/`.`/empty components (one trailing `/` is dropped),
+/// no control, invisible or `"` characters, at most [`MAX_REMOTE_PATH`] bytes. The error never
+/// repeats the path.
+pub(crate) fn validate_root(path: &str) -> Result<String> {
+    if path.len() > MAX_REMOTE_PATH {
+        bail!("the remote path is longer than {MAX_REMOTE_PATH} bytes");
+    }
+    if validate_remote_path(path).is_err() {
+        bail!("the remote path is not an absolute path without control characters or `..`");
+    }
+    if path.chars().any(|c| is_invisible(c) || c == '"') {
+        bail!("the remote path contains an invisible character or a quote");
+    }
+    let trimmed = path.strip_suffix('/').unwrap_or(path);
+    if trimmed.is_empty() {
+        return Ok("/".into());
+    }
+    if trimmed[1..]
+        .split('/')
+        .any(|component| component.is_empty() || component == ".")
+    {
+        bail!("the remote path contains an empty or `.` component");
+    }
+    Ok(trimmed.into())
+}
+
+/// `/a/b` -> `/a`, `/a` -> `/`, `/` -> `/`.
+pub(crate) fn parent_of(path: &str) -> String {
+    match path.trim_end_matches('/').rsplit_once('/') {
+        Some((parent, _)) if !parent.is_empty() => parent.into(),
+        _ => "/".into(),
+    }
+}
+
 /// `/a/b/c.php` -> (`/a/b`, `c.php`); the parent of `/c.php` is `/`.
 pub(crate) fn split_remote(path: &str) -> Result<(&str, &str)> {
     let (parent, name) = validate_remote_path(path)?
@@ -103,6 +150,56 @@ mod tests {
         ] {
             assert!(join_local(base, bad).is_err(), "{bad:?} must be rejected");
         }
+    }
+
+    #[test]
+    fn validate_root_accepts_clean_paths_and_trims_one_slash() {
+        assert_eq!(validate_root("/www").unwrap(), "/www");
+        assert_eq!(validate_root("/www/").unwrap(), "/www");
+        assert_eq!(validate_root("/").unwrap(), "/");
+        assert_eq!(validate_root("/a b/ü").unwrap(), "/a b/ü");
+        assert_eq!(
+            validate_root(&format!("/{}", "d".repeat(1023)))
+                .unwrap()
+                .len(),
+            1024
+        );
+    }
+
+    #[test]
+    fn validate_root_rejects_each_hostile_path() {
+        let long = format!("/{}", "d".repeat(2000));
+        let msg = validate_root(&long).unwrap_err().to_string();
+        assert!(msg.len() < 200, "the error must not repeat the path: {msg}");
+        for bad in [
+            "",
+            "relative",
+            "-la",
+            "/a/../b",
+            "/..",
+            "/a\nb",
+            "/a\rb",
+            "/a\0b",
+            "/a\u{1b}[31m",
+            "/a\u{202E}b",
+            "/a\u{200B}b",
+            "/www\" is \"x",
+            "/a/./b",
+            "/./a",
+            "/a//b",
+            "//a",
+            "/a//",
+            "/a\\b",
+        ] {
+            assert!(validate_root(bad).is_err(), "{bad:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn parent_of_climbs_to_the_root() {
+        assert_eq!(parent_of("/a/b"), "/a");
+        assert_eq!(parent_of("/a"), "/");
+        assert_eq!(parent_of("/"), "/");
     }
 
     #[test]

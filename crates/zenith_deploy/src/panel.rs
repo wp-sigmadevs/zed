@@ -36,7 +36,7 @@ use crate::{
     UploadOutcome, UploadStart, cache_path_for,
     dialog::{DeploymentDialog, project_root},
     download_entry,
-    remote_path::{join_remote, validate_name, validate_remote_path},
+    remote_path::{is_invisible, join_remote, validate_name, validate_remote_path},
     secrets, spawn_operation, upload_warnings,
 };
 
@@ -91,7 +91,7 @@ pub(crate) fn init(cx: &mut App) {
     .detach();
 }
 
-type Session = Arc<smol::lock::Mutex<Box<dyn Transport>>>;
+pub(crate) type Session = Arc<smol::lock::Mutex<Box<dyn Transport>>>;
 type SharedSession = Shared<Task<Result<Session, SharedString>>>;
 
 #[derive(Clone, Debug)]
@@ -1359,7 +1359,7 @@ fn create_private_dir(cache_root: &Path, directory: &Path) -> anyhow::Result<()>
 
 /// Longest piece of server text in a toast, and in the status line, in characters.
 const MAX_TOAST_CHARS: usize = 300;
-const MAX_STATUS_CHARS: usize = 300;
+pub(crate) const MAX_STATUS_CHARS: usize = 300;
 
 /// The palette name of [`UploadRemoteCopy`].
 const UPLOAD_COMMAND: &str = "zenith deploy: upload remote copy";
@@ -1547,7 +1547,7 @@ fn upload_detail(server_type: ServerType) -> String {
 
 /// `plain_text`, or "(unnamed)" when nothing visible is left: a prompt must never name a file
 /// or server with an empty string.
-fn shown(text: &str, max: usize) -> String {
+pub(crate) fn shown(text: &str, max: usize) -> String {
     let text = plain_text(text, max);
     if text.is_empty() {
         "(unnamed)".into()
@@ -1585,15 +1585,6 @@ impl Drop for IncomingDir {
     }
 }
 
-/// Characters that show nothing or reorder text: format characters (zero-width, bidi
-/// overrides and isolates, tags, soft hyphen, BOM).
-fn is_invisible(c: char) -> bool {
-    matches!(u32::from(c),
-        0xAD | 0x34F | 0x61C | 0x115F | 0x1160 | 0x180E | 0x200B | 0x200E..=0x200F
-        | 0x202A..=0x202E | 0x2060..=0x206F | 0x3164 | 0xFEFF | 0xFFA0 | 0xFFF9..=0xFFFB
-        | 0xE0000..=0xE007F)
-}
-
 /// A mark that attaches to the character before it: cutting between them, or starting a text
 /// with one, would attach it to whatever is shown next to the text.
 fn is_combining(c: char) -> bool {
@@ -1605,7 +1596,7 @@ fn is_combining(c: char) -> bool {
 /// Text from a server or a listing, made safe to show: ANSI escape sequences removed whole,
 /// control and invisible/bidi format characters dropped, whitespace (newlines, U+2028/2029)
 /// collapsed to single spaces, at most `max` characters (then `…`).
-fn plain_text(text: &str, max: usize) -> String {
+pub(crate) fn plain_text(text: &str, max: usize) -> String {
     let mut kept = String::new();
     // A cap on the work for a huge reply; escape sequences are short.
     let mut chars = text.chars().take(max.saturating_mul(16).max(64)).peekable();
