@@ -1712,6 +1712,7 @@ impl DeploymentDialog {
                                 .aria_position_in_set(index + 1)
                                 .aria_size_of_set(browser.row_count())
                                 // On the node a screen reader activates, not on the item inside.
+                                .cursor_pointer()
                                 .on_click(cx.listener(move |this, _, window, cx| {
                                     this.open_remote_folder(index, window, cx)
                                 }))
