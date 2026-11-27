@@ -935,7 +935,8 @@ impl ServerStore {
     /// ([`ServerConfig::mappings`]): `project_root` picks the default server, never any file of
     /// the project. Nothing happens, and the answer is [`UploadStart::NotRemote`], unless the
     /// project is local and unshared, the server is visible in it and has `upload_on_save` on with its
-    /// confirmation still matching ([`RECONFIRM`] refuses a switch that is on without one), and
+    /// confirmation still matching ([`RECONFIRM`] refuses a switch that is on without one, for a
+    /// file that is mapped and not excluded; an unmapped file stays `NotRemote`), and
     /// neither the pause nor a session Deny is set. A file under a built-in secret exclusion also
     /// answers `NotRemote` and
     /// emits [`UploadOutcome::Excluded`] ("never uploaded automatically"); one under the
@@ -963,10 +964,11 @@ impl ServerStore {
         else {
             return UploadStart::NotRemote;
         };
-        match self.auto_upload_problem(&server.id) {
-            Some(RECONFIRM) => return UploadStart::Refused(RECONFIRM.into()),
-            Some(_) => return UploadStart::NotRemote,
-            None => {}
+        // RECONFIRM is answered below, once the file is known to be one this server maps: an
+        // unmapped save never shows it.
+        let problem = self.auto_upload_problem(&server.id);
+        if problem.is_some_and(|problem| problem != RECONFIRM) {
+            return UploadStart::NotRemote;
         }
         let Some(local) = buffer_path(buffer.read(cx), cx) else {
             return UploadStart::NotRemote;
@@ -993,6 +995,10 @@ impl ServerStore {
             }
             Some(Excluded::User) => return UploadStart::NotRemote,
             None => {}
+        }
+        // `force` never gets past this: only the user's confirmation in the dialog does.
+        if problem == Some(RECONFIRM) {
+            return UploadStart::Refused(RECONFIRM.into());
         }
         let saved = match SavedText::capture(buffer.read(cx)) {
             Ok(saved) => saved,

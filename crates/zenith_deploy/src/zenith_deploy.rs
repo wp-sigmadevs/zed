@@ -891,7 +891,16 @@ pub(crate) mod test_support {
             .as_fake()
             .insert_tree("/p", serde_json::json!({ "a.txt": "" }))
             .await;
-        let project = Project::test(app_state.fs.clone(), ["/p".as_ref()], cx).await;
+        workspace_in(app_state, "/p".as_ref(), cx).await
+    }
+
+    /// A window whose project is the folder `root`, which the fake file system already has.
+    pub async fn workspace_in<'a>(
+        app_state: &Arc<AppState>,
+        root: &std::path::Path,
+        cx: &'a mut TestAppContext,
+    ) -> (Entity<Workspace>, &'a mut VisualTestContext) {
+        let project = Project::test(app_state.fs.clone(), [root], cx).await;
         let (multi_workspace, cx) =
             cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
         let workspace = multi_workspace.read_with(cx, |multi, _| multi.workspace().clone());

@@ -35,7 +35,8 @@ use crate::{
     ServerRefused, ServerStore, ServerStoreEvent, ServerType, Transport, UploadDecision,
     UploadOutcome, UploadStart, cache_path_for,
     dialog::{DeploymentDialog, project_root},
-    download_entry,
+    download_entry, on_save,
+    remote_edit::buffer_path,
     remote_path::{is_invisible, join_remote, validate_name, validate_remote_path},
     secrets, spawn_operation, upload_warnings,
 };
@@ -85,7 +86,8 @@ pub(crate) fn init(cx: &mut App) {
         let Some(window) = window else {
             return;
         };
-        let panel = cx.new(|cx| RemoteHostPanel::new(workspace, window, cx));
+        let workspace_entity = cx.entity();
+        let panel = cx.new(|cx| RemoteHostPanel::new(workspace, &workspace_entity, window, cx));
         workspace.add_panel(panel, window, cx);
     })
     .detach();
@@ -159,6 +161,10 @@ pub struct RemoteHostPanel {
     /// Remote copies this window opened, by cache path. An entry stays after its tab closes so a
     /// late upload result is still reported here; its subscriptions go with the buffer.
     owned: HashMap<PathBuf, OwnedCopy>,
+    /// Mapped project files this panel started an upload for, by their path. Inserted before the
+    /// call: the store reports a result (an excluded file's message) only after it returns. A
+    /// weak buffer tells a closed tab apart; dead ones are dropped on each insert.
+    mapped_waiting: HashMap<PathBuf, WeakEntity<Buffer>>,
     /// `is_local_unshared` of this window's project. A closure, not a workspace read: the
     /// palette action runs while the workspace is being updated.
     local_unshared: Box<dyn Fn(&App) -> bool>,
@@ -180,7 +186,12 @@ struct OwnedCopy {
 }
 
 impl RemoteHostPanel {
-    fn new(workspace: &Workspace, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    fn new(
+        workspace: &Workspace,
+        workspace_entity: &Entity<Workspace>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let store = ServerStore::global(cx);
         let subscriptions = vec![
             cx.observe_in(&store, window, |this, _, _, cx| {
@@ -194,6 +205,21 @@ impl RemoteHostPanel {
                         cache_path,
                         outcome,
                     } => this.upload_finished(cache_path, outcome, window, cx),
+                },
+            ),
+            // Only an explicit save of the user uploads: autosave, an agent's write and
+            // Save All never reach this event ([`on_save::is_explicit`]).
+            cx.subscribe_in(
+                workspace_entity,
+                window,
+                |this, workspace, event: &workspace::Event, window, cx| {
+                    if let workspace::Event::UserSavedItem {
+                        item, save_intent, ..
+                    } = event
+                        && on_save::is_explicit(*save_intent)
+                    {
+                        this.user_saved(item.as_ref(), workspace, window, cx);
+                    }
                 },
             ),
         ];
@@ -217,6 +243,7 @@ impl RemoteHostPanel {
             scroll_handle: UniformListScrollHandle::new(),
             operations: HashMap::new(),
             owned: HashMap::new(),
+            mapped_waiting: HashMap::new(),
             local_unshared: {
                 let project = workspace.project().clone();
                 Box::new(move |cx| {
@@ -793,6 +820,58 @@ impl RemoteHostPanel {
             },
         );
         self.status = None;
+        cx.notify();
+    }
+
+    /// The user saved `item` explicitly (the caller checked [`on_save::is_explicit`]). A file that
+    /// is not remote and not mapped costs a path lookup and a few map reads: no file access.
+    fn user_saved(
+        &mut self,
+        item: &dyn workspace::item::WeakItemHandle,
+        workspace: &Entity<Workspace>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(editor) = item.upgrade().and_then(|item| item.act_as::<Editor>(cx)) else {
+            return;
+        };
+        let Some(buffer) = editor.read(cx).buffer().read(cx).as_singleton() else {
+            return;
+        };
+        if self.buffer_path(&buffer).is_some() {
+            // An M4a copy: its own `Saved` subscription uploads it.
+            return;
+        }
+        let root = project_root(workspace.read(cx), cx);
+        self.start_mapped(&buffer, root, false, window, cx);
+    }
+
+    /// Uploads a saved project file that maps to the project's default server. The project
+    /// root is the one of this moment, never remembered.
+    fn start_mapped(
+        &mut self,
+        buffer: &Entity<Buffer>,
+        project_root: Option<String>,
+        force: bool,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let local_unshared = (self.local_unshared)(cx);
+        if let Some(path) = buffer_path(buffer.read(cx), cx) {
+            self.mapped_waiting
+                .retain(|_, weak| weak.upgrade().is_some());
+            self.mapped_waiting.insert(path, buffer.downgrade());
+        }
+        let start = self.store.update(cx, |store, cx| {
+            store.upload_mapped(buffer, project_root.as_deref(), local_unshared, force, cx)
+        });
+        match start {
+            UploadStart::Refused(message) => self.toast(&message, cx),
+            UploadStart::Started
+            | UploadStart::Queued
+            | UploadStart::NeedsConfirmation
+            | UploadStart::NotRemote => {}
+        }
         cx.notify();
     }
 
@@ -1911,9 +1990,10 @@ mod tests {
     use super::*;
     use crate::{
         RemoteStat, Servers,
-        test_support::{FakeRemote, init, server, workspace},
+        test_support::{FakeRemote, init, server, workspace, workspace_in},
     };
     use gpui::{TestAppContext, VisualTestContext};
+    use workspace::SaveIntent;
     use workspace::item::SerializableItem as _;
 
     struct Fixture<'a> {
@@ -3722,5 +3802,226 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o700);
+    }
+
+    // ---- Explicit saves of mapped project files (plan 37 M4b) ----
+
+    const MAPPED_REMOTE: &str = "/var/www/t/inc/a.php";
+
+    /// A window whose project folder `proj` is mapped to `/var/www/t` of its default server,
+    /// which has both upload switches on and the no-baseline question skipped. The files are on
+    /// the real disk (the real-path check) and in the fake file system (the editor).
+    struct MappedPanel<'a> {
+        workspace: Entity<Workspace>,
+        panel: Entity<RemoteHostPanel>,
+        cx: &'a mut VisualTestContext,
+        remote: FakeRemote,
+        project: PathBuf,
+        /// Keeps the real files of the project alive.
+        _dir: tempfile::TempDir,
+    }
+
+    async fn mapped_panel<'a>(
+        remote: &FakeRemote,
+        cx: &'a mut TestAppContext,
+        tune: impl FnOnce(&mut ServerConfig),
+    ) -> MappedPanel<'a> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let project = dir.path().join("proj");
+        let project_text = project.to_string_lossy().into_owned();
+        let mut prod = server("Prod", None);
+        prod.anonymous = true;
+        prod.root_path = "/var/www".into();
+        prod.mappings = vec![crate::config::Mapping {
+            local: project_text.clone(),
+            remote: "t".into(),
+        }];
+        prod.upload_on_save = true;
+        prod.upload_on_save_confirmed = true;
+        tune(&mut prod);
+        prod.upload_on_save_fingerprint = Some(on_save::fingerprint(&prod));
+        let server_id = prod.id.clone();
+        let mut servers = Servers::default();
+        servers
+            .project_defaults
+            .insert(project_text, server_id.clone());
+        servers.servers = vec![prod];
+        let app_state = init(cx, servers, remote, dir.path().join("cache"));
+        for (rel, text) in [
+            ("inc/a.php", "orig"),
+            ("inc/b.php", "orig"),
+            ("wp-config.php", "secret"),
+        ] {
+            let path = project.join(rel);
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+            std::fs::write(&path, text).expect("write");
+        }
+        app_state
+            .fs
+            .as_fake()
+            .insert_tree(
+                &project,
+                serde_json::json!({
+                    "inc": { "a.php": "orig", "b.php": "orig" },
+                    "wp-config.php": "secret",
+                }),
+            )
+            .await;
+        // The first save of a file asks "upload anyway?" without a baseline: skipped here.
+        cx.update(|cx| {
+            let store = ServerStore::global(cx);
+            store.update(cx, |store, _| {
+                let fingerprint = store.current_fingerprint(&server_id).expect("fingerprint");
+                store.set_skip_no_baseline_prompt(&server_id, &fingerprint, true);
+            });
+        });
+        let (workspace, cx) = workspace_in(&app_state, &project, cx).await;
+        let panel = workspace
+            .read_with(cx, |workspace, cx| workspace.panel::<RemoteHostPanel>(cx))
+            .expect("the panel is registered");
+        MappedPanel {
+            workspace,
+            panel,
+            cx,
+            remote: remote.clone(),
+            project,
+            _dir: dir,
+        }
+    }
+
+    impl MappedPanel<'_> {
+        /// Opens a project file in a tab and types `text` into it.
+        async fn edit(&mut self, rel: &str, text: &str) -> Entity<Editor> {
+            let path = self.project.join(rel);
+            let item = self
+                .workspace
+                .update_in(self.cx, |workspace, window, cx| {
+                    workspace.open_abs_path(path, OpenOptions::default(), window, cx)
+                })
+                .await
+                .expect("opened");
+            let editor = item.downcast::<Editor>().expect("editor");
+            editor.update_in(self.cx, |editor, window, cx| {
+                editor.set_text(text.to_string(), window, cx)
+            });
+            editor
+        }
+
+        /// The keyboard path of Save: the active item through `Pane::save_item`, which reports
+        /// `UserSavedItem` when it is done.
+        async fn save(&mut self, intent: SaveIntent) {
+            self.workspace
+                .update_in(self.cx, |workspace, window, cx| {
+                    workspace.save_active_item(intent, window, cx)
+                })
+                .await
+                .expect("saved");
+            self.cx.run_until_parked();
+        }
+
+        fn puts(&self) -> Vec<(String, Vec<u8>)> {
+            puts(&self.remote)
+        }
+
+        fn waiting(&mut self) -> Vec<PathBuf> {
+            self.panel.read_with(self.cx, |panel, _| {
+                panel.mapped_waiting.keys().cloned().collect()
+            })
+        }
+
+        fn toast_shown(&mut self) -> bool {
+            self.workspace.read_with(self.cx, |workspace, _| {
+                workspace.has_notification(&NotificationId::unique::<RemoteHostPanel>())
+            })
+        }
+    }
+
+    #[gpui::test]
+    async fn an_explicit_save_of_a_mapped_file_uploads_the_saved_text(cx: &mut TestAppContext) {
+        let remote = FakeRemote::default();
+        let mut m = mapped_panel(&remote, cx, |_| {}).await;
+        let editor = m.edit("inc/a.php", "<?php echo 1;").await;
+        m.save(SaveIntent::Save).await;
+        assert_eq!(
+            m.puts(),
+            [(MAPPED_REMOTE.to_string(), b"<?php echo 1;\n".to_vec())],
+            "the editor adds the final newline on save"
+        );
+        assert!(!editor.read_with(m.cx, |editor, cx| editor.buffer().read(cx).is_dirty(cx)));
+        assert_eq!(
+            m.waiting(),
+            [m.project.join("inc/a.php")],
+            "recorded before the store answered"
+        );
+    }
+
+    #[gpui::test]
+    async fn save_all_does_not_upload_a_mapped_file(cx: &mut TestAppContext) {
+        let remote = FakeRemote::default();
+        let mut m = mapped_panel(&remote, cx, |_| {}).await;
+        let editor = m.edit("inc/a.php", "<?php echo 1;").await;
+        m.cx.dispatch_action(workspace::SaveAll { save_intent: None });
+        m.cx.run_until_parked();
+        assert!(
+            !editor.read_with(m.cx, |editor, cx| editor.buffer().read(cx).is_dirty(cx)),
+            "Save All did save the file"
+        );
+        assert!(m.puts().is_empty());
+        assert!(m.waiting().is_empty());
+    }
+
+    #[gpui::test]
+    async fn a_save_of_an_unmapped_file_does_no_upload_work_and_shows_nothing(
+        cx: &mut TestAppContext,
+    ) {
+        let remote = FakeRemote::default();
+        let mut m = mapped_panel(&remote, cx, |server| server.mappings.clear()).await;
+        m.edit("inc/a.php", "<?php echo 1;").await;
+        m.save(SaveIntent::Save).await;
+        assert!(m.puts().is_empty());
+        assert!(!m.toast_shown());
+        assert!(remote.log().is_empty(), "not even a connection");
+    }
+
+    #[gpui::test]
+    async fn an_unmapped_save_under_a_stale_confirmation_shows_no_toast_but_a_mapped_one_does(
+        cx: &mut TestAppContext,
+    ) {
+        let remote = FakeRemote::default();
+        let mut m = mapped_panel(&remote, cx, |_| {}).await;
+        // A hand edit: the host changes and the mapping moves away from the project, and the
+        // fingerprint is not redone.
+        let project = m.project.to_string_lossy().into_owned();
+        let store = m.panel.read_with(m.cx, |panel, _| panel.store.clone());
+        store.update(m.cx, |store, _| {
+            store.servers.servers[0].host = "other.example.com".into();
+            store.servers.servers[0].mappings[0].local = "/elsewhere".into();
+        });
+        m.edit("inc/a.php", "x").await;
+        m.save(SaveIntent::Save).await;
+        assert!(!m.toast_shown(), "this file is not mapped");
+        store.update(m.cx, |store, _| {
+            store.servers.servers[0].mappings[0].local = project;
+        });
+        m.save(SaveIntent::Save).await;
+        assert!(
+            m.toast_shown(),
+            "mapped again, the confirmation no longer matches"
+        );
+        assert!(m.puts().is_empty());
+    }
+
+    #[gpui::test]
+    async fn the_waiting_map_drops_files_whose_buffer_is_gone(cx: &mut TestAppContext) {
+        let remote = FakeRemote::default();
+        let mut m = mapped_panel(&remote, cx, |_| {}).await;
+        m.panel.update(m.cx, |panel, _| {
+            panel
+                .mapped_waiting
+                .insert("/gone.php".into(), WeakEntity::new_invalid());
+        });
+        m.edit("inc/a.php", "<?php echo 1;").await;
+        m.save(SaveIntent::Save).await;
+        assert_eq!(m.waiting(), [m.project.join("inc/a.php")]);
     }
 }
