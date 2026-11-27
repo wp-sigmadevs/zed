@@ -30,7 +30,7 @@
 //! - "Discard Edits" in the save-conflict prompt reloads the file from disk and still reports
 //!   an explicit save (upstream `Pane::save_item`), so the text that was on disk uploads. Telling
 //!   it apart needs a one-line upstream hook; the owner decides.
-//! - A project file saved while its server's auto-upload confirmation is stale is refused with a
+//! - A mapped, non-excluded project file saved while its server's auto-upload confirmation is stale is refused with a
 //!   message on every explicit save until the user confirms again in Deployment settings.
 
 use std::{
@@ -3450,10 +3450,11 @@ mod tests {
             confirmed.upload_on_save && confirmed.upload_on_save_confirmed,
             "the file still says confirmed"
         );
-        assert_eq!(
-            f.upload(&buffer, true, cx),
-            UploadStart::Refused(RECONFIRM.into())
-        );
+        // Straight to the store: no helper that turns "upload anyway" into something else.
+        let forced = f.store.update(cx, |store, cx| {
+            store.upload_mapped(&buffer, f.project.to_str(), true, true, cx)
+        });
+        assert_eq!(forced, UploadStart::Refused(RECONFIRM.into()));
         cx.run_until_parked();
         assert_eq!(f.connects(), 0);
         assert!(f.puts().is_empty());

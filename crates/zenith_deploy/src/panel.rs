@@ -873,8 +873,15 @@ impl RemoteHostPanel {
             UploadStart::Started | UploadStart::Queued | UploadStart::Excluded => {
                 // The store's event for this file comes after this handler returns.
                 if let Some(path) = buffer_path(buffer.read(cx), cx) {
-                    self.mapped_waiting
-                        .retain(|_, weak| weak.upgrade().is_some());
+                    // A closed tab's entry stays while its upload runs: its result is still
+                    // told here.
+                    let store = self.store.read(cx);
+                    self.mapped_waiting.retain(|path, weak| {
+                        weak.upgrade().is_some()
+                            || store
+                                .copy_ref(path)
+                                .is_some_and(|copy| copy.state == CopyState::Uploading)
+                    });
                     self.mapped_waiting.insert(path, buffer.downgrade());
                 }
             }
@@ -4479,6 +4486,35 @@ mod tests {
         assert_eq!(m.puts(), [(MAPPED_REMOTE.to_string(), b"x\n".to_vec())]);
     }
 
+    #[gpui::test]
+    async fn a_result_for_a_closed_tab_is_still_told_after_another_file_is_saved(
+        cx: &mut TestAppContext,
+    ) {
+        let remote = FakeRemote::default();
+        let mut m = mapped_panel(&remote, cx, |server| server.advanced.connections = 2).await;
+        let (release, gate) = futures::channel::oneshot::channel();
+        *remote.put_gate.lock().expect("gate") = Some(gate);
+        m.edit("inc/a.php", "one").await;
+        m.save(SaveIntent::Save).await;
+        // a.php's tab is closed while its upload runs (the test project keeps the buffer, so a
+        // dead one stands in).
+        let path = m.project.join("inc/a.php");
+        m.panel.update(m.cx, |panel, _| {
+            panel.mapped_waiting.insert(path, WeakEntity::new_invalid());
+        });
+        m.edit("inc/b.php", "two").await;
+        m.save(SaveIntent::Save).await;
+        assert_eq!(m.notice().as_deref(), Some("Uploaded b.php to Prod"));
+        *remote.put_error.lock().expect("error") = Some("550 disk full".into());
+        release.send(()).expect("release");
+        m.cx.run_until_parked();
+        let notice = m.notice().expect("a.php's result is told");
+        assert!(
+            notice.contains("550 disk full") && notice.contains("save again to upload"),
+            "{notice}"
+        );
+    }
+
     // ---- Overwrite is not an explicit save: vim's :w! :wa! :wqa! :exi! send it through Save All ----
 
     #[gpui::test]
@@ -4591,7 +4627,7 @@ mod tests {
             .await
             .expect("opened");
         let editor = item.downcast::<Editor>().expect("editor");
-        editor.update_in(m.cx, |editor, window, cx| {
+        editor.update_in(m.cx, |editor, _window, cx| {
             editor.set_read_only(true);
             editor.buffer().update(cx, |buffer, cx| {
                 buffer
@@ -4599,7 +4635,6 @@ mod tests {
                     .expect("singleton")
                     .update(cx, |buffer, cx| buffer.set_text("stale", cx));
             });
-            let _ = window;
         });
         m.save(SaveIntent::Save).await;
         // The call that really reaches the guards.
