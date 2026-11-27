@@ -679,6 +679,8 @@ pub(crate) mod test_support {
         pub pwd_reply: Arc<Mutex<Option<String>>>,
         /// `pwd` waits (once) until this sender fires or is dropped.
         pub pwd_gate: Arc<Mutex<Option<futures::channel::oneshot::Receiver<()>>>>,
+        /// The next connect waits (once) until this sender fires or is dropped.
+        pub connect_gate: Arc<Mutex<Option<futures::channel::oneshot::Receiver<()>>>>,
     }
 
     impl FakeRemote {
@@ -721,6 +723,14 @@ pub(crate) mod test_support {
                 Box::pin(async move {
                     let password = server.password.map(|password| password.0);
                     remote.push(format!("connect {} password={password:?}", server.host));
+                    let gate = remote
+                        .connect_gate
+                        .lock()
+                        .ok()
+                        .and_then(|mut gate| gate.take());
+                    if let Some(gate) = gate {
+                        gate.await.ok();
+                    }
                     if let Some(error) = &remote.connect_error {
                         return Err(anyhow!(error.clone()));
                     }

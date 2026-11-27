@@ -865,6 +865,34 @@ impl ServerStore {
         }
     }
 
+    /// Why the upload loop of `copy` must stop now: the server's target changed since the copy
+    /// was made, a session Deny, and for a mapped file a pause, a switch or confirmation that no
+    /// longer holds, and a mapping, root path, exclusion or default server that was edited. Run
+    /// before every cycle and again once a session is open: connecting can take a while.
+    fn upload_problem(
+        &self,
+        cache_path: &Path,
+        copy: &RemoteCopy,
+        mapped: Option<&MappedRun>,
+    ) -> Option<&'static str> {
+        target_problem(
+            &copy.target,
+            self.current_target(&copy.server_id).as_deref(),
+        )
+        .or_else(|| {
+            (self.upload_decision(&copy.server_id) == UploadDecision::Deny).then_some(DENIED)
+        })
+        .or_else(|| {
+            mapped
+                .is_some()
+                .then(|| self.auto_upload_problem(&copy.server_id))
+                .flatten()
+        })
+        .or_else(|| {
+            mapped.and_then(|run| self.mapping_problem(cache_path, copy, &run.project_root))
+        })
+    }
+
     /// Why auto-upload to `server_id` may not run now. The switch of the server's own saved
     /// config must be on and the user's one-time confirmation must still match the server's
     /// settings ([`on_save::confirmation_matches`]: a hand-edited `servers.json` does not), and
@@ -886,9 +914,10 @@ impl ServerStore {
         (self.upload_decision(server_id) == UploadDecision::Deny).then_some(DENIED)
     }
 
-    /// The session limit of a server: `advanced.connections` (at least one) at once.
+    /// The session limit of a server: `advanced.connections` (one to ten) at once.
     fn connection_limit(&mut self, server: &ServerConfig) -> std::sync::Arc<smol::lock::Semaphore> {
-        let size = (server.advanced.connections as usize).max(1);
+        // A hand-edited file could say u32::MAX: at most ten sessions at once.
+        let size = (server.advanced.connections as usize).clamp(1, 10);
         match self.connection_limits.get(&server.id) {
             Some((current, limit)) if *current == size => limit.clone(),
             _ => {
@@ -1099,28 +1128,8 @@ async fn run_upload(
                 (
                     copy.remote_path.clone(),
                     copy.stat.clone(),
-                    // The gate again: a Deny said while this save waited in the queue applies.
-                    target_problem(
-                        &copy.target,
-                        this.current_target(&copy.server_id).as_deref(),
-                    )
-                    .or_else(|| {
-                        (this.upload_decision(&copy.server_id) == UploadDecision::Deny)
-                            .then_some(DENIED)
-                    })
-                    // A pause or a switch turned off while this save waited applies too.
-                    .or_else(|| {
-                        mapped
-                            .is_some()
-                            .then(|| this.auto_upload_problem(&copy.server_id))
-                            .flatten()
-                    })
-                    // The mapping, root path or default server was edited while this waited.
-                    .or_else(|| {
-                        mapped.as_ref().and_then(|run| {
-                            this.mapping_problem(&cache_path, copy, &run.project_root)
-                        })
-                    }),
+                    // The gate again: a Deny, pause or edit said while this save waited applies.
+                    this.upload_problem(&cache_path, copy, mapped.as_ref()),
                     // The user's "always" for the first save of a file never uploaded in this
                     // session. With a baseline there is nothing to skip, so a Conflict is never
                     // silenced; after an upload whose verification failed there is no baseline
@@ -1182,7 +1191,34 @@ async fn run_upload(
                     Err(_) => return,
                 };
                 match opened {
-                    Ok(transport) => transport,
+                    Ok(transport) => {
+                        // The gate once more: the connection took time, and a Deny, a pause or an
+                        // edit made meanwhile must not be raced by this upload.
+                        let problem = this.read_with(cx, |this, _| {
+                            this.copy_ref(&cache_path)
+                                .map(|copy| this.upload_problem(&cache_path, copy, mapped.as_ref()))
+                        });
+                        match problem {
+                            Ok(Some(None)) => transport,
+                            Ok(Some(Some(message))) => {
+                                this.update(cx, |this, cx| {
+                                    this.settle(
+                                        &cache_path,
+                                        &UploadOutcome::Blocked(message.into()),
+                                        None,
+                                        cx,
+                                    )
+                                })
+                                .ok();
+                                disconnect(cx, transport);
+                                return;
+                            }
+                            Ok(None) | Err(_) => {
+                                disconnect(cx, transport);
+                                return;
+                            }
+                        }
+                    }
                     Err(error) => {
                         let message = format!(
                             "Could not connect to {}, so nothing was uploaded: {error:#}",
@@ -2736,6 +2772,79 @@ mod tests {
         assert_eq!(f.puts().len(), 3, "the others went one after the other");
         assert_eq!(f.connects(), 3);
         assert_eq!(f.outcomes(), vec![UploadOutcome::Uploaded; 3]);
+    }
+
+    #[gpui::test]
+    async fn a_hand_edited_connection_count_is_clamped_to_ten(cx: &mut TestAppContext) {
+        let f = mapped_fixture(cx, |server| server.advanced.connections = u32::MAX).await;
+        let server = f
+            .store
+            .read_with(cx, |store, _| store.servers().servers[0].clone());
+        let limit = f
+            .store
+            .update(cx, |store, _| store.connection_limit(&server));
+        let held: Vec<_> = (0..10).filter_map(|_| limit.try_acquire_arc()).collect();
+        assert_eq!(held.len(), 10);
+        assert!(limit.try_acquire_arc().is_none(), "the eleventh waits");
+        let none = f.store.update(cx, |store, _| {
+            let mut server = server.clone();
+            server.advanced.connections = 0;
+            store.connection_limit(&server).try_acquire_arc().is_some()
+        });
+        assert!(none, "zero still gets one session");
+    }
+
+    /// A save whose connection is still being made when `act` happens must not upload.
+    async fn a_save_whose_connection_waits_while(
+        cx: &mut TestAppContext,
+        act: impl FnOnce(&Mapped, &mut TestAppContext),
+        blocked: &str,
+    ) {
+        let f = mapped_fixture(cx, |_| {}).await;
+        let buffer = f.open("inc/a.php", cx).await;
+        let (release, gate) = futures::channel::oneshot::channel();
+        *f.remote.connect_gate.lock().expect("gate") = Some(gate);
+        Fixture::save_in(&buffer, "<?php echo 1;", cx);
+        assert_eq!(f.upload(&buffer, true, cx), UploadStart::Started);
+        cx.run_until_parked();
+        assert_eq!(f.connects(), 1, "the connection is being made");
+        act(&f, cx);
+        release.send(()).expect("release");
+        cx.run_until_parked();
+        assert!(f.puts().is_empty(), "nothing went to the server");
+        assert_eq!(f.outcomes(), [UploadOutcome::Blocked(blocked.into())]);
+        assert!(
+            f.remote.log().iter().any(|line| line == "disconnect"),
+            "the session is closed: {:?}",
+            f.remote.log()
+        );
+    }
+
+    #[gpui::test]
+    async fn a_host_changed_while_the_connection_is_made_stops_the_upload(cx: &mut TestAppContext) {
+        a_save_whose_connection_waits_while(
+            cx,
+            |f, cx| {
+                f.edit_servers(cx, |servers| {
+                    servers.servers[0].host = "other.example.com".into()
+                })
+            },
+            TARGET_CHANGED,
+        )
+        .await;
+    }
+
+    #[gpui::test]
+    async fn a_pause_set_while_the_connection_is_made_stops_the_upload(cx: &mut TestAppContext) {
+        a_save_whose_connection_waits_while(
+            cx,
+            |f, cx| {
+                f.store
+                    .update(cx, |store, cx| store.set_auto_upload_paused(true, cx))
+            },
+            "Auto-upload is paused.",
+        )
+        .await;
     }
 
     #[gpui::test]
