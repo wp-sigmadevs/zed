@@ -17,9 +17,9 @@ use anyhow::anyhow;
 use editor::Editor;
 use futures::{FutureExt as _, future::Shared};
 use gpui::{
-    Action, App, ClickEvent, Context, Div, Entity, EventEmitter, FocusHandle, Focusable, Pixels, PromptButton,
-    PromptLevel, Render, SharedString, Subscription, Task, UniformListScrollHandle, WeakEntity,
-    Window, actions, px, uniform_list,
+    Action, App, ClickEvent, Context, Div, Entity, EventEmitter, FocusHandle, Focusable, Pixels,
+    PromptButton, PromptLevel, Render, SharedString, Subscription, Task, UniformListScrollHandle,
+    WeakEntity, Window, actions, px, uniform_list,
 };
 use language::Buffer;
 use settings::Settings as _;
@@ -437,7 +437,7 @@ impl RemoteHostPanel {
             return;
         };
         if self.server_id.as_deref() != Some(server.id.as_str()) {
-            self.select_server(Some(server.id.clone()), cx);
+            self.select_server(Some(server.id), cx);
         }
         let holder = chain.last().cloned();
         for folder in &chain {
@@ -473,7 +473,11 @@ impl RemoteHostPanel {
             .and_then(|id| store.server_for(project, id))
             .ok_or("Choose a host for this project first.")?;
         let name = shown(&server.name, 60);
-        if self.server_id.as_ref().is_some_and(|shown| *shown != server.id) {
+        if self
+            .server_id
+            .as_ref()
+            .is_some_and(|shown| *shown != server.id)
+        {
             return Err(format!(
                 "{file} is mapped through {name}, not the host shown here. Select {name} first."
             ));
@@ -512,7 +516,11 @@ impl RemoteHostPanel {
         }
         self.locating = None;
         // A folder the user collapsed meanwhile: the file may well be there, no verdict.
-        if chain.iter().skip(1).any(|folder| !self.expanded.contains(folder)) {
+        if chain
+            .iter()
+            .skip(1)
+            .any(|folder| !self.expanded.contains(folder))
+        {
             return;
         }
         if let Some(index) = chain.iter().rev().find_map(|folder| row_of(self, folder)) {
@@ -2169,15 +2177,15 @@ impl Render for RemoteHostPanel {
                 let buffer = this.active_buffer(cx);
                 this.upload_active(buffer, window, cx);
             }))
-            .on_action(cx.listener(|this, _: &SelectOpenedFileInRemoteHost, _, cx| {
-                let buffer = this.active_buffer(cx);
-                this.select_opened(buffer, cx);
-            }))
+            .on_action(
+                cx.listener(|this, _: &SelectOpenedFileInRemoteHost, _, cx| {
+                    let buffer = this.active_buffer(cx);
+                    this.select_opened(buffer, cx);
+                }),
+            )
             // The panel is not modal: Tab and Shift-Tab leave it at its ends.
             .on_action(cx.listener(|_, _: &FocusNextControl, window, cx| window.focus_next(cx)))
-            .on_action(
-                cx.listener(|_, _: &FocusPreviousControl, window, cx| window.focus_prev(cx)),
-            )
+            .on_action(cx.listener(|_, _: &FocusPreviousControl, window, cx| window.focus_prev(cx)))
             .size_full()
             .child(self.render_toolbar(window, cx))
             .when_some(self.root_header(cx), |panel, header| panel.child(header))
@@ -2269,12 +2277,8 @@ impl RemoteHostPanel {
     /// indices and depths stay those of the tree.
     fn root_header(&self, cx: &App) -> Option<impl IntoElement> {
         let server = self.server(cx)?;
-        let label: SharedString = format!(
-            "{} ({})",
-            shown(&server.name, 60),
-            shown(&server.host, 100)
-        )
-        .into();
+        let label: SharedString =
+            format!("{} ({})", shown(&server.name, 60), shown(&server.host, 100)).into();
         Some(
             div()
                 .id("remote-host-root")
@@ -2285,7 +2289,11 @@ impl RemoteHostPanel {
                         .h(px(ROW_HEIGHT))
                         .px_2()
                         .gap_1()
-                        .child(div().flex_none().child(Icon::new(IconName::Server).size(IconSize::Small)))
+                        .child(
+                            div()
+                                .flex_none()
+                                .child(Icon::new(IconName::Server).size(IconSize::Small)),
+                        )
                         .child(div().min_w_0().child(Label::new(label).truncate())),
                 ),
         )
@@ -5034,11 +5042,7 @@ mod tests {
         assert_eq!(expanded, ["/var/www/t", "/var/www/t/inc"]);
         assert_eq!(locating, None);
         assert!(!m.toast_shown(), "{:?}", m.notice());
-        assert_eq!(
-            lists(&remote, "/var/www"),
-            1,
-            "showing the panel does not list the root a second time"
-        );
+        assert_eq!(lists(&remote, "/var/www"), 1, "the root is listed once");
         assert_eq!(gets(&remote), 0, "nothing is downloaded");
         assert!(m.puts().is_empty());
     }
@@ -5071,16 +5075,21 @@ mod tests {
         m.open("inc/a.php").await;
         m.select_opened();
         assert_eq!(remote.log().len(), before, "no listing, no connection");
-        assert_eq!(m.located().0.as_deref(), Some("/var/www/t"), "selection kept");
+        assert_eq!(
+            m.located().0.as_deref(),
+            Some("/var/www/t"),
+            "selection kept"
+        );
         let notice = m.notice().expect("a message");
-        assert!(notice.contains("not in a mapped folder of Prod"), "{notice}");
+        assert!(
+            notice.contains("not in a mapped folder of Prod"),
+            "{notice}"
+        );
         assert!(m.toast_shown());
     }
 
     #[gpui::test]
-    async fn select_opened_file_asks_for_a_host_when_the_project_has_none(
-        cx: &mut TestAppContext,
-    ) {
+    async fn select_opened_file_asks_for_a_host_when_the_project_has_none(cx: &mut TestAppContext) {
         let remote = locate_remote(&[file("a.php")]);
         let mut m = mapped_panel(&remote, cx, |_| {}).await;
         m.open("inc/a.php").await;
@@ -5089,10 +5098,14 @@ mod tests {
         store.update(m.cx, |store, _| {
             store.servers.project_defaults.remove(&project);
         });
-        m.panel.update(m.cx, |panel, cx| panel.select_server(None, cx));
+        m.panel
+            .update(m.cx, |panel, cx| panel.select_server(None, cx));
         m.select_opened();
         let notice = m.notice().expect("a message");
-        assert!(notice.contains("Choose a host for this project first"), "{notice}");
+        assert!(
+            notice.contains("Choose a host for this project first"),
+            "{notice}"
+        );
         assert_eq!(lists(&remote, "/var/www"), 0);
     }
 
@@ -5120,8 +5133,9 @@ mod tests {
         let other_id = other.id.clone();
         let store = m.panel.read_with(m.cx, |panel, _| panel.store.clone());
         store.update(m.cx, |store, _| store.servers.servers.push(other));
-        m.panel
-            .update(m.cx, |panel, cx| panel.select_server(Some(other_id.clone()), cx));
+        m.panel.update(m.cx, |panel, cx| {
+            panel.select_server(Some(other_id.clone()), cx)
+        });
         m.show_panel();
         let before = remote.log().len();
         m.open("inc/a.php").await;
@@ -5156,7 +5170,7 @@ mod tests {
                     .and_then(Row::path),
             )
         });
-        assert_eq!(shown, Some(opened.server.id.clone()));
+        assert_eq!(shown, Some(opened.server.id));
         assert_eq!(selected.as_deref(), Some(INDEX));
     }
 
@@ -5186,10 +5200,20 @@ mod tests {
             .refusing
             .lock()
             .expect("lock")
-            .push("/var/www/t".into());
+            .push("/var/www/t/inc".into());
+        // The folder holding the file refuses last: the others are listed and the search waits.
+        let (hold, gate) = futures::channel::oneshot::channel();
+        remote
+            .list_gates
+            .lock()
+            .expect("lock")
+            .insert("/var/www/t/inc".into(), gate);
         let mut m = mapped_panel(&remote, cx, |_| {}).await;
         m.open("inc/a.php").await;
         m.select_opened();
+        assert_eq!(m.located().2.as_deref(), Some(MAPPED_REMOTE), "waiting");
+        drop(hold);
+        m.cx.run_until_parked();
         assert_eq!(m.located().2, None);
         let notice = m.notice().expect("a message");
         assert!(notice.contains("Could not find a.php"), "{notice}");
@@ -5208,7 +5232,11 @@ mod tests {
         let mut m = mapped_panel(&remote, cx, |_| {}).await;
         m.open("inc/a.php").await;
         m.select_opened();
-        assert_eq!(m.located().2.as_deref(), Some(MAPPED_REMOTE), "still looking");
+        assert_eq!(
+            m.located().2.as_deref(),
+            Some(MAPPED_REMOTE),
+            "still looking"
+        );
         m.panel.update(m.cx, |panel, cx| panel.disconnect(cx));
         drop(hold);
         m.cx.run_until_parked();
@@ -5227,8 +5255,12 @@ mod tests {
             cx.notify();
         });
         m.cx.run_until_parked();
-        let root = m.cx.debug_bounds("remote-host-root").expect("the server's line");
-        let error = m.cx.debug_bounds("remote-host-error").expect("the error row");
+        let root =
+            m.cx.debug_bounds("remote-host-root")
+                .expect("the server's line");
+        let error =
+            m.cx.debug_bounds("remote-host-error")
+                .expect("the error row");
         assert!(root.bottom() <= error.top(), "{root:?} above {error:?}");
         let text = m.cx.debug_bounds("remote-host-error-text").expect("text");
         assert!(text.left() > root.left(), "the error sits one level in");
@@ -5280,9 +5312,9 @@ mod tests {
     /// A panel on `/www`, wp-content expanded, the `index.php` row selected, focus in the panel.
     async fn focused_panel_with_a_selected_file(fixture: &mut Fixture<'_>) {
         let server = fixture.servers[0].clone();
-        fixture
-            .panel
-            .update(fixture.cx, |panel, cx| panel.select_server(Some(server.id), cx));
+        fixture.panel.update(fixture.cx, |panel, cx| {
+            panel.select_server(Some(server.id), cx)
+        });
         fixture.cx.run_until_parked();
         click_row(fixture, "wp-content");
         fixture.cx.run_until_parked();
@@ -5351,7 +5383,10 @@ mod tests {
         let before = selected(&mut fixture);
         fixture.cx.simulate_keystrokes("tab");
         assert_eq!(selected(&mut fixture), before, "Tab does not step the rows");
-        assert!(panel_has_focus(&mut fixture), "the dropdown is in the panel");
+        assert!(
+            panel_has_focus(&mut fixture),
+            "the dropdown is in the panel"
+        );
         let mut left = None;
         for presses in 2..=12 {
             fixture.cx.simulate_keystrokes("tab");
