@@ -108,9 +108,10 @@ pub struct ServerConfig {
     /// confirmed) and clears both confirmation fields on every save where the confirmation does not
     /// hold for these very settings (`on_save::confirmation_holds`). Auto-upload runs only while
     /// the flag is on and the stored fingerprint still equals the server's own
-    /// (`on_save::confirmation_matches`). The fingerprint is not a secret and not a signature: it
-    /// protects against an edit that changes the host, root, mappings or exclusions and does not
-    /// also recompute it (a new host typed into `servers.json`, a file that arrived with a repo).
+    /// (`on_save::confirmation_matches`). The fingerprint covers the target (host, port, type,
+    /// user, anonymous), the root folder, the mappings and the local exclusions. It is not a
+    /// secret and not a signature: it protects against an edit of those that does not also
+    /// recompute it (a new host typed into `servers.json`, a file that arrived with a repo).
     /// Accepted: whoever can write `servers.json` and knows the rule controls auto-upload. A file
     /// from before the fingerprint existed has `None` and fails closed. The M4a uploader ignores
     /// all of these by design: its yes is a session-only, in-memory decision (`UploadDecision`).

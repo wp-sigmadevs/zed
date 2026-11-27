@@ -14,16 +14,14 @@ use crate::{
     remote_path::{join_remote, validate_name, validate_remote_path},
 };
 
-/// An explicit save by the user. Closing, skipping and "Save As" never upload. `SaveAll` is not
-/// explicit: the close prompt's "Save all" and the quit prompt send the same intent and cannot be
-/// told apart, so closing or quitting must never upload.
+/// An explicit save by the user. Closing, quitting, skipping and "Save As" never upload.
+/// `SaveAll` and `Overwrite` are not explicit: the close prompt's "Save all", the quit prompt and
+/// vim's `:wa!`, `:xa!`, `:wqa!` and `:exi!` send them through Save All or Close All and save
+/// every open file, clean ones too. So vim's `:w` uploads, `:w!` (Overwrite) does not.
 pub fn is_explicit(intent: SaveIntent) -> bool {
     matches!(
         intent,
-        SaveIntent::Save
-            | SaveIntent::FormatAndSave
-            | SaveIntent::SaveWithoutFormat
-            | SaveIntent::Overwrite
+        SaveIntent::Save | SaveIntent::FormatAndSave | SaveIntent::SaveWithoutFormat
     )
 }
 
@@ -157,12 +155,6 @@ pub fn resolve(
         return Err("Files of the download cache are never uploaded by a mapping.".into());
     }
     validate_mappings(server)?;
-    // Every part of the file path is checked, also the ones above the mapping folder.
-    for component in local.components() {
-        if !matches!(component, Component::RootDir | Component::Prefix(_)) {
-            part(component)?;
-        }
-    }
     let best = server
         .mappings
         .iter()
@@ -172,9 +164,17 @@ pub fn resolve(
             folder.is_absolute().then_some((folder, mapping, rest))
         })
         .max_by_key(|(folder, ..)| folder.components().count());
+    // A file no mapping contains is none of our business: its name is not checked (an explicit
+    // save of any such file would otherwise answer an error every time).
     let Some((folder, mapping, rest)) = best else {
         return Ok(None);
     };
+    // Every part of the file path is checked, also the ones above the mapping folder.
+    for component in local.components() {
+        if !matches!(component, Component::RootDir | Component::Prefix(_)) {
+            part(component)?;
+        }
+    }
     // The file is the mapped folder itself: nothing to upload.
     if rest.as_os_str().is_empty() {
         return Ok(None);
@@ -401,11 +401,11 @@ mod tests {
             SaveIntent::Save,
             SaveIntent::FormatAndSave,
             SaveIntent::SaveWithoutFormat,
-            SaveIntent::Overwrite,
         ] {
             assert!(is_explicit(intent), "{intent:?}");
         }
         for intent in [
+            SaveIntent::Overwrite,
             SaveIntent::SaveAll,
             SaveIntent::Close,
             SaveIntent::Skip,
@@ -458,6 +458,11 @@ mod tests {
         // A bad remote part of the matched mapping is an error, not a fallback.
         assert!(resolve(&self::server(&[("/p", "../up")]), "/p/a.php").is_err());
         assert!(resolve(&self::server(&[("/p", "a")]), "/p/b\\c.php").is_err());
+        // A file that matches no mapping is `None`, whatever its name: no error to show.
+        assert_eq!(
+            resolve(&self::server(&[("/p", "a")]), "/other/a\nb.php"),
+            Ok(None)
+        );
         // A root that is not an absolute remote path is an error.
         let mut relative_root = self::server(&[("/p", "x")]);
         relative_root.root_path = "www".into();
@@ -509,6 +514,31 @@ mod tests {
         }
         assert_eq!(excluded(Path::new("index.php"), &user), None);
         assert_eq!(excluded(Path::new("inc/keys.php"), &user), None);
+    }
+
+    #[test]
+    fn the_secret_list_ignores_case_as_a_case_insensitive_disk_does() {
+        let user = user();
+        for secret in [
+            ".ENV",
+            "WP-CONFIG.PHP",
+            "ID_RSA",
+            "Id_Ed25519.bak",
+            ".GIT/config",
+            ".HTPASSWD",
+            "AUTH.JSON",
+            ".NpmRc",
+            "SFTP-Config.json",
+            ".AWS/credentials",
+            "CERT.PEM",
+        ] {
+            assert_eq!(
+                excluded(Path::new(secret), &user),
+                Some(Excluded::Fixed),
+                "{secret}"
+            );
+        }
+        assert_eq!(excluded(Path::new("ID_RSA.PUB"), &user), None);
     }
 
     #[test]

@@ -17,14 +17,21 @@
 //!   another buffer's text.
 //! - A copy is bound to the server target (host, port, type, user) it was downloaded from.
 //!
-//! Only the user's explicit save uploads (the panel listens to `workspace::Event::UserSavedItem`
-//! and checks [`on_save::is_explicit`]): an agent's write (ACP `write_text_file`), an autosave and
-//! Save All reach the cached file or the project file and nothing else. A cached copy changed that
-//! way is uploaded by the next explicit save or the "Upload" command.
+//! Only the user's explicit save of a single-file tab uploads (the panel listens to
+//! `workspace::Event::UserSavedItem` and checks [`on_save::is_explicit`]): an agent's write (ACP
+//! `write_text_file`), an autosave, Save All, closing, quitting and vim's `:w!` / `:wa!` reach the
+//! cached file or the project file and nothing else. A cached copy changed that way is uploaded
+//! by the next explicit save or the "Upload" command.
 //!
 //! Known limits (each needs more than this crate):
 //! - There is no quit guard while an in-place upload runs: quitting mid-write leaves the remote
 //!   file truncated.
+//! - A save of a multi-buffer tab (a search or diagnostics view) never uploads and says nothing.
+//! - "Discard Edits" in the save-conflict prompt reloads the file from disk and still reports
+//!   an explicit save (upstream `Pane::save_item`), so the text that was on disk uploads. Telling
+//!   it apart needs a one-line upstream hook; the owner decides.
+//! - A project file saved while its server's auto-upload confirmation is stale is refused with a
+//!   message on every explicit save until the user confirms again in Deployment settings.
 
 use std::{
     path::{Path, PathBuf},
@@ -203,6 +210,9 @@ pub enum UploadStart {
     /// The buffer is not an attached buffer of a registered copy (not our download, another
     /// file, or a pre-existing cache file).
     NotRemote,
+    /// A mapped file under the built-in secret list: not sent, and the answer
+    /// ([`UploadOutcome::Excluded`]) arrives as an event after this call returns.
+    Excluded,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -939,7 +949,7 @@ impl ServerStore {
     /// confirmation still matching ([`RECONFIRM`] refuses a switch that is on without one, for a
     /// file that is mapped and not excluded; an unmapped file stays `NotRemote`), and
     /// neither the pause nor a session Deny is set. A file under a built-in secret exclusion also
-    /// answers `NotRemote` and
+    /// answers [`UploadStart::Excluded`] and
     /// emits [`UploadOutcome::Excluded`] ("never uploaded automatically"); one under the
     /// user's own exclusions answers `NotRemote` silently. An unsafe path or an unreadable
     /// buffer is [`UploadStart::Refused`]. `force` is "upload anyway" after an
@@ -992,7 +1002,7 @@ impl ServerStore {
                         resolved.rel.display()
                     )),
                 });
-                return UploadStart::NotRemote;
+                return UploadStart::Excluded;
             }
             Some(Excluded::User) => return UploadStart::NotRemote,
             None => {}
@@ -1011,6 +1021,9 @@ impl ServerStore {
                 && copy.remote_path == resolved.remote
                 && copy.target == target
         };
+        // "Upload anyway" was said for the file as it was: a file whose server, target or
+        // remote path changed since (or that has no copy yet) asks again.
+        let force = force && self.mapped.get(&local).is_some_and(same_target);
         match self.mapped.get_mut(&local) {
             Some(copy) if copy.state == CopyState::Uploading => {
                 if !same_target(copy) {
@@ -2497,7 +2510,22 @@ mod tests {
             force: bool,
             cx: &mut TestAppContext,
         ) -> UploadStart {
+            let path = buffer
+                .read_with(cx, |buffer, cx| buffer_path(buffer, cx))
+                .expect("a file");
             self.store.update(cx, |store, cx| {
+                // "Upload anyway" only counts for a file the store already has a copy of (it
+                // asked about it before). A test that only wants the first-save question out of
+                // the way for a new file gives the skip answer instead.
+                let force = if force && !store.mapped.contains_key(&path) {
+                    let fingerprint = store.current_fingerprint(&self.server_id);
+                    if let Some(fingerprint) = fingerprint {
+                        store.set_skip_no_baseline_prompt(&self.server_id, &fingerprint, true);
+                    }
+                    false
+                } else {
+                    force
+                };
                 store.upload_mapped(buffer, project_root, true, force, cx)
             })
         }
@@ -2698,6 +2726,37 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn upload_anyway_said_for_one_remote_path_does_not_carry_to_another(
+        cx: &mut TestAppContext,
+    ) {
+        let f = mapped_fixture(cx, |_| {}).await;
+        let buffer = f.open("inc/a.php", cx).await;
+        Fixture::save_in(&buffer, "<?php echo 1;", cx);
+        assert_eq!(f.upload(&buffer, false, cx), UploadStart::Started);
+        cx.run_until_parked();
+        assert_eq!(
+            f.outcomes(),
+            [UploadOutcome::AskFirst],
+            "the question is open"
+        );
+        // While it is open the user (confirmed) moves the mapping to another remote folder.
+        f.edit_servers(cx, |servers| {
+            servers.servers[0].mappings[0].remote = "u".into()
+        });
+        assert_eq!(f.upload(&buffer, true, cx), UploadStart::Started);
+        cx.run_until_parked();
+        assert_eq!(
+            f.outcomes(),
+            [UploadOutcome::AskFirst, UploadOutcome::AskFirst],
+            "the new place asks for itself"
+        );
+        assert!(
+            f.puts().is_empty(),
+            "nothing was written to a place nobody approved"
+        );
+    }
+
+    #[gpui::test]
     async fn the_skip_set_silences_the_no_baseline_question_but_never_a_conflict(
         cx: &mut TestAppContext,
     ) {
@@ -2861,7 +2920,7 @@ mod tests {
         let f = mapped_fixture(cx, |_| {}).await;
         let secret = f.open("wp-config.php", cx).await;
         Fixture::save_in(&secret, "<?php define('X', 1);", cx);
-        assert_eq!(f.upload(&secret, true, cx), UploadStart::NotRemote);
+        assert_eq!(f.upload(&secret, true, cx), UploadStart::Excluded);
         cx.run_until_parked();
         assert!(f.puts().is_empty());
         assert_eq!(f.connects(), 0);
