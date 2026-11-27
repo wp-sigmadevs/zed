@@ -20,7 +20,7 @@ use gpui::{
     PromptLevel, Render, SharedString, Subscription, Task, UniformListScrollHandle, WeakEntity,
     Window, actions, px, uniform_list,
 };
-use language::{Buffer, BufferEvent};
+use language::Buffer;
 use settings::Settings as _;
 use ui::{ContextMenu, DropdownMenu, DropdownStyle, IconButton, ListItem, Tooltip, prelude::*};
 use util::ResultExt as _;
@@ -159,7 +159,8 @@ pub struct RemoteHostPanel {
     /// Running operations by key; dropping one cancels it.
     operations: HashMap<String, Task<()>>,
     /// Remote copies this window opened, by cache path. An entry stays after its tab closes so a
-    /// late upload result is still reported here; its subscriptions go with the buffer.
+    /// late upload result is still reported here. A copy uploads only on the user's explicit save
+    /// ([`Self::user_saved`]), never on an autosave, an agent's write or Save All.
     owned: HashMap<PathBuf, OwnedCopy>,
     /// Mapped project files this panel started an upload for, by their path. Inserted before the
     /// call: the store reports a result (an excluded file's message) only after it returns. A
@@ -181,8 +182,6 @@ pub struct RemoteHostPanel {
 /// A remote copy's open buffer in this window.
 struct OwnedCopy {
     buffer: WeakEntity<Buffer>,
-    /// The `Saved` subscription; dropped when the buffer is released.
-    _saved: Option<Subscription>,
 }
 
 impl RemoteHostPanel {
@@ -741,9 +740,7 @@ impl RemoteHostPanel {
                     cx.update(|_, cx| editor.update(cx, |editor, _| editor.set_read_only(true)))?;
                     // A copy the index refused stays read-only and is never attached.
                     if registered.is_ok() {
-                        this.update_in(cx, |this, window, cx| {
-                            this.attach_editor(&cache_path, &editor, window, cx)
-                        })?;
+                        this.update(cx, |this, cx| this.attach_editor(&cache_path, &editor, cx))?;
                     }
                 }
                 if let Err(error) = registered {
@@ -769,14 +766,13 @@ impl RemoteHostPanel {
         self.operations.insert(key, task);
     }
 
-    /// Makes the editor of a freshly opened copy editable and wires its saves to the uploader.
-    /// A file that is not in the index (`is_orphan`) or whose buffer the index refuses stays
+    /// Makes the editor of a freshly opened copy editable; its explicit saves reach the uploader
+    /// through [`Self::user_saved`]. A file that is not in the index (`is_orphan`) or whose buffer the index refuses stays
     /// read-only and never uploads.
     fn attach_editor(
         &mut self,
         cache_path: &Path,
         editor: &Entity<Editor>,
-        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let Some(buffer) = editor.read(cx).buffer().read(cx).as_singleton() else {
@@ -796,15 +792,6 @@ impl RemoteHostPanel {
             editor.set_should_serialize(false, cx);
             editor.set_read_only(false);
         });
-        let saved = cx.subscribe_in(
-            &buffer,
-            window,
-            |this, buffer, event: &BufferEvent, window, cx| {
-                if matches!(event, BufferEvent::Saved) {
-                    this.buffer_saved(buffer, window, cx);
-                }
-            },
-        );
         // Finishes a Disconnect that kept this copy; held by the buffer itself, not this panel.
         let store = self.store.clone();
         let app: &mut App = cx;
@@ -816,7 +803,6 @@ impl RemoteHostPanel {
             cache_path.to_path_buf(),
             OwnedCopy {
                 buffer: buffer.downgrade(),
-                _saved: Some(saved),
             },
         );
         self.status = None;
@@ -839,7 +825,8 @@ impl RemoteHostPanel {
             return;
         };
         if self.buffer_path(&buffer).is_some() {
-            // An M4a copy: its own `Saved` subscription uploads it.
+            // An M4a copy: asks or uploads by the server's session decision.
+            self.start_upload(&buffer, false, false, window, cx);
             return;
         }
         let root = project_root(workspace.read(cx), cx);
@@ -873,15 +860,6 @@ impl RemoteHostPanel {
             | UploadStart::NotRemote => {}
         }
         cx.notify();
-    }
-
-    fn buffer_saved(
-        &mut self,
-        buffer: &Entity<Buffer>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.start_upload(buffer, false, false, window, cx);
     }
 
     /// The palette action: uploads the saved text of the active editor's buffer when it is one
@@ -1993,8 +1971,8 @@ mod tests {
         test_support::{FakeRemote, init, server, workspace, workspace_in},
     };
     use gpui::{TestAppContext, VisualTestContext};
-    use workspace::SaveIntent;
     use workspace::item::SerializableItem as _;
+    use workspace::{Pane, SaveIntent};
 
     struct Fixture<'a> {
         workspace: Entity<Workspace>,
@@ -2396,15 +2374,19 @@ mod tests {
         });
     }
 
-    /// Replaces the text and saves through the project, like Save does.
+    /// Replaces the text and saves the active tab the way the Save command does: the editor
+    /// adds a final newline, and those are the bytes that go to the server.
     async fn edit_and_save(fixture: &mut Fixture<'_>, opened: &Opened, text: &str) {
         edit(fixture, opened, text);
-        let project = fixture
+        save_active(fixture, SaveIntent::Save).await;
+    }
+
+    async fn save_active(fixture: &mut Fixture<'_>, intent: SaveIntent) {
+        fixture
             .workspace
-            .read_with(fixture.cx, |workspace, _| workspace.project().clone());
-        let buffer = opened.buffer.clone();
-        project
-            .update(fixture.cx, |project, cx| project.save_buffer(buffer, cx))
+            .update_in(fixture.cx, |workspace, window, cx| {
+                workspace.save_active_item(intent, window, cx)
+            })
             .await
             .expect("saved");
         fixture.cx.run_until_parked();
@@ -2515,7 +2497,7 @@ mod tests {
         edit_and_save(&mut fixture, &opened, "<?php echo 1;").await;
         assert_eq!(
             puts(&remote),
-            [(INDEX.to_string(), b"<?php echo 1;".to_vec())]
+            [(INDEX.to_string(), b"<?php echo 1;\n".to_vec())]
         );
         let store = store(&mut fixture);
         let baseline = store.read_with(fixture.cx, |store, _| {
@@ -2526,7 +2508,7 @@ mod tests {
         assert_eq!(
             baseline,
             Some(RemoteStat {
-                size: 13,
+                size: 14,
                 stamp: Some("put-1".into())
             })
         );
@@ -2563,7 +2545,7 @@ mod tests {
         edit_and_save(&mut fixture, &opened, "two").await;
         fixture.cx.simulate_prompt_answer("Upload");
         fixture.cx.run_until_parked();
-        assert_eq!(puts(&remote), [(INDEX.to_string(), b"two".to_vec())]);
+        assert_eq!(puts(&remote), [(INDEX.to_string(), b"two\n".to_vec())]);
         let store = store(&mut fixture);
         assert_eq!(
             store.read_with(fixture.cx, |store, _| store
@@ -2631,7 +2613,10 @@ mod tests {
         edit_and_save(&mut fixture, &opened, "mine again").await;
         fixture.cx.simulate_prompt_answer("Overwrite");
         fixture.cx.run_until_parked();
-        assert_eq!(puts(&remote), [(INDEX.to_string(), b"mine again".to_vec())]);
+        assert_eq!(
+            puts(&remote),
+            [(INDEX.to_string(), b"mine again\n".to_vec())]
+        );
     }
 
     #[gpui::test]
@@ -2647,7 +2632,7 @@ mod tests {
         assert!(puts(&remote).is_empty());
         fixture.cx.simulate_prompt_answer("Upload anyway");
         fixture.cx.run_until_parked();
-        assert_eq!(puts(&remote), [(INDEX.to_string(), b"x".to_vec())]);
+        assert_eq!(puts(&remote), [(INDEX.to_string(), b"x\n".to_vec())]);
     }
 
     #[gpui::test]
@@ -2698,15 +2683,9 @@ mod tests {
         store.update(fixture.cx, |store, _| {
             store.set_upload_decision(&server.id, UploadDecision::Allow)
         });
-        let project = fixture
-            .workspace
-            .read_with(fixture.cx, |workspace, _| workspace.project().clone());
         buffer.update(fixture.cx, |buffer, cx| buffer.set_text("stale", cx));
-        project
-            .update(fixture.cx, |project, cx| project.save_buffer(buffer, cx))
-            .await
-            .expect("saved");
-        fixture.cx.run_until_parked();
+        // An explicit save of the restored (read-only) tab: nothing goes out.
+        save_active(&mut fixture, SaveIntent::Save).await;
         assert!(puts(&remote).is_empty());
     }
 
@@ -2716,24 +2695,24 @@ mod tests {
         let mut fixture = fixture(&remote, cx).await;
         let opened = open_index(&mut fixture).await;
         set_decision(&mut fixture, &opened, UploadDecision::Allow);
-        let project = fixture
+        let local = fixture
             .workspace
-            .read_with(fixture.cx, |workspace, _| workspace.project().clone());
-        let path = project.read_with(fixture.cx, |project, cx| {
-            project
-                .find_project_path("/p/a.txt", cx)
-                .expect("project file")
+            .update_in(fixture.cx, |workspace, window, cx| {
+                workspace.open_abs_path(
+                    PathBuf::from("/p/a.txt"),
+                    OpenOptions::default(),
+                    window,
+                    cx,
+                )
+            })
+            .await
+            .expect("opened")
+            .downcast::<Editor>()
+            .expect("editor");
+        local.update_in(fixture.cx, |editor, window, cx| {
+            editor.set_text("local", window, cx)
         });
-        let local = project
-            .update(fixture.cx, |project, cx| project.open_buffer(path, cx))
-            .await
-            .expect("opened");
-        local.update(fixture.cx, |buffer, cx| buffer.set_text("local", cx));
-        project
-            .update(fixture.cx, |project, cx| project.save_buffer(local, cx))
-            .await
-            .expect("saved");
-        fixture.cx.run_until_parked();
+        save_active(&mut fixture, SaveIntent::Save).await;
         assert!(puts(&remote).is_empty());
         assert!(!remote.log().iter().any(|line| line.starts_with("put")));
     }
@@ -2839,7 +2818,10 @@ mod tests {
         assert!(fixture.cx.has_pending_prompt(), "still asks first");
         fixture.cx.simulate_prompt_answer("Upload");
         fixture.cx.run_until_parked();
-        assert_eq!(puts(&remote), [(INDEX.to_string(), b"kept local".to_vec())]);
+        assert_eq!(
+            puts(&remote),
+            [(INDEX.to_string(), b"kept local\n".to_vec())]
+        );
 
         // Another file is not a remote copy: nothing is asked or sent.
         fixture
@@ -4023,5 +4005,109 @@ mod tests {
         m.edit("inc/a.php", "<?php echo 1;").await;
         m.save(SaveIntent::Save).await;
         assert_eq!(m.waiting(), [m.project.join("inc/a.php")]);
+    }
+
+    // ---- Only an explicit save uploads: autosave, an agent's write and Save All never do ----
+
+    /// What an autosave does to an edited tab (`Pane::autosave_item`): saves it, no save intent.
+    async fn autosave(
+        workspace: &Entity<Workspace>,
+        editor: &Entity<Editor>,
+        cx: &mut VisualTestContext,
+    ) {
+        workspace
+            .update_in(cx, |workspace, window, cx| {
+                Pane::autosave_item(editor, workspace.project().clone(), window, cx)
+            })
+            .await
+            .expect("autosaved");
+        cx.run_until_parked();
+        assert!(
+            !editor.read_with(cx, |editor, cx| editor.buffer().read(cx).is_dirty(cx)),
+            "the autosave did save the file"
+        );
+    }
+
+    /// What an agent's `write_text_file` does: saves the buffer through the project.
+    async fn agent_write(
+        workspace: &Entity<Workspace>,
+        editor: &Entity<Editor>,
+        cx: &mut VisualTestContext,
+    ) {
+        let project = workspace.read_with(cx, |workspace, _| workspace.project().clone());
+        let buffer = editor.read_with(cx, |editor, cx| {
+            editor.buffer().read(cx).as_singleton().expect("singleton")
+        });
+        project
+            .update(cx, |project, cx| project.save_buffer(buffer, cx))
+            .await
+            .expect("saved");
+        cx.run_until_parked();
+        assert!(
+            !editor.read_with(cx, |editor, cx| editor.buffer().read(cx).is_dirty(cx)),
+            "the write did save the file"
+        );
+    }
+
+    #[gpui::test]
+    async fn an_allowed_remote_copy_uploads_on_an_explicit_save_only(cx: &mut TestAppContext) {
+        let remote = remote_with_baseline();
+        let mut fixture = fixture(&remote, cx).await;
+        let opened = open_index(&mut fixture).await;
+        set_decision(&mut fixture, &opened, UploadDecision::Allow);
+
+        edit(&mut fixture, &opened, "one");
+        autosave(&fixture.workspace, &opened.editor, fixture.cx).await;
+        assert!(puts(&remote).is_empty(), "an autosave does not upload");
+
+        edit(&mut fixture, &opened, "two");
+        agent_write(&fixture.workspace, &opened.editor, fixture.cx).await;
+        assert!(puts(&remote).is_empty(), "an agent's write does not upload");
+
+        edit(&mut fixture, &opened, "three");
+        fixture
+            .cx
+            .dispatch_action(workspace::SaveAll { save_intent: None });
+        fixture.cx.run_until_parked();
+        assert!(
+            !opened
+                .buffer
+                .read_with(fixture.cx, |buffer, _| buffer.is_dirty())
+        );
+        assert!(puts(&remote).is_empty(), "Save All does not upload");
+
+        // The text those saves left in the file goes out with the next explicit save.
+        save_active(&mut fixture, SaveIntent::Save).await;
+        assert_eq!(puts(&remote), [(INDEX.to_string(), b"three\n".to_vec())]);
+    }
+
+    #[gpui::test]
+    async fn a_mapped_file_uploads_on_an_explicit_save_only(cx: &mut TestAppContext) {
+        let remote = FakeRemote::default();
+        let mut m = mapped_panel(&remote, cx, |_| {}).await;
+        let editor = m.edit("inc/a.php", "one").await;
+        m.save(SaveIntent::Save).await;
+        assert_eq!(m.puts().len(), 1, "an explicit save uploads");
+
+        editor.update_in(m.cx, |editor, window, cx| {
+            editor.set_text("two", window, cx)
+        });
+        autosave(&m.workspace, &editor, m.cx).await;
+        assert_eq!(m.puts().len(), 1, "an autosave does not");
+
+        editor.update_in(m.cx, |editor, window, cx| {
+            editor.set_text("three", window, cx)
+        });
+        agent_write(&m.workspace, &editor, m.cx).await;
+        assert_eq!(m.puts().len(), 1, "an agent's write does not");
+
+        m.save(SaveIntent::Save).await;
+        assert_eq!(
+            m.puts(),
+            [
+                (MAPPED_REMOTE.to_string(), b"one\n".to_vec()),
+                (MAPPED_REMOTE.to_string(), b"three\n".to_vec())
+            ]
+        );
     }
 }

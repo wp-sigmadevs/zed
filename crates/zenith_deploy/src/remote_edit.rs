@@ -1,8 +1,8 @@
 //! Edit a remote file (plan 37 M4a, chunk C2): the index of cached copies and the uploader.
 //!
 //! No UI here. The panel (C3) registers a download with [`ServerStore::register_download`],
-//! attaches the editor's buffer, and on every save calls [`ServerStore::upload`] with the buffer
-//! that saved; the answer to each prompt goes back through [`ServerStore::set_upload_decision`],
+//! attaches the editor's buffer, and on every explicit save calls [`ServerStore::upload`] with the
+//! buffer that saved; the answer to each prompt goes back through [`ServerStore::set_upload_decision`],
 //! `consent_once` or `force`.
 //!
 //! Trust rules the code below keeps:
@@ -17,13 +17,14 @@
 //!   another buffer's text.
 //! - A copy is bound to the server target (host, port, type, user) it was downloaded from.
 //!
-//! Known limits (M4a; each needs more than this crate):
-//! - A save by an agent (ACP `write_text_file`) of an attached cache path fires `Saved` like the
-//!   user's own save and uploads without a prompt when the server's decision is Allow. Telling
-//!   an agent write from an explicit save needs a save intent (M4b) or a hook outside this crate.
+//! Only the user's explicit save uploads (the panel listens to `workspace::Event::UserSavedItem`
+//! and checks [`on_save::is_explicit`]): an agent's write (ACP `write_text_file`), an autosave and
+//! Save All reach the cached file or the project file and nothing else. A cached copy changed that
+//! way is uploaded by the next explicit save or the "Upload" command.
+//!
+//! Known limits (each needs more than this crate):
 //! - There is no quit guard while an in-place upload runs: quitting mid-write leaves the remote
 //!   file truncated.
-//! - Allow plus autosave uploads half-typed files on every autosave (M4b).
 
 use std::{
     path::{Path, PathBuf},
