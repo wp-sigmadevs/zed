@@ -779,7 +779,7 @@ impl ServerStore {
 
     /// The copy of a downloaded cache file or of a mapped project file. The two maps never
     /// share a path: a file under the cache is never mapped.
-    fn copy_ref(&self, path: &Path) -> Option<&RemoteCopy> {
+    pub(crate) fn copy_ref(&self, path: &Path) -> Option<&RemoteCopy> {
         self.copies.get(path).or_else(|| self.mapped.get(path))
     }
 

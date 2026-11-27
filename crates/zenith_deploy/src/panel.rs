@@ -169,6 +169,9 @@ pub struct RemoteHostPanel {
     /// `is_local_unshared` of this window's project. A closure, not a workspace read: the
     /// palette action runs while the workspace is being updated.
     local_unshared: Box<dyn Fn(&App) -> bool>,
+    /// The first visible folder of this window's project, read at each save. A closure for the
+    /// same reason as `local_unshared`.
+    project_root: Box<dyn Fn(&App) -> Option<String>>,
     /// A status line that is not an error ("Uploaded …").
     notice: Option<SharedString>,
     /// A prompt of this window is on screen: a second one would replace it (window.rs), so
@@ -211,13 +214,13 @@ impl RemoteHostPanel {
             cx.subscribe_in(
                 workspace_entity,
                 window,
-                |this, workspace, event: &workspace::Event, window, cx| {
+                |this, _, event: &workspace::Event, window, cx| {
                     if let workspace::Event::UserSavedItem {
                         item, save_intent, ..
                     } = event
                         && on_save::is_explicit(*save_intent)
                     {
-                        this.user_saved(item.as_ref(), workspace, window, cx);
+                        this.user_saved(item.as_ref(), window, cx);
                     }
                 },
             ),
@@ -248,6 +251,14 @@ impl RemoteHostPanel {
                 Box::new(move |cx| {
                     let project = project.read(cx);
                     is_local_unshared(project.is_local(), project.is_shared())
+                })
+            },
+            project_root: {
+                let project = workspace.project().clone();
+                Box::new(move |cx| {
+                    let worktree = project.read(cx).visible_worktrees(cx).next()?;
+                    let root = worktree.read(cx).abs_path();
+                    Some(root.to_string_lossy().into_owned())
                 })
             },
             notice: None,
@@ -814,7 +825,6 @@ impl RemoteHostPanel {
     fn user_saved(
         &mut self,
         item: &dyn workspace::item::WeakItemHandle,
-        workspace: &Entity<Workspace>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -824,25 +834,32 @@ impl RemoteHostPanel {
         let Some(buffer) = editor.read(cx).buffer().read(cx).as_singleton() else {
             return;
         };
-        if self.buffer_path(&buffer).is_some() {
-            // An M4a copy: asks or uploads by the server's session decision.
-            self.start_upload(&buffer, false, false, window, cx);
-            return;
+        self.upload_again(&buffer, false, false, window, cx);
+    }
+
+    /// Uploads the saved text of `buffer` again: an M4a copy through [`Self::start_upload`]
+    /// (`consent_once` answers its first-upload question), any other file as a mapped project
+    /// file. `force` is "overwrite" / "upload anyway"; it never gets past a stale confirmation
+    /// of auto-upload.
+    fn upload_again(
+        &mut self,
+        buffer: &Entity<Buffer>,
+        force: bool,
+        consent_once: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.buffer_path(buffer).is_some() {
+            self.start_upload(buffer, force, consent_once, window, cx);
+        } else {
+            self.start_mapped(buffer, force, cx);
         }
-        let root = project_root(workspace.read(cx), cx);
-        self.start_mapped(&buffer, root, false, window, cx);
     }
 
     /// Uploads a saved project file that maps to the project's default server. The project
-    /// root is the one of this moment, never remembered.
-    fn start_mapped(
-        &mut self,
-        buffer: &Entity<Buffer>,
-        project_root: Option<String>,
-        force: bool,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    /// root is read now, never remembered.
+    fn start_mapped(&mut self, buffer: &Entity<Buffer>, force: bool, cx: &mut Context<Self>) {
+        let project_root = (self.project_root)(cx);
         let local_unshared = (self.local_unshared)(cx);
         if let Some(path) = buffer_path(buffer.read(cx), cx) {
             self.mapped_waiting
@@ -853,7 +870,7 @@ impl RemoteHostPanel {
             store.upload_mapped(buffer, project_root.as_deref(), local_unshared, force, cx)
         });
         match start {
-            UploadStart::Refused(message) => self.toast(&message, cx),
+            UploadStart::Refused(message) => self.say(&message, None, true, cx),
             UploadStart::Started
             | UploadStart::Queued
             | UploadStart::NeedsConfirmation
@@ -909,7 +926,7 @@ impl RemoteHostPanel {
     /// server's listing or the user's config, so it goes through [`plain_text`].
     fn describe(&self, cache_path: &Path, cx: &App) -> Option<Described> {
         let store = self.store.read(cx);
-        let copy = store.copy_for_buffer_path(cache_path)?;
+        let copy = store.copy_ref(cache_path)?;
         let server = store
             .servers
             .servers
@@ -991,10 +1008,13 @@ impl RemoteHostPanel {
 
     /// A second question while one is on screen would replace it: say where the file stands.
     fn saved_here_only(&mut self, file: &str, buffer: &Entity<Buffer>, cx: &mut Context<Self>) {
+        let how = if self.buffer_path(buffer).is_some() {
+            format!("Run \"{UPLOAD_COMMAND}\" to upload it.")
+        } else {
+            "Save it again to upload it.".to_string()
+        };
         self.toast_with(
-            &format!(
-                "{file} is saved on this computer only. Run \"{UPLOAD_COMMAND}\" to upload it."
-            ),
+            &format!("{file} is saved on this computer only. {how}"),
             Some(buffer.downgrade()),
             false,
             cx,
@@ -1039,20 +1059,23 @@ impl RemoteHostPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.owned.contains_key(cache_path) {
+        if !self.owned.contains_key(cache_path) && !self.mapped_waiting.contains_key(cache_path) {
             return;
         }
         cx.notify();
+        // A file under the built-in secret list never got a copy: its message needs no server.
+        if let UploadOutcome::Excluded(message) = outcome {
+            self.say(message, None, true, cx);
+            return;
+        }
         let Some(Described { file, name, .. }) = self.describe(cache_path, cx) else {
             return;
         };
         match outcome {
             UploadOutcome::Uploaded => {
-                let line = format!("Uploaded {file} to {name}");
-                self.notice = Some(line.clone().into());
-                // gpui has no live regions: the status line is silent for a screen reader, so
-                // the notification area records every result too (follow-up in gpui).
-                self.toast_with(&line, None, true, cx);
+                // gpui has no live regions: the toast says it, and so does the status line a
+                // screen reader can reach (follow-up in gpui).
+                self.say(&format!("Uploaded {file} to {name}"), None, true, cx);
             }
             UploadOutcome::Conflict => self.confirm_force(
                 cache_path,
@@ -1070,17 +1093,22 @@ impl RemoteHostPanel {
                 window,
                 cx,
             ),
+            // Never a "force" or retry button: a stale confirmation of auto-upload is only
+            // renewed in the Deployment settings.
             UploadOutcome::Blocked(message) | UploadOutcome::Excluded(message) => {
-                self.toast(&plain_text(message, MAX_TOAST_CHARS), cx)
+                self.say(&plain_text(message, MAX_TOAST_CHARS), None, true, cx)
             }
             UploadOutcome::Failed(message) => {
-                let retry = self
-                    .owned
-                    .get(cache_path)
-                    .map(|copy| copy.buffer.clone())
-                    .filter(|buffer| buffer.upgrade().is_some());
-                self.toast_with(
-                    &format!("{} {FAILED_HINT}", plain_text(message, MAX_TOAST_CHARS)),
+                let retry = self.live_buffer(cache_path).map(|buffer| buffer.downgrade());
+                let hint = if self.owned.contains_key(cache_path) {
+                    FAILED_HINT
+                } else if retry.is_some() {
+                    MAPPED_FAILED_HINT
+                } else {
+                    MAPPED_CLOSED_HINT
+                };
+                self.say(
+                    &format!("{} {hint}", plain_text(message, MAX_TOAST_CHARS)),
                     retry,
                     false,
                     cx,
@@ -1100,21 +1128,23 @@ impl RemoteHostPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let buffer = self
-            .owned
-            .get(cache_path)
-            .and_then(|copy| copy.buffer.upgrade());
-        let Some(buffer) = buffer else {
-            // The tab is closed. The saved text stays in the cache; opening the file again asks
-            // before it replaces that text, and the next upload checks the server again.
-            self.toast(
-                &format!(
-                    "{} Your changes are saved on this computer only. To upload them, open the file again, choose \"{}\", then run \"{UPLOAD_COMMAND}\".",
-                    end_sentence(&message),
-                    REOPEN_BUTTONS[0]
-                ),
-                cx,
-            );
+        let Some(buffer) = self.live_buffer(cache_path) else {
+            // The tab is closed. A remote copy's saved text stays in the cache; opening the file
+            // again asks before it replaces that text, and the next upload checks the server
+            // again. A project file is on disk: the next explicit save uploads it.
+            if self.owned.contains_key(cache_path) {
+                self.toast(
+                    &format!(
+                        "{} Your changes are saved on this computer only. To upload them, open the file again, choose \"{}\", then run \"{UPLOAD_COMMAND}\".",
+                        end_sentence(&message),
+                        REOPEN_BUTTONS[0]
+                    ),
+                    cx,
+                );
+            } else {
+                let said = format!("{} {MAPPED_CLOSED_HINT}", end_sentence(&message));
+                self.say(&said, None, true, cx);
+            }
             return;
         };
         let Some(slot) = claim_prompt(&self.prompt_open) else {
@@ -1134,7 +1164,7 @@ impl RemoteHostPanel {
                 // The button names the server and the file, and a stop only follows an upload the
                 // user already allowed: this call is consent as well as force.
                 if confirmed(answer) {
-                    this.start_upload(&buffer, true, true, window, cx);
+                    this.upload_again(&buffer, true, true, window, cx);
                 }
             })
             .log_err();
@@ -1145,6 +1175,29 @@ impl RemoteHostPanel {
     /// Plain text only: a server's reply may be in `message`.
     fn toast(&mut self, message: &str, cx: &mut Context<Self>) {
         self.toast_with(message, None, false, cx);
+    }
+
+    /// A toast that is also the status line of the panel: a toast goes away by itself and gpui
+    /// has no live regions, so the text stays where a screen reader can reach it.
+    fn say(
+        &mut self,
+        message: &str,
+        retry: Option<WeakEntity<Buffer>>,
+        autohide: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let message = plain_text(message, 2 * MAX_TOAST_CHARS);
+        self.notice = Some(message.clone().into());
+        self.toast_with(&message, retry, autohide, cx);
+        cx.notify();
+    }
+
+    /// The open buffer of a remote copy or of a mapped project file this panel uploaded.
+    fn live_buffer(&self, path: &Path) -> Option<Entity<Buffer>> {
+        match self.owned.get(path) {
+            Some(copy) => copy.buffer.upgrade(),
+            None => self.mapped_waiting.get(path)?.upgrade(),
+        }
     }
 
     /// A toast; `retry` adds a "Retry upload" button that uploads that buffer again, `autohide`
@@ -1172,7 +1225,7 @@ impl RemoteHostPanel {
                     };
                     panel
                         .update(cx, |panel, cx| {
-                            panel.start_upload(&buffer, false, false, window, cx)
+                            panel.upload_again(&buffer, false, false, window, cx)
                         })
                         .log_err();
                 });
@@ -1421,6 +1474,10 @@ pub(crate) const MAX_STATUS_CHARS: usize = 300;
 /// The palette name of [`UploadRemoteCopy`].
 const UPLOAD_COMMAND: &str = "zenith deploy: upload remote copy";
 
+const MAPPED_FAILED_HINT: &str =
+    "Your changes are saved on this computer. Choose Retry upload, or save the file again.";
+const MAPPED_CLOSED_HINT: &str =
+    "Your changes are saved on this computer only; save again to upload.";
 const FAILED_HINT: &str = "Your changes are saved on this computer. Choose Retry upload, or run \"zenith deploy: upload remote copy\".";
 
 /// The shown names of one copy and its server, and the host the user is being asked about.
@@ -3799,6 +3856,7 @@ mod tests {
         cx: &'a mut VisualTestContext,
         remote: FakeRemote,
         project: PathBuf,
+        server_id: String,
         /// Keeps the real files of the project alive.
         _dir: tempfile::TempDir,
     }
@@ -3867,6 +3925,7 @@ mod tests {
             cx,
             remote: remote.clone(),
             project,
+            server_id,
             _dir: dir,
         }
     }
@@ -3908,6 +3967,29 @@ mod tests {
         fn waiting(&mut self) -> Vec<PathBuf> {
             self.panel.read_with(self.cx, |panel, _| {
                 panel.mapped_waiting.keys().cloned().collect()
+            })
+        }
+
+        /// Turns the "skip the no-baseline question" answer off: the first save asks again.
+        fn ask_without_a_baseline(&mut self) {
+            let id = self.server_id.clone();
+            self.cx.update(|_, cx| {
+                ServerStore::global(cx).update(cx, |store, _| {
+                    let fingerprint = store.current_fingerprint(&id).expect("fingerprint");
+                    store.set_skip_no_baseline_prompt(&id, &fingerprint, false);
+                });
+            });
+        }
+
+        fn notice(&mut self) -> Option<String> {
+            self.panel.read_with(self.cx, |panel, _| {
+                panel.notice.as_ref().map(|n| n.to_string())
+            })
+        }
+
+        fn buffer_of(&mut self, editor: &Entity<Editor>) -> Entity<Buffer> {
+            editor.read_with(self.cx, |editor, cx| {
+                editor.buffer().read(cx).as_singleton().expect("singleton")
             })
         }
 
@@ -4109,5 +4191,187 @@ mod tests {
                 (MAPPED_REMOTE.to_string(), b"three\n".to_vec())
             ]
         );
+    }
+
+    // ---- What the user is told about a mapped upload ----
+
+    #[gpui::test]
+    async fn a_mapped_upload_is_told_in_a_toast_and_in_the_status_line(cx: &mut TestAppContext) {
+        let remote = FakeRemote::default();
+        let mut m = mapped_panel(&remote, cx, |_| {}).await;
+        m.edit("inc/a.php", "x").await;
+        m.save(SaveIntent::Save).await;
+        assert_eq!(m.notice().as_deref(), Some("Uploaded a.php to Prod"));
+        assert!(m.toast_shown());
+    }
+
+    #[gpui::test]
+    async fn a_secret_file_says_it_is_never_uploaded_automatically(cx: &mut TestAppContext) {
+        let remote = FakeRemote::default();
+        let mut m = mapped_panel(&remote, cx, |_| {}).await;
+        m.edit("wp-config.php", "x").await;
+        m.save(SaveIntent::Save).await;
+        let notice = m.notice().expect("the file is named");
+        assert!(
+            notice.contains("wp-config.php") && notice.contains("never uploaded automatically"),
+            "{notice}"
+        );
+        assert!(m.toast_shown());
+        assert!(m.puts().is_empty());
+        assert!(remote.log().is_empty(), "not even a connection");
+    }
+
+    #[gpui::test]
+    async fn a_mapped_file_without_a_baseline_asks_and_upload_anyway_uploads_it(
+        cx: &mut TestAppContext,
+    ) {
+        let remote = FakeRemote::default();
+        let mut m = mapped_panel(&remote, cx, |_| {}).await;
+        m.ask_without_a_baseline();
+        m.edit("inc/a.php", "x").await;
+        m.save(SaveIntent::Save).await;
+        let (message, _) = m.cx.pending_prompt().expect("the first save asks");
+        assert!(
+            message.contains("a.php") && message.contains("upload anyway?"),
+            "{message}"
+        );
+        assert!(m.puts().is_empty());
+        m.cx.simulate_prompt_answer("Upload anyway");
+        m.cx.run_until_parked();
+        assert_eq!(m.puts(), [(MAPPED_REMOTE.to_string(), b"x\n".to_vec())]);
+    }
+
+    #[gpui::test]
+    async fn a_changed_mapped_file_asks_and_overwrite_uploads_it(cx: &mut TestAppContext) {
+        let remote = FakeRemote::default();
+        let mut m = mapped_panel(&remote, cx, |_| {}).await;
+        let editor = m.edit("inc/a.php", "one").await;
+        m.save(SaveIntent::Save).await;
+        assert_eq!(m.puts().len(), 1);
+        remote.stats.lock().expect("stats").insert(
+            MAPPED_REMOTE.into(),
+            RemoteStat {
+                size: 99,
+                stamp: Some("other".into()),
+            },
+        );
+        editor.update_in(m.cx, |editor, window, cx| {
+            editor.set_text("two", window, cx)
+        });
+        m.save(SaveIntent::Save).await;
+        let (message, _) =
+            m.cx.pending_prompt()
+                .expect("someone else changed the file");
+        assert!(message.contains("changed on Prod"), "{message}");
+        assert_eq!(m.puts().len(), 1);
+        m.cx.simulate_prompt_answer("Overwrite");
+        m.cx.run_until_parked();
+        assert_eq!(
+            m.puts().last(),
+            Some(&(MAPPED_REMOTE.to_string(), b"two\n".to_vec()))
+        );
+    }
+
+    #[gpui::test]
+    async fn a_question_for_a_mapped_file_whose_tab_closed_becomes_a_note_to_save_again(
+        cx: &mut TestAppContext,
+    ) {
+        let remote = FakeRemote::default();
+        let mut m = mapped_panel(&remote, cx, |_| {}).await;
+        m.ask_without_a_baseline();
+        let (release, gate) = futures::channel::oneshot::channel();
+        *remote.connect_gate.lock().expect("gate") = Some(gate);
+        let editor = m.edit("inc/a.php", "x").await;
+        m.save(SaveIntent::Save).await;
+        // The tab goes away while the connection is still being made.
+        drop(editor);
+        m.workspace
+            .update_in(m.cx, |workspace, window, cx| {
+                workspace.active_pane().update(cx, |pane, cx| {
+                    pane.close_active_item(
+                        &workspace::CloseActiveItem {
+                            save_intent: Some(SaveIntent::Skip),
+                            close_pinned: false,
+                        },
+                        window,
+                        cx,
+                    )
+                })
+            })
+            .await
+            .expect("closed");
+        m.cx.run_until_parked();
+        m.cx.update(|_, _| {});
+        m.cx.run_until_parked();
+        // The test project keeps its open buffers alive, so a closed buffer is stood in for.
+        let path = m.project.join("inc/a.php");
+        m.panel.update(m.cx, |panel, _| {
+            panel.mapped_waiting.insert(path, WeakEntity::new_invalid());
+        });
+        release.send(()).expect("release");
+        m.cx.run_until_parked();
+        assert!(!m.cx.has_pending_prompt(), "nobody is there to answer");
+        let notice = m.notice().expect("the user is told");
+        assert!(
+            notice.contains("saved on this computer only; save again to upload"),
+            "{notice}"
+        );
+        assert!(m.puts().is_empty());
+    }
+
+    #[gpui::test]
+    async fn a_stale_confirmation_is_a_plain_note_that_no_button_or_force_can_get_past(
+        cx: &mut TestAppContext,
+    ) {
+        let remote = FakeRemote::default();
+        let mut m = mapped_panel(&remote, cx, |_| {}).await;
+        // A hand edit of the host: the stored confirmation no longer matches.
+        let store = m.panel.read_with(m.cx, |panel, _| panel.store.clone());
+        store.update(m.cx, |store, _| {
+            store.servers.servers[0].host = "other.example.com".into();
+        });
+        let editor = m.edit("inc/a.php", "x").await;
+        m.save(SaveIntent::Save).await;
+        assert_eq!(
+            m.notice().as_deref(),
+            Some("Auto-upload needs confirming again: turn it on in Deployment settings.")
+        );
+        assert!(m.toast_shown());
+        assert!(!m.cx.has_pending_prompt(), "no \"upload anyway\"");
+        let buffer = m.buffer_of(&editor);
+        m.panel.update_in(m.cx, |panel, window, cx| {
+            panel.upload_again(&buffer, true, true, window, cx)
+        });
+        m.cx.run_until_parked();
+        assert!(m.puts().is_empty(), "force and consent do not get past it");
+        assert!(remote.log().is_empty());
+    }
+
+    #[gpui::test]
+    async fn a_failed_mapped_upload_can_be_retried(cx: &mut TestAppContext) {
+        let remote = FakeRemote::default();
+        let mut m = mapped_panel(&remote, cx, |_| {}).await;
+        *remote.put_error.lock().expect("error") = Some("550 disk full".into());
+        let editor = m.edit("inc/a.php", "x").await;
+        m.save(SaveIntent::Save).await;
+        let notice = m.notice().expect("the failure is told");
+        assert!(
+            notice.contains("550 disk full") && notice.contains("Retry upload"),
+            "{notice}"
+        );
+        assert!(!notice.contains(UPLOAD_COMMAND), "{notice}");
+        assert!(m.puts().is_empty());
+        // The Retry button: the same call again.
+        *remote.put_error.lock().expect("error") = None;
+        let buffer = m.buffer_of(&editor);
+        m.panel.update_in(m.cx, |panel, window, cx| {
+            panel.upload_again(&buffer, false, false, window, cx)
+        });
+        m.cx.run_until_parked();
+        // After a write that failed the server's file is unverified: it asks before it writes.
+        assert!(m.cx.has_pending_prompt() && m.puts().is_empty());
+        m.cx.simulate_prompt_answer("Upload anyway");
+        m.cx.run_until_parked();
+        assert_eq!(m.puts(), [(MAPPED_REMOTE.to_string(), b"x\n".to_vec())]);
     }
 }
