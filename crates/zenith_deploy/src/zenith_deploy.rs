@@ -349,12 +349,17 @@ impl ServerStore {
             return Task::ready(Err(error));
         }
         // The one-time "upload on save" confirmation was given for what `on_save::fingerprint`
-        // covers: it stays on only when the user just confirmed these settings or it was on and
-        // none of them changed. A flag switched on any other way is cleared (plan 37 M4b).
+        // covers: it stays on only when the user just confirmed these settings or it was on,
+        // matched its stored fingerprint and none of them changed. A flag switched on any other
+        // way is cleared. The fingerprint is stored with a confirmation so that a hand-edited
+        // servers.json cannot keep it (plan 37 M4b; upload time checks it too).
         for server in &mut servers.servers {
             let old = previous.servers.iter().find(|old| old.id == server.id);
             server.upload_on_save_confirmed =
                 on_save::confirmation_holds(old, server, reconfirmed.get(&server.id));
+            server.upload_on_save_fingerprint = server
+                .upload_on_save_confirmed
+                .then(|| on_save::fingerprint(server));
         }
         if let Some(error) = &self.load_error {
             return Task::ready(Err(anyhow!(

@@ -102,13 +102,19 @@ pub struct ServerConfig {
     pub mappings: Vec<Mapping>,
     pub excluded_local: Vec<String>,
     pub excluded_remote: Vec<String>,
-    /// M4b auto-upload of mapped files: the Deployment dialog sets both together when the user
-    /// answers "Turn on" to the confirmation, and the store clears the second on every save where
-    /// it does not hold for these very settings (`on_save::confirmation_holds`). The M4a uploader ignores both flags
-    /// by design: its yes is a session-only, in-memory decision (`UploadDecision`), never read
-    /// from a file that could arrive with a repo.
+    /// M4b auto-upload of mapped files: the Deployment dialog sets `upload_on_save` and
+    /// `upload_on_save_confirmed` together when the user answers "Turn on" to the confirmation.
+    /// The store then records `upload_on_save_fingerprint` (`on_save::fingerprint` of the settings
+    /// confirmed) and clears both confirmation fields on every save where the confirmation does not
+    /// hold for these very settings (`on_save::confirmation_holds`). Auto-upload runs only while
+    /// the flag is on and the stored fingerprint still equals the server's own
+    /// (`on_save::confirmation_matches`), so a `servers.json` edited by hand (a new host, a flag
+    /// flipped on, a file that arrived with a repo) stays off until the user confirms again; a file
+    /// from before the fingerprint existed has `None` and fails closed. The M4a uploader ignores
+    /// all of these by design: its yes is a session-only, in-memory decision (`UploadDecision`).
     pub upload_on_save: bool,
     pub upload_on_save_confirmed: bool,
+    pub upload_on_save_fingerprint: Option<String>,
     #[serde(skip)]
     pub password: Option<Password>,
 }
@@ -136,6 +142,7 @@ impl Default for ServerConfig {
             excluded_remote: Vec::new(),
             upload_on_save: false,
             upload_on_save_confirmed: false,
+            upload_on_save_fingerprint: None,
             password: None,
         }
     }
@@ -341,6 +348,10 @@ mod tests {
         assert_eq!(server.root_path, "/");
         assert!(server.excluded_local.iter().any(|entry| entry == ".env"));
         assert!(!server.upload_on_save);
+        assert_eq!(
+            server.upload_on_save_fingerprint, None,
+            "a file from before the fingerprint existed fails closed"
+        );
         assert!(!server.advanced.list_compat);
         // A file written before `list_compat` existed has an `advanced` block without it.
         let old: ServerConfig =

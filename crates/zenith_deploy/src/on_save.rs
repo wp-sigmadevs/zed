@@ -29,8 +29,9 @@ pub fn is_explicit(intent: SaveIntent) -> bool {
 
 /// What a one-time confirmation or a session answer was given for: the target (host, port, type,
 /// user), whether it signs in anonymously, the root folder, the mappings and the excluded local
-/// names. Equal fingerprints, equal places and files that go. In memory only: it holds no secret,
-/// but nothing logs or stores it. Changing the exclusions also forgets a session "skip" answer
+/// names. Equal fingerprints, equal places and files that go. It holds no secret (target, root and
+/// paths only); the store keeps it in `servers.json` as `upload_on_save_fingerprint` to tell a
+/// confirmation from a hand edit, and nothing logs it. Changing the exclusions also forgets a session "skip" answer
 /// (accepted: it asks once more).
 pub(crate) fn fingerprint(server: &ServerConfig) -> String {
     serde_json::json!([
@@ -54,9 +55,10 @@ pub fn needs_reconfirm(old: Option<&ServerConfig>, new: &ServerConfig) -> bool {
 /// any). The flag becomes true only when the user confirmed these very settings now
 /// (`reconfirmed` is the [`fingerprint`] they confirmed) or it was already true and nothing the
 /// fingerprint covers changed. A flag turned on any other way (a stale confirmation, a flag the
-/// caller set without asking) does not hold. This is checked only when a save goes through the
-/// store; a `servers.json` edited by hand is trusted as it is at load. The store applies this on
-/// every save; the dialog uses it to show the checkbox.
+/// caller set without asking) does not hold. "Already true and unchanged" means
+/// [`confirmation_matches`] for `old`: a flag whose stored fingerprint is missing or stale (a file
+/// edited by hand) is not carried over. The store applies this on every save; the dialog uses it
+/// to show the checkbox. A hand edit between saves is caught at upload time by the same check.
 pub(crate) fn confirmation_holds(
     old: Option<&ServerConfig>,
     new: &ServerConfig,
@@ -64,9 +66,15 @@ pub(crate) fn confirmation_holds(
 ) -> bool {
     new.upload_on_save_confirmed
         && (reconfirmed.is_some_and(|confirmed| *confirmed == fingerprint(new))
-            || old.is_some_and(|old| {
-                old.upload_on_save_confirmed && !needs_reconfirm(Some(old), new)
-            }))
+            || old.is_some_and(|old| confirmation_matches(old) && !needs_reconfirm(Some(old), new)))
+}
+
+/// Whether the server's stored confirmation still belongs to its current settings: the flag is on
+/// and the fingerprint recorded when the user confirmed equals the server's own now. A host edited
+/// by hand, a flag flipped on by hand and a file from before the fingerprint existed all fail.
+pub(crate) fn confirmation_matches(server: &ServerConfig) -> bool {
+    server.upload_on_save_confirmed
+        && server.upload_on_save_fingerprint.as_deref() == Some(fingerprint(server).as_str())
 }
 
 /// One `Normal` component as a validated UTF-8 name; `..` and everything else is an error.
@@ -342,6 +350,24 @@ pub async fn check_real_path(
 mod tests {
     use super::*;
     use crate::config::Mapping;
+
+    #[test]
+    fn a_confirmation_matches_only_with_the_flag_and_the_fingerprint_of_these_settings() {
+        let mut on = server(&[("/p", "")]);
+        on.upload_on_save_confirmed = true;
+        assert!(!confirmation_matches(&on), "no stored fingerprint");
+        on.upload_on_save_fingerprint = Some(fingerprint(&on));
+        assert!(confirmation_matches(&on));
+        let mut moved = on.clone();
+        moved.host = "evil.example.com".into();
+        assert!(!confirmation_matches(&moved), "the target changed by hand");
+        let mut off = on.clone();
+        off.upload_on_save_confirmed = false;
+        assert!(!confirmation_matches(&off), "the flag is off");
+        // The same fingerprint does not hold over other settings in `confirmation_holds` either.
+        assert!(!confirmation_holds(Some(&moved), &moved, None));
+        assert!(confirmation_holds(Some(&on), &on, None));
+    }
 
     fn server(mappings: &[(&str, &str)]) -> ServerConfig {
         ServerConfig {

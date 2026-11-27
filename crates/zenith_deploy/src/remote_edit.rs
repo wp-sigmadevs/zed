@@ -48,6 +48,7 @@ use crate::{
 
 const DENIED: &str = "Uploading to this server is off for this session.";
 const MAPPING_CHANGED: &str = "The mapping changed; save again.";
+const RECONFIRM: &str = "Auto-upload needs confirming again: turn it on in Deployment settings.";
 const TARGET_CHANGED: &str =
     "The server's host, port, type or user changed since this download; download it again.";
 
@@ -864,9 +865,11 @@ impl ServerStore {
         }
     }
 
-    /// Why auto-upload to `server_id` may not run now. Both switches of the server's own saved
-    /// config must be on (the second is the user's one-time confirmation), and neither the
-    /// pause nor a session Deny may be set.
+    /// Why auto-upload to `server_id` may not run now. The switch of the server's own saved
+    /// config must be on and the user's one-time confirmation must still match the server's
+    /// settings ([`on_save::confirmation_matches`]: a hand-edited `servers.json` does not), and
+    /// neither the pause nor a session Deny may be set. A switch that is on without a matching
+    /// confirmation answers [`RECONFIRM`].
     fn auto_upload_problem(&self, server_id: &str) -> Option<&'static str> {
         if self.auto_upload_paused {
             return Some("Auto-upload is paused.");
@@ -874,8 +877,11 @@ impl ServerStore {
         let Some(server) = self.servers.servers.iter().find(|s| s.id == server_id) else {
             return Some("This server was removed.");
         };
-        if !(server.upload_on_save && server.upload_on_save_confirmed) {
+        if !server.upload_on_save {
             return Some("Auto-upload is off for this server.");
+        }
+        if !on_save::confirmation_matches(server) {
+            return Some(RECONFIRM);
         }
         (self.upload_decision(server_id) == UploadDecision::Deny).then_some(DENIED)
     }
@@ -899,9 +905,10 @@ impl ServerStore {
     /// server (plan 37 M4b). The target is only ever computed from the user's own saved server
     /// ([`ServerConfig::mappings`]): `project_root` picks the default server, never any file of
     /// the project. Nothing happens, and the answer is [`UploadStart::NotRemote`], unless the
-    /// project is local and unshared, the server is visible in it and has both
-    /// `upload_on_save` and `upload_on_save_confirmed`, and neither the pause nor a session
-    /// Deny is set. A file under a built-in secret exclusion also answers `NotRemote` and
+    /// project is local and unshared, the server is visible in it and has `upload_on_save` on with its
+    /// confirmation still matching ([`RECONFIRM`] refuses a switch that is on without one), and
+    /// neither the pause nor a session Deny is set. A file under a built-in secret exclusion also
+    /// answers `NotRemote` and
     /// emits [`UploadOutcome::Excluded`] ("never uploaded automatically"); one under the
     /// user's own exclusions answers `NotRemote` silently. An unsafe path or an unreadable
     /// buffer is [`UploadStart::Refused`]. `force` is "upload anyway" after an
@@ -927,8 +934,10 @@ impl ServerStore {
         else {
             return UploadStart::NotRemote;
         };
-        if self.auto_upload_problem(&server.id).is_some() {
-            return UploadStart::NotRemote;
+        match self.auto_upload_problem(&server.id) {
+            Some(RECONFIRM) => return UploadStart::Refused(RECONFIRM.into()),
+            Some(_) => return UploadStart::NotRemote,
+            None => {}
         }
         let Some(local) = buffer_path(buffer.read(cx), cx) else {
             return UploadStart::NotRemote;
@@ -2381,6 +2390,7 @@ mod tests {
         prod.upload_on_save = true;
         prod.upload_on_save_confirmed = true;
         tune(&mut prod);
+        prod.upload_on_save_fingerprint = Some(on_save::fingerprint(&prod));
         let server_id = prod.id.clone();
         let mut servers = Servers::default();
         servers
@@ -2458,7 +2468,22 @@ mod tests {
             self.upload_in(buffer, self.project.to_str(), force, cx)
         }
 
+        /// An edit the user confirmed: the stored fingerprint of every confirmed server follows
+        /// its settings (see `edit_servers_by_hand` for the one that does not).
         fn edit_servers(&self, cx: &mut TestAppContext, edit: impl FnOnce(&mut Servers)) {
+            self.edit_servers_by_hand(cx, |servers| {
+                edit(servers);
+                for server in &mut servers.servers {
+                    if server.upload_on_save_confirmed {
+                        server.upload_on_save_fingerprint = Some(on_save::fingerprint(server));
+                    }
+                }
+            });
+        }
+
+        /// What a text editor does to servers.json: the settings change, the stored fingerprint
+        /// stays as it was.
+        fn edit_servers_by_hand(&self, cx: &mut TestAppContext, edit: impl FnOnce(&mut Servers)) {
             self.store.update(cx, |store, cx| {
                 let mut servers = store.servers().clone();
                 edit(&mut servers);
@@ -2500,17 +2525,17 @@ mod tests {
         Fixture::save_in(&buffer, "<?php echo 1;", cx);
         let try_upload = |f: &Mapped, cx: &mut TestAppContext| f.upload(&buffer, true, cx);
 
-        // Only upload_on_save, only the confirmation, neither.
-        for (on, confirmed) in [(true, false), (false, true), (false, false)] {
+        // Only upload_on_save (the user must confirm again), only the confirmation, neither.
+        for (on, confirmed, expected) in [
+            (true, false, UploadStart::Refused(RECONFIRM.into())),
+            (false, true, UploadStart::NotRemote),
+            (false, false, UploadStart::NotRemote),
+        ] {
             f.edit_servers(cx, |servers| {
                 servers.servers[0].upload_on_save = on;
                 servers.servers[0].upload_on_save_confirmed = confirmed;
             });
-            assert_eq!(
-                try_upload(&f, cx),
-                UploadStart::NotRemote,
-                "{on} {confirmed}"
-            );
+            assert_eq!(try_upload(&f, cx), expected, "{on} {confirmed}");
         }
         f.edit_servers(cx, |servers| {
             servers.servers[0].upload_on_save = true;
@@ -3187,6 +3212,96 @@ mod tests {
         })
         .await
         .expect("a repaired mapping saves");
+    }
+
+    #[gpui::test]
+    async fn the_store_records_the_fingerprint_of_a_confirmation_and_drops_it_with_it(
+        cx: &mut TestAppContext,
+    ) {
+        let f = mapped_fixture(cx, |_| {}).await;
+        let save = |cx: &mut TestAppContext, edit: fn(&mut ServerConfig)| {
+            let task = f.store.update(cx, |store, cx| {
+                let previous = store.servers().clone();
+                let mut servers = previous.clone();
+                edit(&mut servers.servers[0]);
+                // A hand-planted stale value must not survive a save.
+                servers.servers[0].upload_on_save_fingerprint = Some("stale".into());
+                store.save(previous, servers, Vec::new(), &Default::default(), cx)
+            });
+            async move {
+                task.await.expect("saved");
+            }
+        };
+        save(cx, |s| s.name = "Renamed".into()).await;
+        let server = f
+            .store
+            .read_with(cx, |store, _| store.servers().servers[0].clone());
+        assert!(server.upload_on_save_confirmed);
+        assert_eq!(
+            server.upload_on_save_fingerprint,
+            Some(on_save::fingerprint(&server)),
+            "a kept confirmation is stored with the fingerprint of its settings"
+        );
+        save(cx, |s| s.host = "other.example.com".into()).await;
+        let server = f
+            .store
+            .read_with(cx, |store, _| store.servers().servers[0].clone());
+        assert!(!server.upload_on_save_confirmed);
+        assert_eq!(server.upload_on_save_fingerprint, None, "cleared with it");
+    }
+
+    /// A servers.json whose host was edited by hand after the user confirmed: the flag and the
+    /// fingerprint of the old host are still in it.
+    fn hand_edited_servers(f: &Mapped, cx: &mut TestAppContext) -> Servers {
+        let mut servers = f.store.read_with(cx, |store, _| store.servers().clone());
+        servers.servers[0].host = "evil.example.com".into();
+        servers
+    }
+
+    #[gpui::test]
+    async fn a_hand_edited_host_with_the_old_confirmation_is_refused_before_any_connection(
+        cx: &mut TestAppContext,
+    ) {
+        let f = mapped_fixture(cx, |_| {}).await;
+        let buffer = f.open("inc/a.php", cx).await;
+        Fixture::save_in(&buffer, "<?php echo 1;", cx);
+        f.edit_servers_by_hand(cx, |servers| {
+            servers.servers[0].host = "evil.example.com".into()
+        });
+        let confirmed = f
+            .store
+            .read_with(cx, |store, _| store.servers().servers[0].clone());
+        assert!(
+            confirmed.upload_on_save && confirmed.upload_on_save_confirmed,
+            "the file still says confirmed"
+        );
+        assert_eq!(
+            f.upload(&buffer, true, cx),
+            UploadStart::Refused(RECONFIRM.into())
+        );
+        cx.run_until_parked();
+        assert_eq!(f.connects(), 0);
+        assert!(f.puts().is_empty());
+    }
+
+    #[gpui::test]
+    async fn a_hand_edited_servers_file_is_refused_after_loading_it(cx: &mut TestAppContext) {
+        let f = mapped_fixture(cx, |_| {}).await;
+        let buffer = f.open("inc/a.php", cx).await;
+        Fixture::save_in(&buffer, "<?php echo 1;", cx);
+        let path = f.dir.path().join("hand-edited.json");
+        hand_edited_servers(&f, cx).save(&path).expect("write");
+        let store = cx.new(|cx| ServerStore::load(path, f.dir.path().join("cache"), cx));
+        cx.run_until_parked();
+        assert!(store.read_with(cx, |store, _| store.is_loaded()));
+        let project = f.project.to_str().map(str::to_owned);
+        let started = store.update(cx, |store, cx| {
+            store.upload_mapped(&buffer, project.as_deref(), true, false, cx)
+        });
+        assert_eq!(started, UploadStart::Refused(RECONFIRM.into()));
+        cx.run_until_parked();
+        assert_eq!(f.connects(), 0);
+        assert!(f.puts().is_empty());
     }
 
     #[gpui::test]

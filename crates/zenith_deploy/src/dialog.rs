@@ -3961,6 +3961,7 @@ mod tests {
         let mut confirmed = server("Live", None);
         confirmed.upload_on_save = true;
         confirmed.upload_on_save_confirmed = true;
+        confirmed.upload_on_save_fingerprint = Some(on_save::fingerprint(&confirmed));
         let servers = Servers {
             servers: vec![confirmed],
             ..Servers::default()
@@ -4340,6 +4341,7 @@ mod tests {
         confirmed.upload_on_save_confirmed = true;
         // Blank and padded entries, as a hand edit leaves them.
         confirmed.excluded_local = vec!["vendor".into(), String::new(), "  *.log ".into()];
+        confirmed.upload_on_save_fingerprint = Some(on_save::fingerprint(&confirmed));
         let servers = Servers {
             servers: vec![confirmed.clone()],
             ..Servers::default()
@@ -4362,6 +4364,7 @@ mod tests {
         padded.upload_on_save = true;
         padded.upload_on_save_confirmed = true;
         padded.excluded_local = vec!["  *.log ".into()];
+        padded.upload_on_save_fingerprint = Some(on_save::fingerprint(&padded));
         let servers = Servers {
             servers: vec![padded],
             ..Servers::default()
@@ -5193,10 +5196,28 @@ mod tests {
             !holds(None, &on, None),
             "a new server has nothing confirmed"
         );
-        assert!(holds(Some(&on), &on, None), "was on, nothing changed");
+        let mut on_stamped = on.clone();
+        on_stamped.upload_on_save_fingerprint = Some(fp.clone());
+        assert!(
+            holds(Some(&on_stamped), &on_stamped, None),
+            "was on with its fingerprint, nothing changed"
+        );
+        assert!(
+            !holds(Some(&on), &on, None),
+            "was on without a stored fingerprint (an old or hand-edited file)"
+        );
+        let mut stale = on.clone();
+        stale.upload_on_save_fingerprint = Some("stale".into());
+        assert!(
+            !holds(Some(&stale), &on, None),
+            "was on with a fingerprint of other settings"
+        );
         let mut other = on.clone();
         other.root_path = "/elsewhere".into();
-        assert!(!holds(Some(&on), &other, None), "was on, settings changed");
+        assert!(
+            !holds(Some(&on_stamped), &other, None),
+            "was on, settings changed"
+        );
         assert!(
             !holds(Some(&saved), &other, Some(&fp)),
             "confirmed other settings"
