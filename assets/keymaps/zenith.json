@@ -78,6 +78,25 @@
     },
   },
   {
+    // The Deployment dialog. Tab and Shift-Tab move between its controls; the base keymap's
+    // context-less "tab" (menu::SelectNext) does nothing there. Enter on a button, tab or row is
+    // handled by the control itself (menu::Confirm on it), not here.
+    "context": "DeploymentDialog",
+    "bindings": {
+      "tab": "zenith_deploy::FocusNextControl",
+      "shift-tab": "zenith_deploy::FocusPreviousControl",
+    },
+  },
+  {
+    // The same keys inside the dialog's editors, so the Excluded Paths box (a full multi-line
+    // editor, which binds editor::Tab) leaves with Tab instead of typing a tab character.
+    "context": "DeploymentDialog > Editor",
+    "bindings": {
+      "tab": "zenith_deploy::FocusNextControl",
+      "shift-tab": "zenith_deploy::FocusPreviousControl",
+    },
+  },
+  {
     // The Open Project dialog (This Window / New Window / Attach / Cancel). Tab and Shift-Tab
     // move between its controls; the base keymap's context-less "tab" (menu::SelectNext) would
     // do nothing here. Enter presses the focused button and Escape is menu::Cancel: no binding.

@@ -6,11 +6,11 @@ use std::collections::HashMap;
 
 use editor::{Editor, EditorEvent};
 use gpui::{
-    App, Context, DismissEvent, Div, Entity, EventEmitter, FocusHandle, Focusable,
-    PathPromptOptions, Role, SharedString, Stateful, Subscription, Task, WeakEntity, Window,
-    actions,
+    App, ClickEvent, Context, DismissEvent, Div, Entity, EventEmitter, FocusHandle, Focusable,
+    PathPromptOptions, Role, SharedString, Stateful, Subscription, Task, Toggled, WeakEntity,
+    Window, actions,
 };
-use ui::{Callout, Checkbox, Disclosure, IconButton, ListItem, Tooltip, prelude::*};
+use ui::{Callout, Checkbox, IconButton, ListItem, Tooltip, prelude::*};
 use util::ResultExt as _;
 use workspace::{ModalView, Toast, Workspace, notifications::NotificationId};
 
@@ -24,6 +24,10 @@ actions!(
     [
         /// Opens the Deployment dialog: servers and their connection settings.
         OpenDeployment,
+        /// Moves focus to the next control of the Deployment dialog.
+        FocusNextControl,
+        /// Moves focus to the previous control of the Deployment dialog.
+        FocusPreviousControl,
     ]
 );
 
@@ -133,6 +137,11 @@ pub struct DeploymentDialog {
     project: Option<String>,
     fields: Fields,
     tab: DialogTab,
+    /// The dialog's own focus handle: tells whether focus is inside it, and takes it when the
+    /// control that had it is gone.
+    focus_handle: FocusHandle,
+    /// The Add Mapping button: where focus goes when the last mapping row is removed.
+    add_mapping_focus: FocusHandle,
     /// The selected server's mappings, rebuilt when the selection or the row count changes.
     mapping_rows: Vec<MappingRow>,
     /// The selected server's `excluded_local`, one pattern per line.
@@ -280,6 +289,8 @@ impl DeploymentDialog {
             project,
             fields,
             tab: DialogTab::Connection,
+            focus_handle: cx.focus_handle(),
+            add_mapping_focus: cx.focus_handle(),
             mapping_rows: Vec::new(),
             excluded,
             port_invalid: false,
@@ -447,7 +458,17 @@ impl DeploymentDialog {
             .map(String::from)
             .collect();
         if let Some(server) = self.selected_server_mut() {
-            server.excluded_local = patterns;
+            // Showing a server's patterns fires this too: a hand-edited list with blank or
+            // padded entries must stay as it is until the user edits it, or OK would count it
+            // as changed and ask for the upload-on-save confirmation again.
+            let tidy = server
+                .excluded_local
+                .iter()
+                .map(|pattern| pattern.trim())
+                .filter(|pattern| !pattern.is_empty());
+            if !tidy.eq(patterns.iter().map(String::as_str)) {
+                server.excluded_local = patterns;
+            }
             cx.notify();
         }
     }
@@ -480,6 +501,17 @@ impl DeploymentDialog {
         if index < server.mappings.len() {
             server.mappings.remove(index);
             self.rebuild_mapping_rows(window, cx);
+            // The row that had focus is gone: hand it to the one that took its place (or the
+            // one before it), else to Add Mapping, so the keyboard stays inside the dialog.
+            let neighbour = self
+                .mapping_rows
+                .get(index)
+                .or_else(|| self.mapping_rows.last());
+            let target = match neighbour {
+                Some(row) => row.remote.focus_handle(cx),
+                None => self.add_mapping_focus.clone(),
+            };
+            window.focus(&target, cx);
         }
     }
 
@@ -492,9 +524,12 @@ impl DeploymentDialog {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(editor) = self.mapping_rows.get(index).map(|row| row.local.clone()) else {
+        let Some(server_id) = self.selected_server().map(|server| server.id.clone()) else {
             return;
         };
+        if index >= self.mapping_rows.len() {
+            return;
+        }
         let paths = cx.prompt_for_paths(PathPromptOptions {
             files: false,
             directories: true,
@@ -511,10 +546,17 @@ impl DeploymentDialog {
             let Some(folder) = folder else {
                 return;
             };
-            this.update_in(cx, |_, window, cx| {
-                editor.update(cx, |editor, cx| {
-                    editor.set_text(folder.to_string_lossy().into_owned(), window, cx)
-                })
+            // The rows may have been rebuilt while the prompt was open: find the row again, and
+            // drop the answer if another server is showing.
+            this.update_in(cx, |this, window, cx| {
+                if this.selected_server().map(|server| &server.id) != Some(&server_id) {
+                    return;
+                }
+                if let Some(row) = this.mapping_rows.get(index) {
+                    row.local.update(cx, |editor, cx| {
+                        editor.set_text(folder.to_string_lossy().into_owned(), window, cx)
+                    });
+                }
             })
             .log_err();
         }));
@@ -565,6 +607,7 @@ impl DeploymentDialog {
         }
         server.name = format!("Server {number}");
         self.servers.servers.push(server);
+        self.tab = DialogTab::Connection;
         self.select(Some(self.servers.servers.len() - 1), window, cx);
         window.focus(&self.fields.host.focus_handle(cx), cx);
     }
@@ -898,34 +941,121 @@ impl DeploymentDialog {
         cx.emit(DismissEvent);
     }
 
+    /// Tab and Shift-Tab. The tab order belongs to the window and does not stop at the dialog's
+    /// edge, so a step that leaves the dialog wraps to its first (or, backwards, last) control.
+    fn move_focus(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if forward {
+            window.focus_next(cx);
+        } else {
+            window.focus_prev(cx);
+        }
+        if self.focus_handle.contains_focused(window, cx) {
+            return;
+        }
+        self.focus_handle.focus(window, cx);
+        window.focus_next(cx);
+        if !forward {
+            // ponytail: walks forward to the last control; a dialog has far fewer than 256.
+            for _ in 0..256 {
+                window.focus_next(cx);
+                if !self.focus_handle.contains_focused(window, cx) {
+                    window.focus_prev(cx);
+                    break;
+                }
+            }
+        }
+    }
+
+    /// A button whose Enter does what its click does. Without this the base keymap's Enter
+    /// (`menu::Confirm`) reaches the dialog and saves it. `button` receives the click handler.
+    fn pressed<B: IntoElement>(
+        press: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + Clone + 'static,
+        button: impl FnOnce(Box<dyn Fn(&ClickEvent, &mut Window, &mut App)>) -> B,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let on_enter = press.clone();
+        let on_click = cx.listener(move |this, _: &ClickEvent, window, cx| press(this, window, cx));
+        div()
+            .on_action(
+                cx.listener(move |this, _: &menu::Confirm, window, cx| on_enter(this, window, cx)),
+            )
+            .child(button(Box::new(on_click)))
+    }
+
+    /// A focusable wrapper whose Enter and Space run `press`: for rows and checkboxes, which
+    /// are not buttons. The wrapped element keeps handling the mouse.
+    fn focusable_press(
+        id: impl Into<gpui::ElementId>,
+        enabled: bool,
+        press: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + Clone + 'static,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let colors = cx.theme().colors();
+        let on_enter = press.clone();
+        div()
+            .id(id)
+            .border_1()
+            .border_color(colors.border_transparent)
+            .rounded_sm()
+            .when(enabled, |this| {
+                this.tab_index(0isize)
+                    .focus_visible(|style| style.border_color(colors.border_focused))
+                    .on_action(cx.listener(move |this, _: &menu::Confirm, window, cx| {
+                        on_enter(this, window, cx)
+                    }))
+                    .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                        // A mouse click is the wrapped element's own business.
+                        if event.is_keyboard() {
+                            press(this, window, cx)
+                        }
+                    }))
+            })
+    }
+
     fn render_server_list(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let has_selection = self.selected.is_some();
         let can_default = has_selection && self.project.is_some();
         let toolbar = h_flex()
             .gap_0p5()
-            .child(
-                IconButton::new("zenith-deploy-add", IconName::Plus)
-                    .icon_size(IconSize::Small)
-                    .tooltip(Tooltip::text("Add Server"))
-                    .aria_label("Add Server")
-                    .on_click(cx.listener(|this, _, window, cx| this.add_server(window, cx))),
-            )
-            .child(
-                IconButton::new("zenith-deploy-remove", IconName::Dash)
-                    .icon_size(IconSize::Small)
-                    .disabled(!has_selection)
-                    .tooltip(Tooltip::text("Remove Server"))
-                    .aria_label("Remove Server")
-                    .on_click(cx.listener(|this, _, window, cx| this.remove_server(window, cx))),
-            )
-            .child(
-                IconButton::new("zenith-deploy-default", IconName::Check)
-                    .icon_size(IconSize::Small)
-                    .disabled(!can_default)
-                    .tooltip(Tooltip::text("Use as Default for This Project"))
-                    .aria_label("Use as Default for This Project")
-                    .on_click(cx.listener(|this, _, _, cx| this.set_default(cx))),
-            );
+            .child(Self::pressed(
+                |this, window, cx| this.add_server(window, cx),
+                |on_click| {
+                    IconButton::new("zenith-deploy-add", IconName::Plus)
+                        .icon_size(IconSize::Small)
+                        .tab_index(0isize)
+                        .tooltip(Tooltip::text("Add Server"))
+                        .aria_label("Add Server")
+                        .on_click(on_click)
+                },
+                cx,
+            ))
+            .child(Self::pressed(
+                |this, window, cx| this.remove_server(window, cx),
+                |on_click| {
+                    IconButton::new("zenith-deploy-remove", IconName::Dash)
+                        .icon_size(IconSize::Small)
+                        .tab_index(0isize)
+                        .disabled(!has_selection)
+                        .tooltip(Tooltip::text("Remove Server"))
+                        .aria_label("Remove Server")
+                        .on_click(on_click)
+                },
+                cx,
+            ))
+            .child(Self::pressed(
+                |this, _, cx| this.set_default(cx),
+                |on_click| {
+                    IconButton::new("zenith-deploy-default", IconName::Check)
+                        .icon_size(IconSize::Small)
+                        .tab_index(0isize)
+                        .disabled(!can_default)
+                        .tooltip(Tooltip::text("Use as Default for This Project"))
+                        .aria_label("Use as Default for This Project")
+                        .on_click(on_click)
+                },
+                cx,
+            ));
+        let border = cx.theme().colors().border;
         let rows =
             self.servers
                 .servers
@@ -938,31 +1068,45 @@ impl DeploymentDialog {
                     } else {
                         server.name.clone()
                     };
-                    ListItem::new(("zenith-deploy-server", index))
-                        .toggle_state(self.selected == Some(index))
-                        .child(
-                            h_flex()
-                                .gap_1()
-                                .child(
-                                    Label::new(label).when(is_default, |label| {
+                    let selected = self.selected == Some(index);
+                    // Focusable so the keyboard can pick a server: Enter or Space selects it.
+                    Self::focusable_press(
+                        ("zenith-deploy-server-focus", index),
+                        true,
+                        move |this, window, cx| this.select(Some(index), window, cx),
+                        cx,
+                    )
+                    .debug_selector(move || format!("zenith-deploy-server-{index}"))
+                    .role(Role::ListBoxOption)
+                    .aria_label(label.clone())
+                    .aria_selected(selected)
+                    .child(
+                        ListItem::new(("zenith-deploy-server", index))
+                            .toggle_state(selected)
+                            .child(
+                                h_flex()
+                                    .gap_1()
+                                    .child(Label::new(label).when(is_default, |label| {
                                         label.weight(gpui::FontWeight::BOLD)
+                                    }))
+                                    .when(is_default, |row| {
+                                        row.child(Label::new("(default)").color(Color::Muted))
                                     }),
-                                )
-                                .when(is_default, |row| {
-                                    row.child(Label::new("(default)").color(Color::Muted))
-                                }),
-                        )
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.select(Some(index), window, cx)
-                        }))
+                            )
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.select(Some(index), window, cx)
+                            })),
+                    )
                 });
         v_flex().w(rems(14.)).gap_1().child(toolbar).child(
             v_flex()
                 .id("zenith-deploy-server-list")
+                .role(Role::ListBox)
+                .aria_label("Servers")
                 .h(rems(22.))
                 .overflow_y_scroll()
                 .border_1()
-                .border_color(cx.theme().colors().border)
+                .border_color(border)
                 .rounded_sm()
                 .children(rows)
                 .when(self.servers.servers.is_empty(), |list| {
@@ -975,7 +1119,13 @@ impl DeploymentDialog {
         )
     }
 
-    fn row(label: &'static str, editor: &Entity<Editor>, cx: &App) -> impl IntoElement {
+    fn row(
+        label: &'static str,
+        role: Role,
+        editor: &Entity<Editor>,
+        window: &Window,
+        cx: &App,
+    ) -> impl IntoElement {
         h_flex()
             .debug_selector(|| format!("zenith-deploy-row-{label}"))
             .gap_2()
@@ -985,38 +1135,83 @@ impl DeploymentDialog {
                     .child(Label::new(label).color(Color::Muted)),
             )
             .child(
-                div()
-                    .debug_selector(|| format!("zenith-deploy-field-{label}"))
-                    .flex_1()
-                    .px_2()
-                    .border_1()
-                    .border_color(cx.theme().colors().border)
-                    .rounded_sm()
-                    .child(editor.clone()),
+                Self::labeled_field(
+                    SharedString::from(format!("zenith-deploy-field-{label}")),
+                    label,
+                    role,
+                    editor,
+                    window,
+                    cx,
+                )
+                .debug_selector(|| format!("zenith-deploy-field-{label}"))
+                .flex_1(),
             )
     }
 
-    /// A bordered editor that screen readers can name: the fork's editors expose no node of
-    /// their own (the pattern of `settings_ui`'s input field).
+    /// A bordered editor that is a tab stop and that screen readers can name: the fork's
+    /// editors expose no node of their own (the pattern of `settings_ui`'s input field). The
+    /// value is read only while assistive technology is connected, and never for a password.
     fn labeled_field(
         id: impl Into<gpui::ElementId>,
         label: impl Into<SharedString>,
         role: Role,
         editor: &Entity<Editor>,
+        window: &Window,
         cx: &App,
     ) -> Stateful<Div> {
         div()
             .id(id)
             .role(role)
             .aria_label(label)
-            .aria_value(editor.read(cx).text(cx))
-            .track_focus(&editor.focus_handle(cx))
+            .when(
+                window.is_a11y_active() && role != Role::PasswordInput,
+                |field| field.aria_value(editor.read(cx).text(cx)),
+            )
+            .track_focus(&editor.focus_handle(cx).tab_index(0).tab_stop(true))
             .min_w_0()
             .px_2()
             .border_1()
             .border_color(cx.theme().colors().border)
             .rounded_sm()
             .child(editor.clone())
+    }
+
+    /// A checkbox that is a tab stop (Enter and Space toggle it) and that screen readers
+    /// announce with its state. `ui::Checkbox` has no focus handle or role of its own.
+    fn checkbox(
+        id: &'static str,
+        label: &'static str,
+        checked: bool,
+        disabled: bool,
+        description: Option<&'static str>,
+        toggle: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + Clone + 'static,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let on_click = toggle.clone();
+        Self::focusable_press(
+            SharedString::from(format!("{id}-focus")),
+            !disabled,
+            toggle,
+            cx,
+        )
+        .role(Role::CheckBox)
+        .aria_label(label)
+        .aria_toggled(if checked {
+            Toggled::True
+        } else {
+            Toggled::False
+        })
+        .when_some(description, |this, text| this.aria_description(text))
+        .child(
+            Checkbox::new(id, checked.into())
+                .label(label)
+                .disabled(disabled)
+                .on_click(
+                    cx.listener(move |this, _: &ToggleState, window, cx| {
+                        on_click(this, window, cx)
+                    }),
+                ),
+        )
     }
 
     fn render_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1026,36 +1221,53 @@ impl DeploymentDialog {
             .debug_selector(|| "zenith-deploy-tabs".to_string())
             .role(Role::TabList)
             .aria_label("Server settings")
-            // The tabs are tab stops 0..2 of this group; the panel and the footer follow in
-            // document order.
-            .tab_group()
             .gap_1()
-            .children(DialogTab::ALL.into_iter().enumerate().map(|(index, tab)| {
+            .children(DialogTab::ALL.into_iter().map(|tab| {
                 let selected = self.tab == tab;
-                h_flex()
+                // The selected tab has a bar under it as well as a background, so the choice
+                // does not rest on colour alone.
+                v_flex()
                     .id(tab.id())
                     .debug_selector(|| tab.id().to_string())
                     .role(Role::Tab)
                     .aria_label(tab.label())
                     .aria_selected(selected)
-                    .tab_index(index as isize)
+                    .tab_index(0isize)
                     .px_2()
-                    .py_0p5()
+                    .pt_0p5()
                     .rounded_sm()
+                    .border_1()
+                    .border_color(colors.border_transparent)
                     .cursor_pointer()
                     .when(selected, |this| this.bg(colors.element_selected))
                     .hover(|style| style.bg(colors.element_hover))
-                    .focus_visible(|style| style.border_1().border_color(colors.border_focused))
+                    .focus_visible(|style| style.border_color(colors.border_focused))
                     .child(Label::new(tab.label()).color(if selected {
                         Color::Default
                     } else {
                         Color::Muted
                     }))
+                    .child(
+                        div()
+                            .h(px(2.))
+                            .w_full()
+                            .mt_0p5()
+                            .rounded_sm()
+                            .bg(if selected {
+                                colors.text_accent
+                            } else {
+                                colors.border_transparent
+                            }),
+                    )
+                    // Enter selects the tab (the base keymap's Enter would save the dialog).
+                    .on_action(
+                        cx.listener(move |this, _: &menu::Confirm, _, cx| this.set_tab(tab, cx)),
+                    )
                     .on_click(cx.listener(move |this, _, _, cx| this.set_tab(tab, cx)))
             }))
     }
 
-    fn render_mappings(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_mappings(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let rows = self.mapping_rows.iter().enumerate().map(|(index, row)| {
             let number = index + 1;
             let side = |label: &'static str| {
@@ -1081,24 +1293,26 @@ impl DeploymentDialog {
                                 format!("Local folder, mapping {number}"),
                                 Role::TextInput,
                                 &row.local,
+                                window,
                                 cx,
                             )
                             .debug_selector(move || format!("zenith-deploy-map-local-{index}"))
                             .flex_1(),
                         )
-                        .child(
-                            button_box().child(
+                        .child(button_box().child(Self::pressed(
+                            move |this, window, cx| this.browse_mapping(index, window, cx),
+                            |on_click| {
                                 Button::new(("zenith-deploy-map-browse", index), "Browse…")
                                     .full_width()
+                                    .tab_index(0isize)
                                     .tooltip(Tooltip::text("Choose the local folder"))
                                     .aria_label(format!(
                                         "Browse for the local folder, mapping {number}"
                                     ))
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        this.browse_mapping(index, window, cx)
-                                    })),
-                            ),
-                        ),
+                                    .on_click(on_click)
+                            },
+                            cx,
+                        ))),
                 )
                 .child(
                     h_flex()
@@ -1110,22 +1324,24 @@ impl DeploymentDialog {
                                 format!("Remote folder, mapping {number}"),
                                 Role::TextInput,
                                 &row.remote,
+                                window,
                                 cx,
                             )
                             .debug_selector(move || format!("zenith-deploy-map-remote-{index}"))
                             .flex_1(),
                         )
-                        .child(
-                            button_box().child(
+                        .child(button_box().child(Self::pressed(
+                            move |this, window, cx| this.remove_mapping(index, window, cx),
+                            |on_click| {
                                 Button::new(("zenith-deploy-map-remove", index), "Remove")
                                     .full_width()
+                                    .tab_index(0isize)
                                     .tooltip(Tooltip::text("Remove this mapping"))
                                     .aria_label(format!("Remove mapping {number}"))
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        this.remove_mapping(index, window, cx)
-                                    })),
-                            ),
-                        ),
+                                    .on_click(on_click)
+                            },
+                            cx,
+                        ))),
                 )
         });
         v_flex()
@@ -1143,15 +1359,21 @@ impl DeploymentDialog {
                 panel.child(Label::new("No mappings. Add one with Add Mapping.").color(Color::Muted))
             })
             .child(
-                div().child(
-                    Button::new("zenith-deploy-map-add", "Add Mapping")
-                        .tooltip(Tooltip::text("Add a mapping, starting at the project folder"))
-                        .on_click(cx.listener(|this, _, window, cx| this.add_mapping(window, cx))),
-                ),
+                div().child(Self::pressed(
+                    |this, window, cx| this.add_mapping(window, cx),
+                    |on_click| {
+                        Button::new("zenith-deploy-map-add", "Add Mapping")
+                            .tab_index(0isize)
+                            .track_focus(&self.add_mapping_focus)
+                            .tooltip(Tooltip::text("Add a mapping, starting at the project folder"))
+                            .on_click(on_click)
+                    },
+                    cx,
+                )),
             )
     }
 
-    fn render_excluded(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_excluded(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         v_flex()
             .debug_selector(|| "zenith-deploy-excluded".to_string())
             .flex_1()
@@ -1168,6 +1390,7 @@ impl DeploymentDialog {
                     "Excluded paths, one pattern per line",
                     Role::MultilineTextInput,
                     &self.excluded,
+                    window,
                     cx,
                 )
                 .debug_selector(|| "zenith-deploy-excluded-field".to_string())
@@ -1187,7 +1410,12 @@ impl DeploymentDialog {
             )
     }
 
-    fn render_form(&self, server: &ServerConfig, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_form(
+        &self,
+        server: &ServerConfig,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let types = h_flex()
             .gap_1()
             .child(
@@ -1203,14 +1431,19 @@ impl DeploymentDialog {
                 ]
                 .into_iter()
                 .map(|(server_type, label)| {
-                    Button::new(
-                        SharedString::from(format!("zenith-deploy-type-{label}")),
-                        label,
+                    Self::pressed(
+                        move |this, window, cx| this.set_type(server_type, window, cx),
+                        |on_click| {
+                            Button::new(
+                                SharedString::from(format!("zenith-deploy-type-{label}")),
+                                label,
+                            )
+                            .tab_index(0isize)
+                            .toggle_state(server.server_type == server_type)
+                            .on_click(on_click)
+                        },
+                        cx,
                     )
-                    .toggle_state(server.server_type == server_type)
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.set_type(server_type, window, cx)
-                    }))
                 }),
             );
         let is_ftp = server.server_type != ServerType::Sftp;
@@ -1223,34 +1456,42 @@ impl DeploymentDialog {
             .flex_1()
             .min_w_0()
             .gap_1p5()
-            .child(Self::row("Name", &self.fields.name, cx))
+            .child(Self::row("Name", Role::TextInput, &self.fields.name, window, cx))
             .child(types)
-            .child(Self::row("Host", &self.fields.host, cx))
-            .child(Self::row("Port", &self.fields.port, cx))
+            .child(Self::row("Host", Role::TextInput, &self.fields.host, window, cx))
+            .child(Self::row("Port", Role::TextInput, &self.fields.port, window, cx))
             .when(self.port_invalid, |form| {
                 form.child(Label::new("Port must be a number from 1 to 65535.").color(Color::Error))
             })
-            .child(Self::row("Username", &self.fields.username, cx))
+            .child(Self::row("Username", Role::TextInput, &self.fields.username, window, cx))
             .when(is_ftp, |form| {
-                form.child(
-                    Checkbox::new("zenith-deploy-anonymous", server.anonymous.into())
-                        .label("Anonymous login")
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.update_selected(cx, |server| server.anonymous = !server.anonymous)
-                        })),
-                )
+                form.child(Self::checkbox(
+                    "zenith-deploy-anonymous",
+                    "Anonymous login",
+                    server.anonymous,
+                    false,
+                    None,
+                    |this, _, cx| {
+                        this.update_selected(cx, |server| server.anonymous = !server.anonymous)
+                    },
+                    cx,
+                ))
             })
             .when(is_ftp && !server.anonymous, |form| {
-                form.child(Self::row("Password", &self.fields.password, cx))
-                    .child(
-                        Checkbox::new("zenith-deploy-save-password", server.save_password.into())
-                            .label("Save password in the Keychain")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.update_selected(cx, |server| {
-                                    server.save_password = !server.save_password
-                                })
-                            })),
-                    )
+                form.child(Self::row("Password", Role::PasswordInput, &self.fields.password, window, cx))
+                    .child(Self::checkbox(
+                        "zenith-deploy-save-password",
+                        "Save password in the Keychain",
+                        server.save_password,
+                        false,
+                        None,
+                        |this, _, cx| {
+                            this.update_selected(cx, |server| {
+                                server.save_password = !server.save_password
+                            })
+                        },
+                        cx,
+                    ))
             })
             .when(removes_password, |form| {
                 form.child(div().debug_selector(|| PASSWORD_NOTE_ID.to_string()).child(
@@ -1267,32 +1508,51 @@ impl DeploymentDialog {
                         .size(LabelSize::Small),
                 )
             })
-            .child(Self::row("Root path", &self.fields.root_path, cx))
-            .child(Self::row("Web URL", &self.fields.web_url, cx))
-            .child(
-                Checkbox::new("zenith-deploy-project-only", project_only.into())
-                    .label("Visible only for this project")
-                    .disabled(!has_project && !project_only)
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        let project = this.project.clone();
-                        this.update_selected(cx, |server| {
-                            server.project = match server.project {
-                                Some(_) => None,
-                                None => project,
-                            }
-                        })
-                    })),
-            )
+            .child(Self::row("Root path", Role::TextInput, &self.fields.root_path, window, cx))
+            .child(Self::row("Web URL", Role::TextInput, &self.fields.web_url, window, cx))
+            .child(Self::checkbox(
+                "zenith-deploy-project-only",
+                "Visible only for this project",
+                project_only,
+                !has_project && !project_only,
+                None,
+                |this, _, cx| {
+                    let project = this.project.clone();
+                    this.update_selected(cx, |server| {
+                        server.project = match server.project {
+                            Some(_) => None,
+                            None => project,
+                        }
+                    })
+                },
+                cx,
+            ))
             .child(
                 h_flex()
                     .gap_1()
-                    .child(
-                        Disclosure::new("zenith-deploy-advanced-toggle", self.advanced_open)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.advanced_open = !this.advanced_open;
-                                cx.notify();
-                            })),
-                    )
+                    .child(Self::pressed(
+                        |this, _, cx| {
+                            this.advanced_open = !this.advanced_open;
+                            cx.notify();
+                        },
+                        |on_click| {
+                            IconButton::new(
+                                "zenith-deploy-advanced-toggle",
+                                if self.advanced_open {
+                                    IconName::ChevronDown
+                                } else {
+                                    IconName::ChevronRight
+                                },
+                            )
+                            .icon_size(IconSize::Small)
+                            .tab_index(0isize)
+                            .tooltip(Tooltip::text("Show or hide the advanced settings"))
+                            .aria_label("Advanced")
+                            .aria_expanded(self.advanced_open)
+                            .on_click(on_click)
+                        },
+                        cx,
+                    ))
                     .child(Label::new("Advanced")),
             )
             .when(self.advanced_open && is_ftp, |form| {
@@ -1300,43 +1560,52 @@ impl DeploymentDialog {
                     v_flex()
                         .pl_4()
                         .gap_1()
-                        .child(
-                            Checkbox::new("zenith-deploy-passive", advanced.passive.into())
-                                .label("Passive mode")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.update_selected(cx, |server| {
-                                        server.advanced.passive = !server.advanced.passive
-                                    })
-                                })),
-                        )
-                        .child(
-                            Checkbox::new("zenith-deploy-list", advanced.use_list.into())
-                                .label("Use LIST instead of MLSD")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.update_selected(cx, |server| {
-                                        server.advanced.use_list = !server.advanced.use_list
-                                    })
-                                })),
-                        )
+                        .child(Self::checkbox(
+                            "zenith-deploy-passive",
+                            "Passive mode",
+                            advanced.passive,
+                            false,
+                            None,
+                            |this, _, cx| {
+                                this.update_selected(cx, |server| {
+                                    server.advanced.passive = !server.advanced.passive
+                                })
+                            },
+                            cx,
+                        ))
+                        .child(Self::checkbox(
+                            "zenith-deploy-list",
+                            "Use LIST instead of MLSD",
+                            advanced.use_list,
+                            false,
+                            None,
+                            |this, _, cx| {
+                                this.update_selected(cx, |server| {
+                                    server.advanced.use_list = !server.advanced.use_list
+                                })
+                            },
+                            cx,
+                        ))
                         .child(
                             h_flex()
                                 .pl_4()
                                 .gap_2()
                                 .debug_selector(|| "zenith-deploy-list-compat".to_string())
-                                .child(
-                                    Checkbox::new(
-                                        "zenith-deploy-list-compat",
-                                        advanced.list_compat.into(),
-                                    )
-                                    .label("Compatible with old version of listing children")
-                                    .disabled(!advanced.use_list)
-                                    .on_click(cx.listener(|this, _, _, cx| {
+                                .child(Self::checkbox(
+                                    "zenith-deploy-list-compat",
+                                    "Compatible with old version of listing children",
+                                    advanced.list_compat,
+                                    !advanced.use_list,
+                                    (!advanced.use_list)
+                                        .then_some("Needs Use LIST instead of MLSD to be on"),
+                                    |this, _, cx| {
                                         this.update_selected(cx, |server| {
                                             server.advanced.list_compat =
                                                 !server.advanced.list_compat
                                         })
-                                    })),
-                                )
+                                    },
+                                    cx,
+                                ))
                                 .when(!advanced.use_list, |row| {
                                     row.child(
                                         div()
@@ -1354,13 +1623,19 @@ impl DeploymentDialog {
             .when(self.advanced_open, |form| {
                 form.child(
                     div().pl_4().child(
-                        Checkbox::new("zenith-deploy-hidden", advanced.hidden_files.into())
-                            .label("Show hidden files")
-                            .on_click(cx.listener(|this, _, _, cx| {
+                        Self::checkbox(
+                            "zenith-deploy-hidden",
+                            "Show hidden files",
+                            advanced.hidden_files,
+                            false,
+                            None,
+                            |this, _, cx| {
                                 this.update_selected(cx, |server| {
                                     server.advanced.hidden_files = !server.advanced.hidden_files
                                 })
-                            })),
+                            },
+                            cx,
+                        ),
                     ),
                 )
             })
@@ -1398,25 +1673,38 @@ impl DeploymentDialog {
         v_flex()
             .gap_1()
             .when_some(status, |footer, (icon, color, message)| {
+                // The icon says passed or failed by shape; the text says it in words.
                 footer.child(
-                    h_flex()
-                        .debug_selector(|| "zenith-deploy-status".to_string())
-                        .gap_1()
+                    div()
+                        .id("zenith-deploy-status-line")
+                        .role(Role::Status)
+                        .aria_label(message.clone())
                         .child(
-                            div()
-                                .flex_none()
-                                .child(Icon::new(icon).color(color).size(IconSize::Small)),
-                        )
-                        .child(
-                            div()
-                                .debug_selector(|| "zenith-deploy-status-text".to_string())
-                                .min_w_0()
-                                .child(Label::new(message).color(color)),
+                            h_flex()
+                                .debug_selector(|| "zenith-deploy-status".to_string())
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .flex_none()
+                                        .child(Icon::new(icon).color(color).size(IconSize::Small)),
+                                )
+                                .child(
+                                    div()
+                                        .debug_selector(|| "zenith-deploy-status-text".to_string())
+                                        .min_w_0()
+                                        .child(Label::new(message).color(color)),
+                                ),
                         ),
                 )
             })
             .when_some(self.error.clone(), |footer, error| {
-                footer.child(Label::new(error).color(Color::Error))
+                footer.child(
+                    div()
+                        .id("zenith-deploy-error")
+                        .role(Role::Alert)
+                        .aria_label(error.clone())
+                        .child(Label::new(error).color(Color::Error)),
+                )
             })
             .when(self.saving, |footer| {
                 footer.child(
@@ -1428,22 +1716,33 @@ impl DeploymentDialog {
             .child(
                 h_flex()
                     .justify_between()
-                    .child(
-                        Button::new("zenith-deploy-test", "Test Connection")
-                            .disabled(self.selected.is_none())
-                            .on_click(cx.listener(|this, _, _, cx| this.test_connection(cx))),
-                    )
+                    .child(Self::pressed(
+                        |this, _, cx| this.test_connection(cx),
+                        |on_click| {
+                            Button::new("zenith-deploy-test", "Test Connection")
+                                .tab_index(0isize)
+                                .disabled(self.selected.is_none())
+                                .on_click(on_click)
+                        },
+                        cx,
+                    ))
                     .child(
                         h_flex()
                             .gap_1()
-                            .child(Button::new("zenith-deploy-cancel", "Cancel").on_click(
-                                cx.listener(|this, _, window, cx| {
-                                    this.cancel(&menu::Cancel, window, cx)
-                                }),
+                            .child(Self::pressed(
+                                |this, window, cx| this.cancel(&menu::Cancel, window, cx),
+                                |on_click| {
+                                    Button::new("zenith-deploy-cancel", "Cancel")
+                                        .tab_index(0isize)
+                                        .on_click(on_click)
+                                },
+                                cx,
                             ))
+                            // Enter on OK is the dialog's own confirm: it saves.
                             .child(
                                 Button::new("zenith-deploy-ok", "OK")
                                     .style(ButtonStyle::Filled)
+                                    .tab_index(0isize)
                                     .disabled(!can_save)
                                     .on_click(cx.listener(|this, _, _, cx| this.save(cx))),
                             ),
@@ -1456,9 +1755,9 @@ impl Render for DeploymentDialog {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let content = match self.selected_server().cloned() {
             Some(server) => match self.tab {
-                DialogTab::Connection => self.render_form(&server, cx).into_any_element(),
-                DialogTab::Mappings => self.render_mappings(cx).into_any_element(),
-                DialogTab::ExcludedPaths => self.render_excluded(cx).into_any_element(),
+                DialogTab::Connection => self.render_form(&server, window, cx).into_any_element(),
+                DialogTab::Mappings => self.render_mappings(window, cx).into_any_element(),
+                DialogTab::ExcludedPaths => self.render_excluded(window, cx).into_any_element(),
             },
             None => v_flex()
                 .flex_1()
@@ -1489,8 +1788,18 @@ impl Render for DeploymentDialog {
         v_flex()
             .debug_selector(|| "zenith-deploy-dialog".to_string())
             .key_context("DeploymentDialog")
+            .tab_group()
+            .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::confirm))
             .on_action(cx.listener(Self::cancel))
+            // The base keymap's Tab is `menu::SelectNext`, which does nothing here:
+            // `assets/keymaps/zenith.json` binds these two inside the dialog, editors included.
+            .on_action(cx.listener(|this, _: &FocusNextControl, window, cx| {
+                this.move_focus(true, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &FocusPreviousControl, window, cx| {
+                this.move_focus(false, window, cx)
+            }))
             .elevation_3(cx)
             .w(width)
             .p_3()
@@ -2913,38 +3222,395 @@ mod tests {
         });
     }
 
-    #[gpui::test]
-    async fn the_tabs_are_tab_stops_in_order(cx: &mut TestAppContext) {
-        let servers = Servers {
-            servers: vec![server("Live", None)],
-            ..Servers::default()
-        };
-        let (_, _, cx) = open_dialog(servers, &FakeRemote::default(), cx).await;
+    /// The real keymaps, so the tests press real keys: the base keymap binds a context-less
+    /// Tab to `menu::SelectNext` and Enter to `menu::Confirm`.
+    fn load_keymaps(cx: &mut VisualTestContext) {
+        cx.update(|_, cx| {
+            for json in [
+                include_str!("../../../assets/keymaps/default-macos.json"),
+                include_str!("../../../assets/keymaps/zenith.json"),
+            ] {
+                match settings::KeymapFile::load(json, cx) {
+                    settings::KeymapFileLoadResult::Success { key_bindings }
+                    | settings::KeymapFileLoadResult::SomeFailedToLoad { key_bindings, .. } => {
+                        cx.bind_keys(key_bindings)
+                    }
+                    settings::KeymapFileLoadResult::JsonParseFailure { error } => {
+                        panic!("{error:#}")
+                    }
+                }
+            }
+        });
+    }
+
+    fn focused(cx: &mut VisualTestContext) -> Option<FocusHandle> {
+        cx.update(|window, cx| window.focused(cx))
+    }
+
+    fn focus(handle: &FocusHandle, cx: &mut VisualTestContext) {
+        cx.update(|window, cx| window.focus(handle, cx));
         cx.run_until_parked();
-        // Clicking a tab focuses it: collect the three tabs' focus handles.
+    }
+
+    fn focus_is_inside(dialog: &Entity<DeploymentDialog>, cx: &mut VisualTestContext) -> bool {
+        let handle = dialog.read_with(cx, |dialog, _| dialog.focus_handle.clone());
+        cx.update(|window, cx| handle.contains_focused(window, cx))
+    }
+
+    /// Clicks each tab in turn and returns their focus handles, leaving the first one focused.
+    fn tab_handles(cx: &mut VisualTestContext) -> Vec<FocusHandle> {
         let mut handles = Vec::new();
         for tab in DialogTab::ALL {
             let bounds = cx.debug_bounds(tab.id()).expect("the tab is drawn");
             cx.simulate_click(bounds.center(), gpui::Modifiers::none());
             cx.run_until_parked();
-            handles.push(cx.update(|window, cx| window.focused(cx)).expect("focused"));
+            handles.push(focused(cx).expect("a click on a tab focuses it"));
         }
-        assert_eq!(handles.len(), 3);
+        let first = cx.debug_bounds(DialogTab::Connection.id()).expect("drawn");
+        cx.simulate_click(first.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        handles
+    }
+
+    async fn open_with_one_server(
+        cx: &mut TestAppContext,
+    ) -> (Entity<DeploymentDialog>, &mut VisualTestContext) {
+        let servers = Servers {
+            servers: vec![server("Live", None)],
+            ..Servers::default()
+        };
+        let (_, dialog, cx) = open_dialog(servers, &FakeRemote::default(), cx).await;
+        load_keymaps(cx);
+        cx.run_until_parked();
+        (dialog, cx)
+    }
+
+    #[gpui::test]
+    async fn tab_and_shift_tab_walk_the_controls_and_wrap_inside_the_dialog(
+        cx: &mut TestAppContext,
+    ) {
+        let (dialog, cx) = open_with_one_server(cx).await;
+        let tabs = tab_handles(cx);
         assert!(
-            handles[0] != handles[1] && handles[1] != handles[2] && handles[0] != handles[2],
+            tabs[0] != tabs[1] && tabs[1] != tabs[2] && tabs[0] != tabs[2],
             "each tab has its own focus handle"
         );
-        // Tab from the first one visits the second, then the third.
-        cx.update(|window, cx| window.focus(&handles[0], cx));
-        for (step, expected) in [(1, &handles[1]), (2, &handles[2])] {
-            cx.update(|window, cx| window.focus_next(cx));
-            let focused = cx.update(|window, cx| window.focused(cx));
-            assert_eq!(
-                focused.as_ref(),
-                Some(expected),
-                "step {step} of Tab from the first tab"
-            );
+        focus(&tabs[0], cx);
+        for (key, expected) in [("tab", 1), ("tab", 2), ("shift-tab", 1), ("shift-tab", 0)] {
+            cx.simulate_keystrokes(key);
+            assert_eq!(focused(cx).as_ref(), Some(&tabs[expected]), "{key}");
         }
+
+        // Forward from the first tab, every control is visited once and the walk comes back to
+        // the tab: Tab wraps at the end instead of leaving the dialog.
+        let mut forward = vec![tabs[0].clone()];
+        loop {
+            cx.simulate_keystrokes("tab");
+            assert!(focus_is_inside(&dialog, cx), "Tab left the dialog");
+            let now = focused(cx).expect("focused");
+            if now == tabs[0] {
+                break;
+            }
+            assert!(!forward.contains(&now), "a control was visited twice");
+            forward.push(now);
+            assert!(forward.len() < 80, "Tab never wraps");
+        }
+        assert!(
+            forward.len() > 15,
+            "the controls are tab stops, not just the tabs: {}",
+            forward.len()
+        );
+        // And backwards, the same controls in the reverse order.
+        let mut backward = vec![tabs[0].clone()];
+        for _ in 1..forward.len() {
+            cx.simulate_keystrokes("shift-tab");
+            assert!(focus_is_inside(&dialog, cx), "Shift-Tab left the dialog");
+            backward.push(focused(cx).expect("focused"));
+        }
+        cx.simulate_keystrokes("shift-tab");
+        assert_eq!(focused(cx).as_ref(), Some(&tabs[0]), "back at the start");
+        let mut expected = forward.clone();
+        expected[1..].reverse();
+        assert_eq!(backward, expected);
+    }
+
+    #[gpui::test]
+    async fn tab_leaves_a_text_field_and_the_multi_line_excluded_box(cx: &mut TestAppContext) {
+        let (dialog, cx) = open_with_one_server(cx).await;
+        let (name, excluded) = dialog.read_with(cx, |dialog, _| {
+            (dialog.fields.name.clone(), dialog.excluded.clone())
+        });
+        set_text(&excluded, "vendor", cx);
+        for tab in [DialogTab::Connection, DialogTab::ExcludedPaths] {
+            dialog.update(cx, |dialog, cx| dialog.set_tab(tab, cx));
+            cx.run_until_parked();
+            let editor = if tab == DialogTab::Connection {
+                &name
+            } else {
+                &excluded
+            };
+            for key in ["tab", "shift-tab"] {
+                let handle = cx.update(|_, cx| editor.focus_handle(cx));
+                focus(&handle, cx);
+                let before = text_of(editor, cx);
+                cx.simulate_keystrokes(key);
+                assert_ne!(
+                    focused(cx).as_ref(),
+                    Some(&handle),
+                    "{tab:?}: {key} must leave the field"
+                );
+                assert!(focus_is_inside(&dialog, cx), "{key} stays in the dialog");
+                assert_eq!(text_of(editor, cx), before, "{key} types nothing");
+            }
+        }
+    }
+
+    #[gpui::test]
+    async fn enter_on_a_tab_selects_it_and_does_not_save(cx: &mut TestAppContext) {
+        let (dialog, cx) = open_with_one_server(cx).await;
+        let name = dialog.read_with(cx, |dialog, _| dialog.fields.name.clone());
+        // A save would write this name to the store and close the dialog.
+        set_text(&name, "Edited", cx);
+        let tabs = tab_handles(cx);
+        focus(&tabs[0], cx);
+        cx.simulate_keystrokes("tab");
+        assert_eq!(focused(cx).as_ref(), Some(&tabs[1]));
+        cx.simulate_keystrokes("enter");
+        dialog.read_with(cx, |dialog, _| {
+            assert_eq!(dialog.tab, DialogTab::Mappings, "Enter selected the tab");
+            assert!(!dialog.saving, "Enter did not start a save");
+        });
+        cx.simulate_keystrokes("tab enter");
+        dialog.read_with(cx, |dialog, _| {
+            assert_eq!(dialog.tab, DialogTab::ExcludedPaths);
+        });
+        let saved = cx.update(|_, cx| ServerStore::global(cx).read(cx).servers().clone());
+        assert_eq!(saved.servers[0].name, "Live", "nothing was saved");
+        assert!(
+            cx.debug_bounds("zenith-deploy-dialog").is_some(),
+            "the dialog is still open"
+        );
+    }
+
+    #[gpui::test]
+    async fn enter_presses_the_focused_button_and_checkbox_not_ok(cx: &mut TestAppContext) {
+        let (dialog, cx) = open_with_one_server(cx).await;
+        let name = dialog.read_with(cx, |dialog, _| dialog.fields.name.clone());
+        set_text(&name, "Edited", cx);
+        let assert_open_and_unsaved = |cx: &mut VisualTestContext, what: &str| {
+            assert!(
+                cx.debug_bounds("zenith-deploy-dialog").is_some(),
+                "{what}: the dialog is still open"
+            );
+            let saved = cx.update(|_, cx| ServerStore::global(cx).read(cx).servers().clone());
+            assert_eq!(saved.servers[0].name, "Live", "{what}: nothing was saved");
+        };
+
+        // A checkbox: Enter and Space toggle it. The username field comes just before it.
+        let anonymous = |dialog: &Entity<DeploymentDialog>, cx: &mut VisualTestContext| {
+            dialog.read_with(cx, |dialog, _| {
+                dialog.selected_server().expect("selected").anonymous
+            })
+        };
+        let username = dialog.read_with(cx, |dialog, cx| dialog.fields.username.focus_handle(cx));
+        focus(&username, cx);
+        cx.simulate_keystrokes("tab");
+        assert!(!anonymous(&dialog, cx));
+        cx.simulate_keystrokes("enter");
+        assert!(anonymous(&dialog, cx), "Enter toggled Anonymous login");
+        assert_open_and_unsaved(cx, "checkbox");
+        let space = gpui::Keystroke::parse("space").expect("keystroke");
+        cx.simulate_keystrokes("space");
+        cx.simulate_event(gpui::KeyUpEvent { keystroke: space });
+        assert!(!anonymous(&dialog, cx), "Space toggled it back");
+        assert_open_and_unsaved(cx, "checkbox");
+
+        // Buttons: Add Mapping, then (focus is in the new row) Remove, three stops later.
+        dialog.update(cx, |dialog, cx| dialog.set_tab(DialogTab::Mappings, cx));
+        cx.run_until_parked();
+        let add = dialog.read_with(cx, |dialog, _| dialog.add_mapping_focus.clone());
+        focus(&add, cx);
+        cx.simulate_keystrokes("enter");
+        dialog.read_with(cx, |dialog, _| {
+            assert_eq!(dialog.mapping_rows.len(), 1, "Enter pressed Add Mapping");
+        });
+        assert_open_and_unsaved(cx, "Add Mapping");
+        // Focus is in the new row's remote field; Remove follows it.
+        cx.simulate_keystrokes("tab enter");
+        dialog.read_with(cx, |dialog, _| {
+            assert!(dialog.mapping_rows.is_empty(), "Enter pressed Remove");
+        });
+        assert_open_and_unsaved(cx, "Remove");
+    }
+
+    #[gpui::test]
+    async fn enter_on_a_server_row_selects_it(cx: &mut TestAppContext) {
+        let servers = Servers {
+            servers: vec![server("One", None), server("Two", None)],
+            ..Servers::default()
+        };
+        let (_, dialog, cx) = open_dialog(servers, &FakeRemote::default(), cx).await;
+        load_keymaps(cx);
+        cx.run_until_parked();
+        let row = cx.debug_bounds("zenith-deploy-server-0").expect("row 0");
+        cx.simulate_click(row.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(dialog.read_with(cx, |dialog, _| dialog.selected), Some(0));
+        cx.simulate_keystrokes("tab enter");
+        assert_eq!(
+            dialog.read_with(cx, |dialog, _| dialog.selected),
+            Some(1),
+            "Tab reached the second row and Enter selected it"
+        );
+        assert!(
+            cx.debug_bounds("zenith-deploy-dialog").is_some(),
+            "Enter did not close the dialog"
+        );
+    }
+
+    #[gpui::test]
+    async fn adding_a_server_from_another_tab_shows_its_host_field_focused(
+        cx: &mut TestAppContext,
+    ) {
+        let (dialog, cx) = open_with_one_server(cx).await;
+        dialog.update(cx, |dialog, cx| {
+            dialog.set_tab(DialogTab::ExcludedPaths, cx)
+        });
+        cx.run_until_parked();
+        dialog.update_in(cx, |dialog, window, cx| dialog.add_server(window, cx));
+        cx.run_until_parked();
+        assert_eq!(
+            dialog.read_with(cx, |dialog, _| dialog.tab),
+            DialogTab::Connection
+        );
+        assert!(cx.debug_bounds("zenith-deploy-field-Host").is_some());
+        let host = dialog.read_with(cx, |dialog, cx| dialog.fields.host.focus_handle(cx));
+        assert_eq!(focused(cx), Some(host), "the focused field is on screen");
+    }
+
+    #[gpui::test]
+    async fn removing_a_mapping_hands_focus_to_a_neighbour(cx: &mut TestAppContext) {
+        let (dialog, cx) = open_with_one_server(cx).await;
+        dialog.update(cx, |dialog, cx| dialog.set_tab(DialogTab::Mappings, cx));
+        dialog.update_in(cx, |dialog, window, cx| {
+            for _ in 0..3 {
+                dialog.add_mapping(window, cx);
+            }
+        });
+        cx.run_until_parked();
+        let remote_of = |index: usize, cx: &mut VisualTestContext| {
+            dialog.read_with(cx, |dialog, _| dialog.mapping_rows[index].remote.clone())
+        };
+        let handle_of = |index: usize, cx: &mut VisualTestContext| {
+            let remote = remote_of(index, cx);
+            cx.update(|_, cx| remote.focus_handle(cx))
+        };
+        let first = handle_of(0, cx);
+        focus(&first, cx);
+        dialog.update_in(cx, |dialog, window, cx| {
+            dialog.remove_mapping(0, window, cx)
+        });
+        cx.run_until_parked();
+        let new_first = handle_of(0, cx);
+        assert_eq!(
+            focused(cx),
+            Some(new_first),
+            "the row that took index 0 has focus"
+        );
+        assert!(focus_is_inside(&dialog, cx));
+
+        // The last row goes: the one before it takes focus.
+        dialog.update_in(cx, |dialog, window, cx| {
+            dialog.remove_mapping(1, window, cx)
+        });
+        cx.run_until_parked();
+        let remaining = handle_of(0, cx);
+        assert_eq!(focused(cx), Some(remaining));
+
+        // The only row goes: Add Mapping takes focus.
+        dialog.update_in(cx, |dialog, window, cx| {
+            dialog.remove_mapping(0, window, cx)
+        });
+        cx.run_until_parked();
+        let add = dialog.read_with(cx, |dialog, _| dialog.add_mapping_focus.clone());
+        assert_eq!(focused(cx), Some(add));
+        assert!(focus_is_inside(&dialog, cx));
+    }
+
+    #[gpui::test]
+    async fn a_hand_edited_pattern_list_keeps_the_upload_confirmation(cx: &mut TestAppContext) {
+        let mut confirmed = server("Live", None);
+        confirmed.upload_on_save = true;
+        confirmed.upload_on_save_confirmed = true;
+        // Blank and padded entries, as a hand edit leaves them.
+        confirmed.excluded_local = vec!["vendor".into(), String::new(), "  *.log ".into()];
+        let servers = Servers {
+            servers: vec![confirmed.clone()],
+            ..Servers::default()
+        };
+        let (_, dialog, cx) = open_dialog(servers, &FakeRemote::default(), cx).await;
+        dialog.update(cx, |dialog, cx| dialog.save(cx));
+        cx.run_until_parked();
+        let saved =
+            cx.update(|_, cx| ServerStore::global(cx).read(cx).servers().servers[0].clone());
+        assert!(
+            saved.upload_on_save_confirmed,
+            "opening and pressing OK changed nothing, so nothing is asked again"
+        );
+        assert_eq!(saved.excluded_local, confirmed.excluded_local);
+    }
+
+    #[gpui::test]
+    async fn a_browse_answer_lands_in_the_same_servers_rebuilt_row(cx: &mut TestAppContext) {
+        let mut one = server("One", None);
+        one.mappings = vec![Mapping {
+            local: "/one".into(),
+            remote: "one".into(),
+        }];
+        let mut two = server("Two", None);
+        two.mappings = vec![Mapping {
+            local: "/two".into(),
+            remote: "two".into(),
+        }];
+        let servers = Servers {
+            servers: vec![one, two],
+            ..Servers::default()
+        };
+        let (_, dialog, cx) = open_dialog(servers, &FakeRemote::default(), cx).await;
+        let local_of_server = |index: usize, cx: &mut VisualTestContext| {
+            dialog.read_with(cx, |dialog, _| {
+                dialog.servers.servers[index].mappings[0].local.clone()
+            })
+        };
+        let select = |index: usize, cx: &mut VisualTestContext| {
+            dialog.update_in(cx, |dialog, window, cx| {
+                dialog.select(Some(index), window, cx)
+            });
+        };
+
+        // The rows were rebuilt (another server shown, then this one again) while the prompt
+        // was open: the answer still lands in this server's first row.
+        dialog.update_in(cx, |dialog, window, cx| {
+            dialog.browse_mapping(0, window, cx)
+        });
+        select(1, cx);
+        select(0, cx);
+        cx.simulate_path_prompt_response(|_| Some(vec!["/chosen".into()]));
+        cx.run_until_parked();
+        assert_eq!(local_of_server(0, cx), "/chosen");
+        let shown = dialog.read_with(cx, |dialog, _| dialog.mapping_rows[0].local.clone());
+        assert_eq!(text_of(&shown, cx), "/chosen");
+
+        // Another server is showing when the answer comes: it is dropped, not typed into that
+        // server's own first row.
+        dialog.update_in(cx, |dialog, window, cx| {
+            dialog.browse_mapping(0, window, cx)
+        });
+        select(1, cx);
+        cx.simulate_path_prompt_response(|_| Some(vec!["/elsewhere".into()]));
+        cx.run_until_parked();
+        assert_eq!(local_of_server(1, cx), "/two");
+        assert_eq!(local_of_server(0, cx), "/chosen");
     }
 
     #[gpui::test]
