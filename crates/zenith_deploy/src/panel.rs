@@ -17,13 +17,16 @@ use anyhow::anyhow;
 use editor::Editor;
 use futures::{FutureExt as _, future::Shared};
 use gpui::{
-    Action, App, Context, Entity, EventEmitter, FocusHandle, Focusable, Pixels, PromptButton,
+    Action, App, ClickEvent, Context, Div, Entity, EventEmitter, FocusHandle, Focusable, Pixels, PromptButton,
     PromptLevel, Render, SharedString, Subscription, Task, UniformListScrollHandle, WeakEntity,
     Window, actions, px, uniform_list,
 };
 use language::Buffer;
 use settings::Settings as _;
-use ui::{ContextMenu, DropdownMenu, DropdownStyle, IconButton, ListItem, Tooltip, prelude::*};
+use ui::{
+    ContextMenu, DropdownMenu, DropdownStyle, IconButton, ListItem, PopoverMenuHandle, Tooltip,
+    prelude::*,
+};
 use util::ResultExt as _;
 use workspace::{
     MultiWorkspace, OpenOptions, OpenVisible, Toast, Workspace,
@@ -35,7 +38,7 @@ use crate::{
     CopyState, DeploySettings, EntryKind, RemoteCopy, RemoteEntry, RemoteStat, ServerConfig,
     ServerRefused, ServerStore, ServerStoreEvent, ServerType, Transport, UploadDecision,
     UploadOutcome, UploadStart, cache_path_for,
-    dialog::{DeploymentDialog, project_root},
+    dialog::{DeploymentDialog, FocusNextControl, FocusPreviousControl, project_root},
     download_entry, on_save,
     remote_edit::buffer_path,
     remote_path::{is_invisible, join_remote, validate_name, validate_remote_path},
@@ -55,6 +58,8 @@ actions!(
         CollapseAll,
         /// Uploads the saved text of the open remote file to its host.
         UploadRemoteCopy,
+        /// Selects the active editor's file in the Remote Host tool window, through the shown server's mappings.
+        SelectOpenedFileInRemoteHost,
     ]
 );
 
@@ -83,6 +88,18 @@ pub(crate) fn init(cx: &mut App) {
                 .active_item_as::<Editor>(cx)
                 .and_then(|editor| editor.read(cx).buffer().read(cx).as_singleton());
             panel.update(cx, |panel, cx| panel.upload_active(buffer, window, cx));
+        });
+        workspace.register_action(|workspace, _: &SelectOpenedFileInRemoteHost, window, cx| {
+            let Some(panel) = workspace.panel::<RemoteHostPanel>(cx) else {
+                return;
+            };
+            let buffer = workspace
+                .active_item_as::<Editor>(cx)
+                .and_then(|editor| editor.read(cx).buffer().read(cx).as_singleton());
+            // First: the listings it starts mark the panel as busy, so showing the panel does
+            // not queue a second listing of the root.
+            panel.update(cx, |panel, cx| panel.select_opened(buffer, cx));
+            workspace.focus_panel::<RemoteHostPanel>(window, cx);
         });
         let Some(window) = window else {
             return;
@@ -182,6 +199,11 @@ pub struct RemoteHostPanel {
     prompt_open: Rc<Cell<bool>>,
     /// The tasks waiting for those answers. Not cleared by Disconnect: the prompt stays up.
     prompts: HashMap<PathBuf, Task<()>>,
+    /// The remote path "Select Opened File" is still looking for: its folders are being listed
+    /// and the row is selected when it shows up. Dropped by [`Self::reset`].
+    locating: Option<String>,
+    /// The host dropdown's popover, so Enter on its trigger opens it.
+    host_handle: PopoverMenuHandle<ContextMenu>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -229,7 +251,8 @@ impl RemoteHostPanel {
             ),
         ];
         let mut this = Self {
-            focus_handle: cx.focus_handle(),
+            // A tab stop, so Tab from the panel itself reaches the toolbar.
+            focus_handle: cx.focus_handle().tab_index(0).tab_stop(true),
             workspace: workspace.weak_handle(),
             store,
             project: project_root(workspace, cx),
@@ -267,6 +290,8 @@ impl RemoteHostPanel {
             notice: None,
             prompt_open: Rc::default(),
             prompts: HashMap::new(),
+            locating: None,
+            host_handle: PopoverMenuHandle::default(),
             _subscriptions: subscriptions,
         };
         this.store_changed(cx);
@@ -284,13 +309,7 @@ impl RemoteHostPanel {
     }
 
     fn root(&self, cx: &App) -> Option<String> {
-        let server = self.server(cx)?;
-        let root = if server.root_path.trim().is_empty() {
-            "/".to_string()
-        } else {
-            server.root_path.trim().to_string()
-        };
-        Some(root)
+        Some(root_of(&self.server(cx)?))
     }
 
     fn store_changed(&mut self, cx: &mut Context<Self>) {
@@ -348,6 +367,7 @@ impl RemoteHostPanel {
         self.rows.clear();
         self.selected = None;
         self.status = None;
+        self.locating = None;
         cx.notify();
     }
 
@@ -388,6 +408,131 @@ impl RemoteHostPanel {
     pub(crate) fn collapse_all(&mut self, cx: &mut Context<Self>) {
         self.expanded.clear();
         self.rebuild_rows(cx);
+    }
+
+    /// "Select Opened File": lists the folders down to the active file's place on the server
+    /// (each at most once, the one holding it always again) and selects its row when it shows
+    /// up. Only listings: nothing is downloaded, opened or uploaded. A remote copy goes to its
+    /// own server and path, any other file through the project's default server's mappings.
+    pub(crate) fn select_opened(&mut self, buffer: Option<Entity<Buffer>>, cx: &mut Context<Self>) {
+        let Some(path) = buffer.and_then(|buffer| buffer_path(buffer.read(cx), cx)) else {
+            self.say("The active tab is not a local file.", None, true, cx);
+            return;
+        };
+        let (server, target) = match self.locate_target(&path, cx) {
+            Ok(located) => located,
+            Err(message) => {
+                self.say(&message, None, true, cx);
+                return;
+            }
+        };
+        let root = root_of(&server);
+        let Some(chain) = chain_to(&root, &target) else {
+            let message = format!(
+                "{} is outside the root folder of {}.",
+                shown(target.rsplit('/').next().unwrap_or_default(), 100),
+                shown(&server.name, 60)
+            );
+            self.say(&message, None, true, cx);
+            return;
+        };
+        if self.server_id.as_deref() != Some(server.id.as_str()) {
+            self.select_server(Some(server.id.clone()), cx);
+        }
+        let holder = chain.last().cloned();
+        for folder in &chain {
+            if *folder != root {
+                self.expanded.insert(folder.clone());
+            }
+            let listed = self.children.contains_key(folder);
+            let holds_it = holder.as_ref() == Some(folder);
+            // A listing in flight is waited for; the folder holding the file is listed again,
+            // the file may be new.
+            if (!listed && !self.loading.contains(folder)) || (listed && holds_it) {
+                self.list(folder.clone(), cx);
+            }
+        }
+        self.locating = Some(target);
+        self.rebuild_rows(cx);
+        self.finish_locate(cx);
+    }
+
+    /// The server and the remote path of the local file `path`, or what to tell the user.
+    fn locate_target(&self, path: &Path, cx: &App) -> Result<(ServerConfig, String), String> {
+        let store = self.store.read(cx);
+        let project = self.project.as_deref();
+        let file = shown(&path.file_name().unwrap_or_default().to_string_lossy(), 100);
+        if let Some(copy) = store.copy_ref(path) {
+            let server = store
+                .server_for(project, &copy.server_id)
+                .ok_or("The server of this copy is not available in this project.")?;
+            return Ok((server, copy.remote_path.clone()));
+        }
+        let server = project
+            .and_then(|project| store.default_for(project))
+            .and_then(|id| store.server_for(project, id))
+            .ok_or("Choose a host for this project first.")?;
+        let name = shown(&server.name, 60);
+        if self.server_id.as_ref().is_some_and(|shown| *shown != server.id) {
+            return Err(format!(
+                "{file} is mapped through {name}, not the host shown here. Select {name} first."
+            ));
+        }
+        match on_save::resolve(&server, path, &store.cache_dir) {
+            Ok(Some(resolved)) => Ok((server, resolved.remote)),
+            Ok(None) => Err(format!("{file} is not in a mapped folder of {name}.")),
+            Err(message) => Err(plain_text(&message, MAX_STATUS_CHARS)),
+        }
+    }
+
+    /// Selects the row [`Self::locating`] waits for once its listing is there. When every
+    /// folder on the way is listed and the file is not in its folder, says so and selects the
+    /// deepest folder that is shown.
+    fn finish_locate(&mut self, cx: &mut Context<Self>) {
+        let Some(target) = self.locating.clone() else {
+            return;
+        };
+        let row_of = |this: &Self, path: &str| {
+            this.rows
+                .iter()
+                .position(|row| row.path().as_deref() == Some(path))
+        };
+        if let Some(index) = row_of(self, &target) {
+            self.locating = None;
+            self.reveal(index, cx);
+            return;
+        }
+        let chain = self.root(cx).and_then(|root| chain_to(&root, &target));
+        let Some(chain) = chain else {
+            self.locating = None;
+            return;
+        };
+        if chain.iter().any(|folder| self.loading.contains(folder)) {
+            return;
+        }
+        self.locating = None;
+        // A folder the user collapsed meanwhile: the file may well be there, no verdict.
+        if chain.iter().skip(1).any(|folder| !self.expanded.contains(folder)) {
+            return;
+        }
+        if let Some(index) = chain.iter().rev().find_map(|folder| row_of(self, folder)) {
+            self.reveal(index, cx);
+        }
+        let message = format!(
+            "{} is not on {}.",
+            shown(target.rsplit('/').next().unwrap_or_default(), 100),
+            self.server(cx)
+                .map(|server| shown(&server.name, 60))
+                .unwrap_or_default()
+        );
+        self.say(&message, None, true, cx);
+    }
+
+    fn reveal(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.selected = Some(index);
+        self.scroll_handle
+            .scroll_to_item(index, gpui::ScrollStrategy::Center);
+        cx.notify();
     }
 
     fn list_root(&mut self, cx: &mut Context<Self>) {
@@ -468,8 +613,12 @@ impl RemoteHostPanel {
                             this.children.insert(path, entries);
                             this.status = None;
                             this.rebuild_rows(cx);
+                            this.finish_locate(cx);
                         }
                         Err(error) => {
+                            let sought = this
+                                .locating
+                                .take_if(|target| chain_holds(&path, target));
                             this.expanded.remove(&path);
                             // A stale listing would be shown again when the folder is re-expanded.
                             // The root has no row to re-expand: keep its listing and show the
@@ -479,6 +628,15 @@ impl RemoteHostPanel {
                             }
                             this.rebuild_rows(cx);
                             this.fail(error, cx);
+                            // A listing that succeeds meanwhile clears the status line: the
+                            // end of the search is told where that does not reach.
+                            if let Some(target) = sought {
+                                let message = format!(
+                                    "Could not find {} on the server: a folder on the way did not list.",
+                                    shown(target.rsplit('/').next().unwrap_or_default(), 100)
+                                );
+                                this.say(&message, None, true, cx);
+                            }
                         }
                     }
                 })
@@ -1420,70 +1578,190 @@ impl RemoteHostPanel {
         menu
     }
 
+    /// A toolbar control whose Enter does what its click does. Without this the base keymap's
+    /// Enter (`menu::Confirm`) reaches the panel and opens the selected row. `button` receives
+    /// the click handler.
+    fn pressed<B: IntoElement>(
+        press: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + Clone + 'static,
+        button: impl FnOnce(Box<dyn Fn(&ClickEvent, &mut Window, &mut App)>) -> B,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let on_enter = press.clone();
+        let on_click = cx.listener(move |this, _: &ClickEvent, window, cx| press(this, window, cx));
+        div()
+            .on_action(
+                cx.listener(move |this, _: &menu::Confirm, window, cx| on_enter(this, window, cx)),
+            )
+            .child(button(Box::new(on_click)))
+    }
+
+    /// The active editor's single buffer: the editor focused last, not the panel, owns the file.
+    fn active_buffer(&self, cx: &App) -> Option<Entity<Buffer>> {
+        let workspace = self.workspace.upgrade()?;
+        let editor = workspace.read(cx).active_item_as::<Editor>(cx)?;
+        editor.read(cx).buffer().read(cx).as_singleton()
+    }
+
     fn render_toolbar(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let label = self
+        let name: SharedString = self
             .server(cx)
-            .map(|server| server.name)
+            .map(|server| shown(&server.name, 60).into())
             .unwrap_or_else(|| "<None>".into());
         let menu = self.host_menu(window, cx);
         let connected = self.session.is_some();
         let has_server = self.server_id.is_some();
-        h_flex()
+        let host = h_flex()
+            .gap_1()
+            .min_w_0()
+            .child(Icon::new(IconName::Server).size(IconSize::Small))
+            .child(Label::new(name.clone()).truncate())
+            .into_any_element();
+        let colors = cx.theme().colors();
+        v_flex()
             .p_1()
-            .gap_0p5()
+            .gap_1()
             .border_b_1()
-            .border_color(cx.theme().colors().border)
+            .border_color(colors.border)
             .child(
-                DropdownMenu::new("zenith-deploy-host", label, menu)
-                    .style(DropdownStyle::Subtle)
-                    .aria_label("Remote host"),
-            )
-            .child(
-                div()
-                    .debug_selector(|| "zenith-deploy-open-dialog".into())
+                h_flex()
+                    .gap_0p5()
                     .child(
-                        IconButton::new("zenith-deploy-open-dialog", IconName::Ellipsis)
-                            .icon_size(IconSize::Small)
-                            .tooltip(Tooltip::text("Deployment Settings…"))
-                            .aria_label("Deployment Settings…")
-                            .on_click(
-                                cx.listener(|this, _, window, cx| this.open_dialog(window, cx)),
+                        // Enter on the closed dropdown opens it, not the selected row.
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .on_action(cx.listener(|this, _: &menu::Confirm, window, cx| {
+                                let handle = this.host_handle.clone();
+                                handle.show(window, cx);
+                            }))
+                            .child(
+                                DropdownMenu::new_with_element("zenith-deploy-host", host, menu)
+                                    .style(DropdownStyle::Outlined)
+                                    .full_width(true)
+                                    .handle(self.host_handle.clone())
+                                    .tab_index(0isize)
+                                    .aria_label("Remote host")
+                                    .aria_value(name),
                             ),
+                    )
+                    .child(
+                        Self::pressed(
+                            |this, window, cx| this.open_dialog(window, cx),
+                            |on_click| {
+                                IconButton::new("zenith-deploy-open-dialog", IconName::Ellipsis)
+                                    .icon_size(IconSize::Small)
+                                    .tab_index(0isize)
+                                    .tooltip(Tooltip::text("Deployment Settings…"))
+                                    .aria_label("Deployment Settings…")
+                                    .on_click(on_click)
+                            },
+                            cx,
+                        )
+                        .debug_selector(|| "zenith-deploy-open-dialog".into()),
                     ),
             )
-            .child(div().flex_1())
             .child(
-                IconButton::new("zenith-deploy-collapse", IconName::ListCollapse)
-                    .icon_size(IconSize::Small)
-                    .disabled(self.expanded.is_empty())
-                    .tooltip(Tooltip::for_action_title("Collapse All", &CollapseAll))
-                    .aria_label("Collapse All")
-                    .on_click(cx.listener(|this, _, _, cx| this.collapse_all(cx))),
-            )
-            .child(
-                IconButton::new("zenith-deploy-refresh", IconName::RotateCw)
-                    .icon_size(IconSize::Small)
-                    .disabled(!has_server)
-                    .tooltip(Tooltip::for_action_title("Refresh", &Refresh))
-                    .aria_label("Refresh")
-                    .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
-            )
-            .child(
-                IconButton::new("zenith-deploy-disconnect", IconName::Disconnected)
-                    .icon_size(IconSize::Small)
-                    .disabled(!connected)
-                    .tooltip(Tooltip::for_action_title("Disconnect", &Disconnect))
-                    .aria_label("Disconnect")
-                    .on_click(cx.listener(|this, _, _, cx| this.disconnect(cx))),
-            )
-            .child(
-                IconButton::new("zenith-deploy-settings", IconName::Settings)
-                    .icon_size(IconSize::Small)
-                    .tooltip(Tooltip::text("Deployment Settings…"))
-                    .aria_label("Deployment Settings…")
-                    .on_click(cx.listener(|this, _, window, cx| this.open_dialog(window, cx))),
+                h_flex()
+                    .gap_0p5()
+                    .child(Self::pressed(
+                        |this, _, cx| this.collapse_all(cx),
+                        |on_click| {
+                            IconButton::new("zenith-deploy-collapse", IconName::ListCollapse)
+                                .icon_size(IconSize::Small)
+                                .disabled(self.expanded.is_empty())
+                                .tab_index(0isize)
+                                .tooltip(Tooltip::for_action_title("Collapse All", &CollapseAll))
+                                .aria_label("Collapse All")
+                                .on_click(on_click)
+                        },
+                        cx,
+                    ))
+                    .child(Self::pressed(
+                        |this, _, cx| this.refresh(cx),
+                        |on_click| {
+                            IconButton::new("zenith-deploy-refresh", IconName::RotateCw)
+                                .icon_size(IconSize::Small)
+                                .icon_color(Color::Success)
+                                .disabled(!has_server)
+                                .tab_index(0isize)
+                                .tooltip(Tooltip::for_action_title("Refresh", &Refresh))
+                                .aria_label("Refresh")
+                                .on_click(on_click)
+                        },
+                        cx,
+                    ))
+                    .child(Self::pressed(
+                        |this, _, cx| this.disconnect(cx),
+                        |on_click| {
+                            IconButton::new("zenith-deploy-disconnect", IconName::Close)
+                                .icon_size(IconSize::Small)
+                                .icon_color(Color::Error)
+                                .disabled(!connected)
+                                .tab_index(0isize)
+                                .tooltip(Tooltip::for_action_title("Disconnect", &Disconnect))
+                                .aria_label("Disconnect")
+                                .on_click(on_click)
+                        },
+                        cx,
+                    ))
+                    .child(Self::pressed(
+                        |this, _, cx| {
+                            let buffer = this.active_buffer(cx);
+                            this.select_opened(buffer, cx)
+                        },
+                        |on_click| {
+                            IconButton::new("zenith-deploy-select-opened", IconName::Crosshair)
+                                .icon_size(IconSize::Small)
+                                .disabled(!has_server)
+                                .tab_index(0isize)
+                                .tooltip(Tooltip::for_action_title(
+                                    "Select Opened File",
+                                    &SelectOpenedFileInRemoteHost,
+                                ))
+                                .aria_label("Select Opened File in Remote Host")
+                                .on_click(on_click)
+                        },
+                        cx,
+                    )),
             )
     }
+}
+
+/// The folder a server's tree starts at.
+fn root_of(server: &ServerConfig) -> String {
+    if server.root_path.trim().is_empty() {
+        "/".to_string()
+    } else {
+        server.root_path.trim().to_string()
+    }
+}
+
+/// The folders from `root` (as given) down to the one holding `target`, by whole path parts.
+/// `None`: `target` is not below `root`, or is not a plain path.
+fn chain_to(root: &str, target: &str) -> Option<Vec<String>> {
+    let base = root.trim_end_matches('/');
+    let rest = target.strip_prefix(base)?.strip_prefix('/')?;
+    let parts: Vec<&str> = rest.split('/').collect();
+    if parts
+        .iter()
+        .any(|part| part.is_empty() || *part == "." || *part == "..")
+    {
+        return None;
+    }
+    let mut folder = base.to_string();
+    let mut chain = vec![root.to_string()];
+    for part in &parts[..parts.len() - 1] {
+        folder = format!("{folder}/{part}");
+        chain.push(folder.clone());
+    }
+    Some(chain)
+}
+
+/// `folder` is on the way to `target` (the folder holding it, or one above).
+fn chain_holds(folder: &str, target: &str) -> bool {
+    target
+        .strip_prefix(folder.trim_end_matches('/'))
+        .is_some_and(|rest| rest.starts_with('/'))
 }
 
 /// The cache holds copies of remote files (maybe `wp-config.php`): owner-only on unix.
@@ -1888,28 +2166,34 @@ impl Render for RemoteHostPanel {
             .on_action(cx.listener(|this, _: &Disconnect, _, cx| this.disconnect(cx)))
             .on_action(cx.listener(|this, _: &CollapseAll, _, cx| this.collapse_all(cx)))
             .on_action(cx.listener(|this, _: &UploadRemoteCopy, window, cx| {
-                // From the panel: the editor focused last, not the panel, owns the file.
-                let buffer = this.workspace.upgrade().and_then(|workspace| {
-                    workspace
-                        .read(cx)
-                        .active_item_as::<Editor>(cx)
-                        .and_then(|editor| editor.read(cx).buffer().read(cx).as_singleton())
-                });
+                let buffer = this.active_buffer(cx);
                 this.upload_active(buffer, window, cx);
             }))
+            .on_action(cx.listener(|this, _: &SelectOpenedFileInRemoteHost, _, cx| {
+                let buffer = this.active_buffer(cx);
+                this.select_opened(buffer, cx);
+            }))
+            // The panel is not modal: Tab and Shift-Tab leave it at its ends.
+            .on_action(cx.listener(|_, _: &FocusNextControl, window, cx| window.focus_next(cx)))
+            .on_action(
+                cx.listener(|_, _: &FocusPreviousControl, window, cx| window.focus_prev(cx)),
+            )
             .size_full()
             .child(self.render_toolbar(window, cx))
+            .when_some(self.root_header(cx), |panel, header| panel.child(header))
             .when_some(self.status.clone(), |panel, status| {
                 // Wrapped so a screen reader can reach the text (a bare `Label` has no id).
                 panel.child(
                     div()
                         .id("remote-host-error")
-                        .role(gpui::Role::Status)
+                        .role(gpui::Role::Alert)
                         .aria_label(SharedString::from(format!("Error: {status}")))
                         .debug_selector(|| "remote-host-error".into())
                         .child(
+                            // One level under the server's line.
                             h_flex()
-                                .px_2()
+                                .pl(px(8. + INDENT))
+                                .pr_2()
                                 .gap_1()
                                 .child(
                                     div().flex_none().child(
@@ -1981,6 +2265,32 @@ impl Render for RemoteHostPanel {
 const HINT: &str = "Files you open here are editable. Saving asks before uploading to the server, unless you chose Always.";
 
 impl RemoteHostPanel {
+    /// The server's line above its tree: the name and the host. Outside the list, so the row
+    /// indices and depths stay those of the tree.
+    fn root_header(&self, cx: &App) -> Option<impl IntoElement> {
+        let server = self.server(cx)?;
+        let label: SharedString = format!(
+            "{} ({})",
+            shown(&server.name, 60),
+            shown(&server.host, 100)
+        )
+        .into();
+        Some(
+            div()
+                .id("remote-host-root")
+                .aria_label(label.clone())
+                .debug_selector(|| "remote-host-root".into())
+                .child(
+                    h_flex()
+                        .h(px(ROW_HEIGHT))
+                        .px_2()
+                        .gap_1()
+                        .child(div().flex_none().child(Icon::new(IconName::Server).size(IconSize::Small)))
+                        .child(div().min_w_0().child(Label::new(label).truncate())),
+                ),
+        )
+    }
+
     /// "Uploading…" while any copy of the shown server uploads, else the last result.
     fn upload_line(&self, cx: &App) -> Option<SharedString> {
         if self.is_uploading(cx) {
@@ -4646,5 +4956,452 @@ mod tests {
         assert!(m.notice().is_none(), "no message either: {:?}", m.notice());
         assert!(!m.toast_shown());
         assert!(remote.log().is_empty());
+    }
+
+    // ---- Remote Host tool window layout and "Select Opened File" ----
+
+    fn dir(name: &str) -> (&str, EntryKind) {
+        (name, EntryKind::Directory)
+    }
+
+    fn file(name: &str) -> (&str, EntryKind) {
+        (name, EntryKind::File)
+    }
+
+    /// `/var/www/t/inc/a.php` is where the mapped fixture's `inc/a.php` lives.
+    fn locate_remote(inc: &[(&str, EntryKind)]) -> FakeRemote {
+        FakeRemote::new(&[
+            ("/var/www", &[dir("t")]),
+            ("/var/www/t", &[dir("inc")]),
+            ("/var/www/t/inc", inc),
+        ])
+    }
+
+    fn lists(remote: &FakeRemote, path: &str) -> usize {
+        let line = format!("list {path}");
+        remote.log().iter().filter(|entry| **entry == line).count()
+    }
+
+    impl MappedPanel<'_> {
+        /// Opens a project file in a tab and leaves its text alone.
+        async fn open(&mut self, rel: &str) {
+            let path = self.project.join(rel);
+            self.workspace
+                .update_in(self.cx, |workspace, window, cx| {
+                    workspace.open_abs_path(path, OpenOptions::default(), window, cx)
+                })
+                .await
+                .expect("opened");
+        }
+
+        fn select_opened(&mut self) {
+            self.cx.dispatch_action(SelectOpenedFileInRemoteHost);
+            self.cx.run_until_parked();
+        }
+
+        fn show_panel(&mut self) {
+            self.workspace.update_in(self.cx, |workspace, window, cx| {
+                workspace.focus_panel::<RemoteHostPanel>(window, cx);
+            });
+            self.cx.run_until_parked();
+        }
+
+        /// (the remote path of the selected row, the expanded folders, what is still sought)
+        fn located(&mut self) -> (Option<String>, Vec<String>, Option<String>) {
+            self.panel.read_with(self.cx, |panel, _| {
+                let mut expanded: Vec<String> = panel.expanded.iter().cloned().collect();
+                expanded.sort();
+                (
+                    panel
+                        .selected
+                        .and_then(|index| panel.rows.get(index))
+                        .and_then(Row::path),
+                    expanded,
+                    panel.locating.clone(),
+                )
+            })
+        }
+    }
+
+    #[gpui::test]
+    async fn select_opened_file_expands_and_selects_its_remote_path(cx: &mut TestAppContext) {
+        let remote = locate_remote(&[file("a.php"), file("b.php")]);
+        let mut m = mapped_panel(&remote, cx, |_| {}).await;
+        m.open("inc/a.php").await;
+        m.select_opened();
+        let (selected, expanded, locating) = m.located();
+        assert_eq!(selected.as_deref(), Some(MAPPED_REMOTE));
+        assert_eq!(expanded, ["/var/www/t", "/var/www/t/inc"]);
+        assert_eq!(locating, None);
+        assert!(!m.toast_shown(), "{:?}", m.notice());
+        assert_eq!(
+            lists(&remote, "/var/www"),
+            1,
+            "showing the panel does not list the root a second time"
+        );
+        assert_eq!(gets(&remote), 0, "nothing is downloaded");
+        assert!(m.puts().is_empty());
+    }
+
+    #[gpui::test]
+    async fn select_opened_file_lists_the_folder_holding_it_again_and_the_rest_once(
+        cx: &mut TestAppContext,
+    ) {
+        let remote = locate_remote(&[file("a.php")]);
+        let mut m = mapped_panel(&remote, cx, |_| {}).await;
+        m.open("inc/a.php").await;
+        m.select_opened();
+        m.select_opened();
+        assert_eq!(lists(&remote, "/var/www"), 1);
+        assert_eq!(lists(&remote, "/var/www/t"), 1);
+        assert_eq!(lists(&remote, "/var/www/t/inc"), 2, "the file may be new");
+        assert_eq!(m.located().0.as_deref(), Some(MAPPED_REMOTE));
+    }
+
+    #[gpui::test]
+    async fn an_unmapped_file_lists_nothing_and_says_so(cx: &mut TestAppContext) {
+        let remote = locate_remote(&[file("a.php")]);
+        let mut m = mapped_panel(&remote, cx, |server| server.mappings.clear()).await;
+        m.show_panel();
+        m.panel.update(m.cx, |panel, cx| {
+            panel.selected = Some(0);
+            cx.notify();
+        });
+        let before = remote.log().len();
+        m.open("inc/a.php").await;
+        m.select_opened();
+        assert_eq!(remote.log().len(), before, "no listing, no connection");
+        assert_eq!(m.located().0.as_deref(), Some("/var/www/t"), "selection kept");
+        let notice = m.notice().expect("a message");
+        assert!(notice.contains("not in a mapped folder of Prod"), "{notice}");
+        assert!(m.toast_shown());
+    }
+
+    #[gpui::test]
+    async fn select_opened_file_asks_for_a_host_when_the_project_has_none(
+        cx: &mut TestAppContext,
+    ) {
+        let remote = locate_remote(&[file("a.php")]);
+        let mut m = mapped_panel(&remote, cx, |_| {}).await;
+        m.open("inc/a.php").await;
+        let project = m.project.to_string_lossy().into_owned();
+        let store = m.panel.read_with(m.cx, |panel, _| panel.store.clone());
+        store.update(m.cx, |store, _| {
+            store.servers.project_defaults.remove(&project);
+        });
+        m.panel.update(m.cx, |panel, cx| panel.select_server(None, cx));
+        m.select_opened();
+        let notice = m.notice().expect("a message");
+        assert!(notice.contains("Choose a host for this project first"), "{notice}");
+        assert_eq!(lists(&remote, "/var/www"), 0);
+    }
+
+    #[gpui::test]
+    async fn a_buffer_without_a_local_file_is_not_located(cx: &mut TestAppContext) {
+        let remote = locate_remote(&[file("a.php")]);
+        let mut m = mapped_panel(&remote, cx, |_| {}).await;
+        m.show_panel();
+        let before = remote.log().len();
+        m.panel
+            .update(m.cx, |panel, cx| panel.select_opened(None, cx));
+        let notice = m.notice().expect("a message");
+        assert!(notice.contains("not a local file"), "{notice}");
+        assert_eq!(remote.log().len(), before);
+    }
+
+    #[gpui::test]
+    async fn select_opened_file_does_not_switch_away_from_another_shown_host(
+        cx: &mut TestAppContext,
+    ) {
+        let remote = locate_remote(&[file("a.php")]);
+        let mut m = mapped_panel(&remote, cx, |_| {}).await;
+        let mut other = server("Staging", None);
+        other.anonymous = true;
+        let other_id = other.id.clone();
+        let store = m.panel.read_with(m.cx, |panel, _| panel.store.clone());
+        store.update(m.cx, |store, _| store.servers.servers.push(other));
+        m.panel
+            .update(m.cx, |panel, cx| panel.select_server(Some(other_id.clone()), cx));
+        m.show_panel();
+        let before = remote.log().len();
+        m.open("inc/a.php").await;
+        m.select_opened();
+        let shown = m.panel.read_with(m.cx, |panel, _| panel.server_id.clone());
+        assert_eq!(shown, Some(other_id), "the shown host stays");
+        let notice = m.notice().expect("a message");
+        assert!(notice.contains("Select Prod first"), "{notice}");
+        assert_eq!(remote.log().len(), before);
+    }
+
+    #[gpui::test]
+    async fn a_remote_copy_selects_its_own_path(cx: &mut TestAppContext) {
+        let remote = remote_with_baseline();
+        let mut fixture = fixture(&remote, cx).await;
+        let opened = open_index(&mut fixture).await;
+        // Another row selected, and the panel on <None>: the copy brings its own host.
+        click_row(&mut fixture, "wp-content");
+        fixture.cx.run_until_parked();
+        fixture
+            .panel
+            .update(fixture.cx, |panel, cx| panel.select_server(None, cx));
+        fixture.cx.run_until_parked();
+        fixture.cx.dispatch_action(SelectOpenedFileInRemoteHost);
+        fixture.cx.run_until_parked();
+        let (shown, selected) = fixture.panel.read_with(fixture.cx, |panel, _| {
+            (
+                panel.server_id.clone(),
+                panel
+                    .selected
+                    .and_then(|index| panel.rows.get(index))
+                    .and_then(Row::path),
+            )
+        });
+        assert_eq!(shown, Some(opened.server.id.clone()));
+        assert_eq!(selected.as_deref(), Some(INDEX));
+    }
+
+    #[gpui::test]
+    async fn a_file_missing_on_the_server_stops_locating(cx: &mut TestAppContext) {
+        let remote = locate_remote(&[file("b.php")]);
+        let mut m = mapped_panel(&remote, cx, |_| {}).await;
+        m.open("inc/a.php").await;
+        m.select_opened();
+        let (selected, expanded, locating) = m.located();
+        assert_eq!(locating, None, "the search is over");
+        assert_eq!(
+            selected.as_deref(),
+            Some("/var/www/t/inc"),
+            "the deepest folder is selected"
+        );
+        assert_eq!(expanded, ["/var/www/t", "/var/www/t/inc"]);
+        let notice = m.notice().expect("a message");
+        assert!(notice.contains("a.php is not on Prod"), "{notice}");
+        assert!(m.toast_shown());
+    }
+
+    #[gpui::test]
+    async fn a_folder_that_fails_to_list_stops_locating(cx: &mut TestAppContext) {
+        let remote = locate_remote(&[file("a.php")]);
+        remote
+            .refusing
+            .lock()
+            .expect("lock")
+            .push("/var/www/t".into());
+        let mut m = mapped_panel(&remote, cx, |_| {}).await;
+        m.open("inc/a.php").await;
+        m.select_opened();
+        assert_eq!(m.located().2, None);
+        let notice = m.notice().expect("a message");
+        assert!(notice.contains("Could not find a.php"), "{notice}");
+        assert!(m.toast_shown());
+    }
+
+    #[gpui::test]
+    async fn a_disconnect_while_locating_drops_the_search(cx: &mut TestAppContext) {
+        let remote = locate_remote(&[file("a.php")]);
+        let (hold, gate) = futures::channel::oneshot::channel();
+        remote
+            .list_gates
+            .lock()
+            .expect("lock")
+            .insert("/var/www/t".into(), gate);
+        let mut m = mapped_panel(&remote, cx, |_| {}).await;
+        m.open("inc/a.php").await;
+        m.select_opened();
+        assert_eq!(m.located().2.as_deref(), Some(MAPPED_REMOTE), "still looking");
+        m.panel.update(m.cx, |panel, cx| panel.disconnect(cx));
+        drop(hold);
+        m.cx.run_until_parked();
+        let (selected, expanded, locating) = m.located();
+        assert_eq!((selected, expanded, locating), (None, vec![], None));
+        assert!(m.panel.read_with(m.cx, |panel, _| panel.rows.is_empty()));
+    }
+
+    #[gpui::test]
+    async fn the_root_row_names_the_server_and_carries_the_error(cx: &mut TestAppContext) {
+        let remote = locate_remote(&[file("a.php")]);
+        let mut m = mapped_panel(&remote, cx, |_| {}).await;
+        m.show_panel();
+        m.panel.update(m.cx, |panel, cx| {
+            panel.status = Some("550 No such folder".into());
+            cx.notify();
+        });
+        m.cx.run_until_parked();
+        let root = m.cx.debug_bounds("remote-host-root").expect("the server's line");
+        let error = m.cx.debug_bounds("remote-host-error").expect("the error row");
+        assert!(root.bottom() <= error.top(), "{root:?} above {error:?}");
+        let text = m.cx.debug_bounds("remote-host-error-text").expect("text");
+        assert!(text.left() > root.left(), "the error sits one level in");
+        assert!(
+            m.cx.debug_bounds("zenith-deploy-settings").is_none(),
+            "the second gear is gone"
+        );
+        // The tree rows keep their depths: the header is not one of them.
+        let rows = m.panel.read_with(m.cx, |panel, _| {
+            panel
+                .rows
+                .iter()
+                .map(|row| (row.entry.name.clone(), row.depth))
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(rows, [("t".to_string(), 0)]);
+    }
+
+    /// The real keymaps, so the tests press real keys: the base keymap binds a context-less
+    /// Tab to `menu::SelectNext` and Enter to `menu::Confirm`.
+    fn load_keymaps(cx: &mut VisualTestContext) {
+        cx.update(|_, cx| {
+            for json in [
+                include_str!("../../../assets/keymaps/default-macos.json"),
+                include_str!("../../../assets/keymaps/zenith.json"),
+            ] {
+                match settings::KeymapFile::load(json, cx) {
+                    settings::KeymapFileLoadResult::Success { key_bindings }
+                    | settings::KeymapFileLoadResult::SomeFailedToLoad { key_bindings, .. } => {
+                        cx.bind_keys(key_bindings)
+                    }
+                    settings::KeymapFileLoadResult::JsonParseFailure { error } => {
+                        panic!("{error:#}")
+                    }
+                }
+            }
+        });
+    }
+
+    fn panel_has_focus(fixture: &mut Fixture<'_>) -> bool {
+        let handle = fixture
+            .panel
+            .read_with(fixture.cx, |panel, _| panel.focus_handle.clone());
+        fixture
+            .cx
+            .update(|window, cx| handle.contains_focused(window, cx))
+    }
+
+    /// A panel on `/www`, wp-content expanded, the `index.php` row selected, focus in the panel.
+    async fn focused_panel_with_a_selected_file(fixture: &mut Fixture<'_>) {
+        let server = fixture.servers[0].clone();
+        fixture
+            .panel
+            .update(fixture.cx, |panel, cx| panel.select_server(Some(server.id), cx));
+        fixture.cx.run_until_parked();
+        click_row(fixture, "wp-content");
+        fixture.cx.run_until_parked();
+        let index = row_index(fixture, "index.php");
+        fixture.panel.update(fixture.cx, |panel, cx| {
+            panel.selected = Some(index);
+            cx.notify();
+        });
+        fixture
+            .workspace
+            .update_in(fixture.cx, |workspace, window, cx| {
+                workspace.focus_panel::<RemoteHostPanel>(window, cx);
+            });
+        fixture.cx.run_until_parked();
+        load_keymaps(fixture.cx);
+        assert!(panel_has_focus(fixture));
+    }
+
+    #[gpui::test]
+    async fn enter_on_a_focused_toolbar_button_runs_the_button_not_the_row(
+        cx: &mut TestAppContext,
+    ) {
+        let remote = remote();
+        let mut fixture = fixture(&remote, cx).await;
+        focused_panel_with_a_selected_file(&mut fixture).await;
+        let expanded = |fixture: &mut Fixture| {
+            fixture
+                .panel
+                .read_with(fixture.cx, |panel, _| panel.expanded.len())
+        };
+        assert_eq!(expanded(&mut fixture), 1);
+        // Panel -> host dropdown -> "..." -> Collapse All.
+        fixture.cx.simulate_keystrokes("tab tab tab");
+        fixture.cx.simulate_keystrokes("enter");
+        fixture.cx.run_until_parked();
+        assert_eq!(expanded(&mut fixture), 0, "Collapse All ran");
+        assert_eq!(gets(&remote), 0, "the selected file was not opened");
+    }
+
+    #[gpui::test]
+    async fn enter_on_the_host_dropdown_opens_its_menu_not_the_row(cx: &mut TestAppContext) {
+        let remote = remote();
+        let mut fixture = fixture(&remote, cx).await;
+        focused_panel_with_a_selected_file(&mut fixture).await;
+        fixture.cx.simulate_keystrokes("tab enter");
+        fixture.cx.run_until_parked();
+        let open = fixture
+            .panel
+            .read_with(fixture.cx, |panel, _| panel.host_handle.is_deployed());
+        assert!(open, "the menu is open");
+        assert_eq!(gets(&remote), 0, "the selected file was not opened");
+    }
+
+    #[gpui::test]
+    async fn tab_walks_the_toolbar_and_leaves_the_panel_without_stepping_rows(
+        cx: &mut TestAppContext,
+    ) {
+        let remote = remote();
+        let mut fixture = fixture(&remote, cx).await;
+        focused_panel_with_a_selected_file(&mut fixture).await;
+        let selected = |fixture: &mut Fixture| {
+            fixture
+                .panel
+                .read_with(fixture.cx, |panel, _| panel.selected)
+        };
+        let before = selected(&mut fixture);
+        fixture.cx.simulate_keystrokes("tab");
+        assert_eq!(selected(&mut fixture), before, "Tab does not step the rows");
+        assert!(panel_has_focus(&mut fixture), "the dropdown is in the panel");
+        let mut left = None;
+        for presses in 2..=12 {
+            fixture.cx.simulate_keystrokes("tab");
+            if !panel_has_focus(&mut fixture) {
+                left = Some(presses);
+                break;
+            }
+        }
+        assert!(left.is_some(), "Tab never left the panel: it wraps");
+        // And backwards from the panel itself.
+        fixture
+            .workspace
+            .update_in(fixture.cx, |workspace, window, cx| {
+                workspace.focus_panel::<RemoteHostPanel>(window, cx);
+            });
+        fixture.cx.run_until_parked();
+        assert!(panel_has_focus(&mut fixture));
+        fixture.cx.simulate_keystrokes("shift-tab");
+        assert!(!panel_has_focus(&mut fixture), "Shift-Tab leaves the panel");
+    }
+
+    #[test]
+    fn the_way_to_a_file_follows_whole_path_parts_below_the_root() {
+        assert_eq!(
+            chain_to("/var/www", "/var/www/t/a.php"),
+            Some(vec!["/var/www".to_string(), "/var/www/t".to_string()])
+        );
+        // The root as the server wrote it keys the first listing.
+        assert_eq!(
+            chain_to("/var/www/", "/var/www/a.php"),
+            Some(vec!["/var/www/".to_string()])
+        );
+        assert_eq!(
+            chain_to("/", "/a/b.php"),
+            Some(vec!["/".to_string(), "/a".to_string()])
+        );
+        for (root, target) in [
+            ("/var/www", "/var/wwwx/a.php"),
+            ("/var/www", "/var/www"),
+            ("/var/www", "/var/www/"),
+            ("/var/www", "/var/www/../etc/passwd"),
+            ("/var/www", "/var/www/./a.php"),
+            ("/var/www", "/var/www//a.php"),
+            ("/var/www", "/etc/passwd"),
+        ] {
+            assert_eq!(chain_to(root, target), None, "{root} {target}");
+        }
+        assert!(chain_holds("/a", "/a/b.php"));
+        assert!(chain_holds("/", "/a/b.php"));
+        assert!(!chain_holds("/a", "/ab/c.php"));
+        assert!(!chain_holds("/a/b.php", "/a/b.php"));
     }
 }

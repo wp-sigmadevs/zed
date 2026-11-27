@@ -162,10 +162,14 @@
     },
   },
   {
-    // Refresh in the Remote Host tool window, as PhpStorm's ⌘R in tool windows.
+    // Refresh in the Remote Host tool window, as PhpStorm's ⌘R in tool windows. Tab and
+    // Shift-Tab move between its controls (the base keymap's Tab would step the tree rows;
+    // Up and Down do that).
     "context": "RemoteHostPanel",
     "bindings": {
       "secondary-r": "zenith_deploy::Refresh",
+      "tab": "zenith_deploy::FocusNextControl",
+      "shift-tab": "zenith_deploy::FocusPreviousControl",
     },
   },
   {
