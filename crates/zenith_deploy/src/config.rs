@@ -102,9 +102,11 @@ pub struct ServerConfig {
     pub mappings: Vec<Mapping>,
     pub excluded_local: Vec<String>,
     pub excluded_remote: Vec<String>,
-    /// Reserved for M4b (auto-upload of mapped files). The M4a uploader ignores both flags by
-    /// design: its yes is a session-only, in-memory decision (`UploadDecision`), never read from
-    /// a file that could arrive with a repo. The M1b dialog does not offer the switch at all.
+    /// M4b auto-upload of mapped files: the Deployment dialog's checkbox sets the first, and the
+    /// second only after the user confirmed these very settings (`on_save::confirmation_holds`;
+    /// the store clears it on every save that does not hold). The M4a uploader ignores both flags
+    /// by design: its yes is a session-only, in-memory decision (`UploadDecision`), never read
+    /// from a file that could arrive with a repo.
     pub upload_on_save: bool,
     pub upload_on_save_confirmed: bool,
     #[serde(skip)]

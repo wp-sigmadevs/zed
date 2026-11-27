@@ -7,8 +7,8 @@ use std::collections::HashMap;
 use editor::{Editor, EditorEvent};
 use gpui::{
     App, ClickEvent, Context, DismissEvent, Div, Entity, EventEmitter, FocusHandle, Focusable,
-    PathPromptOptions, Role, SharedString, Stateful, Subscription, Task, Toggled, WeakEntity,
-    Window, actions,
+    PathPromptOptions, PromptButton, PromptLevel, Role, SharedString, Stateful, Subscription, Task,
+    Toggled, WeakEntity, Window, actions,
 };
 use ui::{Callout, Checkbox, IconButton, ListItem, Tooltip, prelude::*};
 use util::ResultExt as _;
@@ -56,6 +56,9 @@ const OUTDATED: &str = "The saved servers changed while this dialog was open (an
 const PASSWORD_CLEARED: &str = "Saved. The saved password was removed because the host, port, type or username changed; type a new one.";
 const PORT_INVALID: &str = "Port must be a number from 1 to 65535.";
 pub(crate) const NO_USERNAME: &str = "Username is not specified";
+const NEEDS_MAPPING: &str = "Add a mapping first: only mapped files upload.";
+const NEEDS_DEFAULT: &str =
+    "Only the default server for this project uploads on save. Use this server as default first.";
 
 struct Fields {
     name: Entity<Editor>,
@@ -152,6 +155,12 @@ pub struct DeploymentDialog {
     /// The selected server's `excluded_local`, one pattern per line.
     excluded: Entity<Editor>,
     port_invalid: bool,
+    /// For each server whose "upload on save" the user confirmed in this dialog, the
+    /// [`on_save::fingerprint`] they confirmed. Handed to the store on OK, which keeps the
+    /// confirmation only while the saved settings still have that fingerprint.
+    reconfirmed: HashMap<String, String>,
+    /// The confirmation prompt is open: a second one does not stack.
+    confirm_open: bool,
     advanced_open: bool,
     test_status: Option<TestStatus>,
     error: Option<SharedString>,
@@ -159,6 +168,7 @@ pub struct DeploymentDialog {
     saving: bool,
     workspace: WeakEntity<Workspace>,
     _test: Option<Task<()>>,
+    _confirm: Option<Task<()>>,
     _save: Option<Task<()>>,
     _browse: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
@@ -308,12 +318,15 @@ impl DeploymentDialog {
             mapping_rows: Vec::new(),
             excluded,
             port_invalid: false,
+            reconfirmed: HashMap::new(),
+            confirm_open: false,
             advanced_open: false,
             test_status: None,
             error: None,
             saving: false,
             workspace,
             _test: None,
+            _confirm: None,
             _save: None,
             _browse: None,
             _subscriptions: subscriptions,
@@ -639,6 +652,7 @@ impl DeploymentDialog {
             .project_defaults
             .retain(|_, server_id| *server_id != removed.id);
         self.passwords.remove(&removed.id);
+        self.reconfirmed.remove(&removed.id);
         self.removed.push(removed.id);
         let next = if self.servers.servers.is_empty() {
             None
@@ -646,6 +660,84 @@ impl DeploymentDialog {
             Some(index.min(self.servers.servers.len() - 1))
         };
         self.select(next, window, cx);
+        // The Remove button that had focus is disabled now: keep focus inside the dialog.
+        if next.is_none() {
+            window.focus(&self.add_server_focus, cx);
+        }
+    }
+
+    /// Whether the selected server may offer "upload on save": it is this project's default
+    /// (the one auto-upload uses) and it has a mapping to upload by.
+    fn upload_on_save_blocker(&self, server: &ServerConfig) -> Option<&'static str> {
+        if server.mappings.is_empty() {
+            Some(NEEDS_MAPPING)
+        } else if !self.is_default(server) {
+            Some(NEEDS_DEFAULT)
+        } else {
+            None
+        }
+    }
+
+    /// Whether "upload on save" is on and confirmed for these very settings: the checkbox is
+    /// checked only then, so a change of the target, root, mappings or exclusions after the
+    /// confirmation shows it unchecked, as the store will save it.
+    fn upload_on_save_active(&self, server: &ServerConfig) -> bool {
+        let old = self.base.servers.iter().find(|old| old.id == server.id);
+        server.upload_on_save
+            && on_save::confirmation_holds(old, server, self.reconfirmed.get(&server.id))
+    }
+
+    /// The checkbox: off turns it off; on asks first, naming the server, its root folder and
+    /// the number of mappings, and only an answer of "Turn on" sets it. Nothing else turns it
+    /// on, and the store keeps it only for the settings confirmed here
+    /// ([`on_save::confirmation_holds`]).
+    pub(crate) fn toggle_upload_on_save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(server) = self.selected_server().cloned() else {
+            return;
+        };
+        if self.upload_on_save_active(&server) {
+            self.reconfirmed.remove(&server.id);
+            self.update_selected(cx, |server| {
+                server.upload_on_save = false;
+                server.upload_on_save_confirmed = false;
+            });
+            return;
+        }
+        if self.confirm_open || self.upload_on_save_blocker(&server).is_some() {
+            return;
+        }
+        let count = server.mappings.len();
+        let message = format!("Upload changed files to \"{}\" when you save?", server.name);
+        let mut detail = format!(
+            "Root folder: {}\n{count} {}\n\nEvery time you save a mapped file of this project with Save, it is written to this server over the file that is there. Closing, Save As and files you excluded never upload.",
+            server.root_path,
+            if count == 1 { "mapping" } else { "mappings" },
+        );
+        if server.server_type == ServerType::Ftp {
+            detail.push_str("\n\nFTP sends your password and the files unencrypted.");
+        }
+        let buttons = [PromptButton::cancel("Cancel"), PromptButton::new("Turn on")];
+        let answer = window.prompt(PromptLevel::Warning, &message, Some(&detail), &buttons, cx);
+        let (id, fingerprint) = (server.id.clone(), on_save::fingerprint(&server));
+        self.confirm_open = true;
+        self._confirm = Some(cx.spawn(async move |this, cx| {
+            let answer = answer.await.unwrap_or(0);
+            this.update(cx, |this, cx| {
+                this.confirm_open = false;
+                // The prompt named the settings as they were when it opened.
+                let Some(server) = this.servers.servers.iter_mut().find(|s| s.id == id) else {
+                    return;
+                };
+                if answer != 1 || on_save::fingerprint(server) != fingerprint {
+                    return;
+                }
+                server.upload_on_save = true;
+                server.upload_on_save_confirmed = true;
+                this.reconfirmed.insert(id, fingerprint);
+                cx.notify();
+            })
+            .log_err();
+        }));
     }
 
     /// Marks the selected server as this project's default (PhpStorm's ✓).
@@ -862,6 +954,7 @@ impl DeploymentDialog {
             deletes.push(secrets::delete_password(&keychain, id, cx));
         }
         let servers = self.servers.clone();
+        let reconfirmed = self.reconfirmed.clone();
         let store = self.store.clone();
         let base = self.base.clone();
         let workspace = self.workspace.clone();
@@ -897,7 +990,7 @@ impl DeploymentDialog {
                     applied += 1;
                 }
                 let save = store.update(cx, |store, cx| {
-                    store.save(base, servers, session_changes, &Default::default(), cx)
+                    store.save(base, servers, session_changes, &reconfirmed, cx)
                 });
                 save.await.map_err(|error| {
                     if applied == 0 {
@@ -1297,7 +1390,12 @@ impl DeploymentDialog {
             }))
     }
 
-    fn render_mappings(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_mappings(
+        &self,
+        server: &ServerConfig,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let rows = self.mapping_rows.iter().enumerate().map(|(index, row)| {
             let number = index + 1;
             let side = |label: &'static str| {
@@ -1374,6 +1472,11 @@ impl DeploymentDialog {
                         ))),
                 )
         });
+        let blocker = self.upload_on_save_blocker(server);
+        let active = self.upload_on_save_active(server);
+        // A box that is on can always be turned off, even when the server stopped being the
+        // default meanwhile.
+        let disabled = blocker.is_some() && !active;
         v_flex()
             .debug_selector(|| "zenith-deploy-mappings".to_string())
             .flex_1()
@@ -1401,6 +1504,22 @@ impl DeploymentDialog {
                     cx,
                 )),
             )
+            .child(Self::checkbox(
+                "zenith-deploy-upload-on-save",
+                "Upload changed files to default server on explicit save",
+                active,
+                disabled,
+                blocker.filter(|_| disabled),
+                |this, window, cx| this.toggle_upload_on_save(window, cx),
+                cx,
+            ))
+            .when_some(blocker.filter(|_| disabled), |panel, reason| {
+                panel.child(
+                    div()
+                        .debug_selector(|| "zenith-deploy-upload-on-save-note".to_string())
+                        .child(Label::new(reason).color(Color::Muted).size(LabelSize::Small)),
+                )
+            })
     }
 
     fn render_excluded(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1802,7 +1921,7 @@ impl Render for DeploymentDialog {
         let content = match self.selected_server().cloned() {
             Some(server) => match self.tab {
                 DialogTab::Connection => self.render_form(&server, window, cx).into_any_element(),
-                DialogTab::Mappings => self.render_mappings(window, cx).into_any_element(),
+                DialogTab::Mappings => self.render_mappings(&server, window, cx).into_any_element(),
                 DialogTab::ExcludedPaths => self.render_excluded(window, cx).into_any_element(),
             },
             None => v_flex()
@@ -4203,5 +4322,311 @@ mod tests {
                 "the user is told the saved password was removed"
             );
         });
+    }
+
+    /// A dialog on one server "Live", optionally with a mapping and as this project's default,
+    /// the keymaps loaded and the Mappings tab open.
+    async fn open_upload(
+        mapped: bool,
+        default: bool,
+        cx: &mut TestAppContext,
+    ) -> (
+        Entity<Workspace>,
+        Entity<DeploymentDialog>,
+        &mut VisualTestContext,
+    ) {
+        let mut live = server("Live", None);
+        if mapped {
+            live.mappings = vec![Mapping {
+                local: "/p/src".into(),
+                remote: String::new(),
+            }];
+        }
+        let mut servers = Servers {
+            servers: vec![live],
+            ..Servers::default()
+        };
+        if default {
+            let id = servers.servers[0].id.clone();
+            servers.project_defaults.insert("/p".into(), id);
+        }
+        let (workspace, dialog, cx) = open_dialog(servers, &FakeRemote::default(), cx).await;
+        load_keymaps(cx);
+        dialog.update(cx, |dialog, cx| dialog.set_tab(DialogTab::Mappings, cx));
+        cx.run_until_parked();
+        (workspace, dialog, cx)
+    }
+
+    fn upload_flags(dialog: &Entity<DeploymentDialog>, cx: &mut VisualTestContext) -> (bool, bool) {
+        dialog.read_with(cx, |dialog, _| {
+            let server = dialog.selected_server().expect("selected");
+            (server.upload_on_save, server.upload_on_save_confirmed)
+        })
+    }
+
+    fn saved_flags(cx: &mut VisualTestContext) -> (bool, bool) {
+        cx.update(|_, cx| {
+            let store = ServerStore::global(cx);
+            let server = &store.read(cx).servers().servers[0];
+            (server.upload_on_save, server.upload_on_save_confirmed)
+        })
+    }
+
+    fn turn_on(dialog: &Entity<DeploymentDialog>, answer: &str, cx: &mut VisualTestContext) {
+        dialog.update_in(cx, |dialog, window, cx| {
+            dialog.toggle_upload_on_save(window, cx)
+        });
+        cx.run_until_parked();
+        assert!(cx.has_pending_prompt(), "turning it on asks first");
+        cx.simulate_prompt_answer(answer);
+        cx.run_until_parked();
+    }
+
+    /// One server, so each case is its own test: a second workspace in one test panics.
+    async fn check_upload_checkbox(
+        mapped: bool,
+        default: bool,
+        note: Option<&'static str>,
+        cx: &mut TestAppContext,
+    ) {
+        let (_, dialog, cx) = open_upload(mapped, default, cx).await;
+        let blocker = dialog.read_with(cx, |dialog, _| {
+            dialog.upload_on_save_blocker(dialog.selected_server().expect("selected"))
+        });
+        assert_eq!(blocker, note);
+        assert_eq!(
+            cx.debug_bounds("zenith-deploy-upload-on-save-note")
+                .is_some(),
+            note.is_some(),
+            "the reason is shown as text"
+        );
+        dialog.update_in(cx, |dialog, window, cx| {
+            dialog.toggle_upload_on_save(window, cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            cx.has_pending_prompt(),
+            note.is_none(),
+            "only an allowed server asks"
+        );
+        if note.is_none() {
+            cx.simulate_prompt_answer("Cancel");
+        }
+        assert_eq!(upload_flags(&dialog, cx), (false, false));
+    }
+
+    #[gpui::test]
+    async fn the_upload_checkbox_is_off_without_a_mapping(cx: &mut TestAppContext) {
+        check_upload_checkbox(false, true, Some(NEEDS_MAPPING), cx).await;
+    }
+
+    #[gpui::test]
+    async fn the_upload_checkbox_is_off_on_a_server_that_is_not_the_default(
+        cx: &mut TestAppContext,
+    ) {
+        check_upload_checkbox(true, false, Some(NEEDS_DEFAULT), cx).await;
+    }
+
+    #[gpui::test]
+    async fn the_upload_checkbox_is_off_without_both(cx: &mut TestAppContext) {
+        check_upload_checkbox(false, false, Some(NEEDS_MAPPING), cx).await;
+    }
+
+    #[gpui::test]
+    async fn the_upload_checkbox_asks_on_the_default_server_with_a_mapping(
+        cx: &mut TestAppContext,
+    ) {
+        check_upload_checkbox(true, true, None, cx).await;
+    }
+
+    #[gpui::test]
+    async fn declining_the_confirmation_leaves_upload_on_save_off(cx: &mut TestAppContext) {
+        let (_, dialog, cx) = open_upload(true, true, cx).await;
+        dialog.update_in(cx, |dialog, window, cx| {
+            dialog.toggle_upload_on_save(window, cx)
+        });
+        cx.run_until_parked();
+        let (message, detail) = cx.pending_prompt().expect("the confirmation");
+        assert!(message.contains("Live"), "names the server: {message}");
+        assert!(detail.contains("/www"), "names the root folder: {detail}");
+        assert!(
+            detail.contains("1 mapping"),
+            "counts the mappings: {detail}"
+        );
+        cx.simulate_prompt_answer("Cancel");
+        cx.run_until_parked();
+        assert_eq!(upload_flags(&dialog, cx), (false, false));
+        dialog.read_with(cx, |dialog, _| {
+            assert!(dialog.reconfirmed.is_empty(), "nothing was confirmed");
+            assert!(!dialog.confirm_open, "the prompt slot is free again");
+        });
+        dialog.update(cx, |dialog, cx| dialog.save(cx));
+        cx.run_until_parked();
+        assert_eq!(saved_flags(cx), (false, false));
+    }
+
+    #[gpui::test]
+    async fn accepting_records_the_fingerprint_and_the_store_keeps_it(cx: &mut TestAppContext) {
+        let (workspace, dialog, cx) = open_upload(true, true, cx).await;
+        turn_on(&dialog, "Turn on", cx);
+        assert_eq!(upload_flags(&dialog, cx), (true, true));
+        dialog.read_with(cx, |dialog, _| {
+            let server = dialog.selected_server().expect("selected");
+            assert_eq!(
+                dialog.reconfirmed.get(&server.id),
+                Some(&on_save::fingerprint(server))
+            );
+            assert!(dialog.upload_on_save_active(server));
+        });
+        dialog.update(cx, |dialog, cx| dialog.save(cx));
+        cx.run_until_parked();
+        assert_eq!(saved_flags(cx), (true, true));
+
+        // Unchecking turns both off and forgets the confirmation.
+        let dialog = reopen(&workspace, cx);
+        dialog.update_in(cx, |dialog, window, cx| {
+            dialog.toggle_upload_on_save(window, cx)
+        });
+        assert!(!cx.has_pending_prompt(), "turning it off does not ask");
+        assert_eq!(upload_flags(&dialog, cx), (false, false));
+        dialog.read_with(cx, |dialog, _| assert!(dialog.reconfirmed.is_empty()));
+    }
+
+    #[gpui::test]
+    async fn editing_a_mapping_after_confirming_forces_a_new_confirmation(cx: &mut TestAppContext) {
+        let (_, dialog, cx) = open_upload(true, true, cx).await;
+        turn_on(&dialog, "Turn on", cx);
+        let remote = dialog.read_with(cx, |dialog, _| dialog.mapping_rows[0].remote.clone());
+        set_text(&remote, "elsewhere", cx);
+        dialog.read_with(cx, |dialog, _| {
+            assert!(
+                !dialog.upload_on_save_active(dialog.selected_server().expect("selected")),
+                "the checkbox shows unchecked: the confirmation was for other settings"
+            );
+        });
+        dialog.update(cx, |dialog, cx| dialog.save(cx));
+        cx.run_until_parked();
+        let (_, confirmed) = saved_flags(cx);
+        assert!(
+            !confirmed,
+            "the store refuses a confirmation for old settings"
+        );
+    }
+
+    #[gpui::test]
+    async fn the_store_refuses_a_flag_nobody_confirmed(cx: &mut TestAppContext) {
+        let (_, dialog, cx) = open_upload(true, true, cx).await;
+        // What a hand-edited list or a bug would send: the flag on, no confirmation given.
+        dialog.update(cx, |dialog, cx| {
+            dialog.update_selected(cx, |server| {
+                server.upload_on_save = true;
+                server.upload_on_save_confirmed = true;
+            })
+        });
+        dialog.read_with(cx, |dialog, _| {
+            assert!(!dialog.upload_on_save_active(dialog.selected_server().expect("selected")));
+        });
+        dialog.update(cx, |dialog, cx| dialog.save(cx));
+        cx.run_until_parked();
+        assert_eq!(
+            saved_flags(cx),
+            (true, false),
+            "the switch stays, the confirmation does not"
+        );
+    }
+
+    #[test]
+    fn a_confirmation_holds_only_for_what_was_confirmed() {
+        let mut saved = ServerConfig::new();
+        saved.mappings = vec![Mapping {
+            local: "/p".into(),
+            remote: String::new(),
+        }];
+        let mut on = saved.clone();
+        on.upload_on_save_confirmed = true;
+        let fp = on_save::fingerprint(&on);
+        let holds = |old: Option<&ServerConfig>, new: &ServerConfig, fp: Option<&String>| {
+            on_save::confirmation_holds(old, new, fp)
+        };
+        assert!(holds(Some(&saved), &on, Some(&fp)), "confirmed now");
+        assert!(!holds(Some(&saved), &on, None), "never confirmed");
+        assert!(
+            !holds(None, &on, None),
+            "a new server has nothing confirmed"
+        );
+        assert!(holds(Some(&on), &on, None), "was on, nothing changed");
+        let mut other = on.clone();
+        other.root_path = "/elsewhere".into();
+        assert!(!holds(Some(&on), &other, None), "was on, settings changed");
+        assert!(
+            !holds(Some(&saved), &other, Some(&fp)),
+            "confirmed other settings"
+        );
+        assert!(!holds(Some(&on), &saved, Some(&fp)), "the flag is off");
+    }
+
+    #[gpui::test]
+    async fn enter_toggles_the_upload_checkbox_and_does_not_save(cx: &mut TestAppContext) {
+        let (_, dialog, cx) = open_upload(true, true, cx).await;
+        let name = dialog.read_with(cx, |dialog, _| dialog.fields.name.clone());
+        // A save would write this name to the store and close the dialog.
+        set_text(&name, "Edited", cx);
+        let add = dialog.read_with(cx, |dialog, _| dialog.add_mapping_focus.clone());
+        focus(&add, cx);
+        cx.simulate_keystrokes("tab");
+        let checkbox = focused(cx).expect("focused");
+        cx.simulate_keystrokes("enter");
+        assert!(cx.has_pending_prompt(), "Enter on the checkbox asks first");
+        assert_eq!(upload_flags(&dialog, cx), (false, false), "not yet on");
+        cx.simulate_prompt_answer("Turn on");
+        cx.run_until_parked();
+        assert_eq!(upload_flags(&dialog, cx), (true, true));
+        assert_eq!(
+            focused(cx),
+            Some(checkbox),
+            "focus is still on the checkbox"
+        );
+        assert!(
+            cx.debug_bounds("zenith-deploy-dialog").is_some(),
+            "the dialog is still open"
+        );
+        let saved = cx.update(|_, cx| ServerStore::global(cx).read(cx).servers().clone());
+        assert_eq!(saved.servers[0].name, "Live", "Enter did not save");
+        assert!(!saved.servers[0].upload_on_save);
+
+        // Enter again turns it off, and Space does what Enter does.
+        cx.simulate_keystrokes("enter");
+        assert_eq!(
+            upload_flags(&dialog, cx),
+            (false, false),
+            "Enter turned it off"
+        );
+        let space = gpui::Keystroke::parse("space").expect("keystroke");
+        cx.simulate_keystrokes("space");
+        cx.simulate_event(gpui::KeyUpEvent { keystroke: space });
+        cx.run_until_parked();
+        assert!(cx.has_pending_prompt(), "Space on the checkbox asks too");
+        cx.simulate_prompt_answer("Cancel");
+        cx.run_until_parked();
+        assert_eq!(upload_flags(&dialog, cx), (false, false));
+    }
+
+    #[gpui::test]
+    async fn removing_the_last_server_moves_focus_to_add_server(cx: &mut TestAppContext) {
+        let (dialog, cx) = open_with_one_server(cx).await;
+        let add = dialog.read_with(cx, |dialog, _| dialog.add_server_focus.clone());
+        focus(&add, cx);
+        // Add Server, then Remove Server.
+        cx.simulate_keystrokes("tab enter");
+        dialog.read_with(cx, |dialog, _| {
+            assert!(dialog.servers().servers.is_empty(), "Enter pressed Remove");
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            focused(cx),
+            Some(add),
+            "focus did not fall out of the dialog"
+        );
+        assert!(focus_is_inside(&dialog, cx));
     }
 }

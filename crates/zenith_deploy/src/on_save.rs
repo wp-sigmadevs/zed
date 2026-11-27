@@ -50,6 +50,24 @@ pub fn needs_reconfirm(old: Option<&ServerConfig>, new: &ServerConfig) -> bool {
     old.is_none_or(|old| fingerprint(old) != fingerprint(new))
 }
 
+/// Whether `new` may be saved with `upload_on_save_confirmed` on, over `old` (the saved server, if
+/// any). The flag becomes true only when the user confirmed these very settings now
+/// (`reconfirmed` is the [`fingerprint`] they confirmed) or it was already true and nothing the
+/// fingerprint covers changed. A flag turned on any other way (a hand-edited list, a stale
+/// confirmation) does not hold. The store applies this on every save; the dialog uses it to show
+/// the checkbox.
+pub(crate) fn confirmation_holds(
+    old: Option<&ServerConfig>,
+    new: &ServerConfig,
+    reconfirmed: Option<&String>,
+) -> bool {
+    new.upload_on_save_confirmed
+        && (reconfirmed.is_some_and(|confirmed| *confirmed == fingerprint(new))
+            || old.is_some_and(|old| {
+                old.upload_on_save_confirmed && !needs_reconfirm(Some(old), new)
+            }))
+}
+
 /// One `Normal` component as a validated UTF-8 name; `..` and everything else is an error.
 fn part(component: Component<'_>) -> Result<&str, String> {
     let Component::Normal(name) = component else {

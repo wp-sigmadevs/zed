@@ -349,13 +349,12 @@ impl ServerStore {
             return Task::ready(Err(error));
         }
         // The one-time "upload on save" confirmation was given for what `on_save::fingerprint`
-        // covers: a server that now differs in any of it must be confirmed again (plan 37 M4b).
+        // covers: it stays on only when the user just confirmed these settings or it was on and
+        // none of them changed. A flag switched on any other way is cleared (plan 37 M4b).
         for server in &mut servers.servers {
             let old = previous.servers.iter().find(|old| old.id == server.id);
-            let confirmed_now = reconfirmed.get(&server.id) == Some(&on_save::fingerprint(server));
-            if !confirmed_now && on_save::needs_reconfirm(old, server) {
-                server.upload_on_save_confirmed = false;
-            }
+            server.upload_on_save_confirmed =
+                on_save::confirmation_holds(old, server, reconfirmed.get(&server.id));
         }
         if let Some(error) = &self.load_error {
             return Task::ready(Err(anyhow!(
